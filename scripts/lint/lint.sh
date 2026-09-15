@@ -42,7 +42,7 @@ function run() {
 }
 
 function run_tests() {
-  run "ruff" ruff check openpilot --quiet
+  run "ruff" ruff check openpilot moonpilot --quiet  # moonpilot
   run "check_shell" python3 "$DIR/check_shell.py" "${SHELL_FILES[@]}"
   run "check_dependencies" python3 "$DIR/check_dependencies.py"
   run "check_indentation" "$DIR/check_indentation.py" "${PYTHON_FILES[@]}"
@@ -52,7 +52,7 @@ function run_tests() {
   run "check_nomerge_comments" "$DIR/check_nomerge_comments.sh" "${ALL_FILES[@]}"
 
   if [[ -z "$FAST" ]]; then
-    run "ty" ty check openpilot
+    run "ty" ty check openpilot moonpilot  # moonpilot
     run "codespell" codespell "${ALL_FILES[@]}"
   fi
 
@@ -114,7 +114,7 @@ while IFS= read -r -d '' f; do
       PYTHON_FILES+=("$f")
     fi
   fi
-done < <(git ls-files -z openpilot)
+done < <(git ls-files -z openpilot moonpilot)  # moonpilot
 
 # Include tooling, launchers, and the extensionless Git hook.
 SHELL_FILES=()

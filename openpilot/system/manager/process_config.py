@@ -6,6 +6,7 @@ from opendbc.car.structs import car
 from openpilot.common.params import Params
 from openpilot.common.hardware import PC, COMMA_HARDWARE
 from openpilot.system.manager.process import PythonProcess, NativeProcess, DaemonProcess
+from moonpilot.procs import MOONPILOT_PROCS  # moonpilot
 
 WEBCAM = os.getenv("USE_WEBCAM") is not None
 
@@ -119,5 +120,7 @@ procs = [
   PythonProcess("webrtcd", "openpilot.system.webrtc.webrtcd", or_(livestream, notcar)),
   PythonProcess("joystick", "openpilot.tools.joystick.joystick_control", and_(joystick, iscar)),
 ]
+
+procs += MOONPILOT_PROCS  # moonpilot
 
 managed_processes = {p.name: p for p in procs}

@@ -136,7 +136,7 @@ def module_name(path):
 
 def collect(targets, keyword):
   use_ignores = not targets
-  targets = targets or ["openpilot"]
+  targets = targets or ["openpilot", "moonpilot"]  # moonpilot
   loader = unittest.TestLoader()
   tests = []
   errors = []

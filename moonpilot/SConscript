@@ -1,0 +1,5 @@
+# moonpilot native targets. Mirror openpilot/*/SConscript, e.g.:
+#   Import('env', 'common', 'messaging')
+#   env.Program('moonpilotd', ['moonpilotd.cc'], LIBS=[common, messaging])
+# Exported by SConstruct: env, arch, acados, ffmpeg_libs, envCython, np_version, common, messaging.
+# CPPPATH already contains the repo root, so #include "moonpilot/foo.h" resolves.
