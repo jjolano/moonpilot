@@ -4,7 +4,7 @@ Personal fork of [openpilot](https://github.com/commaai/openpilot). The name is 
 
 ## The rule
 
-Fork code lives in `moonpilot/`. Upstream files carry **seams** only: a one-line hook into `moonpilot/`, marked with a literal `moonpilot` comment or identifier. The fork's whole surface on upstream is the table below — keep it that way and `git merge upstream/master` only ever conflicts on seam lines.
+Fork code lives in `moonpilot/`. Upstream files carry **seams** only: the minimum lines that hook into `moonpilot/`, each marked with a literal `moonpilot` comment or identifier. The fork's whole surface on upstream is the table below — keep it that way and `git merge upstream/master` only ever conflicts on seam lines.
 
 New fork behavior: write it under `moonpilot/`, hook it at the seam that already exists. A genuinely new seam means updating this table *and* `ALLOWED` in `moonpilot/tests/test_upstream_touches.py`, which fails on any other upstream edit.
 
@@ -26,6 +26,19 @@ New fork behavior: write it under `moonpilot/`, hook it at the seam that already
 | `openpilot/selfdrive/ui/layouts/settings/settings.py` | `PanelType.MOONPILOT` + panel from `moonpilot/ui/settings.py` |
 | `openpilot/selfdrive/ui/mici/layouts/settings/settings.py` | settings entry + panel from `moonpilot/ui/settings_mici.py` |
 
+Pick by need — reuse a seam, never invent one:
+
+- Setting or persisted state → a row in `moonpilot/params_keys.h`, named `Moonpilot*`.
+- Long-running work → `MOONPILOT_PROCS` in `moonpilot/procs.py`. The name must be unique (`test_manager.test_duplicate_procs`).
+- State other components observe → fill in `MoonpilotState`, then publish `moonpilotState`. Add a row to `openpilot/cereal/services.py` only once a publisher exists — that file then joins the table above and `ALLOWED`.
+- Native binary → `moonpilot/SConscript`.
+- UI → a panel under `moonpilot/ui/`, registered in **both** UI trees.
+
+## Editing upstream
+
+- Seam lines only. Never reformat, reorder, or tidy adjacent upstream code — an incidental whitespace fix turns a one-line merge conflict into a whole-file one.
+- When upstream's types or signatures clash with a seam, adapt the fork side. `MOONPILOT_PROCS` is annotated with upstream's process union rather than widening upstream's `procs` list, so `procs += MOONPILOT_PROCS` type-checks with no upstream edit.
+
 ## Sync with upstream
 
 Fork work lives on `master`. Merge, never rebase; no force-push.
@@ -45,3 +58,4 @@ Then bump `COMMA_VERSION` to the new upstream version, keeping the `-moonpilot` 
 - UI is Python + raylib; tizi (`openpilot/selfdrive/ui/layouts/`) and mici (`openpilot/selfdrive/ui/mici/layouts/`) are separate trees — a fork panel is registered in both.
 - Tests run through a unittest loader (`tools/test_runner.py`), so fork tests subclass `unittest.TestCase`.
 - Style is enforced by `scripts/lint/lint.sh` and `pyproject.toml` (ruff, ty, codespell); fork code mirrors the conventions of the upstream file it hooks into.
+- `scripts/lint/lint.sh` walks `git ls-files`, so a new file is invisible to lint until it is tracked — `git add` before trusting a clean run.
