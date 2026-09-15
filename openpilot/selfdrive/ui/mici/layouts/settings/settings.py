@@ -7,7 +7,7 @@ from openpilot.selfdrive.ui.mici.layouts.settings.device import DeviceLayoutMici
 from openpilot.selfdrive.ui.mici.layouts.settings.developer import DeveloperLayoutMici
 from openpilot.selfdrive.ui.mici.layouts.settings.software import SoftwareLayoutMici
 from openpilot.selfdrive.ui.mici.layouts.settings.firehose import FirehoseLayout
-from moonpilot.ui.settings_mici import MoonpilotLayoutMici  # moonpilot
+from moonpilot.ui.settings_mici import MoonpilotLayoutMici  # moonpilot seam, see AGENTS.md
 from openpilot.system.ui.lib.application import gui_app, FontWeight
 
 
@@ -45,9 +45,9 @@ class SettingsLayout(NavScroller):
     firehose_btn = SettingsBigButton("firehose", "", gui_app.texture("icons_mici/settings/firehose.png", 52, 62))
     firehose_btn.set_click_callback(lambda: gui_app.push_widget(firehose_panel))
 
-    moonpilot_panel = MoonpilotLayoutMici()  # moonpilot
-    moonpilot_btn = SettingsBigButton("moonpilot", "")  # moonpilot
-    moonpilot_btn.set_click_callback(lambda: gui_app.push_widget(moonpilot_panel))  # moonpilot
+    moonpilot_panel = MoonpilotLayoutMici()  # moonpilot seam, see AGENTS.md
+    moonpilot_btn = SettingsBigButton("moonpilot", "")  # moonpilot seam, see AGENTS.md
+    moonpilot_btn.set_click_callback(lambda: gui_app.push_widget(moonpilot_panel))  # moonpilot seam, see AGENTS.md
 
     self._scroller.add_widgets([
       toggles_btn,
@@ -56,7 +56,7 @@ class SettingsLayout(NavScroller):
       software_btn,
       firehose_btn,
       developer_btn,
-      moonpilot_btn,  # moonpilot
+      moonpilot_btn,  # moonpilot seam, see AGENTS.md
     ])
 
     self._font_medium = gui_app.font(FontWeight.MEDIUM)

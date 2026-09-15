@@ -12,6 +12,7 @@ from openpilot.system.ui.lib.application import gui_app, FontWeight, MousePos, T
 from openpilot.system.ui.lib.multilang import tr, trn
 from openpilot.system.ui.widgets.label import gui_label
 from openpilot.system.ui.widgets import Widget
+from moonpilot.features import brand as moonpilot_brand  # moonpilot seam, see AGENTS.md
 
 HEADER_HEIGHT = 80
 HEAD_BUTTON_FONT_SIZE = 40
@@ -228,6 +229,6 @@ class HomeLayout(Widget):
     self._prev_alerts_present = alerts_present
 
   def _get_version_text(self) -> str:
-    brand = "moonpilot"  # moonpilot
+    brand = moonpilot_brand(self.params)  # moonpilot seam, see AGENTS.md
     description = self.params.get("UpdaterCurrentDescription")
     return f"{brand} {description}" if description else brand

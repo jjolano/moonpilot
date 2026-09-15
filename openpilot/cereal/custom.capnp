@@ -10,7 +10,7 @@ $Cxx.namespace("cereal");
 # DO rename the structs
 # DON'T change the identifier (e.g. @0x81c2f05a394cf4af)
 
-struct MoonpilotState @0x81c2f05a394cf4af {
+struct MoonpilotState @0x81c2f05a394cf4af {  # moonpilot seam: upstream's reserved struct, renamed. Do not change the @0x id, and see AGENTS.md before editing.
 }
 
 struct CustomReserved1 @0xaedffd8f31e7b55d {

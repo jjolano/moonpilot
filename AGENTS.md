@@ -59,12 +59,46 @@ Feature toggles go in the **moonpilot panel**, never as new sidebar entries: the
 - Moonpilot's version is the one to keep → keep it, and let the seam carry the choice.
 - Upstream claims a reserved struct or param name → upstream's wins; the fork moves.
 
-Don't scaffold a `moonpilot/features.py` registry before there is a feature. The row-per-toggle shape above is the convention; a table that drives the panel is worth building once there are two or three toggles to drive.
+### The registry
+
+`moonpilot/features.py` drives the panel. Adding a feature is three things: a `Feature(...)`, a row in `moonpilot/params_keys.h`, and the code behind it.
+
+```python
+BRANDING = Feature(
+  key="MoonpilotBranding",      # the params_keys.h row, which carries the default
+  title="moonpilot branding",   # what the panel shows
+  description="...",            # shown as the item's description / long-press help
+)
+FEATURES: tuple[Feature, ...] = (BRANDING,)
+```
+
+Both panels build their rows by iterating `FEATURES`, so a new row appears in tizi and mici without touching either panel file. Read a feature's state with `enabled(feature, params)`, never `get_bool`, for the reason above. When a feature's decision is more than a boolean, add a function next to `enabled` — `brand(params)` is the pattern: the seam calls it, the feature stays a table row.
 
 ## Editing upstream
 
 - Seam lines only. Never reformat, reorder, or tidy adjacent upstream code — an incidental whitespace fix turns a one-line merge conflict into a whole-file one.
 - When upstream's types or signatures clash with a seam, adapt the fork side. `MOONPILOT_PROCS` is annotated with upstream's process union rather than widening upstream's `procs` list, so `procs += MOONPILOT_PROCS` type-checks with no upstream edit.
+
+### Seam markers
+
+Every fork line inside an upstream file carries the marker `moonpilot seam, see AGENTS.md`, in that file's comment syntax (`#`, `//`, or capnp's trailing `#`). The marker is what tells anyone — human or agent — that the line is fork-owned and why it is there.
+
+    brand = moonpilot_brand(self.params)  # moonpilot seam, see AGENTS.md
+
+Capnp seams carry the invariant they must not break, since a wrong edit there corrupts recorded data:
+
+    moonpilotState @107 :Custom.MoonpilotState;  # moonpilot seam: do not change @107 or which struct it points to. See AGENTS.md before editing.
+
+`git diff` showing an unmarked change to a file under `openpilot/` means something is wrong: either the line is a seam and needs the marker, or it is an upstream edit that should not be there.
+
+### Seams carry intent you cannot infer — ask
+
+A seam is one line, but the decision behind it — why the fork diverged, and whether that divergence is still wanted — is not in the code. Before you delete, restructure, or "clean up" a seam, or fold a fork behavior back into upstream's:
+
+- If the intent is legible from `moonpilot/` and the docs, proceed.
+- If it is **not** — the fork changed behavior and you cannot tell whether that was deliberate and still wanted, or which side should win after an upstream rework — **ask the developer** with the question tool. Name the file and line, quote the seam, and give the concrete options (keep fork / take upstream / keep both behind a toggle).
+
+Never silently drop a seam to make a merge or a lint error go away. Deleting fork behavior is the developer's call, not an inference to be made from a clean-looking diff.
 
 ## Sync with upstream
 

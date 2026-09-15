@@ -7,7 +7,7 @@ from openpilot.selfdrive.ui.layouts.settings.device import DeviceLayout
 from openpilot.selfdrive.ui.layouts.settings.firehose import FirehoseLayout
 from openpilot.selfdrive.ui.layouts.settings.software import SoftwareLayout
 from openpilot.selfdrive.ui.layouts.settings.toggles import TogglesLayout
-from moonpilot.ui.settings import MoonpilotLayout  # moonpilot
+from moonpilot.ui.settings import MoonpilotLayout  # moonpilot seam, see AGENTS.md
 from openpilot.system.ui.lib.application import gui_app, FontWeight, MousePos
 from openpilot.system.ui.lib.multilang import tr, tr_noop
 from openpilot.system.ui.lib.text_measure import measure_text_cached
@@ -38,7 +38,7 @@ class PanelType(IntEnum):
   SOFTWARE = 3
   FIREHOSE = 4
   DEVELOPER = 5
-  MOONPILOT = 6  # moonpilot
+  MOONPILOT = 6  # moonpilot seam, see AGENTS.md
 
 
 @dataclass
@@ -64,7 +64,7 @@ class SettingsLayout(Widget):
       PanelType.SOFTWARE: PanelInfo(tr_noop("Software"), SoftwareLayout()),
       PanelType.FIREHOSE: PanelInfo(tr_noop("Firehose"), FirehoseLayout()),
       PanelType.DEVELOPER: PanelInfo(tr_noop("Developer"), DeveloperLayout()),
-      PanelType.MOONPILOT: PanelInfo(tr_noop("moonpilot"), MoonpilotLayout()),  # moonpilot
+      PanelType.MOONPILOT: PanelInfo(tr_noop("moonpilot"), MoonpilotLayout()),  # moonpilot seam, see AGENTS.md
     }
 
     self._font_medium = gui_app.font(FontWeight.MEDIUM)

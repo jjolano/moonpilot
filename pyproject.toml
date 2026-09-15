@@ -96,7 +96,7 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = [
   "openpilot",
-  "moonpilot",  # moonpilot
+  "moonpilot",  # moonpilot seam, see AGENTS.md
 ]
 
 [tool.hatch.metadata]
