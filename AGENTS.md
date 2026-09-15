@@ -44,13 +44,39 @@ Pick by need — reuse a seam, never invent one:
 Fork work lives on `master`. Merge, never rebase; no force-push.
 
     git fetch upstream
-    git merge upstream/master
-    # conflicts land on seam lines; `grep -n moonpilot <file>` shows what the fork added
+    git merge upstream/master    # conflicts land on seam lines; `grep -n moonpilot <file>` shows the fork's side
+    python3 -c "import moonpilot.procs, moonpilot.ui.settings, moonpilot.ui.settings_mici"
     tools/op.sh lint
     tools/op.sh test moonpilot
     tools/op.sh build
 
 Then bump `COMMA_VERSION` to the new upstream version, keeping the `-moonpilot` suffix.
+
+### A clean merge is not a working seam
+
+The `import` line is not decoration. Upstream renaming a symbol the fork imports merges without a single conflict and passes lint:
+
+| Check | What it can see |
+| --- | --- |
+| `git merge` | upstream editing the same lines as a seam — nothing else |
+| `moonpilot/tests/test_upstream_touches.py` | **only fork edits.** After a merge, upstream's changes are inside the merge-base, so the guard is blind to them by construction |
+| `tools/op.sh lint` (ty) | fork-side mistakes, not upstream renames: renaming `text_item` in `openpilot/system/ui/widgets/list_view.py` still reports *All checks passed* |
+| the `import moonpilot…` line | upstream renames/removals the fork depends on — it raises `ImportError` on that same rename |
+| `tools/op.sh build` | the params and capnp seams (compiles `params.cc`, regenerates cereal) |
+| UI boot test | a panel or brand seam that no longer constructs |
+
+### Scenarios
+
+| Upstream does | Merge | Action |
+| --- | --- | --- |
+| Rewrites a line a seam sits on — the brand string, `COMMA_VERSION`, the wheel `packages` list, a `PanelType` entry | conflict | take upstream's version on their line, keep the fork's intent on ours, re-add the `# moonpilot` marker |
+| Adds rows/lines near a seam — a param, a proc, a `SConscript`, a settings panel | usually clean | rebuild and re-check. A new settings panel is clean to merge but shifts the fork panel down the tizi sidebar (it sits at y 960–1070 of 1080); re-verify it is not clipped. The mici scroller scrolls, so it absorbs the extra entry |
+| Renames or removes a symbol the fork imports | clean | the `import moonpilot…` line fails. Fix `moonpilot/`, never upstream |
+| Deletes a file the fork hooked | modify/delete conflict | re-attach the seam at the nearest equivalent point, then drop the dead row from the table above and from `ALLOWED` |
+| Adds its own `AGENTS.md` | add/add conflict | this file stays fork-owned; fold in anything useful from upstream's |
+| Wants a reserved struct or param name the fork also uses | conflict | upstream's ids and names win — move the fork to the next free `CustomReservedN`, never the reverse |
+
+Last 2000 upstream commits, per seam file: `pyproject.toml` (391) and `SConstruct` (320) move almost weekly, so those two conflict most; `cereal/log.capnp` (31), `common/params_keys.h` (18) and `scripts/lint/lint.sh` (16) are moderate; `process_config.py`, the UI settings panels, `home.py`, `version.h` and `custom.capnp` have moved 2–7 times. A new seam is a permanent recurring conflict surface — add one only when no existing seam reaches.
 
 ## Working here
 
