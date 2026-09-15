@@ -34,6 +34,33 @@ Pick by need — reuse a seam, never invent one:
 - Native binary → `moonpilot/SConscript`.
 - UI → a panel under `moonpilot/ui/`, registered in **both** UI trees.
 
+## Features
+
+A feature is code under `moonpilot/` reached through an existing seam. Whether it also gets a user-facing toggle is a separate call:
+
+- **Shape every seam to delegate, not replace.** `brand = moonpilot_brand() or "openpilot"  # moonpilot` leaves upstream's value in the line, so stock behavior still exists to fall back to. `brand = "moonpilot"` deletes it, and there is nothing left to toggle back to. Both are one line; only one keeps the option.
+- **Add a toggle only for behavior you would actually flip.** Every toggle is a second code path you now have to keep working. A feature that is always on costs nothing to leave always on — most should be.
+
+When a feature does get one, it is a param plus a control, all inside `moonpilot/`:
+
+1. A row in `moonpilot/params_keys.h` — `{"Moonpilot<Feature>", {PERSISTENT, BOOL, "1"}}`. The third element is the default; `"1"` means on.
+2. A control in the moonpilot panel: tizi (`moonpilot/ui/settings.py`) uses `toggle_item(...)` with a callback doing `params.put_bool(key, state, block=True)`, plus the refresh loop upstream's `developer.py` uses to mirror external changes; mici (`moonpilot/ui/settings_mici.py`) uses `BigParamControl(text, key, description=...)`, which writes the param itself.
+3. A read in fork code, with `params.get(key, return_default=True)` — **not** `get_bool`.
+
+That read is the trap: `get_bool` ignores the declared default and reports off for an unset param. The declaration only becomes true because `openpilot/system/manager/manager.py` seeds every unset param from its default at boot. On device both work; in a bare script or a test outside the manager, only `return_default=True` does.
+
+Gate anything that changes driving behavior on `ui_state.is_offroad()` — the `enabled=` argument — and if it needs a restart to take effect, say so in the description the way the alpha-longitudinal toggle does.
+
+Feature toggles go in the **moonpilot panel**, never as new sidebar entries: the tizi sidebar already reaches y 1070 of 1080 with 7 entries, so an 8th clips. The panel body scrolls and takes as many rows as you like — upstream's Developer panel carries 8 in the same widget.
+
+### When moonpilot and upstream converge
+
+- Upstream implements something moonpilot already has → delete moonpilot's version and its toggle row. A switch between two identical behaviors is rot, and it is how a fork accumulates dead weight.
+- Moonpilot's version is the one to keep → keep it, and let the seam carry the choice.
+- Upstream claims a reserved struct or param name → upstream's wins; the fork moves.
+
+Don't scaffold a `moonpilot/features.py` registry before there is a feature. The row-per-toggle shape above is the convention; a table that drives the panel is worth building once there are two or three toggles to drive.
+
 ## Editing upstream
 
 - Seam lines only. Never reformat, reorder, or tidy adjacent upstream code — an incidental whitespace fix turns a one-line merge conflict into a whole-file one.
