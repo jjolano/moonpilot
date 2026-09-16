@@ -12,6 +12,7 @@ def _feature_toggle(feature: Feature, params: Params):
     description=feature.description,
     initial_state=enabled(feature, params),
     callback=lambda state, key=feature.key: params.put_bool(key, state, block=True),
+    enabled=ui_state.is_offroad if feature.offroad_only else True,
   )
 
 

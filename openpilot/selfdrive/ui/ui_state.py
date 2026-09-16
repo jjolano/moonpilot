@@ -52,6 +52,7 @@ class UIState:
         "onroadEvents",
         "extrinsicsCalibration",
         "radarState",
+        "moonpilotState",  # moonpilot seam, see AGENTS.md
         "deviceState",
         "pandaStates",
         "carParams",

@@ -20,7 +20,15 @@ New fork behavior: write it under `moonpilot/`, hook it at the seam that already
 | `openpilot/system/manager/process_config.py` | `procs += MOONPILOT_PROCS` from `moonpilot/procs.py` |
 | `openpilot/cereal/custom.capnp` | `MoonpilotState` (upstream's reserved struct; never change the `@0x…` id) |
 | `openpilot/cereal/log.capnp` | `moonpilotState @107` event field |
+| `openpilot/cereal/services.py` | `moonpilotState` service row |
 | `openpilot/common/version.h` | `COMMA_VERSION "<upstream>-moonpilot"` |
+| `openpilot/selfdrive/controls/plannerd.py` | `moonpilotState` subscription |
+| `openpilot/selfdrive/controls/lib/longitudinal_planner.py` | lead danger factor from `moonpilot.lead` |
+| `openpilot/selfdrive/controls/lib/longitudinal_mpc_lib/long_mpc.py` | `lead_danger_factor` kwarg on `LongitudinalMpc.update` |
+| `openpilot/selfdrive/test/process_replay/process_replay.py` | `moonpilotState` in plannerd's `pubs` |
+| `openpilot/selfdrive/ui/ui_state.py` | `moonpilotState` subscription |
+| `openpilot/selfdrive/ui/onroad/model_renderer.py` | lead path draw (tizi) |
+| `openpilot/selfdrive/ui/mici/onroad/model_renderer.py` | lead path draw (mici) |
 | `openpilot/selfdrive/ui/layouts/home.py` | brand string (tizi) |
 | `openpilot/selfdrive/ui/mici/layouts/home.py` | brand label (mici) |
 | `openpilot/selfdrive/ui/layouts/settings/settings.py` | `PanelType.MOONPILOT` + panel from `moonpilot/ui/settings.py` |

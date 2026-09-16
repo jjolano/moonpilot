@@ -3,3 +3,4 @@
 //   {"MoonpilotExample", {PERSISTENT, BOOL}},        // no default
 //   {"MoonpilotToggle", {PERSISTENT, BOOL, "1"}},    // default on
 {"MoonpilotBranding", {PERSISTENT, BOOL, "1"}},
+{"MoonpilotLeadLateral", {PERSISTENT, BOOL, "1"}},

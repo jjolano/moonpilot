@@ -34,6 +34,7 @@ _services: dict[str, tuple] = {
   "pandaStates": (True, 10., 1),
   "peripheralState": (True, 2., 1),
   "radarState": (True, 20., 5),
+  "moonpilotState": (True, 20., 5),  # moonpilot seam, see AGENTS.md
   "narrowRoadEncodeIdx": (False, 20., 1),
   "radarTracks": (True, 20.),
   "sendcan": (True, 100., 139, QueueSize.MEDIUM),

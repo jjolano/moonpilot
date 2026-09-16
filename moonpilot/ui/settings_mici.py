@@ -10,6 +10,8 @@ def _feature_button(feature: Feature, params: Params):
   # BigParamControl reads get_bool, which ignores the declared default, so set the
   # initial state from the same read the feature itself uses.
   button.set_checked(enabled(feature, params))
+  if feature.offroad_only:
+    button.set_enabled(ui_state.is_offroad)
   return button
 
 

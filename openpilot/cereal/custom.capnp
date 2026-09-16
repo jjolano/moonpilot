@@ -11,6 +11,43 @@ $Cxx.namespace("cereal");
 # DON'T change the identifier (e.g. @0x81c2f05a394cf4af)
 
 struct MoonpilotState @0x81c2f05a394cf4af {  # moonpilot seam: upstream's reserved struct, renamed. Do not change the @0x id, and see AGENTS.md before editing.
+  # Normalized lead trajectories, one entry per modelV2.leadsV3 slot (3), in that order.
+  # leads[0]/leads[1] correspond to radarState.leadOne/leadTwo.
+  leads @0 :List(LeadTrajectory);
+
+  struct LeadTrajectory {
+    present @0 :Bool;
+    prob @1 :Float32;      # radard's filtered lead probability where radard has a counterpart, the raw model prob otherwise
+    probTime @2 :Float32;  # s; the time prob refers to (ModelConstants.LEAD_T_OFFSETS[i])
+    source @3 :Source;
+
+    # Anchored so index 0 equals the fused radarState values.
+    # x: m forward of the front bumper. y: m in car frame, LEFT POSITIVE (radarState convention).
+    t @4 :List(Float32);   # s, ModelConstants.LEAD_T_IDXS
+    x @5 :List(Float32);
+    y @6 :List(Float32);
+    v @7 :List(Float32);   # m/s absolute lead speed
+    a @8 :List(Float32);   # m/s^2, signed; negative is deceleration
+    xStd @9 :List(Float32);
+    yStd @10 :List(Float32);
+    vStd @11 :List(Float32);
+    aStd @12 :List(Float32);
+
+    # Derived here so every consumer agrees. yawRel: lead heading relative to the ego x
+    # axis, atan2(dy/dt, v), left positive, one entry per t.
+    # inPathProb: per-sample probability that the lead's lateral Gaussian lies inside the
+    # ego path corridor, one entry per t. inPath: those probabilities inverse-variance
+    # weighted into one scalar and asymmetrically filtered. 1.0 means fully in path.
+    yawRel @13 :List(Float32);
+    inPath @14 :Float32;
+    inPathProb @15 :List(Float32);
+  }
+
+  enum Source {
+    none @0;
+    vision @1;
+    radar @2;
+  }
 }
 
 struct CustomReserved1 @0xaedffd8f31e7b55d {

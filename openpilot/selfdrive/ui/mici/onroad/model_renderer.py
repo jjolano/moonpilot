@@ -12,6 +12,7 @@ from openpilot.selfdrive.ui.mici.onroad import blend_colors
 from openpilot.system.ui.lib.application import gui_app
 from openpilot.system.ui.lib.shader_polygon import draw_polygon, Gradient
 from openpilot.system.ui.widgets import Widget
+from moonpilot.lead import resample  # moonpilot seam, see AGENTS.md
 
 CLIP_MARGIN = 500
 MIN_DRAW_DISTANCE = 10.0
@@ -60,6 +61,10 @@ class ModelRenderer(Widget):
     self._road_edge_stds = np.zeros(2, dtype=np.float32)
     self._lead_vehicles = [LeadVehicle(), LeadVehicle()]
     self._path_offset_z = HEIGHT_INIT[0]
+
+    # moonpilot seam, see AGENTS.md: the lead's predicted path, drawn as a ribbon.
+    self._lead_path = ModelPoints()
+    self._lead_in_path = 1.0
 
     # Initialize ModelPoints objects
     self._path = ModelPoints()
@@ -136,12 +141,15 @@ class ModelRenderer(Widget):
       self._update_model(lead_one, path_x_array)
       if render_lead_indicator:
         self._update_leads(radar_state, path_x_array)
+      if sm.valid['moonpilotState']:  # moonpilot seam, see AGENTS.md
+        self._update_lead_path(sm['moonpilotState'], path_x_array)
       self._transform_dirty = False
 
     # Draw elements (hide when disengaged)
     if ui_state.status != UIStatus.DISENGAGED:
       self._draw_lane_lines()
       self._draw_path(sm)
+      self._draw_lead_path()  # moonpilot seam, see AGENTS.md
 
     # if render_lead_indicator and radar_state:
     #   self._draw_lead_indicator()
@@ -358,6 +366,41 @@ class ModelRenderer(Widget):
         draw_polygon(self._rect, path_pts, rl.Color(0, 0, 0, 90))
       else:
         draw_polygon(self._rect, path_pts, gradient=gradient)
+
+
+  def _update_lead_path(self, moonpilot_state, path_x_array):  # moonpilot seam, see AGENTS.md
+    """Project the nearest lead's predicted path into a ribbon."""
+    lead = moonpilot_state.leads[0] if len(moonpilot_state.leads) else None
+    if lead is None or not lead.present or len(lead.x) < 2:
+      self._lead_path = ModelPoints()
+      return
+
+    # Densify with the same helper the planner path uses, so both agree on the shape.
+    t_dense = np.arange(0.0, lead.t[-1] + 1e-9, 0.5)
+    x_d = resample(lead.t, lead.x, t_dense)
+    y_d = resample(lead.t, lead.y, t_dense)
+    if x_d.size < 2 or y_d.size < 2:
+      self._lead_path = ModelPoints()
+      return
+
+    # z follows the ego path at the lead's distance; y is negated back into the model's
+    # right-positive convention the projection below works in.
+    z = np.array([self._path.raw_points[self._get_path_length_idx(path_x_array, x), 2] for x in x_d], dtype=np.float32)
+    raw_points = np.array([x_d, -y_d, z], dtype=np.float32).T
+    self._lead_path = ModelPoints(
+      raw_points=raw_points,
+      projected_points=self._map_line_to_polygon(raw_points, 0.5, self._path_offset_z, len(raw_points) - 1),
+    )
+    self._lead_in_path = float(lead.inPath)
+
+  def _draw_lead_path(self):  # moonpilot seam, see AGENTS.md
+    """Draw the lead's predicted path, fading with the in-path probability the planner acts on."""
+    if self._lead_path.projected_points.size == 0:
+      return
+
+    alpha = int(np.clip(self._lead_in_path, 0.0, 1.0) * 90)
+    points = self._lead_path.projected_points + np.array([self._rect.x, self._rect.y], dtype=np.float32)
+    draw_polygon(self._rect, points, rl.Color(218, 202, 37, alpha))
 
   def _draw_lead_indicator(self):
     # Draw lead vehicles if available
