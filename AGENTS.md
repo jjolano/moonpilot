@@ -21,7 +21,7 @@ New fork behavior: write it under `moonpilot/`, hook it at the seam that already
 | `openpilot/cereal/custom.capnp` | `MoonpilotState` (upstream's reserved struct; never change the `@0x…` id) |
 | `openpilot/cereal/log.capnp` | `moonpilotState @107` event field |
 | `openpilot/cereal/services.py` | `moonpilotState` service row |
-| `openpilot/common/version.h` | `COMMA_VERSION "<upstream>-moonpilot"` |
+| `openpilot/common/version.h` | `COMMA_VERSION "<upstream>-moonpilot.<fork revision>"` |
 | `openpilot/selfdrive/controls/plannerd.py` | `moonpilotState` subscription |
 | `openpilot/selfdrive/controls/lib/longitudinal_planner.py` | lead danger factor from `moonpilot.lead` |
 | `openpilot/selfdrive/controls/lib/longitudinal_mpc_lib/long_mpc.py` | `lead_danger_factor` kwarg on `LongitudinalMpc.update` |
@@ -119,7 +119,24 @@ Fork work lives on `master`. Merge, never rebase; no force-push.
     tools/op.sh test moonpilot
     tools/op.sh build
 
-Then bump `COMMA_VERSION` to the new upstream version, keeping the `-moonpilot` suffix.
+Then bump `COMMA_VERSION`'s upstream part to the new upstream version, leaving the `-moonpilot.<n>` suffix alone. See **Versioning** below.
+
+### Versioning
+
+`COMMA_VERSION` in `openpilot/common/version.h` carries upstream's version and the fork's own, and the two bump separately:
+
+    #define COMMA_VERSION "0.11.2-moonpilot.1"
+    #                          ^        ^        ^
+    #                          |        |        └ fork revision: count up per fork release
+    #                          |        └ fork marker: never dropped
+    #                          └ upstream's version: taken verbatim on merge
+
+- **Merging upstream** moves the upstream part to upstream's new version and leaves the fork revision alone. Upstream's release edits this same line, so the merge conflicts — that conflict is the reminder to do it.
+- **Releasing the fork** bumps only the fork revision (`.2`, `.3`, …). It is a plain counter, not semver: it answers "which fork state is this?" and nothing orders by it — the updater works on git commits, not version strings.
+- **Keep the shape** `<upstream>-moonpilot.<n>`, with no spaces. `updated.py` composes `"version / branch / commit / date"` and mici's `_split_description` requires exactly four parts split on `" / "`, so a version containing `" / "` silently renders as blank in that panel. `moonpilot/tests/test_version.py` fails if the shape drifts.
+- Nothing else has to change when the suffix moves. Upstream already ships the accessor for reading the upstream part alone — `OpenpilotMetadata.short_version` is `version.split('-')[0]` (`openpilot/common/version.py:75`) — and `loggerd`'s own test asserts the logged version equals `get_version()`, so the fork string flows through unchanged.
+
+The fork marker also does **not** exist to disguise the fork as upstream. `OpenpilotMetadata.comma_remote` and the git origin feed upstream's release metrics, and upstream asks forks not to touch them (`openpilot/common/version.py:79`). The suffix is moonpilot's own identity, not a way to look like comma.
 
 ### A clean merge is not a working seam
 
