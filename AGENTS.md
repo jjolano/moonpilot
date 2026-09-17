@@ -72,15 +72,15 @@ Feature toggles go in the **moonpilot panel**, never as new sidebar entries: the
 `moonpilot/features.py` drives the panel. Adding a feature is three things: a `Feature(...)`, a row in `moonpilot/params_keys.h`, and the code behind it.
 
 ```python
-BRANDING = Feature(
-  key="MoonpilotBranding",      # the params_keys.h row, which carries the default
-  title="moonpilot branding",   # what the panel shows
-  description="...",            # shown as the item's description / long-press help
+LEAD_LATERAL = Feature(
+  key="MoonpilotLeadLateral",     # the params_keys.h row, which carries the default
+  title="lead lateral prediction",  # what the panel shows
+  description="...",                # shown as the item's description / long-press help
 )
-FEATURES: tuple[Feature, ...] = (BRANDING,)
+FEATURES: tuple[Feature, ...] = (LEAD_LATERAL,)
 ```
 
-Both panels build their rows by iterating `FEATURES`, so a new row appears in tizi and mici without touching either panel file. Read a feature's state with `enabled(feature, params)`, never `get_bool`, for the reason above. When a feature's decision is more than a boolean, add a function next to `enabled` — `brand(params)` is the pattern: the seam calls it, the feature stays a table row.
+Both panels build their rows by iterating `FEATURES`, so a new row appears in tizi and mici without touching either panel file. Read a feature's state with `enabled(feature, params)`, never `get_bool`, for the reason above. When a feature's decision is more than a boolean, add a function next to `enabled` — the seam calls it and no param is needed: `brand()` and `version()` are the pattern, fork identity with nothing to flip.
 
 ## Editing upstream
 
@@ -91,7 +91,7 @@ Both panels build their rows by iterating `FEATURES`, so a new row appears in ti
 
 Every fork line inside an upstream file carries the marker `moonpilot seam, see AGENTS.md`, in that file's comment syntax (`#`, `//`, or capnp's trailing `#`). The marker is what tells anyone — human or agent — that the line is fork-owned and why it is there.
 
-    brand = moonpilot_brand(self.params)  # moonpilot seam, see AGENTS.md
+    brand = moonpilot_brand() or "openpilot"  # moonpilot seam, see AGENTS.md
 
 Capnp seams carry the invariant they must not break, since a wrong edit there corrupts recorded data:
 

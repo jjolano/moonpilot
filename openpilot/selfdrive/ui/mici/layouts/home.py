@@ -162,7 +162,7 @@ class MiciHomeLayout(Widget):
       self._mic_icon,
     ], spacing=18)
 
-    brand = moonpilot_brand(ui_state.params)  # moonpilot seam, see AGENTS.md
+    brand = moonpilot_brand() or "openpilot"  # moonpilot seam, see AGENTS.md
     self._openpilot_label = UnifiedLabel(brand, font_size=96, font_weight=FontWeight.DISPLAY, max_width=480, wrap_text=False)  # moonpilot
     self._version_label = UnifiedLabel("", font_size=36, font_weight=FontWeight.ROMAN, max_width=480, wrap_text=False)
     self._large_version_label = UnifiedLabel("", font_size=64, text_color=rl.GRAY, font_weight=FontWeight.ROMAN, max_width=480, wrap_text=False)

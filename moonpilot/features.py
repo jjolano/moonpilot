@@ -12,12 +12,6 @@ class Feature:
   offroad_only: bool = False  # changes driving behavior, so only flip it while parked
 
 
-BRANDING = Feature(
-  key="MoonpilotBranding",
-  title="moonpilot branding",
-  description="Show moonpilot instead of openpilot as the product name. Takes effect after a reboot.",
-)
-
 LEAD_LATERAL = Feature(
   key="MoonpilotLeadLateral",
   title="lead lateral prediction",
@@ -27,7 +21,7 @@ LEAD_LATERAL = Feature(
 
 # Behaviors the driver can swap back to upstream. The settings panel is built from this
 # table, so a feature is one row here, one row in params_keys.h, and its own code.
-FEATURES: tuple[Feature, ...] = (BRANDING, LEAD_LATERAL)
+FEATURES: tuple[Feature, ...] = (LEAD_LATERAL,)
 
 
 def enabled(feature: Feature, params: Params) -> bool:
@@ -37,9 +31,11 @@ def enabled(feature: Feature, params: Params) -> bool:
   return bool(params.get(feature.key, return_default=True))
 
 
-def brand(params: Params) -> str:
-  # Delegates rather than replaces, so upstream's own name stays reachable.
-  return "moonpilot" if enabled(BRANDING, params) else "openpilot"
+def brand() -> str:
+  # Fork identity, like version(). Always on, so no param and no toggle to carry: nobody
+  # picks between "moonpilot" and "openpilot" as a name. The seams name upstream's own
+  # value as a fallback, so this is the only thing standing between them and stock.
+  return "moonpilot"
 
 
 def version() -> str:
