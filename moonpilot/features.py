@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 
+from moonpilot import deps
 from openpilot.common.params import Params
 from openpilot.common.version import get_version
 
@@ -10,6 +11,7 @@ class Feature:
   title: str
   description: str
   offroad_only: bool = False  # changes driving behavior, so only flip it while parked
+  requires: tuple[str, ...] = ()  # modules that must be importable for this feature to run
 
 
 LEAD_LATERAL = Feature(
@@ -19,16 +21,39 @@ LEAD_LATERAL = Feature(
   offroad_only=True,
 )
 
+# No requires: `requires` gates on importable Python modules, and tailscale here is a binary.
+# There is nothing to gate either way — the supervisor installs what is missing and the settings
+# row says so while it does.
+TAILSCALE = Feature(
+  key="MoonpilotTailscale",
+  title="tailscale",
+  description="Join this device to your tailnet for remote access. Downloads tailscale (~35 MB) the first time, then shows a sign-in link here.",
+)
+
 # Behaviors the driver can swap back to upstream. The settings panel is built from this
 # table, so a feature is one row here, one row in params_keys.h, and its own code.
-FEATURES: tuple[Feature, ...] = (LEAD_LATERAL,)
+FEATURES: tuple[Feature, ...] = (LEAD_LATERAL, TAILSCALE)
 
 
-def enabled(feature: Feature, params: Params) -> bool:
+def missing_modules(feature: Feature) -> tuple[str, ...]:
+  return tuple(module for module in feature.requires if not deps.available(module))
+
+
+def available(feature: Feature) -> bool:
+  return not missing_modules(feature)
+
+
+def wanted(feature: Feature, params: Params) -> bool:
   # Not get_bool: that ignores the default declared in params_keys.h and reports off for
   # an unset param. return_default=True is the value that holds inside and outside the
   # manager, which seeds unset params from their default at boot.
   return bool(params.get(feature.key, return_default=True))
+
+
+def enabled(feature: Feature, params: Params) -> bool:
+  # The seam-facing "is this behavior on" predicate: a feature the driver asked for but
+  # whose dependencies are not installed yet is off, so seams never import what is missing.
+  return available(feature) and wanted(feature, params)
 
 
 def brand() -> str:

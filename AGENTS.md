@@ -52,7 +52,9 @@ A feature is code under `moonpilot/` reached through an existing seam. Whether i
 When a feature does get one, it is a param plus a control, all inside `moonpilot/`:
 
 1. A row in `moonpilot/params_keys.h` — `{"Moonpilot<Feature>", {PERSISTENT, BOOL, "1"}}`. The third element is the default; `"1"` means on.
-2. A control in the moonpilot panel: tizi (`moonpilot/ui/settings.py`) uses `toggle_item(...)` with a callback doing `params.put_bool(key, state, block=True)`, plus the refresh loop upstream's `developer.py` uses to mirror external changes; mici (`moonpilot/ui/settings_mici.py`) uses `BigParamControl(text, key, description=...)`, which writes the param itself.
+2. A control in the moonpilot panel: tizi (`moonpilot/ui/settings.py`) uses `toggle_item(...)` with a callback doing `params.put_bool(key, state, block=True)`; mici (`moonpilot/ui/settings_mici.py`) uses `BigParamControl(text, key, description=...)`, which writes the param itself.
+
+   The two panels refresh by different mechanisms, and it is the opposite of the obvious guess. tizi's `title`, `description` and `enabled` take callables that `list_view` re-resolves on every render, so a tizi row needs no refresh loop at all. mici's `set_value` and `set_checked` are pushed rather than resolved, so a mici row whose state can change outside the panel does need one — a `_update_rows()` called from `show_event()` and registered with `ui_state.add_offroad_transition_callback(...)`, the loop upstream's mici `developer.py` uses.
 3. A read in fork code, with `params.get(key, return_default=True)` — **not** `get_bool`.
 
 That read is the trap: `get_bool` ignores the declared default and reports off for an unset param. The declaration only becomes true because `openpilot/system/manager/manager.py` seeds every unset param from its default at boot. On device both work; in a bare script or a test outside the manager, only `return_default=True` does.
@@ -67,10 +69,55 @@ Feature toggles go in the **moonpilot panel**, never as new sidebar entries: the
 
 - **A scalar or small JSON value** → a `Moonpilot*` param row. Persistent, atomic, readable by every process. This is the answer for almost everything.
 - **Anything bigger or unbounded** → `data_dir(feature)`: `/data/moonpilot/<feature>` on device, `~/.comma/moonpilot/<feature>` on PC, created on demand. Survives updates; a factory reset wipes it.
-- **Must survive a factory reset** — a licence, an identity, a calibration → `persist_root()`, `/persist/moonpilot`, on the partition a reset leaves alone. Keep it small; the dongle id and RSA key live there too.
+- **Must survive a factory reset** — a license, an identity, a calibration → `persist_root()`, `/persist/moonpilot`, on the partition a reset leaves alone. Keep it small; the dongle id and RSA key live there too.
 - **Per-drive artifacts** → inside the route directory under `Paths.log_root()`, the only tree the drive deleter reclaims when space runs low.
 
 Two traps: loose files in the params directory are unlinked by `Params::clearAll`, which deletes everything there that is not in the key list; and the drive deleter only frees space under `realdata`, so a store in `data_dir()` shares the partition with driver footage and needs its own bound — a size cap, a ring buffer, or retention.
+
+### Dependencies
+
+The device runs the system `python3` straight out of the read-only AGNOS image with `PYTHONPATH` pointed at the checkout: no venv, no `pip`, no `uv`, and nothing in the boot path that would ever read `uv.lock`. `tools/setup_dependencies.sh` — the script that curls uv and runs `uv sync --frozen` into `.venv` — is called only from `tools/op.sh`, so it is the dev-PC and CI flow and it never runs on a car. `uv.lock` therefore describes the PC environment, not the device's, and a module the device needs is not merely slow to arrive: it is absent, and importing it fails where the import is.
+
+That makes the fork's dependency surface the **init path**: whatever is reachable at import time from the modules a seam pulls in — `moonpilot.procs` from the manager at boot, `moonpilot/ui/settings*.py` from the UI at start, `moonpilot.lead` from `longitudinal_planner` (plannerd) and the renderers. Under those, import only the standard library, `numpy`, and `openpilot`'s own modules.
+
+Anything else is a runtime import, in one of two shapes:
+
+- **A `PythonProcess` under `MOONPILOT_PROCS`.** The manager imports the process table and nothing behind it, and its `launcher` imports the module inside the child, so a module that fails to import costs that process and no more. The shape for code that a given device may simply never be able to run.
+- **An import at the point of use**, inside the function or the `main()` that needs it, with the failure turning the feature off instead of propagating. The shape for an optional capability inside code that must keep running.
+
+The fork side of a seam still has to return upstream's value when the module is missing — see **delegate, not replace** above. Never an import on the init path, and never a row in upstream's `dependencies`: that list only goes down (`scripts/lint/check_dependencies.py` fails against a fixed budget), `uv.lock` is not in `ALLOWED` so the edit would be rejected anyway, and — the reason that actually matters — the device never installs from `uv.lock` at all. A dependency the fork genuinely needs goes through `requires` and the fork's own lock, in the two sections below.
+
+### The gate
+
+A feature that needs a module the lock does not carry declares it: `Feature(..., requires=("PIL",))` in `moonpilot/features.py`. `requires` holds **importable module names**, not install specs. `available(feature)` is `deps.available()` over each of them, `wanted(feature, params)` is the param read, and `enabled(feature, params)` is the two ANDed — so the seam keeps calling `enabled()` unchanged, and a feature whose dependency is missing is off everywhere at once without the planner or the UI needing to know why.
+
+Three consequences:
+
+- An unavailable feature's row is **disabled with the reason where the driver will see it**: in the description for tizi (`moonpilot/ui/settings.py`), in the value line for mici (`moonpilot/ui/settings_mici.py`) — a disabled mici widget cannot open its long-press dialog, so its description is unreachable.
+- A feature's `PythonProcess` is gated on the same predicate. `ensure_running` never restarts a child that exited while `should_run` was still True — `start()` no-ops while `self.proc` is set (`openpilot/system/manager/process.py:142-147,166-171`) — so a proc that dies is gone until the next boot. Gating it on the same availability check is what gives it a lifetime that tracks the feature's: started when there is work, stopped the moment there is not, and long-lived processes loop internally rather than exiting.
+- Availability is `importlib.util.find_spec`, never a real `import`. The check runs on the init path — `moonpilot.procs`, both panels, `moonpilot.lead` — where importing the module is exactly the thing that must not happen.
+
+### How a dependency reaches the device
+
+There is no venv, no `pip` and no `uv` on device: third-party packages come from the read-only AGNOS image, and `tools/setup_dependencies.sh` only ever runs where there is a network. `/data` is the only writable tree, and it is not on `sys.path`. Nothing inside the checkout survives an update either — the updater runs `git clean -xdff` and `git reset --hard`, then swaps the whole directory.
+
+So `moonpilot/deps.py` builds the environment beside the checkout, not in it: it bootstraps a pinned static `uv` into `/data/moonpilot/deps/bin`, installs `moonpilot/deps.lock` into `/data/moonpilot/deps/site-packages` with `--require-hashes`, and **appends** that directory to `sys.path`. Append, never insert: the fork supplies what is absent and never shadows what the OS ships.
+
+That append cannot only happen at import, because the timing is wrong: the UI, plannerd and the manager all import `deps.py` early in the boot, when the tree may not exist yet, and then run for hours. So `activate()` also runs inside `available()` — a package `depsd` installs mid-boot becomes visible to processes that were already running, instead of staying invisible until a restart. A feature module that imports its package at the top level is covered by the same two mechanisms: it must import `moonpilot.features` or `moonpilot.deps` above the third-party import, and a manager-spawned process is forked from a manager that has already called `available()` in its `should_run` evaluation, so the child inherits the wired-up path.
+
+`moonpilot/depsd.py` is the process that does it — registered in `MOONPILOT_PROCS`, it waits on `deviceState.networkType`, skips while `networkMetered`, and backs off exponentially so a device that cannot succeed is not retrying in a tight loop. Two ceilings, named rather than hidden: a device that only ever sees a metered connection never installs, and a factory reset wipes `/data/moonpilot`, so the packages are fetched again on the next unmetered network.
+
+Adding a dependency is three things, and they must agree: a `Requirement(module, spec)` row in `moonpilot/deps.py`, the matching hash-pinned line in `moonpilot/deps.lock` (`uv pip compile --generate-hashes --output-file moonpilot/deps.lock ...`), and the module name in the consuming feature's `requires`. `moonpilot/tests/test_deps.py` fails if any of the three disagree. `REQUIREMENTS` is empty today, so the mechanism is inert and structurally correct at the same time — the first row is what turns it on.
+
+### A binary the device doesn't ship
+
+Some capabilities are a native binary rather than a Python package — tailscale is the one so far, `moonpilot/tailscale.py`. The shape is the same as above with the module machinery swapped for a download, and `moonpilot/fetch.py` is the shared half: `download()` verifies the sha256 **before** anything executes the payload (it runs as root), and `extract()` writes each member to `<name>.new` and `os.replace`s it into place, because overwriting a running binary is `ETXTBSY` — an upgrade reinstalls over a live `tailscaled`.
+
+The binaries live under `data_root()` for the reason `deps.py` gives, never in the checkout. A `.version` marker beside them is what makes a version bump reinstall; the pinned `VERSION`/`SHA256` in `moonpilot/tailscale.py` is the **only** thing that updates the client, so `tailscale update` is never called and `tailscale set --auto-update=false` is issued once per run — a tailnet-wide auto-update policy would otherwise have tailscaled replace the binaries it is running from and try to restart itself through systemd or init.d, neither of which the fork installs, leaving new binaries on disk, an old process running, and a marker that lies about both. Because `os.replace` leaves the running process on the old inode, an upgrade must also restart the supervised child; it is therefore offroad-only, and a failed upgrade leaves the working tunnel alone.
+
+Device processes are not root, so a privileged child goes through `sudo -n` — `tailscale.sudo()` prefixes `daemon_args()`, `cli_args()`, `up_args()` and the kill in the supervisor. The supervisor must kill its own child on exit: `ensure_running` will not, and an orphaned root `tailscaled` keeps the tunnel open with nothing supervising it. That kill is scoped to the child's own `--socket` path rather than the binary, because `binaries()` prefers a pair the OS ships and the binary path would take a distro's daemon down with ours. For the same reason `daemon_args()` passes `--statedir` explicitly: tailscaled fills its var root from `--state` only when that file's directory is named `tailscale`, and an empty var root sends certs, Taildrop and `profile-data` to HOME, which on device is the read-only rootfs.
+
+Daemon → UI state travels through one `CLEAR_ON_MANAGER_START` string param, `MoonpilotTailscaleStatus`, decoded by `moonpilot/tailscale.py`, so neither panel ever shells out and a reboot cannot leave a stale `running 100.x` on screen. Both trees' QR sign-in dialogs — `moonpilot/ui/tailscale_qr.py` and `moonpilot/ui/tailscale_qr_mici.py` — are fork-owned and self-contained on purpose: they import `make_texture` from upstream's qrcode module but subclass nothing, because a silently-unused override of a renamed upstream method is exactly the failure a merge cannot see.
 
 ### When moonpilot and upstream converge
 
@@ -80,7 +127,7 @@ Two traps: loose files in the params directory are unlinked by `Params::clearAll
 
 ### The registry
 
-`moonpilot/features.py` drives the panel. Adding a feature is three things: a `Feature(...)`, a row in `moonpilot/params_keys.h`, and the code behind it.
+`moonpilot/features.py` drives the panel. Adding a feature is three things: a `Feature(...)`, a row in `moonpilot/params_keys.h`, and the code behind it — plus, when it needs a module the device does not ship, `requires=(...)` on the `Feature` and the matching rows in `moonpilot/deps.py` and `moonpilot/deps.lock` that **The gate** and **How a dependency reaches the device** describe. That fourth one is the easy one to forget, because the feature works on your PC without it: the module is already importable there.
 
 ```python
 LEAD_LATERAL = Feature(
@@ -181,4 +228,13 @@ Last 2000 upstream commits, per seam file: `pyproject.toml` (391) and `SConstruc
 - UI is Python + raylib; tizi (`openpilot/selfdrive/ui/layouts/`) and mici (`openpilot/selfdrive/ui/mici/layouts/`) are separate trees — a fork panel is registered in both.
 - Tests run through a unittest loader (`tools/test_runner.py`), so fork tests subclass `unittest.TestCase`.
 - Style is enforced by `scripts/lint/lint.sh` and `pyproject.toml` (ruff, ty, codespell); fork code mirrors the conventions of the upstream file it hooks into.
-- `scripts/lint/lint.sh` walks `git ls-files`, so a new file is invisible to lint until it is tracked — `git add` before trusting a clean run.
+- `scripts/lint/lint.sh` builds its `${ALL_FILES[@]}` checks — codespell, `check_added_large_files`, the shebang checks — from `git ls-files -z openpilot moonpilot`, so **an untracked file escapes them until it is `git add`ed**. `ruff` and `ty` are handed those two directories instead and do see untracked files. A green run therefore means less than it looks like: stage first, then trust it.
+- That list stops at `openpilot/` and `moonpilot/`, so `AGENTS.md` — the file every agent obeys — is linted by nothing. `moonpilot/tests/test_agents_md.py` is its only mechanical check, which is the argument for putting anything here that can be checked by a machine into that test rather than trusting the prose.
+
+## Keeping this file true
+
+Every claim here is a statement about code — a mechanism, an ordering, a ceiling — and the next agent acts on it without checking. So this file is part of the change, not documentation written after it: when a change alters a claim, the claim moves in the same commit, and when you add a mechanism you document the part that is surprising, because that is the only part anyone needs.
+
+The failure mode is writing from memory. An earlier revision of this file stated that the manager restarts a process that dies. It does not: `ensure_running` reaps only on the `should_run`-false path, and `start()` no-ops while `self.proc` is set, so a child that exits is gone until the next boot (`openpilot/system/manager/process.py:142-147,166-171,223-238`). The sentence read as an obvious truth and was wrong, and it was wrong in the direction that breaks things — an agent would have built a self-terminating process and watched it die once, silently. Re-read the sentence you are invalidating against the file it describes.
+
+Where a claim is mechanically checkable, pin it with a test rather than trusting the prose. That is already how much of this file is held up — `test_version.py` (the version shape), `test_paths.py` (the fork state roots), `test_upstream_touches.py` (the seam table against `ALLOWED`), `test_deps.py` (the registry agreeing with the lock) — and `test_agents_md.py` extends the same pattern to the fork paths named here, so a rename that misses this file fails the suite instead of misleading the next reader.

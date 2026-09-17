@@ -1,0 +1,13 @@
+# moonpilot's external Python requirements, hash-locked.
+#
+# The install source of truth: moonpilot/depsd.py installs this file, and nothing else, into
+# <data_root>/deps/site-packages. `uv pip install --require-hashes` treats a requirement without a
+# hash as a hard error, so every line here carries its own — never hand-edit a pin in.
+#
+# Regenerate after changing moonpilot/deps.py's REQUIREMENTS:
+#   uv pip compile --generate-hashes --output-file moonpilot/deps.lock <spec>...
+# passing every Requirement.spec, e.g. `pillow==11.0.0`. A REQUIREMENTS row and its line here land
+# in the same commit: a row without a line never installs, a line without a row never gets asked
+# for.
+#
+# Empty today — REQUIREMENTS is empty. Installing this file is a no-op that exits 0.
