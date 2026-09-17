@@ -5,6 +5,7 @@ from openpilot.common.realtime import Priority, config_realtime_process
 from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.controls.lib.ldw import LaneDepartureWarning
 from openpilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPlanner
+from moonpilot.longitudinal import moonpilot_longitudinal_planner  # moonpilot seam, see AGENTS.md
 import openpilot.cereal.messaging as messaging
 
 
@@ -17,7 +18,7 @@ def main():
   cloudlog.info("plannerd got CarParams: %s", CP.brand)
 
   ldw = LaneDepartureWarning()
-  longitudinal_planner = LongitudinalPlanner(CP)
+  longitudinal_planner = moonpilot_longitudinal_planner(CP) or LongitudinalPlanner(CP)  # moonpilot seam, see AGENTS.md
   pm = messaging.PubMaster(['longitudinalPlan', 'driverAssistance'])
   sm = messaging.SubMaster(['carControl', 'carState', 'controlsState', 'vehicleParameters', 'radarState', 'modelV2', 'selfdriveState',
                            'moonpilotState'],  # moonpilot seam, see AGENTS.md

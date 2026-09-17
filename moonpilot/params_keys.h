@@ -5,6 +5,7 @@
 //   {"MoonpilotToggle", {PERSISTENT, BOOL, "1"}},    // default on
 {"MoonpilotLeadLateral", {PERSISTENT, BOOL, "1"}},
     {"MoonpilotTorqueLateral", {PERSISTENT, BOOL, "1"}},
+    {"MoonpilotLongitudinal", {PERSISTENT, BOOL, "1"}},
     {"MoonpilotTailscale", {PERSISTENT, BOOL, "0"}},
     // Tailscaled -> panels, one line: "<state>" or "<state> <detail>", decoded
     // in moonpilot/tailscale.py. CLEAR_ON_MANAGER_START so a reboot cannot

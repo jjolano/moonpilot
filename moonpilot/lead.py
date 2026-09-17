@@ -232,3 +232,15 @@ def lead_danger_factor(sm, params: Params, default: float) -> float:
 
   # One scalar shared by both MPC leads, so only the nearest one's prediction can be acted on.
   return float(np.interp(leads[0].inPath, [0.0, 1.0], [MOONPILOT_OUT_OF_PATH_DANGER, default]))
+
+
+def nearest_lead_in_path(sm) -> float:
+  """inPath probability of the nearest published lead; 1.0 when there is nothing to say about it.
+
+  lead_danger_factor's counterpart for the fork longitudinal policy, which has no MPC danger
+  zone to scale and scales its time gap instead.
+  """
+  leads = _moonpilot_leads(sm)
+  if leads is None or len(leads) == 0 or not leads[0].present:
+    return 1.0
+  return float(leads[0].inPath)

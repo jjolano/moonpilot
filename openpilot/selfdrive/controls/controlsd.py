@@ -22,6 +22,7 @@ from openpilot.selfdrive.controls.lib.longcontrol import LongControl
 from openpilot.selfdrive.modeld.modeld import LAT_SMOOTH_SECONDS
 from openpilot.selfdrive.locationd.helpers import PoseCalibrator, Pose
 from moonpilot.latcontrol import moonpilot_latcontrol  # moonpilot seam, see AGENTS.md
+from moonpilot.longcontrol import moonpilot_longcontrol  # moonpilot seam, see AGENTS.md
 
 State = log.SelfdriveState.OpenpilotState
 LaneChangeState = log.LaneChangeState
@@ -51,7 +52,7 @@ class Controls:
     self.pose_calibrator = PoseCalibrator()
     self.calibrated_pose: Pose | None = None
 
-    self.LoC = LongControl(self.CP)
+    self.LoC = moonpilot_longcontrol(self.CP) or LongControl(self.CP)  # moonpilot seam, see AGENTS.md
     self.VM = VehicleModel(self.CP)
     self.LaC: LatControl
     if self.CP.steerControlType == car.CarParams.SteerControlType.angle:
