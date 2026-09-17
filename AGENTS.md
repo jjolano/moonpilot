@@ -36,7 +36,7 @@ New fork behavior: write it under `moonpilot/`, hook it at the seam that already
 
 Pick by need — reuse a seam, never invent one:
 
-- Setting or persisted state → a row in `moonpilot/params_keys.h`, named `Moonpilot*`.
+- Setting or small persisted value → a row in `moonpilot/params_keys.h`, named `Moonpilot*`. Anything bigger goes to a root from `moonpilot/paths.py` — see **Storage** below.
 - Long-running work → `MOONPILOT_PROCS` in `moonpilot/procs.py`. The name must be unique (`test_manager.test_duplicate_procs`).
 - State other components observe → fill in `MoonpilotState`, then publish `moonpilotState`. Add a row to `openpilot/cereal/services.py` only once a publisher exists — that file then joins the table above and `ALLOWED`.
 - Native binary → `moonpilot/SConscript`.
@@ -60,6 +60,17 @@ That read is the trap: `get_bool` ignores the declared default and reports off f
 Gate anything that changes driving behavior on `ui_state.is_offroad()` — the `enabled=` argument — and if it needs a restart to take effect, say so in the description the way the alpha-longitudinal toggle does.
 
 Feature toggles go in the **moonpilot panel**, never as new sidebar entries: the tizi sidebar already reaches y 1070 of 1080 with 7 entries, so an 8th clips. The panel body scrolls and takes as many rows as you like — upstream's Developer panel carries 8 in the same widget.
+
+### Storage
+
+`/data/openpilot` is git state — the updater runs `git reset --hard` in the finalized overlay and the installer moves a fresh clone over the directory — so **nothing fork-owned is ever written inside the checkout**. `moonpilot/paths.py` holds the roots, and no upstream seam is involved in using them:
+
+- **A scalar or small JSON value** → a `Moonpilot*` param row. Persistent, atomic, readable by every process. This is the answer for almost everything.
+- **Anything bigger or unbounded** → `data_dir(feature)`: `/data/moonpilot/<feature>` on device, `~/.comma/moonpilot/<feature>` on PC, created on demand. Survives updates; a factory reset wipes it.
+- **Must survive a factory reset** — a licence, an identity, a calibration → `persist_root()`, `/persist/moonpilot`, on the partition a reset leaves alone. Keep it small; the dongle id and RSA key live there too.
+- **Per-drive artifacts** → inside the route directory under `Paths.log_root()`, the only tree the drive deleter reclaims when space runs low.
+
+Two traps: loose files in the params directory are unlinked by `Params::clearAll`, which deletes everything there that is not in the key list; and the drive deleter only frees space under `realdata`, so a store in `data_dir()` shares the partition with driver footage and needs its own bound — a size cap, a ring buffer, or retention.
 
 ### When moonpilot and upstream converge
 
