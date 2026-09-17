@@ -21,6 +21,13 @@ LEAD_LATERAL = Feature(
   offroad_only=True,
 )
 
+TORQUE_LATERAL = Feature(
+  key="MoonpilotTorqueLateral",
+  title="moonpilot steering",
+  description="moonpilot's own torque steering controller instead of openpilot's. Torque-steered cars only; takes effect after a restart.",
+  offroad_only=True,
+)
+
 # No requires: `requires` gates on importable Python modules, and tailscale here is a binary.
 # There is nothing to gate either way — the supervisor installs what is missing and the settings
 # row says so while it does.
@@ -32,7 +39,7 @@ TAILSCALE = Feature(
 
 # Behaviors the driver can swap back to upstream. The settings panel is built from this
 # table, so a feature is one row here, one row in params_keys.h, and its own code.
-FEATURES: tuple[Feature, ...] = (LEAD_LATERAL, TAILSCALE)
+FEATURES: tuple[Feature, ...] = (LEAD_LATERAL, TORQUE_LATERAL, TAILSCALE)
 
 
 def missing_modules(feature: Feature) -> tuple[str, ...]:

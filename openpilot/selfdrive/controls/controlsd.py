@@ -21,6 +21,7 @@ from openpilot.selfdrive.controls.lib.latcontrol_torque import LatControlTorque
 from openpilot.selfdrive.controls.lib.longcontrol import LongControl
 from openpilot.selfdrive.modeld.modeld import LAT_SMOOTH_SECONDS
 from openpilot.selfdrive.locationd.helpers import PoseCalibrator, Pose
+from moonpilot.latcontrol import moonpilot_latcontrol  # moonpilot seam, see AGENTS.md
 
 State = log.SelfdriveState.OpenpilotState
 LaneChangeState = log.LaneChangeState
@@ -60,7 +61,7 @@ class Controls:
     elif self.CP.lateralTuning.which() == 'pid':
       self.LaC = LatControlPID(self.CP, self.CI, DT_CTRL)
     elif self.CP.lateralTuning.which() == 'torque':
-      self.LaC = LatControlTorque(self.CP, self.CI, DT_CTRL)
+      self.LaC = moonpilot_latcontrol(self.CP, self.CI, DT_CTRL) or LatControlTorque(self.CP, self.CI, DT_CTRL)  # moonpilot seam, see AGENTS.md
 
   def update(self):
     self.sm.update(15)

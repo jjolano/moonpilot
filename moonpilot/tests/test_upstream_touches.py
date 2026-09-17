@@ -22,6 +22,7 @@ ALLOWED = {
   "openpilot/selfdrive/controls/plannerd.py": "moonpilotState subscription",
   "openpilot/selfdrive/controls/lib/longitudinal_planner.py": "lead danger factor from moonpilot",
   "openpilot/selfdrive/controls/lib/longitudinal_mpc_lib/long_mpc.py": "lead_danger_factor kwarg",
+  "openpilot/selfdrive/controls/controlsd.py": "moonpilot torque lateral controller",
   "openpilot/selfdrive/test/process_replay/process_replay.py": "moonpilotState in plannerd pubs",
   "openpilot/selfdrive/ui/ui_state.py": "moonpilotState subscription",
   "openpilot/selfdrive/ui/onroad/model_renderer.py": "lead path draw (tizi)",

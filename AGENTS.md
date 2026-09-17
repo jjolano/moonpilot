@@ -25,6 +25,7 @@ New fork behavior: write it under `moonpilot/`, hook it at the seam that already
 | `openpilot/selfdrive/controls/plannerd.py` | `moonpilotState` subscription |
 | `openpilot/selfdrive/controls/lib/longitudinal_planner.py` | lead danger factor from `moonpilot.lead` |
 | `openpilot/selfdrive/controls/lib/longitudinal_mpc_lib/long_mpc.py` | `lead_danger_factor` kwarg on `LongitudinalMpc.update` |
+| `openpilot/selfdrive/controls/controlsd.py` | `moonpilot_latcontrol()` from `moonpilot/latcontrol.py` picks the torque lateral controller |
 | `openpilot/selfdrive/test/process_replay/process_replay.py` | `moonpilotState` in plannerd's `pubs` |
 | `openpilot/selfdrive/ui/ui_state.py` | `moonpilotState` subscription |
 | `openpilot/selfdrive/ui/onroad/model_renderer.py` | lead path draw (tizi) |
@@ -118,6 +119,16 @@ The binaries live under `data_root()` for the reason `deps.py` gives, never in t
 Device processes are not root, so a privileged child goes through `sudo -n` — `tailscale.sudo()` prefixes `daemon_args()`, `cli_args()`, `up_args()` and the kill in the supervisor. The supervisor must kill its own child on exit: `ensure_running` will not, and an orphaned root `tailscaled` keeps the tunnel open with nothing supervising it. That kill is scoped to the child's own `--socket` path rather than the binary, because `binaries()` prefers a pair the OS ships and the binary path would take a distro's daemon down with ours. For the same reason `daemon_args()` passes `--statedir` explicitly: tailscaled fills its var root from `--state` only when that file's directory is named `tailscale`, and an empty var root sends certs, Taildrop and `profile-data` to HOME, which on device is the read-only rootfs.
 
 Daemon → UI state travels through one `CLEAR_ON_MANAGER_START` string param, `MoonpilotTailscaleStatus`, decoded by `moonpilot/tailscale.py`, so neither panel ever shells out and a reboot cannot leave a stale `running 100.x` on screen. Both trees' QR sign-in dialogs — `moonpilot/ui/tailscale_qr.py` and `moonpilot/ui/tailscale_qr_mici.py` — are fork-owned and self-contained on purpose: they import `make_texture` from upstream's qrcode module but subclass nothing, because a silently-unused override of a renamed upstream method is exactly the failure a merge cannot see.
+
+### The lateral controller
+
+`moonpilot/latcontrol.py` is the fork's own torque lateral controller, and the seam in `openpilot/selfdrive/controls/controlsd.py` is a factory call that returns `None` when the toggle is off, so upstream's controller stays on the line as the fallback. Three things about it are not obvious:
+
+- **It is chosen once, at construction.** controlsd builds one `LatControl` in `__init__` and never revisits it, so the toggle takes a restart — the feature description says so, and the row is offroad-only.
+- **It only exists for torque-steered cars.** The seam sits in the `lateralTuning == 'torque'` branch, so angle- and curvature-steered cars never reach it and the toggle is a no-op there.
+- **It logs into upstream's `LateralTorqueState`**, with `version` in a fork band (1000) so a log says which controller produced it. No new cereal struct, so the plotjuggler and jotpluggler torque-controller layouts keep working.
+
+The control law is upstream's family — feedforward in lateral acceleration, PI on the delay-matched error, friction compensation — because that is the part real miles paid for; the gains and every other number are fork-owned, in that file's header block. `moonpilot/tests/test_latcontrol.py` pins what the seam depends on: the delay-matched setpoint, the roll and friction terms in the feedforward, the saturation timer, and an integrator that does not survive a disengagement.
 
 ### When moonpilot and upstream converge
 
@@ -220,7 +231,7 @@ The `import` line is not decoration. Upstream renaming a symbol the fork imports
 | Adds its own `AGENTS.md` | add/add conflict | this file stays fork-owned; fold in anything useful from upstream's |
 | Wants a reserved struct or param name the fork also uses | conflict | upstream's ids and names win — move the fork to the next free `CustomReservedN`, never the reverse |
 
-Last 2000 upstream commits, per seam file: `pyproject.toml` (391) and `SConstruct` (320) move almost weekly, so those two conflict most; `cereal/log.capnp` (31), `common/params_keys.h` (18) and `scripts/lint/lint.sh` (16) are moderate; `process_config.py`, the UI settings panels, `home.py`, `version.h` and `custom.capnp` have moved 2–7 times. A new seam is a permanent recurring conflict surface — add one only when no existing seam reaches.
+Last 2000 upstream commits, per seam file: `pyproject.toml` (391) and `SConstruct` (320) move almost weekly, so those two conflict most; `cereal/log.capnp` (31), `common/params_keys.h` (18) and `scripts/lint/lint.sh` (16) are moderate; `process_config.py`, the UI settings panels, `home.py`, `version.h`, `custom.capnp` and `controlsd.py` have moved 2–7 times. A new seam is a permanent recurring conflict surface — add one only when no existing seam reaches.
 
 ## Working here
 
