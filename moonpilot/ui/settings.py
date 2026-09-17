@@ -1,4 +1,4 @@
-from moonpilot.features import FEATURES, Feature, enabled
+from moonpilot.features import FEATURES, Feature, enabled, version
 from openpilot.common.params import Params
 from openpilot.selfdrive.ui.ui_state import ui_state
 from openpilot.system.ui.widgets import Widget
@@ -20,12 +20,14 @@ class MoonpilotLayout(Widget):
   def __init__(self):
     super().__init__()
     self._params = ui_state.params
-    self._scroller = Scroller([
-      *(_feature_toggle(feature, self._params) for feature in FEATURES),
-      text_item("version", self._params.get("Version") or "N/A"),
-      text_item("branch", self._params.get("GitBranch") or "N/A"),
-      text_item("commit", (self._params.get("GitCommit") or "N/A")[:8]),
-    ], line_separator=True, spacing=0)
+    self._scroller = Scroller(
+      [
+        text_item("version", version()),
+        *(_feature_toggle(feature, self._params) for feature in FEATURES),
+      ],
+      line_separator=True,
+      spacing=0,
+    )
 
   def _render(self, rect):
     self._scroller.render(rect)

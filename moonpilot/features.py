@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 
 from openpilot.common.params import Params
+from openpilot.common.version import get_version
 
 
 @dataclass(frozen=True)
@@ -39,3 +40,10 @@ def enabled(feature: Feature, params: Params) -> bool:
 def brand(params: Params) -> str:
   # Delegates rather than replaces, so upstream's own name stays reachable.
   return "moonpilot" if enabled(BRANDING, params) else "openpilot"
+
+
+def version() -> str:
+  # Fork identity, like brand(): COMMA_VERSION verbatim, "<upstream>-moonpilot.<fork revision>".
+  # get_version() reads version.h directly, so this is right outside the manager too, where the
+  # Version param is unset. See AGENTS.md, Versioning.
+  return get_version()

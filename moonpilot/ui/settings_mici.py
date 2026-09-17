@@ -1,6 +1,6 @@
 from moonpilot.features import FEATURES, Feature, enabled
 from openpilot.common.params import Params
-from openpilot.selfdrive.ui.mici.widgets.button import BigParamControl, GreyBigButton
+from openpilot.selfdrive.ui.mici.widgets.button import BigParamControl
 from openpilot.selfdrive.ui.ui_state import ui_state
 from openpilot.system.ui.widgets.scroller import NavScroller
 
@@ -19,9 +19,4 @@ class MoonpilotLayoutMici(NavScroller):
   def __init__(self):
     super().__init__()
     params = ui_state.params
-    self._scroller.add_widgets([
-      *(_feature_button(feature, params) for feature in FEATURES),
-      GreyBigButton("version", params.get("Version") or "N/A"),
-      GreyBigButton("branch", params.get("GitBranch") or "N/A"),
-      GreyBigButton("commit", (params.get("GitCommit") or "N/A")[:8]),
-    ])
+    self._scroller.add_widgets([_feature_button(feature, params) for feature in FEATURES])
