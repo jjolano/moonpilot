@@ -48,10 +48,16 @@ class TestSubmoduleContextFiles(unittest.TestCase):
   def test_each_fork_carries_a_pointer_not_a_copy(self):
     for name in SUBMODULES:
       with self.subTest(submodule=name):
-        context = ROOT / name / "AGENTS.md"
-        if not context.exists():
-          # The submodules are separate clones; a checkout without them is not a doc failure
+        # A submodule that is not checked out at all — a fresh clone without `--recursive` — is not
+        # a doc failure, and `.git` is what distinguishes that case: a submodule's `.git` is a file
+        # holding the gitdir pointer, so it exists exactly when the submodule has been initialized.
+        # A missing file *inside* a checked-out submodule is the drift this test exists to catch, so
+        # it must fail, not skip.
+        if not (ROOT / name / ".git").exists():
           self.skipTest(f"{name} is not checked out")
+
+        context = ROOT / name / "AGENTS.md"
+        self.assertTrue(context.is_file(), f"{name}/AGENTS.md is missing")
 
         text = context.read_text()
         # The import is what makes a session inside the submodule inherit the fork's rules, and
