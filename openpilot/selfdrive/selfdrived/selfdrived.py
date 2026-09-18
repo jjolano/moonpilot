@@ -25,6 +25,7 @@ from openpilot.selfdrive.selfdrived.alertmanager import AlertManager, set_offroa
 
 from openpilot.common.version import get_build_metadata
 from openpilot.common.hardware import HARDWARE
+from moonpilot.engage import moonpilot_engage  # moonpilot seam, see AGENTS.md
 
 REPLAY = "REPLAY" in os.environ
 SIMULATION = "SIMULATION" in os.environ
@@ -132,6 +133,7 @@ class SelfdriveD:
     self.dm_uncertain_alerted = False
     self.state_machine = StateMachine()
     self.rk = Ratekeeper(100, print_delay_threshold=None)
+    self.engage = moonpilot_engage(self.CP)  # moonpilot seam, see AGENTS.md
 
     # Determine startup event
     self.startup_event = EventName.startup if build_metadata.openpilot.comma_remote and build_metadata.tested_channel else EventName.startupMaster
@@ -461,6 +463,8 @@ class SelfdriveD:
         self.params.put('LongitudinalPersonality', self.personality)
         self.events.add(EventName.personalityChanged)
 
+    self.engage.update(CS, self.events, self.enabled)  # moonpilot seam, see AGENTS.md
+
   def data_sample(self):
     _car_state = messaging.recv_one(self.car_state_sock)
     CS = _car_state.carState if _car_state else self.CS_prev
@@ -502,8 +506,8 @@ class SelfdriveD:
       self.mismatch_counter = 0
 
     # All pandas not in silent mode must have controlsAllowed when openpilot is enabled
-    if self.enabled and any(not ps.controlsAllowed for ps in self.sm['pandaStates']
-           if ps.safetyModel not in IGNORED_SAFETY_MODES):
+    if self.enabled and any(not self.engage.controls_allowed(ps) for ps in self.sm['pandaStates']
+           if ps.safetyModel not in IGNORED_SAFETY_MODES):  # moonpilot seam, see AGENTS.md
       self.mismatch_counter += 1
 
     return CS

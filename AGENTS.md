@@ -16,16 +16,22 @@ New fork behavior: write it under `moonpilot/`, hook it at the seam that already
 | `pyproject.toml` | `moonpilot` in the hatch wheel packages, so `import moonpilot` resolves |
 | `scripts/lint/lint.sh` | ruff / ty / `git ls-files` cover `moonpilot/` |
 | `tools/test_runner.py` | `moonpilot` in the default test targets |
+| `.gitmodules` | relative fork URLs for `panda` and `opendbc_repo` |
+| `panda` (submodule) | `HEALTH_FLAG_CONTROLS_ALLOWED_LATERAL` in `board/health.h`, published in `board/main_comms.h` |
+| `opendbc_repo` (submodule) | the fork's safety layer: `opendbc/safety/moonpilot/lateral_engage.h`, `PCM_CRUISE_2` in `modes/toyota.h`, the 12 lateral reads in `lateral.h` |
 | `openpilot/common/params_keys.h` | `#include "moonpilot/params_keys.h"` — fork params, one row per key |
 | `openpilot/system/manager/process_config.py` | `procs += MOONPILOT_PROCS` from `moonpilot/procs.py` |
 | `openpilot/cereal/custom.capnp` | `MoonpilotState` (upstream's reserved struct; never change the `@0x…` id) |
-| `openpilot/cereal/log.capnp` | `moonpilotState @107` event field |
+| `openpilot/cereal/log.capnp` | `moonpilotState @107` event field; `PandaState.controlsAllowedLateral @38` |
 | `openpilot/cereal/services.py` | `moonpilotState` service row |
 | `openpilot/common/version.h` | `COMMA_VERSION "<upstream>-moonpilot.<fork revision>"` |
 | `openpilot/selfdrive/controls/plannerd.py` | `moonpilotState` subscription; `moonpilot_longitudinal_planner()` picks the longitudinal planner |
 | `openpilot/selfdrive/controls/lib/longitudinal_planner.py` | lead danger factor from `moonpilot.lead` |
 | `openpilot/selfdrive/controls/lib/longitudinal_mpc_lib/long_mpc.py` | `lead_danger_factor` kwarg on `LongitudinalMpc.update` |
 | `openpilot/selfdrive/controls/controlsd.py` | `moonpilot_latcontrol()` picks the torque lateral controller, `moonpilot_longcontrol()` the acceleration controller |
+| `openpilot/selfdrive/car/card.py` | `moonpilot_engage_safety_param()` before `CarParams` is written |
+| `openpilot/selfdrive/pandad/pandad.cc` | `PandaState.controlsAllowedLateral` from the panda health flag |
+| `openpilot/selfdrive/selfdrived/selfdrived.py` | `moonpilot_engage()`; `LateralEngage.update()` after every event source; the panda cross-check |
 | `openpilot/selfdrive/test/process_replay/process_replay.py` | `moonpilotState` in plannerd's `pubs` |
 | `openpilot/selfdrive/ui/ui_state.py` | `moonpilotState` subscription |
 | `openpilot/selfdrive/ui/onroad/model_renderer.py` | lead path draw (tizi) |
@@ -79,7 +85,7 @@ Two traps: loose files in the params directory are unlinked by `Params::clearAll
 
 The device runs the system `python3` straight out of the read-only AGNOS image with `PYTHONPATH` pointed at the checkout: no venv, no `pip`, no `uv`, and nothing in the boot path that would ever read `uv.lock`. `tools/setup_dependencies.sh` — the script that curls uv and runs `uv sync --frozen` into `.venv` — is called only from `tools/op.sh`, so it is the dev-PC and CI flow and it never runs on a car. `uv.lock` therefore describes the PC environment, not the device's, and a module the device needs is not merely slow to arrive: it is absent, and importing it fails where the import is.
 
-That makes the fork's dependency surface the **init path**: whatever is reachable at import time from the modules a seam pulls in — `moonpilot.procs` from the manager at boot, `moonpilot/ui/settings*.py` from the UI at start, `moonpilot.lead` from `longitudinal_planner` (plannerd) and the renderers. Under those, import only the standard library, `numpy`, and `openpilot`'s own modules.
+That makes the fork's dependency surface the **init path**: whatever is reachable at import time from the modules a seam pulls in — `moonpilot.procs` from the manager at boot, `moonpilot/ui/settings*.py` from the UI at start, `moonpilot.lead` from `longitudinal_planner` (plannerd) and the renderers, `moonpilot.engage` from `card` and `selfdrived`. Under those, import only the standard library, `numpy`, and `openpilot`'s own modules.
 
 Anything else is a runtime import, in one of two shapes:
 
@@ -146,6 +152,40 @@ One trap is worth naming: `log.LongitudinalPersonality.standard` is a plain `int
 
 `process_replay` reference logs differ for plannerd and controlsd with the feature on; that test needs route data and is in `tools/test_runner.py`'s `IGNORED` list, so a run of it would need regenerated refs or the param flipped off.
 
+### Lateral-only engagement
+
+`moonpilot/engage.py` is the fork's half-engaged state: openpilot steers from the car's cruise **main switch**, and the car's own ACC takes over speed only once the driver sets it. It cannot be done on the openpilot side alone — panda blocks steering unless its own `controls_allowed` is true, and that flag is only set on the rising edge of stock ACC — so this is the fork's one feature that reaches into `opendbc` and `panda` as well as the openpilot tree. Read the whole chain before changing any part of it.
+
+The permission itself is in the forked safety layer, `opendbc/safety/moonpilot/lateral_engage.h`, reached through `opendbc/safety/lateral.h`:
+
+- **`controls_allowed` keeps upstream's exact meaning** — stock ACC engagement — and stays the only thing `get_longitudinal_allowed()` reads, so every longitudinal check, the brake/gas/regen exits and the heartbeat logic behave exactly as upstream wrote them. `controls_allowed_lateral` is a second, additive flag that only ever gates steering: all 12 reads of `controls_allowed` in `lateral.h` become `(controls_allowed || controls_allowed_lateral)`. A change that widens the first flag instead of the second hands the fork the longitudinal controls it does not have.
+- **What arms it:** the rising edge of the cruise main switch, or of the openpilot heartbeat, while *both* are true, and only when the brand's safety param enabled the rule. What clears it: either of those going false, a rising edge of `steering_disengage`, a disable event in selfdrived, and the lag/validity path in `safety_tick` (both `controls_allowed = false` sites call `lateral_engage_exit()`).
+- **Brake and gas deliberately do not appear in the rule.** Keeping steering through a brake tap is the point of the feature, so the fork suppresses two events instead — `pcmDisable`, which is level-triggered whenever stock ACC is off, and `pedalPressed`, the brake/gas disengage. Gas keeps its softer `gasPressedOverride` path, which is an override rather than a disable, so steering continues through it too. Suppressing an event is narrower than changing what raises it: anything else upstream adds in the same event type still disengages.
+- **The enable rides the safety param, not `alternative_experience`.** `toyota_init` has to see it to pick its rx-check set, and the param reaches `init` by construction while alt-exp only happens to be set first by pandad. `ToyotaSafetyFlags.LATERAL_ENGAGE` is `16 << 8`, the next free Toyota flag, and a stock config's params and rx-check array are byte-identical to upstream's.
+
+`moonpilot/engage.py` is the openpilot side, wired through three seams: `openpilot/selfdrive/car/card.py` calls `moonpilot_engage_safety_param()` before `CarParams` is written, `openpilot/selfdrive/selfdrived/selfdrived.py` runs `LateralEngage.update()` after every other event source and uses `controls_allowed()` for the panda cross-check, and `openpilot/selfdrive/pandad/pandad.cc` publishes the flag from the panda health bit `HEALTH_FLAG_CONTROLS_ALLOWED_LATERAL`. Four things about it are not obvious:
+
+- **Latching is what makes a disable last, and it is released on an edge.** With `pcmDisable` and `pedalPressed` suppressed, the events that would keep re-disengaging are gone, so an authoritative disable (`USER_DISABLE`, `IMMEDIATE_DISABLE`, `SOFT_DISABLE`) latches the state off in the module and only a re-arm gesture clears it: the cruise main switch coming back on, the LKAS button, or ACC's **rising** edge — not ACC merely being set. Clearing on the level would undo a driver's LKAS press one frame later for anyone cruising with ACC set, which makes their own off switch look broken; `moonpilot/tests/test_engage.py` pins both directions. `SOFT_DISABLE` is included because a soft-disable event without `NO_ENTRY` would otherwise make this an engage/disable loop; the LKAS toggle adds `buttonCancel` — a real `USER_DISABLE` — precisely because the state machine leaves the enabled state on a disable event and on nothing else, so toggling a module flag alone would steer while the driver watched the button do nothing.
+- **The engage request is `buttonEnable`, under `not enabled and not NO_ENTRY`, and only while not blocked.** `NO_ENTRY` is what keeps a standstill or an uncalibrated car from nagging with refuse alerts — the attempt simply repeats once the blocker clears — and the `not blocked` half is what stops the latch from being undone by the very next frame's arming request. Upstream's own `pcmEnable` on the same frame counts as the ask, so the fork does not stack a second enable event on it.
+- **The panda cross-check has to see the new permission**, or half-engaged reads as `controlsMismatch` and disengages. `LateralEngage.controls_allowed(ps)` accepts either flag; that keeps the mismatch check sharp instead of switching it off.
+- **The decision is made once, at construction**, like the fork's other behavior toggles, so the row takes a restart — which its description says.
+
+The ceiling is the car: **Toyota/Lexus with stock longitudinal (`CP.pcmCruise`) that carries `PCM_CRUISE_2`**, not `passive` (a dashcam-mode car has already had its `safetyConfigs` replaced with a single noOutput config by the time the seam runs, so `_available()` checks the flag itself rather than trusting where the call sits), and not `ToyotaFlags.UNSUPPORTED_DSU` — those read the main switch out of `DSU_CRUISE` at 5 Hz, below panda's 10 Hz rx-check minimum, so `_available()` reports the feature unavailable rather than arming a check that would fail on the road. `PCM_CRUISE_2` is an rx check the fork added (33 Hz, checksum and counter ignored on purpose — a mismatch there would clear `controls_allowed` for *every* message, a worse failure than trusting a switch bit), and its real rate is unvalidated until someone drives it: if the car reports `safetyRxChecksInvalid` or `controlsMismatch` with the feature on, measure the rate from a route and set the check's frequency to it rather than relaxing the check. `controlsd` is deliberately untouched: `CC.latActive` already follows `selfdriveState.active`, and `CC.longActive` already requires `CP.openpilotLongitudinalControl`, so the half-engaged state needs no second code path in the acceleration controller.
+
+### Forked opendbc and panda
+
+`panda` and `opendbc_repo` point at `jjolano/moonpilot-panda` and `jjolano/moonpilot-opendbc` (relative URLs in `.gitmodules`), each with `upstream` still on comma and fork work committed on `master`. The safety code compiles into the panda firmware, so a fork-owned safety layer means fork-owned submodules, and nothing else reaches them. They sync the same way the superproject does — merge, never rebase, no force-push — with their own `master`:
+
+    cd panda && git fetch upstream && git merge upstream/master
+    cd ../opendbc_repo && git fetch upstream && git merge upstream/master
+
+Then record the merge with an ordinary `git add panda opendbc_repo` in the superproject. `git submodule update` on the device fetches the default refspec, so the recorded SHA must be reachable from the fork's default branch — a fork commit left on a side branch does not reach a device. Both are forks of commaai's repos in the same fork network as every other account, so `gh repo fork` will refuse once one exists; creating a plain public repo and pushing to it is the equivalent, and the only requirement is that `master` carries the commits.
+
+Two comma rules come with editing `opendbc/safety/`, both in `docs/SAFETY.md`:
+
+- **the fork cannot use the openpilot trademark**, which is what makes `moonpilot`'s own brand load-bearing rather than cosmetic;
+- **the full safety test suite must be preserved and pass, including any new coverage the fork's changes require.** `opendbc/safety/tests/test.sh` enforces the second half mechanically — 100% line coverage of every non-libsafety safety file — so new C in that tree that no test reaches is a failing gate, not a warning. `moonpilot/tests/test_engage.py` holds the openpilot half of the same feature; the safety half is `opendbc/safety/tests/lateral_engage_common.py` plus one class per rx-check branch in `test_toyota.py`.
+
 ### When moonpilot and upstream converge
 
 - Upstream implements something moonpilot already has → delete moonpilot's version and its toggle row. A switch between two identical behaviors is rot, and it is how a fork accumulates dead weight.
@@ -199,12 +239,12 @@ Fork work lives on `master`. Merge, never rebase; no force-push.
 
     git fetch upstream
     git merge upstream/master    # conflicts land on seam lines; `grep -n moonpilot <file>` shows the fork's side
-    python3 -c "import moonpilot.procs, moonpilot.ui.settings, moonpilot.ui.settings_mici"
+    python3 -c "import moonpilot.engage, moonpilot.procs, moonpilot.ui.settings, moonpilot.ui.settings_mici"
     tools/op.sh lint
     tools/op.sh test moonpilot
     tools/op.sh build
 
-Then bump `COMMA_VERSION`'s upstream part to the new upstream version, leaving the `-moonpilot.<n>` suffix alone. See **Versioning** below.
+Then bump `COMMA_VERSION`'s upstream part to the new upstream version, leaving the `-moonpilot.<n>` suffix alone. See **Versioning** below. The two forked submodules sync on their own schedule — see **Forked opendbc and panda** — and `git submodule update --init --recursive` after a merge is what puts their recorded commits in place.
 
 ### Versioning
 
@@ -244,6 +284,7 @@ The `import` line is not decoration. Upstream renaming a symbol the fork imports
 | Adds rows/lines near a seam — a param, a proc, a `SConscript`, a settings panel | usually clean | rebuild and re-check. A new settings panel is clean to merge but shifts the fork panel down the tizi sidebar (it sits at y 960–1070 of 1080); re-verify it is not clipped. The mici scroller scrolls, so it absorbs the extra entry |
 | Renames or removes a symbol the fork imports | clean | the `import moonpilot…` line fails. Fix `moonpilot/`, never upstream |
 | Deletes a file the fork hooked | modify/delete conflict | re-attach the seam at the nearest equivalent point, then drop the dead row from the table above and from `ALLOWED` |
+| Renames or restructures the safety layer the fork forked | clean in the superproject | the fork's `opendbc_repo` merge is where it lands, and `moonpilot/engage.py` is what breaks if a symbol it imports is gone. Merge the submodule first, then the superproject |
 | Adds its own `AGENTS.md` | add/add conflict | this file stays fork-owned; fold in anything useful from upstream's |
 | Wants a reserved struct or param name the fork also uses | conflict | upstream's ids and names win — move the fork to the next free `CustomReservedN`, never the reverse |
 

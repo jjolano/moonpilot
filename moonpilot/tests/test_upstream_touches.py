@@ -10,19 +10,23 @@ FORK_OWNED = ("moonpilot/", "AGENTS.md", "CLAUDE.md")
 
 # Upstream files moonpilot may modify, and the seam each one carries.
 ALLOWED = {
+  ".gitmodules": "forked opendbc/panda submodules",
   "SConstruct": "moonpilot/SConscript registration",
   "pyproject.toml": "moonpilot in the editable install",
   "scripts/lint/lint.sh": "lint moonpilot/",
   "tools/test_runner.py": "test moonpilot/ by default",
   "openpilot/cereal/custom.capnp": "MoonpilotState struct",
-  "openpilot/cereal/log.capnp": "moonpilotState event field",
+  "openpilot/cereal/log.capnp": "moonpilotState event field; the PandaState lateral-controls field",
   "openpilot/cereal/services.py": "moonpilotState service row",
   "openpilot/common/params_keys.h": "moonpilot/params_keys.h include",
   "openpilot/common/version.h": "fork version string",
+  "openpilot/selfdrive/car/card.py": "lateral engagement safety param",
   "openpilot/selfdrive/controls/plannerd.py": "moonpilotState subscription; moonpilot longitudinal planner",
   "openpilot/selfdrive/controls/lib/longitudinal_planner.py": "lead danger factor from moonpilot",
   "openpilot/selfdrive/controls/lib/longitudinal_mpc_lib/long_mpc.py": "lead_danger_factor kwarg",
   "openpilot/selfdrive/controls/controlsd.py": "moonpilot torque lateral controller, and acceleration controller",
+  "openpilot/selfdrive/pandad/pandad.cc": "lateral-controls health flag",
+  "openpilot/selfdrive/selfdrived/selfdrived.py": "lateral engagement events and panda cross-check",
   "openpilot/selfdrive/test/process_replay/process_replay.py": "moonpilotState in plannerd pubs",
   "openpilot/selfdrive/ui/ui_state.py": "moonpilotState subscription",
   "openpilot/selfdrive/ui/onroad/model_renderer.py": "lead path draw (tizi)",
@@ -32,6 +36,10 @@ ALLOWED = {
   "openpilot/selfdrive/ui/mici/layouts/home.py": "brand string",
   "openpilot/selfdrive/ui/mici/layouts/settings/settings.py": "moonpilot panel",
   "openpilot/system/manager/process_config.py": "MOONPILOT_PROCS",
+  # The fork's own opendbc/panda: recorded as submodule pointer moves, so the paths of the
+  # submodules themselves are the upstream paths here.
+  "opendbc_repo": "forked safety layer, on jjolano/moonpilot-opendbc",
+  "panda": "forked health flag, on jjolano/moonpilot-panda",
 }
 
 

@@ -20,6 +20,7 @@ from opendbc.car.car_helpers import get_car, interfaces
 from opendbc.car.interfaces import CarInterfaceBase, RadarInterfaceBase
 from openpilot.selfdrive.pandad import can_capnp_to_list, can_list_to_can_capnp
 from openpilot.selfdrive.car.cruise import VCruiseHelper
+from moonpilot.engage import moonpilot_engage_safety_param  # moonpilot seam, see AGENTS.md
 
 REPLAY = "REPLAY" in os.environ
 
@@ -142,6 +143,8 @@ class Car:
     prev_cp = self.params.get("CarParamsPersistent")
     if prev_cp is not None:
       self.params.put("CarParamsPrevRoute", prev_cp, block=True)
+
+    moonpilot_engage_safety_param(self.CP)  # moonpilot seam, see AGENTS.md
 
     # Write CarParams for controls and radard
     cp_bytes = self.CP.to_bytes()

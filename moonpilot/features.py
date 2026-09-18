@@ -44,9 +44,16 @@ TAILSCALE = Feature(
   description="Join this device to your tailnet for remote access. Downloads tailscale (~35 MB) the first time, then shows a sign-in link here.",
 )
 
+LATERAL_ENGAGE = Feature(
+  key="MoonpilotLateralEngage",
+  title="lateral engagement",
+  description="Steer from the cruise main switch alone; ACC owns speed once set. Brake and gas no longer disengage; LKAS toggles. Toyota/stock ACC; restart.",
+  offroad_only=True,
+)
+
 # Behaviors the driver can swap back to upstream. The settings panel is built from this
 # table, so a feature is one row here, one row in params_keys.h, and its own code.
-FEATURES: tuple[Feature, ...] = (LEAD_LATERAL, TORQUE_LATERAL, LONGITUDINAL, TAILSCALE)
+FEATURES: tuple[Feature, ...] = (LEAD_LATERAL, TORQUE_LATERAL, LONGITUDINAL, TAILSCALE, LATERAL_ENGAGE)
 
 
 def missing_modules(feature: Feature) -> tuple[str, ...]:
