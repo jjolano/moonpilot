@@ -181,10 +181,20 @@ The ceiling is the car: **Toyota/Lexus with stock longitudinal (`CP.pcmCruise`) 
 
 Then record the merge with an ordinary `git add panda opendbc_repo` in the superproject. `git submodule update` on the device fetches the default refspec, so the recorded SHA must be reachable from the fork's default branch — a fork commit left on a side branch does not reach a device. Both are forks of commaai's repos in the same fork network as every other account, so `gh repo fork` will refuse once one exists; creating a plain public repo and pushing to it is the equivalent, and the only requirement is that `master` carries the commits.
 
+One consequence of the fork owning the safety layer lands in panda rather than here: **panda's own `./test.sh` cannot build the firmware.** Its `setup.sh` creates a venv whose `pyproject.toml` pins `opendbc @ git+https://github.com/commaai/opendbc.git@master`, so that venv holds *upstream* opendbc with no `opendbc/safety/moonpilot/`, and panda's standalone `scons` stops on `'controls_allowed_lateral' undeclared` before any test runs. Build from here — `tools/op.sh build`, which puts `opendbc_repo` on the include path — or give the standalone run the fork's opendbc: `PYTHONPATH=../opendbc_repo panda/.venv/bin/python -m unittest discover -s panda/tests`. Never repoint panda's `pyproject.toml` at the fork; that line is upstream's, and `panda/AGENTS.md` records this too.
+
 Two comma rules come with editing `opendbc/safety/`, both in `docs/SAFETY.md`:
 
 - **the fork cannot use the openpilot trademark**, which is what makes `moonpilot`'s own brand load-bearing rather than cosmetic;
 - **the full safety test suite must be preserved and pass, including any new coverage the fork's changes require.** `opendbc/safety/tests/test.sh` enforces the second half mechanically — 100% line coverage of every non-libsafety safety file — so new C in that tree that no test reaches is a failing gate, not a warning. `moonpilot/tests/test_engage.py` holds the openpilot half of the same feature; the safety half is `opendbc/safety/tests/lateral_engage_common.py` plus one class per rx-check branch in `test_toyota.py`.
+
+### The forks' own context files
+
+`panda/AGENTS.md` and `opendbc_repo/AGENTS.md`, each with a `CLAUDE.md` symlink beside it, are the two places the fork's rules are restated — and they restate nothing: each is one screen that ends in a heading whose body is the line `@../AGENTS.md`. The harness expands an `@path` import inline before injection, so a session started inside a submodule gets this file whole.
+
+They exist because discovery walks up only as far as the **repository root**, and a submodule is one: `panda/.git` and `opendbc_repo/.git` are `gitdir:` pointers, so a session whose cwd is inside either one finds that repo's own root and stops, never reaching this file. From the superproject the same files are the opposite of hidden — a deeper `AGENTS.md` is listed in the `<dir-context>` block that tells an agent to read it before editing that directory.
+
+What belongs in them is the repo-local delta: what the fork changed there, the invariants that must not break, and the gate commands. What must never go in them is a copy of anything here — a second copy of a claim is a second thing to keep true, and the two drift.
 
 ### When moonpilot and upstream converge
 
@@ -305,4 +315,4 @@ Every claim here is a statement about code — a mechanism, an ordering, a ceili
 
 The failure mode is writing from memory. An earlier revision of this file stated that the manager restarts a process that dies. It does not: `ensure_running` reaps only on the `should_run`-false path, and `start()` no-ops while `self.proc` is set, so a child that exits is gone until the next boot (`openpilot/system/manager/process.py:142-147,166-171,223-238`). The sentence read as an obvious truth and was wrong, and it was wrong in the direction that breaks things — an agent would have built a self-terminating process and watched it die once, silently. Re-read the sentence you are invalidating against the file it describes.
 
-Where a claim is mechanically checkable, pin it with a test rather than trusting the prose. That is already how much of this file is held up — `test_version.py` (the version shape), `test_paths.py` (the fork state roots), `test_upstream_touches.py` (the seam table against `ALLOWED`), `test_deps.py` (the registry agreeing with the lock) — and `test_agents_md.py` extends the same pattern to the fork paths named here, so a rename that misses this file fails the suite instead of misleading the next reader.
+Where a claim is mechanically checkable, pin it with a test rather than trusting the prose. That is already how much of this file is held up — `test_version.py` (the version shape), `test_paths.py` (the fork state roots), `test_upstream_touches.py` (the seam table against `ALLOWED`), `test_deps.py` (the registry agreeing with the lock) — and `test_agents_md.py` extends the same pattern to the fork paths named here — and to the two submodule context files, which must exist, must import this file, and must stay short enough to be pointers rather than a second copy — so a rename, a deletion, or a paste that misses this file fails the suite instead of misleading the next reader.
