@@ -9,11 +9,12 @@ problem. The policy is three candidates, and the smallest wins:
   - the time gap itself, biased by ``MoonpilotLeadLateral`` when the lead is predicted to leave the
     path — the fork's lateral prediction reaches the longitudinal policy here, since there is no
     MPC danger zone to scale;
-  - a kinematic brake that takes over once the required decel passes the regulator's braking
-    authority, and then holds the exact constant-deceleration profile that arrives at the stop
-    distance with the lead's speed — self-consistent without a solver, which is what makes the
-    approach smooth. The handover into it is a step in the candidate; it is arbitration that keeps
-    that step out of the output, and the jerk limit that turns what remains into a rate;
+  - a time-to-collision approach term that takes over once the headway it wants passes the
+    regulator's braking authority, and then holds the closing rate inside what the remaining slack
+    affords at ``TTC_TARGET`` seconds — one number, no solver. It is a proportional term, not a
+    profile, so it saturates at the actuator's decel limit on a stopped lead; the handover into it is
+    a step in the candidate, and it is arbitration that keeps that step out of the output while the
+    jerk limit turns what remains into a rate;
   - the cruise term, and in experimental mode the model's own accel, the same candidates upstream
     arbitrates between.
 
@@ -53,6 +54,7 @@ from openpilot.selfdrive.modeld.constants import ModelConstants
 
 from moonpilot.features import LEAD_LATERAL, LONGITUDINAL, enabled
 from moonpilot.lead import LeadAccelEstimator, nearest_lead_in_path
+from moonpilot.slam import ego_speed_correction
 
 LongCtrlState = car.CarControl.Actuators.LongControlState
 # From cereal, not from long_mpc — that module imports the compiled acados solver at import time,
@@ -72,10 +74,13 @@ MOONPILOT_T_FOLLOW = {
 }
 MOONPILOT_K_GAP = 0.3  # 1/s^2 on the spacing error
 MOONPILOT_K_V = 0.6  # 1/s on the relative speed
-MOONPILOT_APPROACH_DECEL = 1.0  # m/s^2; the decel an approach is planned at, and the
-# spacing regulator's braking authority — one number, so
-# the two terms meet continuously
-MOONPILOT_MIN_SLACK = 0.5  # m; floor on the braking-distance denominator
+MOONPILOT_APPROACH_DECEL = 1.0  # m/s^2; the spacing regulator's braking authority, and the
+# decel the approach term binds past — one number, so the
+# two terms meet at the same output
+MOONPILOT_TTC_TARGET = 5.0  # s; headway the approach term holds the closing rate inside
+MOONPILOT_K_TTC = 1.0  # 1/s on the excess closing rate
+MOONPILOT_MIN_SLACK = 0.5  # m; unused since the approach term went time-to-collision —
+# kept because removing a fork constant costs merge surface and buys nothing
 MOONPILOT_LEAD_PREVIEW_T = 1.0  # s of the lead's own braking credited to the safety term
 MOONPILOT_A_LEAD_MIN = -10.0  # m/s^2; bounds on a lead's accel estimate, upstream's (long_mpc.process_lead)
 MOONPILOT_A_LEAD_MAX = 5.0
@@ -124,28 +129,37 @@ def lead_accel(v_ego, gap, v_lead, a_lead, t_follow) -> float:
   its braking authority is capped at the approach decel, so large speed errors do not turn into hard
   braking through the gain.
 
-  The kinematic term is the exact deceleration that arrives at STOP_DISTANCE with the lead's
-  (preview-corrected) speed, and it only binds once that exceeds the approach decel. Following it is
-  self-consistent — a constant-deceleration approach keeps the required value constant — which is
-  what makes the approach profile smooth without a solver.
+  The approach term is time-to-collision: it holds the closing rate inside what the slack affords at
+  TTC_TARGET seconds of headway — ``closing <= slack / TTC_TARGET`` — and binds once honoring that
+  needs more than the approach decel, i.e. ``slack < TTC_TARGET * (closing - APPROACH_DECEL /
+  K_TTC)``: with the shipped numbers, ``slack < 5 * (closing - 1)``. So closing at 25 m/s on a
+  stopped lead binds at a 126 m gap, on a 20 m/s lead at 26 m; below 1 m/s of closing rate nothing
+  binds and the regulator alone owns the creep.
 
-  The handover into it is a step, not a crossover: where the required decel reaches the approach
-  decel the regulator's output is whatever the spacing error says, positive when the gap is still
-  wide — +19.9 m/s^2 at 25 m/s closing on a 20 m/s lead — and the kinematic term replaces it from
-  there. That step is only safe because it is a *candidate*: `policy` takes the minimum, so while the
-  lead asks for more than the cruise term the cruise term governs and the output never sees it. What
-  the output steps by is therefore cruise's cap minus the approach decel, and the caller's jerk limit
-  turns that into a rate. What this term buys is the profile after the handover, not continuity
-  across it.
+  The handover into it is a step, not a crossover: where the TTC term binds the regulator's output is
+  whatever the spacing error says, positive while the gap is still wide — +10.1 m/s^2 at 25 m/s and
+  126 m — and the TTC term replaces it from there. That step is only safe because it is a *candidate*:
+  `policy` takes the minimum, so while the lead asks for more than the cruise term the cruise term
+  governs and the output never sees it. What the output steps by is therefore cruise's cap minus the
+  approach decel, and the caller's jerk limit turns that into a rate.
+
+  The TTC term keeps ramping as the gap closes — it is a proportional controller on the excess
+  closing rate, not a profile — so on a stopped lead it reaches the actuator's own decel limit and
+  holds there: past a bind the command is saturated, and what shapes the last meters is the regulator
+  taking back over as the closing rate falls. That is the accepted cost of the law: this term buys
+  its response to a lead that starts slowing (it reads the closing rate, which the lead's own speed
+  history drives) at the price of using the full decel budget on a parked lead.
   """
   gap = max(float(gap), 0.0)
   v_lead = max(float(v_lead), 0.0)
   v_lead_eff = max(0.0, v_lead + min(float(a_lead), 0.0) * MOONPILOT_LEAD_PREVIEW_T)
   a_track = max(MOONPILOT_K_GAP * (gap - MOONPILOT_STOP_DISTANCE - t_follow * v_ego) + MOONPILOT_K_V * (v_lead - v_ego), -MOONPILOT_APPROACH_DECEL)
-  if v_ego <= v_lead_eff:
+  closing = v_ego - v_lead_eff
+  if closing <= 0.0:
     return a_track  # not closing: nothing to brake for
-  a_req = -(v_ego**2 - v_lead_eff**2) / (2 * max(gap - MOONPILOT_STOP_DISTANCE, MOONPILOT_MIN_SLACK))
-  return min(a_track, a_req) if a_req < -MOONPILOT_APPROACH_DECEL else a_track
+  slack = max(gap - MOONPILOT_STOP_DISTANCE, 0.0)
+  a_ttc = -MOONPILOT_K_TTC * (closing - slack / MOONPILOT_TTC_TARGET)
+  return min(a_track, a_ttc) if a_ttc < -MOONPILOT_APPROACH_DECEL else a_track
 
 
 def jerk_limit(a_cmd, a_prev, dt) -> float:
@@ -255,6 +269,12 @@ class MoonpilotLongitudinalPlanner:
 
     CS = sm['carState']
     v_ego = max(CS.vEgo, 0.0)
+    # The rolling-window ego correction, when there is a fresh one to apply: the wheel speed is a
+    # scale error away from the truth -- ~5 % on a worn tyre set -- and every term below plans from
+    # it, so the correction goes in at the source rather than into one of the candidates. Zero when
+    # the feature is off, nothing is published, the correction is stale or its publisher is dead,
+    # which makes this exactly the plan this planner had before the correction existed.
+    v_ego = max(0.0, v_ego + ego_speed_correction(sm))
     a_ego = float(np.clip(CS.aEgo, ACCEL_MIN, ACCEL_MAX))
 
     v_cruise = min(CS.vCruise, V_CRUISE_MAX) * CV.KPH_TO_MS

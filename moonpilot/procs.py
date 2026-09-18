@@ -27,8 +27,10 @@ def _tailscale_wanted(started: bool, params, CP) -> bool:
 #               PythonProcess(name, module, should_run, enabled=True) / DaemonProcess(name, module, param_name)
 # Typed as the same union upstream's literal list infers, so `procs += MOONPILOT_PROCS` stays well-typed.
 MOONPILOT_PROCS: list[DaemonProcess | NativeProcess | PythonProcess] = [
-  # Normalizes the model's lead trajectories onto moonpilotState. Observation only, so no
-  # config_realtime_process; see moonpilot/lead.py.
+  # Normalizes the model's lead trajectories onto moonpilotState, and the fork's rolling-window ego
+  # correction with them: msgq allows one publisher per service, so the correction rides this
+  # process rather than a second one. Observation only, so no config_realtime_process; see
+  # moonpilot/lead.py and moonpilot/slam.py.
   PythonProcess("leadd", "moonpilot.leadd", _only_onroad),
   # Installs the external Python packages a feature declares, once the device has a network.
   # Stopped by the manager as soon as nothing is missing; see moonpilot/depsd.py.

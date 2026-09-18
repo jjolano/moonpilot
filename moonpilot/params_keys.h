@@ -6,6 +6,9 @@
 {"MoonpilotLeadLateral", {PERSISTENT, BOOL, "1"}},
     {"MoonpilotTorqueLateral", {PERSISTENT, BOOL, "1"}},
     {"MoonpilotLongitudinal", {PERSISTENT, BOOL, "1"}},
+    // Off by default: it changes the speed the planner plans from, and the
+    // correction is not validated until someone drives it.
+    {"MoonpilotSlam", {PERSISTENT, BOOL, "0"}},
     {"MoonpilotTailscale", {PERSISTENT, BOOL, "0"}},
     // Off by default: it changes the safety model, and the PCM_CRUISE_2 rate on
     // the car is not validated until someone drives it.

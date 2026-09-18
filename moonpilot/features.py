@@ -44,6 +44,13 @@ TAILSCALE = Feature(
   description="Join this device to your tailnet for remote access. Downloads tailscale (~35 MB) the first time, then shows a sign-in link here.",
 )
 
+SLAM = Feature(
+  key="MoonpilotSlam",
+  title="rolling-window ego correction",
+  description="Smooths recent ego motion over a 5 s rotating window and corrects the speed the fork planner plans from. Off = the raw wheel speed.",
+  offroad_only=True,
+)
+
 LATERAL_ENGAGE = Feature(
   key="MoonpilotLateralEngage",
   title="lateral engagement",
@@ -53,7 +60,7 @@ LATERAL_ENGAGE = Feature(
 
 # Behaviors the driver can swap back to upstream. The settings panel is built from this
 # table, so a feature is one row here, one row in params_keys.h, and its own code.
-FEATURES: tuple[Feature, ...] = (LEAD_LATERAL, TORQUE_LATERAL, LONGITUDINAL, TAILSCALE, LATERAL_ENGAGE)
+FEATURES: tuple[Feature, ...] = (LEAD_LATERAL, TORQUE_LATERAL, LONGITUDINAL, SLAM, TAILSCALE, LATERAL_ENGAGE)
 
 
 def missing_modules(feature: Feature) -> tuple[str, ...]:

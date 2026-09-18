@@ -48,6 +48,21 @@ struct MoonpilotState @0x81c2f05a394cf4af {  # moonpilot seam: upstream's reserv
     vision @1;
     radar @2;
   }
+
+  # moonpilot seam, see AGENTS.md. The rolling-window ego-motion correction, additive on the raw
+  # inputs: a consumer that ignores it whole (`valid` false) reduces to stock behavior. moonpilot's
+  # moonpilotState publisher fills it from moonpilot/slam.py.
+  egoCorrection @1 :EgoCorrection;
+
+  struct EgoCorrection {
+    valid @0 :Bool;
+    monoTime @1 :UInt64;  # ns; publisher logMonoTime of the window end the correction describes
+    age @2 :Float32;      # s; the window end to now. Reject past MAX_AGE + MOONPILOT_SLAM_POSE_DELAY
+    dPos @3 :Float32;     # m, along-track position correction (smoothed minus raw), + forward
+    dVel @4 :Float32;     # m/s, ego speed correction, + forward
+    dYaw @5 :Float32;     # rad, heading correction, + left
+    corrStd @6 :Float32;  # m, 1-sigma of dPos; a consumer scales its trust by 1 / (1 + corrStd)
+  }
 }
 
 struct CustomReserved1 @0xaedffd8f31e7b55d {
