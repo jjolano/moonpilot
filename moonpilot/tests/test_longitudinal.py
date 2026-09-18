@@ -28,6 +28,8 @@ from openpilot.selfdrive.test.longitudinal_maneuvers.test_longitudinal import cr
 
 from moonpilot.longitudinal import (
   MOONPILOT_APPROACH_DECEL,
+  MOONPILOT_CONTROL_T_IDX,
+  MOONPILOT_FCW_DECEL,
   MOONPILOT_JERK_EMERGENCY,
   MOONPILOT_JERK_UP,
   MOONPILOT_K_GAP,
@@ -39,8 +41,10 @@ from moonpilot.longitudinal import (
   MoonpilotLongitudinalPlanner,
   cruise_accel,
   lead_accel,
+  lead_state_at,
   moonpilot_longitudinal_planner,
   policy,
+  required_decel,
 )
 
 Personality = log.LongitudinalPersonality
@@ -244,8 +248,10 @@ class TestPolicyFunctions(unittest.TestCase):
     for v_ego, v_lead, v_cruise_kph in ((25.0, 20.0, 108.0), (20.0, 18.0, 108.0), (15.0, 14.0, 108.0)):
       v_cruise = v_cruise_kph * CV.KPH_TO_MS
       gap_star = MOONPILOT_STOP_DISTANCE + (v_ego**2 - v_lead**2) / (2 * MOONPILOT_APPROACH_DECEL)
+
       def run(gap, v_ego=v_ego, v_lead=v_lead, v_cruise=v_cruise):
         return policy(v_ego, [(Source.lead0, gap, v_lead, 0.0)], v_cruise, t_follow, False, 0.0, 0.0, CP, -0.3, True)[0]
+
       candidate_step = abs(lead_accel(v_ego, gap_star + 1e-3, v_lead, 0.0, t_follow) - lead_accel(v_ego, gap_star - 1e-3, v_lead, 0.0, t_follow))
       output_step = abs(run(gap_star + 1e-3) - run(gap_star - 1e-3))
       self.assertLessEqual(output_step, candidate_step + 1e-9)  # arbitration never amplifies
@@ -268,6 +274,31 @@ class TestPolicyFunctions(unittest.TestCase):
       a_track = max(MOONPILOT_K_GAP * (gap_star - MOONPILOT_STOP_DISTANCE - t_follow * v_ego) + MOONPILOT_K_V * (v_lead - v_ego), -MOONPILOT_APPROACH_DECEL)
       self.assertAlmostEqual(lead_accel(v_ego, gap_star - 1e-3, v_lead, 0.0, t_follow), -MOONPILOT_APPROACH_DECEL, delta=1e-3)
       self.assertAlmostEqual(lead_accel(v_ego, gap_star + 1e-3, v_lead, 0.0, t_follow), a_track, delta=1e-3)
+
+  def test_a_lead_that_stops_inside_the_horizon_keeps_its_stopping_distance(self):
+    """The predicted travel is the integral of the lead's clamped speed: monotone in t, and exactly
+    the stopping distance once it has stopped. The unclamped integral matched until the lead's own
+    stop time and then walked it backwards, clamping the 12.5 m it had covered to 0.5 m by the end
+    of this sweep."""
+    lead = _lead(50.0, 10.0, a_lead=-4.0, a_lead_tau=0.0)
+    travel = [lead_state_at(lead, float(t), 0.0, -4.0)[0] - 50.0 for t in np.arange(0.05, 5.0, 0.05)]
+    self.assertTrue(all(later >= earlier - 1e-9 for earlier, later in zip(travel, travel[1:], strict=False)))
+    self.assertAlmostEqual(travel[-1], 10.0**2 / (2 * 4.0), delta=1e-6)
+    self.assertAlmostEqual(lead_state_at(lead, 1.0, 0.0, -4.0)[1], 6.0, delta=1e-6)
+    self.assertEqual(lead_state_at(lead, 5.0, 0.0, -4.0)[1], 0.0)
+
+  def test_the_lead_accel_estimate_is_bounded(self):
+    """A stepped lead speed differentiates into hundreds of m/s^2; upstream clips it, so does this."""
+    self.assertAlmostEqual(lead_state_at(_lead(50.0, 20.0, a_lead_tau=0.0), 1.0, 0.0, -400.0)[1], 10.0, delta=1e-6)
+
+  def test_required_decel_counts_a_braking_lead(self):
+    """FCW's input: a lead braking hard at matched speed is a threat even at zero relative speed,
+    and routine lead braking is not."""
+    self.assertLess(required_decel(20.0, 20.0, 20.0, -8.0), MOONPILOT_FCW_DECEL)
+    self.assertGreater(required_decel(20.0, 35.0, 20.0, -5.0), MOONPILOT_FCW_DECEL)
+    self.assertGreater(required_decel(20.0, 25.0, 20.0, -3.0), MOONPILOT_FCW_DECEL)
+    # a lead holding its speed is unchanged: the stopped-car case the threshold was set on
+    self.assertAlmostEqual(required_decel(20.0, 30.0, 0.0, 0.0), -(20.0**2) / (2 * (30.0 - 0.25)), delta=1e-9)
 
 
 class TestPlanner(unittest.TestCase):
@@ -343,6 +374,25 @@ class TestPlanner(unittest.TestCase):
     sm = _inputs(v_ego=20.0, lead=_lead(30.0, 0.0, model_prob=0.5), standstill=False)
     for _ in range(10):
       planner.update(sm)
+    self.assertFalse(planner.fcw)
+
+  def test_fcw_fires_for_a_lead_braking_hard_at_matched_speed(self):
+    """The lead's speed history is the only accel input (`a_lead=0.0` on every frame), so a planner
+    that went back to reading `aLeadK` cannot pass this: at matched speed with a steady lead the
+    required decel is zero for every frame."""
+    planner = _planner()
+    for i in range(10):
+      lead = _lead(20.0, 20.0 - 8.0 * i * DT_MDL, a_lead=0.0, a_lead_tau=0.0, model_prob=0.95)
+      planner.update(_inputs(v_ego=20.0, lead=lead, standstill=False))
+    self.assertTrue(planner.fcw)
+
+  def test_fcw_stays_off_for_routine_lead_braking(self):
+    """Same shape, and the bounds that separate a warning from a nuisance. Not extended past 20
+    frames: by vLead ~ 10 m/s the required decel legitimately passes -4.0."""
+    planner = _planner()
+    for i in range(20):
+      lead = _lead(35.0, 20.0 - 5.0 * i * DT_MDL, a_lead=0.0, a_lead_tau=0.0, model_prob=0.95)
+      planner.update(_inputs(v_ego=20.0, lead=lead, standstill=False))
     self.assertFalse(planner.fcw)
 
   def test_fcw_does_not_latch_at_a_standstill(self):
@@ -429,6 +479,36 @@ class TestPlanner(unittest.TestCase):
     self.assertLess(v_ego, 0.5)  # it stopped
     self.assertGreater(gap, 5.0)  # and it did not run into the lead
 
+  def test_a_braking_lead_reaches_the_command_from_its_speed_history(self):
+    """The observable statement of the estimator, closed-loop: the lead's speed history alone — every
+    frame carries `a_lead=0.0` — has to bring the braking into the command.
+
+    Measured 0.25 s to -1.0 m/s^2 and 0.40 s to -2.0 m/s^2 on this loop's clock, against 0.55 s and
+    1.50 s for the same planner reading `aLeadK` directly (which is a revert's shape here, since
+    every `_lead` carries `a_lead=0.0`); the bounds sit between the two, not on the measurement.
+    """
+    planner = _planner()
+    t_follow = MOONPILOT_T_FOLLOW[int(Personality.standard)]
+    v_ego, v_lead = 20.0, 20.0
+    gap = MOONPILOT_STOP_DISTANCE + t_follow * v_ego
+    reached = {}
+    since_onset = None
+    for frame in range(120):  # 2 s of settled following, then the lead brakes at -3.5 m/s^2
+      if frame * DT_MDL >= 2.0:
+        v_lead = max(0.0, v_lead - 3.5 * DT_MDL)
+        since_onset = DT_MDL if since_onset is None else since_onset + DT_MDL
+      planner.update(_inputs(v_ego=v_ego, v_cruise_kph=108.0, lead=_lead(gap, v_lead, model_prob=0.95), standstill=v_ego < 0.1))
+      if since_onset is not None:
+        for threshold in (-1.0, -2.0):
+          if threshold not in reached and planner.output_a_target <= threshold:
+            reached[threshold] = since_onset
+      v_ego = max(0.0, v_ego + planner.output_a_target * DT_MDL)
+      gap = max(0.0, gap - (v_ego - v_lead) * DT_MDL)
+    self.assertTrue(-1.0 in reached)
+    self.assertTrue(-2.0 in reached)
+    self.assertLessEqual(reached[-1.0], 0.30)
+    self.assertLessEqual(reached[-2.0], 0.45)
+
   def test_publish_fills_what_consumers_read(self):
     planner = _planner()
     sm = _inputs(v_ego=20.0, lead=_lead(35.0, 20.0))
@@ -462,6 +542,19 @@ class TestPlanner(unittest.TestCase):
     self.assertAlmostEqual(planner.a_desired_trajectory[0], planner.output_a_target, delta=1e-6)
     # a decaying lead closes the gap, so the plan must not be asking for acceleration by the end
     self.assertLess(planner.v_desired_trajectory[-1], planner.v_desired_trajectory[0])
+
+  def test_the_published_speeds_are_the_integral_of_the_published_accels(self):
+    """The plan has to be self-consistent: its speeds integrate its own accels on the published
+    grid. They were one grid step apart, which also meant the gap the rollout used was not the gap
+    this plan produces."""
+    planner = _planner()
+    sm = _inputs(v_ego=25.0, v_cruise_kph=108.0, lead=_lead(60.0, 20.0, a_lead=-2.0, a_lead_tau=0.0))
+    for _ in range(20):
+      planner.update(sm)
+    for i in range(CONTROL_N - 1):
+      dt = float(MOONPILOT_CONTROL_T_IDX[i + 1] - MOONPILOT_CONTROL_T_IDX[i])
+      expected = max(0.0, float(planner.v_desired_trajectory[i] + planner.a_desired_trajectory[i] * dt))
+      self.assertAlmostEqual(float(planner.v_desired_trajectory[i + 1]), expected, delta=1e-6)
 
 
 class TestPlannerSeam(unittest.TestCase):

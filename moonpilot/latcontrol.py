@@ -10,9 +10,10 @@ Two mechanisms are deliberately not upstream's:
   - the setpoint is read out of the request buffer at a fractional frame, so a lateralDelay that
     is not a whole number of frames (it moves continuously) does not step the setpoint by a whole
     10 ms as it drifts;
-  - the desired jerk is the low-passed first difference of the request, instead of a centered
-    difference at an index derived from the delay and a 0.19 s lookahead, which for the delays
-    cars report lands on that same difference anyway.
+  - the desired jerk is a centered difference at the same fractional resolution as the setpoint, one
+    0.19 s lookahead ahead of it, rather than at an integer frame index derived from the delay. The
+    two agree while the delay is near 0.2 s; only the fractional form holds the lookahead at 0.19 s
+    on a car whose estimated delay is larger.
 
 The controller is picked once, at construction, so the toggle needs a restart, and it only runs
 on a car whose lateralTuning is torque — angle and curvature cars never reach the seam.
@@ -41,6 +42,7 @@ MOONPILOT_KP_V = [250.0, 120.0, 65.0, 30.0, 11.5, 5.5, 3.5, 2.0, 0.8]
 MOONPILOT_KI = 0.15
 MOONPILOT_JERK_CUTOFF_HZ = 1.2  # a 100 Hz plan's own jerk is mostly noise above this
 MOONPILOT_JERK_GAIN = 0.3  # how much anticipated jerk counts as error when breaking friction
+MOONPILOT_JERK_LOOKAHEAD_T = 0.19  # s ahead of the delayed setpoint the jerk is read at
 MOONPILOT_BUFFER_SECONDS = 1.0  # ceiling on the steering delay this can match
 MOONPILOT_INTEGRATOR_MIN_SPEED = 5.0  # m/s; below it the angle measurement is too coarse to integrate
 MOONPILOT_VERSION = 1000  # logged; a fork band upstream's counter will not reach
@@ -91,8 +93,12 @@ class MoonpilotLatControlTorque(LatControl):
     older_accel = self.requests[-1 - older]
     return newer_accel + (frames - whole) * (older_accel - newer_accel)
 
-  def _desired_jerk(self) -> float:
-    return self.jerk_filter.update((self.requests[-1] - self.requests[-2]) / self.dt)
+  def _desired_jerk(self, lat_delay: float) -> float:
+    # Read one lookahead ahead of the setpoint, not at the newest request: with the buffer read at a
+    # fractional frame this is upstream's centered difference exactly, and it keeps the anticipation
+    # at the lookahead on a car whose estimated delay is large (lagd publishes up to 0.65 s).
+    delay = max(lat_delay - MOONPILOT_JERK_LOOKAHEAD_T, self.dt)
+    return self.jerk_filter.update((self._setpoint(delay - self.dt) - self._setpoint(delay + self.dt)) / (2 * self.dt))
 
   def update(self, active, CS, VM, params, steer_limited_by_safety, desired_curvature, curvature_limited, lat_delay):
     torque_log = log.ControlsState.LateralTorqueState.new_message()
@@ -106,7 +112,7 @@ class MoonpilotLatControlTorque(LatControl):
     self.requests.append(desired_lat_accel)
     setpoint = self._setpoint(lat_delay)
     error = setpoint - measured_lat_accel
-    desired_jerk = self._desired_jerk()
+    desired_jerk = self._desired_jerk(lat_delay)
 
     # Friction only applies outside the steering's own deadzone, in lateral acceleration units.
     curvature_deadzone = abs(VM.calc_curvature(math.radians(self.steering_angle_deadzone_deg), CS.vEgo, 0.0))

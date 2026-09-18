@@ -12,7 +12,7 @@ from openpilot.common.constants import ACCELERATION_DUE_TO_GRAVITY
 from openpilot.common.params import Params
 from openpilot.common.realtime import DT_CTRL
 
-from moonpilot.latcontrol import MOONPILOT_KI, MoonpilotLatControlTorque, moonpilot_latcontrol
+from moonpilot.latcontrol import MOONPILOT_JERK_LOOKAHEAD_T, MOONPILOT_KI, MoonpilotLatControlTorque, moonpilot_latcontrol
 
 # A request small enough that the controller runs inside its own limits, so the integrator
 # is not anti-windup frozen at zero (the PID freezes it once the sum clips).
@@ -77,6 +77,25 @@ class TestMoonpilotLatControlTorque(unittest.TestCase):
     for i in range(500):
       lac_log = _run(lac, VM, CS, params, 1, desired_curvature=1.0 * i * DT_CTRL / 625)
     self.assertAlmostEqual(lac_log.desiredLateralJerk, 1.0, delta=0.02)
+
+  def test_jerk_is_read_at_the_lookahead_not_at_the_newest_request(self):
+    """A car with a large estimated delay must not anticipate the whole delay: a request that starts
+    ramping is not in the jerk until it has aged past delay - lookahead (26 frames here)."""
+    lac, VM, _ = _controller()
+    CS, params = _state(), log.VehicleParameters.new_message()
+    lat_delay = MOONPILOT_JERK_LOOKAHEAD_T + 0.26
+    _run(lac, VM, CS, params, 200, desired_curvature=0.0, lat_delay=lat_delay)
+
+    request, lac_log = 0.0, None
+    for _ in range(10):  # 0.1 s of ramp: nothing has reached the lookahead yet
+      request += 1.0 * DT_CTRL / 625
+      lac_log = _run(lac, VM, CS, params, 1, desired_curvature=request, lat_delay=lat_delay)
+    self.assertLess(abs(lac_log.desiredLateralJerk), 0.05)
+
+    for _ in range(100):
+      request += 1.0 * DT_CTRL / 625
+      lac_log = _run(lac, VM, CS, params, 1, desired_curvature=request, lat_delay=lat_delay)
+    self.assertAlmostEqual(lac_log.desiredLateralJerk, 1.0, delta=0.05)
 
   def test_roll_is_taken_out_of_the_feedforward(self):
     lac, VM, _ = _controller()

@@ -9,9 +9,12 @@ right-positive, so `y` is negated on the way out.
 """
 
 import math
+from collections import deque
+
 import numpy as np
 
 from openpilot.common.params import Params
+from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.modeld.constants import ModelConstants
 
 from moonpilot.features import LEAD_LATERAL, enabled
@@ -30,6 +33,12 @@ MOONPILOT_OUT_OF_PATH_DANGER = 0.4  # relaxed MPC danger factor for a fully out-
 MOONPILOT_INPATH_RC = 1.0  # s; decay time constant of the asymmetric inPath filter
 # Dense where a cut-in matters, none of it past the ~4 s where a cut-in can still be avoided.
 MOONPILOT_INPATH_GRID = np.arange(0.0, 4.0 + 1e-9, 0.25)
+# The lead accel estimator's window. radard's aLeadK is a KF1D with fixed gains (radard.py:29-48),
+# tau = 0.49 s at DT_MDL, so 90 % of a -3 m/s^2 step takes 1.20 s. A least-squares slope over this
+# window reaches the same step in the window's own length and averages noise instead of lagging it.
+MOONPILOT_LEAD_ACCEL_WINDOW = 7  # samples, 0.35 s at DT_MDL
+MOONPILOT_LEAD_ACCEL_MIN_SAMPLES = 3  # below this the slope is noise, so radard's value stands
+MOONPILOT_LEAD_SPEED_JUMP = 2.5  # m/s in one frame: re-association, not motion (50 m/s^3)
 
 LEAD_T_IDXS = ModelConstants.LEAD_T_IDXS
 LEAD_T_OFFSETS = ModelConstants.LEAD_T_OFFSETS
@@ -48,6 +57,51 @@ def resample(t_src, values, t_dst) -> np.ndarray:
   if t_src.size < 2 or values.size < 2:
     return np.empty((0,), dtype=float)
   return np.interp(np.asarray(t_dst, dtype=float), t_src, values)
+
+
+class LeadAccelEstimator:
+  """A lead's acceleration from the slope of `vLead` over a short window.
+
+  radard reports `aLeadK` from a Kalman filter with hardcoded gains (`radard.py:29-48`): tau is
+  0.49 s at DT_MDL, so 90 % of a -3 m/s^2 step arrives 1.20 s late, which is most of the margin a
+  braking lead gives us. The least-squares slope over MOONPILOT_LEAD_ACCEL_WINDOW samples has no lag
+  of its own — a clean ramp reads exactly as soon as MOONPILOT_LEAD_ACCEL_MIN_SAMPLES are on it,
+  0.10 s — so the only latency it carries is the ramp onto a window that already holds samples from
+  before the step: 0.30 s at the full window. It averages measurement noise rather than lagging it:
+  0.19 m/s^2 of jitter over the window for 0.05 m/s of noise, against 1.41 m/s^2 for a one-frame
+  difference. The lead's *speed* is left alone — `vLead` has no filter lag to remove, and this
+  fit's endpoint value would add a transient bias exactly at the onset of braking.
+
+  Returns radard's own `aLeadK` whenever the window cannot speak: a vision-only lead (there
+  `aLeadK` is the model's own unfiltered accel), fewer than MOONPILOT_LEAD_ACCEL_MIN_SAMPLES
+  samples, a new `radarTrackId`, a source flip, or a `vLead` jump past MOONPILOT_LEAD_SPEED_JUMP.
+
+  One instance per radarState slot, updated every frame *including* the frames where the slot is
+  absent — the reset is what keeps a new lead from inheriting the previous one's samples. Sample
+  spacing is one model frame by construction: radard publishes `radarState` once per `modelV2`
+  frame (`radard.py:263-272`), and plannerd is polled on the same message.
+  """
+
+  def __init__(self, dt: float = DT_MDL, window: int = MOONPILOT_LEAD_ACCEL_WINDOW):
+    self._samples: deque[float] = deque(maxlen=window)
+    self._track: tuple[bool, bool, int] | None = None
+    # slope = sum(w_i * v_i) for a uniform grid: w_i = 12 (i - (n-1)/2) / (dt n (n^2 - 1)).
+    self._weights = {n: (np.arange(n) - (n - 1) / 2.0) * (12.0 / (dt * n * (n * n - 1))) for n in range(MOONPILOT_LEAD_ACCEL_MIN_SAMPLES, window + 1)}
+
+  def update(self, lead) -> float:
+    track = (bool(lead.present), bool(lead.radar), int(lead.radarTrackId))
+    v_lead = float(lead.vLead)
+    if track != self._track or (self._samples and abs(v_lead - self._samples[-1]) > MOONPILOT_LEAD_SPEED_JUMP):
+      self._samples.clear()
+    self._track = track
+
+    if not (lead.present and lead.radar):
+      return float(lead.aLeadK)
+    self._samples.append(v_lead)
+    if len(self._samples) < MOONPILOT_LEAD_ACCEL_MIN_SAMPLES:
+      return float(lead.aLeadK)
+    n = len(self._samples)
+    return float(self._weights[n] @ np.fromiter(self._samples, float, n))
 
 
 def lead_yaw_rel(t, y, v) -> list[float]:

@@ -16,10 +16,14 @@ from openpilot.selfdrive.modeld.constants import ModelConstants
 from moonpilot.lead import (
   MOONPILOT_INPATH_GRID,
   MOONPILOT_INPATH_RC,
+  MOONPILOT_LEAD_ACCEL_MIN_SAMPLES,
+  MOONPILOT_LEAD_ACCEL_WINDOW,
+  MOONPILOT_LEAD_SPEED_JUMP,
   MOONPILOT_MIN_Y_STD,
   MOONPILOT_OUT_OF_PATH_DANGER,
   MOONPILOT_PATH_HALF_WIDTH,
   MOONPILOT_RADAR_TO_CAMERA,
+  LeadAccelEstimator,
   lead_danger_factor,
   lead_in_path,
   lead_in_path_prob,
@@ -52,7 +56,7 @@ class ModelLead:
 
 
 class FusedLead:
-  def __init__(self, d_rel, y_rel, v_lead=10.0, a_lead=0.0, present=True, radar=False, model_prob=0.9):
+  def __init__(self, d_rel, y_rel, v_lead=10.0, a_lead=0.0, present=True, radar=False, model_prob=0.9, a_lead_tau=1.5, track_id=0):
     self.dRel = d_rel
     self.yRel = y_rel
     self.vLead = v_lead
@@ -60,6 +64,8 @@ class FusedLead:
     self.present = present
     self.radar = radar
     self.modelProb = model_prob
+    self.aLeadTau = a_lead_tau
+    self.radarTrackId = track_id
 
 
 class FakeSubMaster:
@@ -116,6 +122,71 @@ class TestRadarOffset(unittest.TestCase):
     from openpilot.selfdrive.controls.radard import RADAR_TO_CAMERA
 
     self.assertEqual(MOONPILOT_RADAR_TO_CAMERA, RADAR_TO_CAMERA)
+
+
+class TestLeadAccelEstimator(unittest.TestCase):
+  """The estimator that replaced radard's `aLeadK` as the planner's lead accel.
+
+  Every case feeds a constant-accel speed history with `aLeadK = 0.0` (or a sentinel), so a return
+  that reads the field instead of the window cannot pass.
+  """
+
+  @staticmethod
+  def _feed(estimator, v0=20.0, a=-3.0, frames=MOONPILOT_LEAD_ACCEL_WINDOW, a_lead=0.0, track_id=0, present=True, radar=True):
+    """Feed `frames` samples of v = v0 + a*i*DT_MDL, oldest first; returns the last estimate."""
+    out = None
+    for i in range(frames):
+      out = estimator.update(FusedLead(35.0, 0.0, v_lead=v0 + a * i * DT_MDL, a_lead=a_lead, present=present, radar=radar, track_id=track_id))
+    return out
+
+  def test_a_braking_lead_is_recognized_within_the_window(self):
+    """The whole point: a -3 m/s^2 ramp reads as -3 m/s^2 after three frames, where radard's filter
+    is at -0.12 m/s^2 on that same frame and needs 1.2 s to reach 90 % of it."""
+    self.assertAlmostEqual(self._feed(LeadAccelEstimator(), frames=MOONPILOT_LEAD_ACCEL_WINDOW), -3.0, delta=0.01)
+    self.assertLess(self._feed(LeadAccelEstimator(), frames=MOONPILOT_LEAD_ACCEL_MIN_SAMPLES), -2.0)
+
+  def test_noise_is_averaged_not_amplified(self):
+    """0.05 m/s of measurement noise on a steady follower: bounded, and far below the jerk limits.
+    A one-frame difference would put 1.4 m/s^2 of jitter on the same input."""
+    estimator = LeadAccelEstimator()
+    rng = np.random.default_rng(0)
+    estimates = np.array([estimator.update(FusedLead(35.0, 0.0, v_lead=20.0 + rng.normal(0.0, 0.05))) for _ in range(200)])
+    self.assertLess(float(np.abs(estimates).max()), 0.6)
+    self.assertLess(float(estimates[MOONPILOT_LEAD_ACCEL_MIN_SAMPLES:].std()), 0.25)
+
+  def test_a_vision_lead_keeps_the_model_accel(self):
+    """Only a radar-matched lead has a speed history to fit; the model's own accel is already there."""
+    estimator = LeadAccelEstimator()
+    for frame in range(10):
+      self.assertEqual(self._feed(estimator, frames=1, a_lead=-1.7, radar=False, v0=20.0 - 3.0 * frame * DT_MDL), -1.7)
+
+  def test_a_new_track_does_not_inherit_the_old_one(self):
+    estimator = LeadAccelEstimator()
+    step = 3.0 * DT_MDL
+    self.assertAlmostEqual(self._feed(estimator), -3.0, delta=0.01)
+    # a different radar track entirely: radard's value stands until this track's own window fills
+    self.assertEqual(self._feed(estimator, frames=1, v0=20.0 - step, a_lead=0.0, track_id=1), 0.0)
+    self.assertAlmostEqual(self._feed(estimator, frames=2, v0=20.0 - 2 * step, track_id=1), -3.0, delta=0.01)
+
+  def test_a_speed_jump_is_reassociation_not_braking(self):
+    """A lead that re-associates 3.5 m/s away is a new object, not a 70 m/s^2 brake."""
+    estimator = LeadAccelEstimator()
+    step = 3.0 * DT_MDL
+    self.assertAlmostEqual(self._feed(estimator), -3.0, delta=0.01)
+    jumped = 20.0 - 3.0 * (MOONPILOT_LEAD_ACCEL_WINDOW - 1) * DT_MDL - (MOONPILOT_LEAD_SPEED_JUMP + 1.0)
+    self.assertEqual(self._feed(estimator, frames=1, v0=jumped, a_lead=-9.9), -9.9)
+    self.assertEqual(self._feed(estimator, frames=1, v0=jumped - step, a_lead=-9.9), -9.9)  # still two samples
+    self.assertAlmostEqual(self._feed(estimator, frames=1, v0=jumped - 2 * step, a_lead=-9.9), -3.0, delta=0.01)
+
+  def test_an_absent_slot_clears_the_window(self):
+    """The planner ticks every instance every frame for this reason: an absent or replaced lead may
+    not leave samples behind for the next one to inherit."""
+    estimator = LeadAccelEstimator()
+    step = 3.0 * DT_MDL
+    self.assertAlmostEqual(self._feed(estimator), -3.0, delta=0.01)
+    self.assertEqual(self._feed(estimator, frames=1, present=False, a_lead=-9.9), -9.9)
+    self.assertEqual(self._feed(estimator, frames=MOONPILOT_LEAD_ACCEL_MIN_SAMPLES - 1, v0=20.0 - step, a_lead=-9.9), -9.9)
+    self.assertAlmostEqual(self._feed(estimator, frames=1, v0=20.0 - 3 * step, a_lead=-9.9), -3.0, delta=0.01)
 
 
 class TestNormalizeLead(unittest.TestCase):

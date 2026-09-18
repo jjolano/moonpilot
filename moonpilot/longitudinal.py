@@ -24,6 +24,11 @@ Two things are deliberately not upstream's:
     divides by the delay, so a step in the plan comes out amplified by ``action_t / dt`` — measured
     at 45 m/s^3 and instant ACCEL_MIN saturation in simulation.
 
+  - the lead's acceleration is the fork's own estimate — the least-squares slope of ``vLead`` over
+    ``moonpilot.lead.LeadAccelEstimator``'s window — because radard's ``aLeadK`` is a Kalman filter
+    with a 0.49 s time constant, and a lead braking at -3.5 m/s^2 reached -2.0 m/s^2 of command
+    0.25 s later through it than through the slope. ``aLeadK`` stays as the fallback.
+
 The planner is picked once, at construction, so the toggle needs a restart, and it only exists on a
 car with ``openpilotLongitudinalControl`` — cars whose stock ACC owns acceleration never reach the
 seam. Upstream's MPC stays on the line as the fallback.
@@ -47,7 +52,7 @@ from openpilot.selfdrive.controls.lib.drive_helpers import CONTROL_N, should_sto
 from openpilot.selfdrive.modeld.constants import ModelConstants
 
 from moonpilot.features import LEAD_LATERAL, LONGITUDINAL, enabled
-from moonpilot.lead import nearest_lead_in_path
+from moonpilot.lead import LeadAccelEstimator, nearest_lead_in_path
 
 LongCtrlState = car.CarControl.Actuators.LongControlState
 # From cereal, not from long_mpc — that module imports the compiled acados solver at import time,
@@ -72,6 +77,8 @@ MOONPILOT_APPROACH_DECEL = 1.0  # m/s^2; the decel an approach is planned at, an
 # the two terms meet continuously
 MOONPILOT_MIN_SLACK = 0.5  # m; floor on the braking-distance denominator
 MOONPILOT_LEAD_PREVIEW_T = 1.0  # s of the lead's own braking credited to the safety term
+MOONPILOT_A_LEAD_MIN = -10.0  # m/s^2; bounds on a lead's accel estimate, upstream's (long_mpc.process_lead)
+MOONPILOT_A_LEAD_MAX = 5.0
 MOONPILOT_OUT_OF_PATH_T_FOLLOW = 0.7  # time-gap scale for a lead predicted to leave the path
 MOONPILOT_K_CRUISE = 1.0  # 1/s on the speed error
 MOONPILOT_A_CRUISE_MIN = -1.2  # m/s^2; cruise never brakes harder than this
@@ -148,20 +155,55 @@ def jerk_limit(a_cmd, a_prev, dt) -> float:
   return float(np.clip(a_cmd, a_prev - down * dt, a_prev + MOONPILOT_JERK_UP * dt))
 
 
-def lead_state_at(lead, t, v_ego, a_ego) -> tuple[float, float, float]:
-  """Gap, lead speed and lead accel at time t: lead accel decays as exp(-aLeadTau t^2 / 2)
-  (radard's own decay model), ego advances at constant a_ego."""
-  a_traj = lead.aLeadK * math.exp(-lead.aLeadTau * t**2 / 2.0)
-  v_lead = max(0.0, lead.vLead + 0.5 * (lead.aLeadK + a_traj) * t)
-  x_lead = max(0.0, lead.vLead * t + 0.25 * (lead.aLeadK + a_traj) * t * t)
-  v_ego_t = max(0.0, v_ego + a_ego * t)
-  x_ego = max(0.0, (v_ego + v_ego_t) / 2 * t)
-  return max(0.0, lead.dRel + x_lead - x_ego), v_lead, a_traj
+def lead_accel_estimate(a_lead: float) -> float:
+  """A lead's accel estimate, bounded the way upstream's MPC bounds it: radard's Kalman reports
+  implausible values on a track that just appeared, and the maneuver plant differentiates a stepped
+  lead speed into hundreds of m/s^2."""
+  return min(max(float(a_lead), MOONPILOT_A_LEAD_MIN), MOONPILOT_A_LEAD_MAX)
 
 
-def required_decel(v_ego, gap, v_lead) -> float:
-  """Decel needed to avoid contact, CRASH_DISTANCE margin. FCW's whole input."""
-  return -(v_ego**2 - max(v_lead, 0.0) ** 2) / (2 * max(gap - MOONPILOT_CRASH_DISTANCE, 0.1))
+def lead_state_at(lead, t, x_ego, a_lead) -> tuple[float, float, float]:
+  """Gap, lead speed and lead accel at time t, given the ego's own travel x_ego by then.
+
+  Lead accel decays as exp(-aLeadTau t^2 / 2) — radard's own decay model — and the lead's travel is
+  the integral of its *clamped* speed: a lead that brakes to a stop inside the horizon has covered
+  its stopping distance, where the unclamped integral walked it backwards and then clamped the travel
+  to zero. Exact whenever aLeadTau == 0, which is what radard reports for anything braking hard
+  enough to matter: aLeadTau is driven to 0 while |aLeadK| >= 0.5 (radard.py:76-79). The accel itself
+  is the caller's estimate (`moonpilot.lead.LeadAccelEstimator`), not `aLeadK`; only the decay is
+  radard's. Against a decaying accel it is the trapezoid — measured against exact integration over
+  aLeadTau's reachable range (0.3 from the vision path, otherwise a FirstOrderFilter decaying toward 0
+  from 1.5, radard.py:18,55,145) within 0.1 m across the 0.55 s command horizon, and 6.2 m at the
+  2.5 s tail at the clip's own -10 m/s^2 bound (3.1 m for |aLeadK| <= 5) — and that tail is the
+  published plan, not the command.
+  """
+  a_lead = lead_accel_estimate(a_lead)
+  a_traj = a_lead * math.exp(-lead.aLeadTau * t**2 / 2.0)
+  a_avg = 0.5 * (a_lead + a_traj)
+  v_lead = max(0.0, float(lead.vLead))
+  v_end = v_lead + a_avg * t
+  if v_end > 0.0:
+    x_lead = 0.5 * (v_lead + v_end) * t
+  else:  # stopped inside t: its own stopping distance at that average decel
+    x_lead, v_end = (v_lead**2 / (-2.0 * a_avg) if a_avg < 0.0 else 0.0), 0.0
+  return max(0.0, lead.dRel + x_lead - x_ego), v_end, a_traj
+
+
+def required_decel(v_ego, gap, v_lead, a_lead=0.0) -> float:
+  """Decel needed to avoid contact, CRASH_DISTANCE margin. FCW's whole input.
+
+  Two constraints, and the harder one wins: matching the speed of a lead that holds it, and stopping
+  short of where a lead that keeps braking at its current rate comes to rest. Without the second, a
+  lead braking hard at matched speed reads as no threat at all until the speed measurement has
+  caught up — 0.7 s at -8 m/s^2, which is most of the margin the warning exists to buy.
+  """
+  slack = max(gap - MOONPILOT_CRASH_DISTANCE, 0.1)
+  v_lead = max(float(v_lead), 0.0)
+  a_lead = lead_accel_estimate(a_lead)
+  a_match = -(v_ego**2 - v_lead**2) / (2 * slack)
+  if a_lead >= 0.0:
+    return a_match
+  return min(a_match, -(v_ego**2) / (2 * (slack + v_lead**2 / (-2 * a_lead))))
 
 
 def policy(v_ego, leads, v_cruise, t_follow, e2e, model_accel, steer_angle_deg, CP, accel_coast, allow_throttle):
@@ -189,6 +231,8 @@ class MoonpilotLongitudinalPlanner:
     self.dt = dt
     self.params = Params()
     self.action_t = CP.longitudinalActuatorDelay + DT_MDL
+    # One per radarState slot, ticked every frame so an absent or replaced lead resets its window.
+    self.lead_accel = (LeadAccelEstimator(dt), LeadAccelEstimator(dt))
 
     self.output_a_target = init_a
     self.output_should_stop = False
@@ -233,17 +277,22 @@ class MoonpilotLongitudinalPlanner:
     t_follow = self._t_follow(sm)
     e2e = sm['selfdriveState'].experimentalMode
     model_accel = sm['modelV2'].action.desiredAcceleration
-    leads = [
-      (source, lead)
-      for source, lead in ((LongitudinalPlanSource.lead0, sm['radarState'].leadOne), (LongitudinalPlanSource.lead1, sm['radarState'].leadTwo))
-      if lead.present
-    ]
+    leads = []
+    for estimator, (source, lead) in zip(
+      self.lead_accel,
+      ((LongitudinalPlanSource.lead0, sm['radarState'].leadOne), (LongitudinalPlanSource.lead1, sm['radarState'].leadTwo)),
+      strict=True,
+    ):
+      a_lead = estimator.update(lead)  # every frame, present or not: that is what resets the window
+      if lead.present:
+        leads.append((source, lead, a_lead))
 
     # Delay compensation by state prediction: where the car and the leads will be when this command
     # reaches the actuator. The policy is evaluated there, not inverted back through the plan.
     a_prev = float(self.output_a_target)
     v_pred = max(0.0, v_ego + a_prev * self.action_t)
-    lead_states = [(source, *lead_state_at(lead, self.action_t, v_ego, a_prev)) for source, lead in leads]
+    x_pred = 0.5 * (v_ego + v_pred) * self.action_t
+    lead_states = [(source, *lead_state_at(lead, self.action_t, x_pred, a_lead)) for source, lead, a_lead in leads]
     a_cmd, source = policy(v_pred, lead_states, v_cruise, t_follow, e2e, model_accel, steer_angle, self.CP, accel_coast, self.allow_throttle)
 
     a_target = float(np.clip(jerk_limit(a_cmd, a_prev, self.dt), ACCEL_MIN, ACCEL_MAX))
@@ -256,7 +305,9 @@ class MoonpilotLongitudinalPlanner:
     )
     self.j_desired_trajectory = np.gradient(self.a_desired_trajectory, MOONPILOT_CONTROL_T_IDX)
 
-    crash = any(lead.modelProb > MOONPILOT_FCW_MODEL_PROB and required_decel(v_ego, lead.dRel, lead.vLead) < MOONPILOT_FCW_DECEL for _, lead in leads)
+    crash = any(
+      lead.modelProb > MOONPILOT_FCW_MODEL_PROB and required_decel(v_ego, lead.dRel, lead.vLead, a_lead) < MOONPILOT_FCW_DECEL for _, lead, a_lead in leads
+    )
     self.crash_cnt = self.crash_cnt + 1 if crash else 0
     fcw = self.crash_cnt > MOONPILOT_FCW_COUNT and not CS.standstill
     if fcw and not self.fcw:
@@ -269,18 +320,25 @@ class MoonpilotLongitudinalPlanner:
     self.solve_time = time.monotonic() - start
 
   def _trajectory(self, v_ego, a_target, leads, v_cruise, t_follow, e2e, model_accel, steer_angle, accel_coast):
-    """The same policy rolled forward over the published horizon, from (v_ego, a_target)."""
+    """The same policy rolled forward over the published horizon, from (v_ego, a_target). The ego's
+    own travel is carried in x, so the gap the leads are rolled against is the gap this plan
+    produces. The old loop advanced the state by the *backward* interval and rolled the leads against
+    a gap recomputed from the initial speed and the loop's current accel: on a closing lead at
+    25 m/s, its speeds sat up to 0.42 m/s away from the consistent rollout's."""
     speeds = np.zeros(CONTROL_N)
     accels = np.zeros(CONTROL_N)
-    v, a, t_prev = v_ego, a_target, 0.0
-    for i, t in enumerate(MOONPILOT_CONTROL_T_IDX):
-      states = [(source, *lead_state_at(lead, float(t), v_ego, a)) for source, lead in leads]
+    v, a, x, t_prev = v_ego, a_target, 0.0, 0.0
+    for i, t_idx in enumerate(MOONPILOT_CONTROL_T_IDX):
+      t = float(t_idx)
+      states = [(source, *lead_state_at(lead, t, x, a_lead)) for source, lead, a_lead in leads]
       a_cmd, _ = policy(v, states, v_cruise, t_follow, e2e, model_accel, steer_angle, self.CP, accel_coast, self.allow_throttle)
-      a = float(np.clip(jerk_limit(a_cmd, a, float(t) - t_prev), ACCEL_MIN, ACCEL_MAX))
+      a = float(np.clip(jerk_limit(a_cmd, a, t - t_prev), ACCEL_MIN, ACCEL_MAX))
       speeds[i] = v
       accels[i] = a
-      v = max(0.0, v + a * (float(t) - t_prev))
-      t_prev = float(t)
+      dt = float(MOONPILOT_CONTROL_T_IDX[i + 1]) - t if i + 1 < CONTROL_N else 0.0
+      v_next = max(0.0, v + a * dt)
+      x += 0.5 * (v + v_next) * dt
+      v, t_prev = v_next, t
     return speeds, accels
 
   def _t_follow(self, sm):
