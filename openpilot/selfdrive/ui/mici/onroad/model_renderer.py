@@ -14,6 +14,7 @@ from openpilot.system.ui.lib.shader_polygon import draw_polygon, Gradient
 from openpilot.system.ui.widgets import Widget
 from moonpilot.features import LEAD_LATERAL, enabled  # moonpilot seam, see AGENTS.md
 from moonpilot.lead import resample  # moonpilot seam, see AGENTS.md
+from moonpilot.ui.onroad import moonpilot_status_color  # moonpilot seam, see AGENTS.md
 
 CLIP_MARGIN = 500
 MIN_DRAW_DISTANCE = 10.0
@@ -295,7 +296,8 @@ class ModelRenderer(Widget):
   def _get_ll_color(self, prob: float, adjacent: bool, left: bool):
     alpha = np.clip(prob, 0.0, 0.7)
     if adjacent:
-      _base_color = LANE_LINE_COLORS.get(ui_state.status, LANE_LINE_COLORS[UIStatus.DISENGAGED])
+      _base_color = (moonpilot_status_color(ui_state, LANE_LINE_COLORS) or
+                     LANE_LINE_COLORS.get(ui_state.status, LANE_LINE_COLORS[UIStatus.DISENGAGED]))  # moonpilot seam, see AGENTS.md
       color = rl.Color(_base_color.r, _base_color.g, _base_color.b, int(alpha * 255))
 
       # turn adjacent lls orange if torque is high

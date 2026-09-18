@@ -39,6 +39,7 @@ ALLOWED = {
   "openpilot/selfdrive/selfdrived/selfdrived.py": "lateral engagement events and panda cross-check, and the fork's startup alert",
   "openpilot/selfdrive/test/process_replay/process_replay.py": "moonpilotState in plannerd pubs",
   "openpilot/selfdrive/ui/ui_state.py": "moonpilotState subscription",
+  "openpilot/selfdrive/ui/onroad/augmented_road_view.py": "half-engaged border color",
   "openpilot/selfdrive/ui/onroad/model_renderer.py": "lead path draw (tizi)",
   "openpilot/selfdrive/ui/mici/onroad/model_renderer.py": "lead path draw (mici)",
   "openpilot/selfdrive/ui/layouts/home.py": "brand string",
