@@ -22,6 +22,7 @@ from openpilot.selfdrive.controls.lib.longcontrol import LongControl
 from openpilot.selfdrive.modeld.modeld import LAT_SMOOTH_SECONDS
 from openpilot.selfdrive.locationd.helpers import PoseCalibrator, Pose
 from moonpilot.latcontrol import moonpilot_latcontrol  # moonpilot seam, see AGENTS.md
+from moonpilot.curvature import moonpilot_curvature  # moonpilot seam, see AGENTS.md
 from moonpilot.longcontrol import moonpilot_longcontrol  # moonpilot seam, see AGENTS.md
 
 State = log.SelfdriveState.OpenpilotState
@@ -53,6 +54,7 @@ class Controls:
     self.calibrated_pose: Pose | None = None
 
     self.LoC = moonpilot_longcontrol(self.CP) or LongControl(self.CP)  # moonpilot seam, see AGENTS.md
+    self.curvature_preview = moonpilot_curvature()  # moonpilot seam, see AGENTS.md
     self.VM = VehicleModel(self.CP)
     self.LaC: LatControl
     if self.CP.steerControlType == car.CarParams.SteerControlType.angle:
@@ -126,6 +128,9 @@ class Controls:
       new_desired_curvature = self.sm['lateralManeuverPlan'].desiredCurvature if CC.latActive else self.curvature
     else:
       new_desired_curvature = model_v2.action.desiredCurvature if CC.latActive else self.curvature
+    if self.curvature_preview is not None:  # moonpilot seam, see AGENTS.md
+      new_desired_curvature = self.curvature_preview.update(model_v2, CS.vEgo, self.sm['lateralDelay'].lateralDelay + LAT_SMOOTH_SECONDS,
+                                                            CC.latActive, new_desired_curvature)
     self.desired_curvature, curvature_limited = clip_curvature(CS.vEgo, self.desired_curvature, new_desired_curvature, lp.roll)
     lat_delay = self.sm["lateralDelay"].lateralDelay + LAT_SMOOTH_SECONDS
 

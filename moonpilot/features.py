@@ -28,10 +28,24 @@ TORQUE_LATERAL = Feature(
   offroad_only=True,
 )
 
+PATH_PREVIEW = Feature(
+  key="MoonpilotPathPreview",
+  title="path preview steering",
+  description="Add a bounded share of the path's upcoming curvature to the model's steering request, so a curve is entered earlier. Restart to apply.",
+  offroad_only=True,
+)
+
 LONGITUDINAL = Feature(
   key="MoonpilotLongitudinal",
   title="moonpilot longitudinal",
   description="moonpilot's own longitudinal planner and acceleration controller, not openpilot's MPC. openpilot-longitudinal cars only; restart to apply.",
+  offroad_only=True,
+)
+
+CURVE_SPEED = Feature(
+  key="MoonpilotCurveSpeed",
+  title="curve speed control",
+  description="Slow for a curve the model already sees, and hold the lateral acceleration it is pulling. Braking is bounded, and only added. Immediate.",
   offroad_only=True,
 )
 
@@ -60,7 +74,7 @@ LATERAL_ENGAGE = Feature(
 
 # Behaviors the driver can swap back to upstream. The settings panel is built from this
 # table, so a feature is one row here, one row in params_keys.h, and its own code.
-FEATURES: tuple[Feature, ...] = (LEAD_LATERAL, TORQUE_LATERAL, LONGITUDINAL, SLAM, TAILSCALE, LATERAL_ENGAGE)
+FEATURES: tuple[Feature, ...] = (LEAD_LATERAL, TORQUE_LATERAL, PATH_PREVIEW, LONGITUDINAL, CURVE_SPEED, SLAM, TAILSCALE, LATERAL_ENGAGE)
 
 
 def missing_modules(feature: Feature) -> tuple[str, ...]:

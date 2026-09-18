@@ -34,7 +34,7 @@ ALLOWED = {
   "openpilot/selfdrive/controls/plannerd.py": "moonpilotState subscription; moonpilot longitudinal planner",
   "openpilot/selfdrive/controls/lib/longitudinal_planner.py": "lead danger factor from moonpilot",
   "openpilot/selfdrive/controls/lib/longitudinal_mpc_lib/long_mpc.py": "lead_danger_factor kwarg",
-  "openpilot/selfdrive/controls/controlsd.py": "moonpilot torque lateral controller, and acceleration controller",
+  "openpilot/selfdrive/controls/controlsd.py": "moonpilot torque lateral controller, curvature preview, and acceleration controller",
   "openpilot/selfdrive/pandad/pandad.cc": "lateral-controls health flag",
   "openpilot/selfdrive/selfdrived/selfdrived.py": "lateral engagement events and panda cross-check, and the fork's startup alert",
   "openpilot/selfdrive/test/process_replay/process_replay.py": "moonpilotState in plannerd pubs",

@@ -19,6 +19,12 @@ problem. The policy is three candidates, and the smallest wins:
   - the cruise term, and in experimental mode the model's own accel, the same candidates upstream
     arbitrates between.
 
+``MoonpilotCurveSpeed`` adds two more terms *inside* the cruise slot, so the reported source stays
+``cruise`` and ``min`` means they can only ever add braking: a kinematic pre-brake against the model
+path's own curvature, and a proportional regulator on the lateral accel the car is actually pulling.
+``moonpilot/curve.py`` is where the math and its constants live; both are inert without the model's
+path arrays and, for the in-curve term, ``vehicleParameters.valid``.
+
 Two things are deliberately not upstream's:
 
   - delay compensation is done by predicting the state at the actuator delay and evaluating the
@@ -44,6 +50,7 @@ import numpy as np
 import openpilot.cereal.messaging as messaging
 from opendbc.car.interfaces import ACCEL_MIN, ACCEL_MAX
 from opendbc.car.structs import car
+from opendbc.car.vehicle_model import VehicleModel
 from openpilot.cereal import log
 from openpilot.common.constants import CV
 from openpilot.common.params import Params
@@ -53,7 +60,21 @@ from openpilot.selfdrive.car.cruise import V_CRUISE_MAX, V_CRUISE_UNSET
 from openpilot.selfdrive.controls.lib.drive_helpers import CONTROL_N, should_stop
 from openpilot.selfdrive.modeld.constants import ModelConstants
 
-from moonpilot.features import LEAD_LATERAL, LONGITUDINAL, enabled
+from moonpilot.curve import (
+  MOONPILOT_CURVE_BIAS_KEY,
+  MOONPILOT_CURVE_BIAS_MAX,
+  MOONPILOT_CURVE_BIAS_MIN_SPEED,
+  MOONPILOT_CURVE_BIAS_MIN_SAMPLES,
+  MOONPILOT_CURVE_BIAS_PERSIST_EVERY,
+  LatAccelBiasEstimator,
+  curve_accel,
+  curve_targets,
+  hold_speed,
+  lat_accel_budget,
+  lat_accel_hold,
+  predicted_lat_accel,
+)
+from moonpilot.features import CURVE_SPEED, LEAD_LATERAL, LONGITUDINAL, enabled
 from moonpilot.lead import LeadAccelEstimator, nearest_lead_in_path
 from moonpilot.slam import ego_speed_correction
 
@@ -269,15 +290,23 @@ def required_decel(v_ego, gap, v_lead, a_lead=0.0) -> float:
   return min(a_match, -(v_ego**2) / (2 * (slack + v_lead**2 / (-2 * a_lead))))
 
 
-def policy(v_ego, leads, v_cruise, t_follow, e2e, model_accel, steer_angle_deg, CP, accel_coast, allow_throttle):
+def policy(v_ego, leads, v_cruise, t_follow, e2e, model_accel, steer_angle_deg, CP, accel_coast, allow_throttle, curve=None, x_ego=0.0, v_hold=math.inf):
   """The smallest of the candidates, and which one it was.
 
   `leads` is a sequence of (source, gap, v_lead, a_lead) for the leads that are present, in
   radarState order, each carrying the slot it came from so that an absent leadOne does not make
   leadTwo report itself as lead0. The model's own accel goes last, so an upstream change that lets a
   NaN through the model cannot win the comparison and land in the plan.
+
+  `curve` is `moonpilot.curve.curve_targets`' output and `v_hold` its in-curve setpoint, both fed into
+  the cruise slot as a minimum — so the reported source stays `cruise`, and the two curve terms are
+  live in experimental mode too. That is the point of putting them there rather than beside the model
+  candidate: `min` means they can only ever add braking to whatever the model asked for, never
+  substitute for it.
   """
-  candidates = [(cruise_accel(v_ego, v_cruise, e2e, steer_angle_deg, CP, accel_coast, allow_throttle), LongitudinalPlanSource.cruise)]
+  a_curve = min(curve_accel(v_ego, x_ego, curve), lat_accel_hold(v_ego, v_hold))
+  a_cruise = min(cruise_accel(v_ego, v_cruise, e2e, steer_angle_deg, CP, accel_coast, allow_throttle), a_curve)
+  candidates = [(a_cruise, LongitudinalPlanSource.cruise)]
   candidates += [(lead_accel(v_ego, gap, v_lead, a_lead, t_follow), source) for source, gap, v_lead, a_lead in leads]
   if e2e:
     candidates.append((float(model_accel), LongitudinalPlanSource.e2e))
@@ -294,6 +323,14 @@ class MoonpilotLongitudinalPlanner:
     self.dt = dt
     self.params = Params()
     self.action_t = CP.longitudinalActuatorDelay + DT_MDL
+    # The curve speed control's per-car calibration (`moonpilot/curve.py`): realized lateral accel over
+    # what the path predicted, one-sided so it can only ever plan for less speed. Seeded from the last
+    # drive, and the vehicle model is what turns a measured steer angle into a measured curvature.
+    self.VM = VehicleModel(CP)
+    self.lat_bias = LatAccelBiasEstimator(dt)
+    seeded_scale = self.params.get(MOONPILOT_CURVE_BIAS_KEY, return_default=True)
+    if isinstance(seeded_scale, float) and seeded_scale > 1.0:
+      self.lat_bias.seed(min(seeded_scale, MOONPILOT_CURVE_BIAS_MAX), MOONPILOT_CURVE_BIAS_MIN_SAMPLES)
     # One per radarState slot, ticked every frame so an absent or replaced lead resets its window.
     self.lead_accel = (LeadAccelEstimator(dt), LeadAccelEstimator(dt))
 
@@ -346,6 +383,29 @@ class MoonpilotLongitudinalPlanner:
     t_follow = self._t_follow(sm)
     e2e = sm['selfdriveState'].experimentalMode
     model_accel = sm['modelV2'].action.desiredAcceleration
+
+    # The curve speed control. The measured curvature is the car's own — `-VM.calc_curvature` of the
+    # steer angle, the same idiom controlsd and `moonpilot/latcontrol.py` use — and the model's path
+    # is what it is scored against. The measurement uses the raw `CS.vEgo` rather than the
+    # slam-corrected `v_ego`: it is a measurement of the car, not a plan input.
+    vp = sm['vehicleParameters']
+    self.VM.update_params(max(vp.stiffnessFactor, 0.1), max(vp.steerRatio, 0.1))
+    measured_curvature = -self.VM.calc_curvature(math.radians(CS.steeringAngleDeg - vp.angleOffsetDeg), CS.vEgo, vp.roll)
+    curve_allowed = enabled(CURVE_SPEED, self.params)
+    # Only frames where the fork's own lateral control is what steers the car, at speed and off the
+    # pedals: a disengaged or overridden stretch would pair a prediction of the model's path with a
+    # measurement of the driver's steering.
+    bias_valid = (
+      curve_allowed and vp.valid and sm['carControl'].latActive and not CS.steeringPressed and not CS.standstill and CS.vEgo > MOONPILOT_CURVE_BIAS_MIN_SPEED
+    )
+    self.lat_bias.update(predicted_lat_accel(sm['modelV2']), measured_curvature * CS.vEgo**2, bias_valid)
+    scale = self.lat_bias.applied()
+    curve = curve_targets(sm['modelV2'], curve_allowed, vp.roll, scale)
+    v_hold = math.inf
+    if curve_allowed:
+      budget = float(lat_accel_budget(math.copysign(1.0, measured_curvature), vp.roll, scale))
+      v_hold = hold_speed(measured_curvature, CS.vEgo, budget, CS.standstill, vp.valid)
+
     leads = []
     for estimator, (source, lead) in zip(
       self.lead_accel,
@@ -384,7 +444,21 @@ class MoonpilotLongitudinalPlanner:
     v_pred = max(0.0, v_ego + a_prev * self.action_t)
     x_pred = 0.5 * (v_ego + v_pred) * self.action_t
     lead_states = [(source, *lead_state_at(lead, self.action_t + lead_age, x_pred + x_stale, a_lead, a_lead_tau)) for source, lead, a_lead, a_lead_tau in leads]
-    a_cmd, source = policy(v_pred, lead_states, v_cruise, t_follow, e2e, model_accel, steer_angle, self.CP, accel_coast, self.allow_throttle)
+    a_cmd, source = policy(
+      v_pred,
+      lead_states,
+      v_cruise,
+      t_follow,
+      e2e,
+      model_accel,
+      steer_angle,
+      self.CP,
+      accel_coast,
+      self.allow_throttle,
+      curve=curve,
+      x_ego=x_pred,
+      v_hold=v_hold,
+    )
 
     a_target = float(np.clip(jerk_limit(a_cmd, a_prev, self.dt), ACCEL_MIN, ACCEL_MAX))
     if not math.isfinite(a_target):
@@ -392,7 +466,7 @@ class MoonpilotLongitudinalPlanner:
       a_target = 0.0
 
     self.v_desired_trajectory, self.a_desired_trajectory = self._trajectory(
-      v_ego, a_target, leads, v_cruise, t_follow, e2e, model_accel, steer_angle, accel_coast, lead_age
+      v_ego, a_target, leads, v_cruise, t_follow, e2e, model_accel, steer_angle, accel_coast, lead_age, curve, v_hold
     )
     self.j_desired_trajectory = np.gradient(self.a_desired_trajectory, MOONPILOT_CONTROL_T_IDX)
 
@@ -428,27 +502,45 @@ class MoonpilotLongitudinalPlanner:
     # and resume still works because a lead that pulls away lifts the command over the 0.1 threshold by
     # itself — both `long_control_state_trans`'s cruise-standstill pin and controlsd's resume read this
     # flag, so the car releases on the first frame rather than waiting for the gap to open.
+    # The model's own `shouldStop` stays experimental-only, unlike its accel. It is
+    # `should_stop(v_ego, desiredAcceleration)` computed in modeld (`modeld.py:59`), i.e. `v_ego <
+    # 0.3 and a < 0.1` — precisely the creeping-behind-a-lead state the `trailing` gate above exists
+    # to keep out of `LongControlState.stopping`, so admitting it here would undo that fix from the
+    # other side.
     trailing = v_ego > MOONPILOT_SHOULD_STOP_SPEED and any(s == source and v_lead > MOONPILOT_SHOULD_STOP_SPEED for s, _, v_lead, _ in lead_states)
     self.output_should_stop = (should_stop(v_ego, a_target) and not trailing) or (e2e and sm['modelV2'].action.shouldStop)
     self.output_a_target = a_target
     self.source = source
+    if self.lat_bias.frames % MOONPILOT_CURVE_BIAS_PERSIST_EVERY == 0 and self.lat_bias.status == 'estimated':
+      self._persist_lat_scale()
     self.solve_time = time.monotonic() - start
 
-  def _trajectory(self, v_ego, a_target, leads, v_cruise, t_follow, e2e, model_accel, steer_angle, accel_coast, lead_age=0.0):
+  def _persist_lat_scale(self):
+    """Persist the learned value so the next boot plans with it from the first frame. Gated on a
+    trusted estimate, so an unestimated or invalid one never becomes the next drive's scale."""
+    value = round(self.lat_bias.estimate, 3)
+    self.params.put(MOONPILOT_CURVE_BIAS_KEY, value)
+    cloudlog.info(f"moonpilot curve lateral scale {value:.3f} over {self.lat_bias.samples} paired frames")
+
+  def _trajectory(self, v_ego, a_target, leads, v_cruise, t_follow, e2e, model_accel, steer_angle, accel_coast, lead_age=0.0, curve=None, v_hold=math.inf):
     """The same policy rolled forward over the published horizon, from (v_ego, a_target). The ego's
     own travel is carried in x, so the gap the leads are rolled against is the gap this plan
     produces. The old loop advanced the state by the *backward* interval and rolled the leads against
     a gap recomputed from the initial speed and the loop's current accel: on a closing lead at
     25 m/s, its speeds sat up to 0.42 m/s away from the consistent rollout's. `lead_age` carries the
     same staleness correction `update` applies, so the published plan is the same prediction the
-    command was taken from rather than a fresher one."""
+    command was taken from rather than a fresher one. `curve` and `v_hold` ride along for the same
+    reason: the rollout is the policy the command came from, with the curve's own travel accumulated
+    in `x` and the measured curvature held across the horizon."""
     speeds = np.zeros(CONTROL_N)
     accels = np.zeros(CONTROL_N)
     v, a, x, t_prev = v_ego, a_target, 0.0, 0.0
     for i, t_idx in enumerate(MOONPILOT_CONTROL_T_IDX):
       t = float(t_idx)
       states = [(source, *lead_state_at(lead, t + lead_age, x + v_ego * lead_age, a_lead, a_lead_tau)) for source, lead, a_lead, a_lead_tau in leads]
-      a_cmd, _ = policy(v, states, v_cruise, t_follow, e2e, model_accel, steer_angle, self.CP, accel_coast, self.allow_throttle)
+      a_cmd, _ = policy(
+        v, states, v_cruise, t_follow, e2e, model_accel, steer_angle, self.CP, accel_coast, self.allow_throttle, curve=curve, x_ego=x, v_hold=v_hold
+      )
       a = float(np.clip(jerk_limit(a_cmd, a, t - t_prev), ACCEL_MIN, ACCEL_MAX))
       speeds[i] = v
       accels[i] = a
