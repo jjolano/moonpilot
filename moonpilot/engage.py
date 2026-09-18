@@ -17,10 +17,18 @@ What the module does at runtime:
     the engage/disengage policy. It suppresses the two events whose whole purpose is the behavior
     being replaced — `pcmDisable` (level-triggered whenever stock ACC is off) and `pedalPressed`
     (the brake/gas disengage) — and asks to engage when the driver turns the cruise main switch on.
-    Disengaging is upstream's: the cruise main switch, the LKAS button, a steering override,
-    cancel, and every fault still land in `wrongCarMode`, `steerDisengage`, `buttonCancel` or a
-    disable event, and any authoritative disable latches the half-engaged state off until the
-    driver re-arms.
+    Disengaging is upstream's: the cruise main switch, the LKAS button and every fault still land
+    in `wrongCarMode`, `buttonCancel` or a disable event. An authoritative disable — `USER_DISABLE`
+    or `IMMEDIATE_DISABLE`, which on this car is the main switch, a steer fault or a lane-keeping
+    fault — latches the half-engaged state off until the driver re-arms with the LKAS button or by
+    cycling the main switch; a soft disable is left to upstream's own state machine, which returns
+    to enabled by itself once the condition clears.
+
+    Two of upstream's disengages are inert here rather than suppressed: Toyota's cancel button
+    never reaches openpilot as `buttonCancel` (the car's wheel only wires the LKAS and distance
+    buttons), so the driver's ACC cancel drops to the half-engaged state with steering intact; and
+    `steerDisengage` — the panda rule's own `steering_disengage` — is a signal only Tesla's rx hook
+    ever sets, so on Toyota a driver's torque is upstream's blending path, not a disarm.
 
 Scope, and the ceilings that come with it:
 
@@ -138,15 +146,22 @@ class LateralEngage:
     # The point of the feature: a brake or gas tap must not take the steering with it.
     events.events = [e for e in events.events if e not in SUPPRESSED_EVENTS]
 
-    if events.contains(ET.USER_DISABLE) or events.contains(ET.IMMEDIATE_DISABLE) or events.contains(ET.SOFT_DISABLE):
-      # Cancel, main-switch-off, steer faults, and every fault latch it off until the driver
-      # re-arms. SOFT_DISABLE is included so a soft-disable event without NO_ENTRY cannot make
-      # this an engage/disable loop.
+    if events.contains(ET.USER_DISABLE) or events.contains(ET.IMMEDIATE_DISABLE):
+      # The main switch going off, a steer fault, and every authoritative disable latch it off
+      # until the driver re-arms.
       self._blocked = True
-    elif not enabled and not self._blocked and not events.contains(ET.NO_ENTRY) and not events.contains(ET.ENABLE):
+    elif not enabled and not self._blocked and not events.contains(ET.ENABLE) and not events.contains(ET.NO_ENTRY) and not events.contains(ET.SOFT_DISABLE):
       # The driver's arming gesture is the cruise main switch coming on, which upstream has no
       # event for on a stock-ACC car. buttonEnable carries the normal engage chime, and skipping
       # it while a NO_ENTRY is present is what keeps a standstill or an uncalibrated car from
       # nagging with refuse alerts — the attempt simply repeats once the blocker clears. ET.ENABLE
       # skips it when upstream already asked (its own pcmEnable on the same frame).
+      #
+      # A soft disable is deliberately not latched: upstream's own state machine already treats it
+      # as recoverable, returning to enabled when the condition clears inside SOFT_DISABLE_TIME,
+      # and a transient one — an EPS temp fault, a door, a gear — should cost the state for as
+      # long as it lasts, not for the rest of the drive. The NO_ENTRY that every SOFT_DISABLE
+      # event but bigModelFailed also carries is what keeps the request from re-firing while one
+      # holds; SOFT_DISABLE is excluded from the request itself so that a type without one cannot
+      # engage and soft-disable in a loop.
       events.add(EventName.buttonEnable)

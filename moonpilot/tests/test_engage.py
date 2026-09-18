@@ -12,8 +12,9 @@ from opendbc.car.structs import car
 from opendbc.car.toyota.values import ToyotaFlags, ToyotaSafetyFlags
 from openpilot.cereal import log
 from openpilot.common.params import Params
+from openpilot.common.realtime import DT_CTRL
 from openpilot.selfdrive.selfdrived.events import ET, Events
-from openpilot.selfdrive.selfdrived.state import StateMachine
+from openpilot.selfdrive.selfdrived.state import SOFT_DISABLE_TIME, StateMachine
 
 from moonpilot.engage import LateralEngage, moonpilot_engage, moonpilot_engage_safety_param
 
@@ -87,11 +88,15 @@ class TestEngageSafetyParam(unittest.TestCase):
     self.assertEqual(cp.safetyConfigs[0].safetyParam, 73)
 
   def test_out_of_scope_cars_are_untouched(self):
-    for cp in (_cp(brand='honda'), _cp(pcm_cruise=False),
-               # Card replaces safetyConfigs with a noOutput config before the seam runs, so a
-               # passive car's config must stay untouched however Toyota-shaped the params look
-               _cp(passive=True),
-               _cp(flags=ToyotaFlags.UNSUPPORTED_DSU), _cp(flags=ToyotaFlags.TSS2 | ToyotaFlags.UNSUPPORTED_DSU)):
+    for cp in (
+      _cp(brand='honda'),
+      _cp(pcm_cruise=False),
+      # Card replaces safetyConfigs with a noOutput config before the seam runs, so a
+      # passive car's config must stay untouched however Toyota-shaped the params look
+      _cp(passive=True),
+      _cp(flags=ToyotaFlags.UNSUPPORTED_DSU),
+      _cp(flags=ToyotaFlags.TSS2 | ToyotaFlags.UNSUPPORTED_DSU),
+    ):
       moonpilot_engage_safety_param(cp, _params(on=True))
       self.assertEqual(cp.safetyConfigs[0].safetyParam, 73, cp.flags)
 
@@ -202,13 +207,12 @@ class TestEngagePolicy(unittest.TestCase):
     events = self._run(_cs(available=True, enabled=True), extra_events=(EventName.pcmEnable,))
     self.assertTrue(EventName.buttonEnable not in events.events)  # upstream's own pcmEnable is the ask
 
-  def test_every_fault_type_latches(self):
-    # One representative event per disable type, each asserted to really carry that type, so the
-    # test cannot go vacuous if upstream moves the events around
+  def test_an_authoritative_disable_latches(self):
+    # One representative event per authoritative disable type, each asserted to really carry that
+    # type, so the test cannot go vacuous if upstream moves the events around
     for event_type, event in (
       (ET.USER_DISABLE, EventName.steerDisengage),
       (ET.IMMEDIATE_DISABLE, EventName.steerUnavailable),
-      (ET.SOFT_DISABLE, EventName.espDisabled),
     ):
       engage = LateralEngage(True)
       events = Events()
@@ -221,6 +225,37 @@ class TestEngagePolicy(unittest.TestCase):
       events = Events()
       engage.update(_cs(available=True), events, enabled=False)
       self.assertTrue(EventName.buttonEnable not in events.events, event_type)
+
+  def test_a_soft_disable_is_not_latched(self):
+    """Upstream recovers from a soft disable by itself, so half-engagement must not outlast it.
+
+    Latching one would cost the state for the rest of the drive on a condition upstream rides
+    out — an EPS temp fault, a door, a gear — which is what sunnypilot's own MADS "paused" state
+    exists to avoid.
+    """
+    engage = LateralEngage(True)
+    events = Events()
+    events.add(EventName.espDisabled)
+    self.assertTrue(events.contains(ET.SOFT_DISABLE))
+    engage.update(_cs(available=True), events, enabled=True)
+    self.assertTrue(EventName.buttonEnable not in events.events)
+
+    # The condition clears and upstream has disabled: the engage request comes straight back, no
+    # driver gesture needed
+    events = Events()
+    engage.update(_cs(available=True), events, enabled=False)
+    self.assertTrue(EventName.buttonEnable in events.events)
+
+  def test_a_soft_disable_that_stays_does_not_nag(self):
+    """The request is gated on the soft disable itself, so a type without a NO_ENTRY cannot loop"""
+    engage = LateralEngage(True)
+    # bigModelFailed is the one SOFT_DISABLE event upstream raises without a NO_ENTRY
+    for _ in range(10):
+      events = Events()
+      events.add(EventName.bigModelFailed)
+      self.assertTrue(events.contains(ET.SOFT_DISABLE) and not events.contains(ET.NO_ENTRY))
+      engage.update(_cs(available=True), events, enabled=False)
+      self.assertTrue(EventName.buttonEnable not in events.events)
 
   def test_main_switch_off_clears_and_defers_to_upstream(self):
     self._run(_cs(available=True, enabled=True, buttons=LKAS_PRESS))  # block it
@@ -259,7 +294,7 @@ class TestScriptedDrive(unittest.TestCase):
     self.prev = _cs()
     self.acc_set = False
 
-  def _step(self, cs, brake=False, gas=False, acc_set=False, main_switch=True, buttons=()):
+  def _step(self, cs, brake=False, gas=False, acc_set=False, main_switch=True, buttons=(), fault=None):
     # Upstream's car events for this car state, the ones the fork's scope touches. pcmEnable and
     # pcmDisable are rising/falling edges in car_events, not levels, so the harness emits them the
     # same way: a driver's ACC cancel is one frame of pcmDisable, however long ACC stays off.
@@ -270,6 +305,8 @@ class TestScriptedDrive(unittest.TestCase):
       self.events.add(EventName.gasPressedOverride)
     if brake:
       self.events.add(EventName.pedalPressed)
+    if fault is not None:
+      self.events.add(fault)  # a level-triggered condition, e.g. an EPS temp fault
     if acc_set and not self.acc_set:
       self.events.add(EventName.pcmEnable)
     elif self.acc_set and not acc_set:
@@ -297,13 +334,11 @@ class TestScriptedDrive(unittest.TestCase):
     # The wheel's LKAS button while cruising with ACC set: the driver's off switch has to hold.
     # Its own disable event rides the press frame only, so a latch cleared on ACC's level would
     # re-engage on the very next frame and the button would appear to do nothing.
-    self.assertEqual(self._step(_cs(available=True), acc_set=True, buttons=LKAS_PRESS),
-                     (State.disabled, False, False))
+    self.assertEqual(self._step(_cs(available=True), acc_set=True, buttons=LKAS_PRESS), (State.disabled, False, False))
     self.assertEqual(self._step(_cs(available=True), acc_set=True), (State.disabled, False, False))
 
     # Pressed again: back on, ACC set the whole time
-    self.assertEqual(self._step(_cs(available=True), acc_set=True, buttons=LKAS_PRESS),
-                     (State.enabled, True, True))
+    self.assertEqual(self._step(_cs(available=True), acc_set=True, buttons=LKAS_PRESS), (State.enabled, True, True))
 
     # ACC canceled: back to half-engaged, not disengaged
     self.assertEqual(self._step(_cs(available=True)), (State.enabled, True, True))
@@ -321,6 +356,28 @@ class TestScriptedDrive(unittest.TestCase):
     self.assertEqual(self._step(_cs(available=False), main_switch=False), (State.disabled, False, False))
 
     # And the main switch back on re-engages, which is the arming gesture
+    self.assertEqual(self._step(_cs(available=True)), (State.enabled, True, True))
+
+  def test_a_soft_disable_recovers_by_itself(self):
+    """A transient fault costs the state while it lasts, not the rest of the drive.
+
+    Upstream's soft-disable timer is the whole mechanism, and the module stays out of its way: a
+    fault that clears inside SOFT_DISABLE_TIME comes back on its own, and one that outlasts it
+    comes back the frame the condition does. Neither takes the LKAS button or the main switch.
+    """
+    self.assertEqual(self._step(_cs(available=True)), (State.enabled, True, True))
+
+    # A short EPS temp fault: soft-disabling, still actuating, and enabled again the frame it
+    # clears — the case a latch on SOFT_DISABLE would have ended for the drive
+    self.assertEqual(self._step(_cs(available=True), fault=EventName.steerTempUnavailable), (State.softDisabling, True, True))
+    self.assertEqual(self._step(_cs(available=True)), (State.enabled, True, True))
+
+    # A door open longer than the timer reaches disabled, and holds there while it stays open
+    for _ in range(int(SOFT_DISABLE_TIME / DT_CTRL) + 2):
+      self._step(_cs(available=True), fault=EventName.doorOpen)
+    self.assertEqual(self._step(_cs(available=True), fault=EventName.doorOpen), (State.disabled, False, False))
+
+    # Closed again: engaged, with no driver gesture
     self.assertEqual(self._step(_cs(available=True)), (State.enabled, True, True))
 
 
