@@ -51,6 +51,7 @@ from moonpilot.longitudinal import (
   MOONPILOT_K_GAP,
   MOONPILOT_K_TTC,
   MOONPILOT_K_V,
+  MOONPILOT_MODEL_BRAKE_THRESHOLD,
   MOONPILOT_OUT_OF_PATH_T_FOLLOW,
   MOONPILOT_STOP_DISTANCE,
   MOONPILOT_T_FOLLOW,
@@ -59,6 +60,7 @@ from moonpilot.longitudinal import (
   cruise_accel,
   lead_accel,
   lead_state_at,
+  model_candidate,
   moonpilot_longitudinal_planner,
   policy,
   required_decel,
@@ -931,6 +933,106 @@ class TestPlannerSeam(unittest.TestCase):
     self.assertIsInstance(moonpilot_longitudinal_planner(_cp(), _params(on=True)), MoonpilotLongitudinalPlanner)
     self.assertIsNone(moonpilot_longitudinal_planner(_cp(), _params(on=False)))
     self.assertIsNone(moonpilot_longitudinal_planner(_cp(openpilot_longitudinal=False), _params(on=True)))
+
+
+class TestModelBraking(unittest.TestCase):
+  """`MoonpilotModelBraking`: the model's own accel as a braking-only candidate outside experimental
+  mode, behind a deadband and otherwise bounded only by the actuator.
+
+  Every case is open-loop — the same `_inputs` for 40 frames at 20 m/s against a 30 m/s set speed and
+  no lead — so the cruise candidate is firmly positive and the model is the only thing that can
+  brake. 40 frames is past the jerk limit's reach in every one of them: the ramp to `ACCEL_MIN` is
+  `MOONPILOT_JERK_EMERGENCY` at 10.0 m/s^3, i.e. 0.5 m/s^2 per 0.05 s frame, 7 frames.
+  """
+
+  @staticmethod
+  def _run(params_on=True, frames=40, **inputs):
+    planner = _planner(params_on=params_on)
+    sm = _inputs(**inputs)
+    for _ in range(frames):
+      planner.update(sm)
+    return planner
+
+  def test_the_deadband_keeps_a_shallow_model_ask_out_of_the_command(self):
+    """-0.4 m/s^2 is below the threshold, so the model is not in the comparison at all — not merely
+    losing it. Without that, a model dithering either side of zero would ratchet the cruise term
+    down one-way and the car would settle below the set speed on a clear road."""
+    self.assertLess(-0.4, 0.0)
+    self.assertGreater(-0.4, MOONPILOT_MODEL_BRAKE_THRESHOLD)
+    asked, quiet = self._run(model_accel=-0.4), self._run(model_accel=0.0)
+    self.assertAlmostEqual(asked.output_a_target, quiet.output_a_target, delta=1e-12)
+    self.assertEqual(asked.source, quiet.source)
+    self.assertEqual(asked.source, Source.cruise)
+
+  def test_a_real_model_brake_reaches_the_command(self):
+    planner = self._run(model_accel=-1.5)
+    self.assertAlmostEqual(planner.output_a_target, -1.5)
+    self.assertEqual(planner.source, Source.e2e)
+
+  def test_a_deep_ask_reaches_the_actuator_floor_not_a_fork_floor(self):
+    """Past the deadband the ask goes in whole. What bounds it is `ACCEL_MIN`, and only that — a
+    fork-owned floor above it was measured and removed, because the corpus showed it withholding
+    braking the driver had already started."""
+    planner = self._run(model_accel=-6.0)
+    self.assertAlmostEqual(planner.output_a_target, ACCEL_MIN)
+    self.assertEqual(planner.source, Source.e2e)
+
+  def test_an_emergency_ask_gets_the_emergency_jerk(self):
+    """The bound is the actuator's own, and reaching it is not rate-limited by the comfort jerk: a
+    deep ask moves the command at `MOONPILOT_JERK_EMERGENCY`, which is what makes full authority
+    usable in the time an emergency leaves."""
+    planner = self._run(model_accel=-6.0, frames=2)
+    # one frame from a standing positive command: 0.5 m/s^2 of the emergency ramp, not 0.1 of it
+    self.assertLess(planner.output_a_target, -0.4)
+
+  def test_the_toggle_off_is_the_planner_without_the_model(self):
+    planner = self._run(params_on=False, model_accel=-6.0)
+    self.assertGreater(planner.output_a_target, 0.0)
+    self.assertEqual(planner.source, Source.cruise)
+
+  def test_experimental_mode_is_unchanged(self):
+    """The accel goes in raw there — no deadband, and the toggle is not read at all, since
+    experimental mode means the model's own accel is the candidate."""
+    for params_on in (True, False):
+      with self.subTest(params_on=params_on):
+        planner = self._run(params_on=params_on, experimental=True, model_accel=-0.3)
+        self.assertAlmostEqual(planner.output_a_target, -0.3)
+        self.assertEqual(planner.source, Source.e2e)
+
+  def test_the_model_shouldstop_stays_experimental_only(self):
+    """`should_stop(v_ego, desiredAcceleration)` from modeld is the creep state the should-stop
+    trailing gate exists to exclude, so unlike the accel it is admitted in experimental mode only."""
+    self.assertFalse(self._run(model_should_stop=True).output_should_stop)
+    self.assertTrue(self._run(experimental=True, model_should_stop=True).output_should_stop)
+
+  def test_the_model_candidate_never_reduces_braking(self):
+    """`policy` takes the minimum, so the candidate can only ever add braking — the invariant that
+    lets a model signal sit in front of the verified deterministic law. Swept over the deterministic
+    terms' regimes; the deepest ask is well past both the deadband and `ACCEL_MIN`, so the pass-
+    through cannot hide an ordering change."""
+    CP = _cp()
+    t_follow = MOONPILOT_T_FOLLOW[int(Personality.standard)]
+    v_cruise = 108.0 * CV.KPH_TO_MS
+    model = messaging.new_message("modelV2").modelV2
+    for v_ego in (0.0, 5.0, 20.0, 33.0):
+      for gap in (8.0, 20.0, 60.0, 200.0):
+        for v_lead in (0.0, 10.0, 20.0):
+          leads = [(Source.lead0, gap, v_lead, 0.0)]
+          deterministic, _ = policy(v_ego, leads, v_cruise, t_follow, False, None, 0.0, CP, -0.3, True)
+          for a in (-6.0, -2.0, -0.6, 0.0, 2.0):
+            model.action.desiredAcceleration = a
+            candidate = model_candidate(model, False, True)
+            braked, _ = policy(v_ego, leads, v_cruise, t_follow, False, candidate, 0.0, CP, -0.3, True)
+            self.assertLessEqual(braked, deterministic + 1e-12)
+
+  def test_the_feature_row_matches_the_params_default(self):
+    feature = next(f for f in FEATURES if f.key == "MoonpilotModelBraking")
+    # It changes driving behavior, so the row is offroad-only. It ships on: the candidate can only
+    # add braking, and the corpus behind that is in `model_candidate`.
+    self.assertTrue(feature.offroad_only)
+    self.assertFalse(feature.requires)
+    text = (ROOT / "moonpilot" / "params_keys.h").read_text()
+    self.assertTrue('{"MoonpilotModelBraking", {PERSISTENT, BOOL, "1"}}' in text)
 
 
 class TestCurveSpeed(unittest.TestCase):

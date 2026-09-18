@@ -42,6 +42,13 @@ LONGITUDINAL = Feature(
   offroad_only=True,
 )
 
+MODEL_BRAKING = Feature(
+  key="MoonpilotModelBraking",
+  title="model braking",
+  description="Outside experimental mode, let the model's own braking ask through to the command. Applies immediately.",
+  offroad_only=True,
+)
+
 CURVE_SPEED = Feature(
   key="MoonpilotCurveSpeed",
   title="curve speed control",
@@ -74,7 +81,7 @@ LATERAL_ENGAGE = Feature(
 
 # Behaviors the driver can swap back to upstream. The settings panel is built from this
 # table, so a feature is one row here, one row in params_keys.h, and its own code.
-FEATURES: tuple[Feature, ...] = (LEAD_LATERAL, TORQUE_LATERAL, PATH_PREVIEW, LONGITUDINAL, CURVE_SPEED, SLAM, TAILSCALE, LATERAL_ENGAGE)
+FEATURES: tuple[Feature, ...] = (LEAD_LATERAL, TORQUE_LATERAL, PATH_PREVIEW, LONGITUDINAL, MODEL_BRAKING, CURVE_SPEED, SLAM, TAILSCALE, LATERAL_ENGAGE)
 
 
 def missing_modules(feature: Feature) -> tuple[str, ...]:

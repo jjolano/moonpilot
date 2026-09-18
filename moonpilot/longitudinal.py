@@ -16,8 +16,9 @@ problem. The policy is three candidates, and the smallest wins:
     for more than stopping needs, and the floor covers the rest. The handover into either is a step in
     the candidate; it is arbitration that keeps that step out of the output while the jerk limit turns
     what remains into a rate;
-  - the cruise term, and in experimental mode the model's own accel, the same candidates upstream
-    arbitrates between.
+  - the cruise term, and the model's own accel — raw in experimental mode, and outside it a
+    braking-only candidate behind ``MoonpilotModelBraking`` (see ``model_candidate``) — the same
+    candidates upstream arbitrates between.
 
 ``MoonpilotCurveSpeed`` adds two more terms *inside* the cruise slot, so the reported source stays
 ``cruise`` and ``min`` means they can only ever add braking: a kinematic pre-brake against the model
@@ -30,7 +31,10 @@ Two things are deliberately not upstream's:
   - delay compensation is done by predicting the state at the actuator delay and evaluating the
     policy there, not by inverting the published plan through ``get_accel_from_plan``. That inverse
     divides by the delay, so a step in the plan comes out amplified by ``action_t / dt`` — measured
-    at 45 m/s^3 and instant ACCEL_MIN saturation in simulation.
+    at 45 m/s^3 and instant ACCEL_MIN saturation in simulation. The delay itself is measured onroad
+    by ``moonpilot.latency``: ``action_t`` is ``max(CP.longitudinalActuatorDelay, that estimate) +
+    the planner's own period`` (DT_MDL in production), since upstream's constant is a cookie-cutter
+    default and a measured value may only lengthen the projection.
 
   - the lead's acceleration is the fork's own estimate — the least-squares slope of ``vLead`` over
     ``moonpilot.lead.LeadAccelEstimator``'s window — because radard's ``aLeadK`` is a Kalman filter
@@ -74,7 +78,17 @@ from moonpilot.curve import (
   lat_accel_hold,
   predicted_lat_accel,
 )
-from moonpilot.features import CURVE_SPEED, LEAD_LATERAL, LONGITUDINAL, enabled
+from moonpilot.features import CURVE_SPEED, LEAD_LATERAL, LONGITUDINAL, MODEL_BRAKING, enabled
+from moonpilot.latency import (
+  MOONPILOT_LAG_BLOCKS_NEEDED,
+  MOONPILOT_LAG_KEY,
+  MOONPILOT_LAG_LOG_DELTA,
+  MOONPILOT_LAG_MAX,
+  MOONPILOT_LAG_MIN,
+  MOONPILOT_LAG_MIN_SPEED,
+  MOONPILOT_LAG_PERSIST_EVERY,
+  LongLagEstimator,
+)
 from moonpilot.lead import LeadAccelEstimator, nearest_lead_in_path
 from moonpilot.slam import ego_speed_correction
 
@@ -136,6 +150,10 @@ MOONPILOT_JERK_DOWN = 2.0  # m/s^3; the comfort jerk, and it is the approach's o
 MOONPILOT_JERK_EMERGENCY = 10.0  # m/s^3, reached at ACCEL_MIN
 MOONPILOT_ALLOW_THROTTLE_THRESHOLD = 0.4
 MOONPILOT_MIN_ALLOW_THROTTLE_SPEED = 2.5  # m/s
+MOONPILOT_MODEL_BRAKE_THRESHOLD = -0.5  # m/s^2; outside experimental mode the model is ignored
+# until it asks for at least this much braking, and past that its ask goes in whole: the floor under
+# it is the actuator's own ACCEL_MIN, not a fork value. See `model_candidate` for why a fork-owned
+# floor above that was measured and removed.
 MOONPILOT_CRASH_DISTANCE = 0.25  # m; FCW contact margin
 MOONPILOT_FCW_DECEL = -4.0  # m/s^2 required decel that means it cannot be avoided
 MOONPILOT_FCW_COUNT = 2  # frames above threshold before FCW latches
@@ -290,6 +308,38 @@ def required_decel(v_ego, gap, v_lead, a_lead=0.0) -> float:
   return min(a_match, -(v_ego**2) / (2 * (slack + v_lead**2 / (-2 * a_lead))))
 
 
+def model_candidate(model, e2e, allowed) -> float | None:
+  """The model's own accel as a candidate, and whether it gets one this frame.
+
+  Experimental mode is unchanged: the accel goes in raw, which is what that mode means. Outside it
+  the model is a *braking* input on top of the deterministic policy, gated by a deadband and
+  otherwise unbounded — the floor under it is the actuator's own, not a fork value.
+
+  The deadband is because `policy` takes the minimum: a model accel dithering either side of zero
+  would be a one-way ratchet against the cruise term, and the car would settle below the set speed
+  on a clear road. Below the threshold the model is not asking for anything a driver would feel.
+
+  Past it the ask goes in whole. What bounds it is `ACCEL_MIN`, and that bound is unconditional:
+  enforced by the clip every command passes through in `update`, by the identical clip in the
+  published rollout, and again by the controller from the car's own `accel_limits` — so a deep ask
+  still reaches full authority in an emergency, at `MOONPILOT_JERK_EMERGENCY`.
+
+  A fork-owned floor above that was tried and removed. Over the 235-minute local corpus it bound
+  2.23 min in 61 of 494 admitted episodes, withholding a median 0.25 m/s^2 there and at most 1.23,
+  and every one of those frames coincided with the car already braking — what it withheld was
+  braking the driver had already begun. Its release valve never fired at all: `hardBrakePredicted`
+  was false on all 282,554 frames, as the composite of a 5 m/s^2 head peaking at 0.118 against its
+  0.15 gate and a 3 m/s^2 head that does reach 0.955.
+
+  None means no candidate, which is exactly the planner this fork had before this existed. A NaN
+  takes that branch too, since the comparison is false.
+  """
+  a = float(model.action.desiredAcceleration)
+  if not e2e and (not allowed or not a < MOONPILOT_MODEL_BRAKE_THRESHOLD):
+    return None
+  return a
+
+
 def policy(v_ego, leads, v_cruise, t_follow, e2e, model_accel, steer_angle_deg, CP, accel_coast, allow_throttle, curve=None, x_ego=0.0, v_hold=math.inf):
   """The smallest of the candidates, and which one it was.
 
@@ -308,7 +358,7 @@ def policy(v_ego, leads, v_cruise, t_follow, e2e, model_accel, steer_angle_deg, 
   a_cruise = min(cruise_accel(v_ego, v_cruise, e2e, steer_angle_deg, CP, accel_coast, allow_throttle), a_curve)
   candidates = [(a_cruise, LongitudinalPlanSource.cruise)]
   candidates += [(lead_accel(v_ego, gap, v_lead, a_lead, t_follow), source) for source, gap, v_lead, a_lead in leads]
-  if e2e:
+  if model_accel is not None:
     candidates.append((float(model_accel), LongitudinalPlanSource.e2e))
   accel, source = min(candidates, key=lambda c: c[0])
   return float(accel), source
@@ -322,7 +372,22 @@ class MoonpilotLongitudinalPlanner:
     self.CP = CP
     self.dt = dt
     self.params = Params()
-    self.action_t = CP.longitudinalActuatorDelay + DT_MDL
+    # The measured command -> delivered-accel lag (`moonpilot/latency.py`), seeded from the last
+    # drive when there is one. `action_t` below is the whole of the delay compensation, and upstream's
+    # `longitudinalActuatorDelay` is a cookie-cutter default for every car without an override
+    # (`opendbc/car/interfaces.py`, `# TODO estimate car specific lag`). The learned value may only
+    # lengthen the projection, so an unset param, a stale one and a measurement below the stock
+    # constant are all exactly the planner this fork had before.
+    self.long_lag = LongLagEstimator(CP, dt)
+    self.long_lag_logged = self.long_lag.applied_delay()
+    # `isinstance` is load-bearing: the tests' FakeParams answers every key with a bool, and a bool is
+    # not a float, so no test is seeded. The real param is a FLOAT whose "0.0" default is below the
+    # ROI floor and so is not a seed either.
+    seeded = self.params.get(MOONPILOT_LAG_KEY, return_default=True)
+    if isinstance(seeded, float) and seeded >= MOONPILOT_LAG_MIN:
+      self.long_lag.seed(min(seeded, MOONPILOT_LAG_MAX), MOONPILOT_LAG_BLOCKS_NEEDED)
+      self.long_lag_logged = self.long_lag.applied_delay()
+    self.action_t = self.long_lag.applied_delay() + dt
     # The curve speed control's per-car calibration (`moonpilot/curve.py`): realized lateral accel over
     # what the path predicted, one-sided so it can only ever plan for less speed. Seeded from the last
     # drive, and the vehicle model is what turns a measured steer angle into a measured curvature.
@@ -331,6 +396,7 @@ class MoonpilotLongitudinalPlanner:
     seeded_scale = self.params.get(MOONPILOT_CURVE_BIAS_KEY, return_default=True)
     if isinstance(seeded_scale, float) and seeded_scale > 1.0:
       self.lat_bias.seed(min(seeded_scale, MOONPILOT_CURVE_BIAS_MAX), MOONPILOT_CURVE_BIAS_MIN_SAMPLES)
+    self.frames = 0
     # One per radarState slot, ticked every frame so an absent or replaced lead resets its window.
     self.lead_accel = (LeadAccelEstimator(dt), LeadAccelEstimator(dt))
 
@@ -374,6 +440,24 @@ class MoonpilotLongitudinalPlanner:
     if reset_state:
       self.output_a_target = a_ego
 
+    # Learn the chain's lag from the command that was in effect last frame (`output_a_target` is
+    # assigned at the end of this one) and the acceleration the car answered with. Gated to the frames
+    # where that command is what moves the car: when the planner resets, `output_a_target` *is*
+    # `a_ego` and carries no information about the chain, the car's own ACC owns acceleration outside
+    # `pid`, and a standstill, a pedal or a force-decel stop is not the policy either. Every other gate
+    # — excitation, recovery buffer, blocks — belongs to the estimator.
+    lag_valid = (
+      not reset_state
+      and sm['controlsState'].longControlState == LongCtrlState.pid
+      and v_ego > MOONPILOT_LAG_MIN_SPEED
+      and not CS.standstill
+      and not CS.brakePressed
+      and not CS.gasPressed
+      and not sm['controlsState'].forceDecel
+    )
+    self.long_lag.update(self.output_a_target, a_ego, lag_valid)
+    self.action_t = self.long_lag.applied_delay() + self.dt
+
     accel_coast = coast_accel(sm['carControl'].orientationNED[1]) if len(sm['carControl'].orientationNED) == 3 else ACCEL_MAX
     throttle_probs = sm['modelV2'].meta.disengagePredictions.gasPressProbs
     throttle_prob = throttle_probs[1] if len(throttle_probs) > 1 else 1.0
@@ -382,7 +466,7 @@ class MoonpilotLongitudinalPlanner:
     steer_angle = CS.steeringAngleDeg - sm['vehicleParameters'].angleOffsetDeg
     t_follow = self._t_follow(sm)
     e2e = sm['selfdriveState'].experimentalMode
-    model_accel = sm['modelV2'].action.desiredAcceleration
+    model_accel = model_candidate(sm['modelV2'], e2e, enabled(MODEL_BRAKING, self.params))
 
     # The curve speed control. The measured curvature is the car's own — `-VM.calc_curvature` of the
     # steer angle, the same idiom controlsd and `moonpilot/latcontrol.py` use — and the model's path
@@ -511,9 +595,21 @@ class MoonpilotLongitudinalPlanner:
     self.output_should_stop = (should_stop(v_ego, a_target) and not trailing) or (e2e and sm['modelV2'].action.shouldStop)
     self.output_a_target = a_target
     self.source = source
+    # Persist the learned value so the next boot projects through it from the first frame. Gated on a
+    # trusted estimate, so an unestimated or invalid one never becomes the next drive's constant.
+    self.frames += 1
+    if self.frames % MOONPILOT_LAG_PERSIST_EVERY == 0 and self.long_lag.status == 'estimated':
+      self._persist_lag()
     if self.lat_bias.frames % MOONPILOT_CURVE_BIAS_PERSIST_EVERY == 0 and self.lat_bias.status == 'estimated':
       self._persist_lat_scale()
     self.solve_time = time.monotonic() - start
+
+  def _persist_lag(self):
+    value = round(self.long_lag.estimate, 3)
+    self.params.put(MOONPILOT_LAG_KEY, value)
+    if abs(value - self.long_lag_logged) > MOONPILOT_LAG_LOG_DELTA:
+      cloudlog.info(f"moonpilot longitudinal lag {value:.3f} s over {self.long_lag.valid_blocks} blocks, action_t {self.action_t:.3f} s")
+      self.long_lag_logged = value
 
   def _persist_lat_scale(self):
     """Persist the learned value so the next boot plans with it from the first frame. Gated on a

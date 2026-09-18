@@ -6,6 +6,10 @@
 {"MoonpilotLeadLateral", {PERSISTENT, BOOL, "1"}},
     {"MoonpilotTorqueLateral", {PERSISTENT, BOOL, "1"}},
     {"MoonpilotLongitudinal", {PERSISTENT, BOOL, "1"}},
+    // On by default: `policy` takes the minimum, so the model's ask can only
+    // ever add braking, and past the deadband it is bounded by the actuator's
+    // own ACCEL_MIN rather than a fork floor.
+    {"MoonpilotModelBraking", {PERSISTENT, BOOL, "1"}},
     // Off by default: it changes the speed the planner plans from, and the
     // correction is not validated until someone drives it.
     {"MoonpilotSlam", {PERSISTENT, BOOL, "0"}},
@@ -24,6 +28,11 @@
     // in moonpilot/tailscale.py. CLEAR_ON_MANAGER_START so a reboot cannot
     // leave a stale "running 100.x" on screen.
     {"MoonpilotTailscaleStatus", {CLEAR_ON_MANAGER_START, STRING}},
+    // Learned onroad by moonpilot/latency.py, written by the fork longitudinal
+    // planner: the command -> delivered-accel lag in seconds. 0.0 means nothing
+    // measured yet, which is below the estimator's own ROI floor and so is
+    // never applied.
+    {"MoonpilotLongLag", {PERSISTENT, FLOAT, "0.0"}},
     // Learned onroad by moonpilot/curve.py: realized lateral acceleration over
     // what the model's path predicted. 1.0 is neutral, and the applied value is
     // clamped at or above it, so a learned bias only ever plans for less speed.
