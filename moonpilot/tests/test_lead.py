@@ -1,5 +1,6 @@
 import unittest
 from typing import cast
+from unittest import mock
 
 import numpy as np
 import pyray as rl
@@ -10,6 +11,7 @@ from openpilot.common.realtime import DT_MDL
 from openpilot.cereal import log, messaging
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import LEAD_DANGER_FACTOR
 from openpilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPlanner
+from openpilot.selfdrive.ui.ui_state import ui_state
 from opendbc.car.honda.interface import CarInterface
 from opendbc.car.honda.values import CAR
 from openpilot.selfdrive.modeld.constants import ModelConstants
@@ -472,6 +474,21 @@ class TestRendererLeadPath(unittest.TestCase):
         single = self._state([0.0])
         r._update_lead_path(single, path_x)
         assert r._lead_path.projected_points.size == 0
+
+  def test_toggle_off_clears_the_ribbon(self):
+    """The ribbon shows the inPath the fork planner acts on, so it follows that feature's toggle:
+    with upstream's planner back in the line there is no decision for it to draw."""
+    for tree in ("tizi", "mici"):
+      with self.subTest(tree=tree):
+        r = self._renderer(tree)
+        path_x = np.linspace(0.0, 60.0, 33).astype(np.float32)
+        r._update_lead_path(self._state([0.0] * 6), path_x)
+        assert r._lead_path.projected_points.size > 0
+
+        with mock.patch.object(ui_state, "params", _params(on=False)):
+          r._update_lead_path(self._state([0.0] * 6), path_x)
+        assert r._lead_path.projected_points.size == 0
+        self.assertEqual(r._lead_in_path, 1.0)
 
 
 class TestLeadDangerFactor(unittest.TestCase):

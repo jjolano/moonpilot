@@ -12,6 +12,7 @@ from openpilot.selfdrive.ui.mici.onroad import blend_colors
 from openpilot.system.ui.lib.application import gui_app
 from openpilot.system.ui.lib.shader_polygon import draw_polygon, Gradient
 from openpilot.system.ui.widgets import Widget
+from moonpilot.features import LEAD_LATERAL, enabled  # moonpilot seam, see AGENTS.md
 from moonpilot.lead import resample  # moonpilot seam, see AGENTS.md
 
 CLIP_MARGIN = 500
@@ -370,6 +371,14 @@ class ModelRenderer(Widget):
 
   def _update_lead_path(self, moonpilot_state, path_x_array):  # moonpilot seam, see AGENTS.md
     """Project the nearest lead's predicted path into a ribbon."""
+    # Off with the feature: the ribbon draws the inPath the fork planner acts on, so with
+    # upstream's MPC back in the line there is no decision on screen to visualize. Reset rather
+    # than skip the update, so a ribbon drawn before the toggle went off does not linger.
+    if not enabled(LEAD_LATERAL, ui_state.params):
+      self._lead_path = ModelPoints()
+      self._lead_in_path = 1.0
+      return
+
     lead = moonpilot_state.leads[0] if len(moonpilot_state.leads) else None
     if lead is None or not lead.present or len(lead.x) < 2:
       self._lead_path = ModelPoints()
