@@ -64,12 +64,20 @@ def hunks(diff_text: str) -> list[tuple[str, list[str], list[str]]]:
   per region is the convention AGENTS.md states. A hunk that replaces lines carries both lists; one
   that only adds upstream behavior carries additions alone, and one that only removes it carries
   removals alone. All three are fork edits, which is why both directions are checked below.
+
+  The path comes from whichever side names a real file, so a deleted file is attributed to the path
+  it had -- `+++ /dev/null` there names no file, and a whole deleted upstream file would otherwise
+  slip past both guards as an unknown path. A file the fork adds is the mirror case, resolved the
+  same way.
   """
   out: list[tuple[str, list[str], list[str]]] = []
-  path = ""
+  path = old_path = ""
   for line in diff_text.splitlines():
-    if line.startswith("+++ "):
-      path = line[4:].strip().removeprefix("b/")
+    if line.startswith("--- "):
+      old_path = line[4:].strip().removeprefix("a/")
+    elif line.startswith("+++ "):
+      new_path = line[4:].strip().removeprefix("b/")
+      path = old_path if new_path == "/dev/null" else new_path
     elif line.startswith("@@"):
       out.append((path, [], []))
     elif out and line.startswith("+") and not line.startswith("+++"):
@@ -96,15 +104,29 @@ def unmarked_hunks(diff_text: str, files) -> list[tuple[str, list[str]]]:
   return bad
 
 
-def silent_removal_hunks(diff_text: str, files) -> list[tuple[str, list[str]]]:
+def deleted_paths(base: str) -> set[str]:
+  """Paths this diff deletes outright.
+
+  The removal check exempts these and nothing else. A whole deletion is not the silent edit that
+  check exists to catch -- git labels it `deleted file mode`, and the file-name guard is what
+  sanctions it, since the path still has to be an ALLOWED one. A *partial* removal leaves the file
+  in place, is an ordinary-looking edit, and is refused as before.
+  """
+  return set(git("diff", "--name-only", "--diff-filter=D", base).stdout.split())
+
+
+def silent_removal_hunks(diff_text: str, files, skip=()) -> list[tuple[str, list[str]]]:
   """Regions that *remove* upstream behavior from an allowed file and add nothing back.
 
   The marker check reads additions, and a hunk with no additions has no line to carry a marker, so a
   pure deletion of upstream behavior -- a dropped alert, a dropped check -- would pass both guards
-  while being exactly the upstream edit they exist to catch. The fork replaces rather than deletes
-  today, which is what makes this assertion affordable: it fails the first time that changes.
+  while being exactly the upstream edit they exist to catch. `skip` is the whole-file deletions above,
+  and it is deliberately not a general escape: the fork replaces rather than deletes in every path
+  that survives, which is what makes this assertion affordable.
   """
-  return [(path, removed) for path, added, removed in hunks(diff_text) if path in files and path not in SUBMODULES and removed and not added]
+  return [
+    (path, removed) for path, added, removed in hunks(diff_text) if path in files and path not in SUBMODULES and path not in skip and removed and not added
+  ]
 
 
 class TestUpstreamTouches(unittest.TestCase):
@@ -113,6 +135,11 @@ class TestUpstreamTouches(unittest.TestCase):
       self.skipTest(f"no {UPSTREAM} ref; run: git fetch upstream")
 
     base = git("merge-base", "HEAD", UPSTREAM).stdout.strip()
+    # Deletions are listed, not filtered out: a deleted path has to be an ALLOWED one, which is what
+    # keeps the guard on a fork that deletes an upstream file it never hooked, and what keeps the row
+    # of a hooked file alive while the deletion is still in this diff. The removal check exempts the
+    # whole-file case explicitly -- see `deleted_paths` -- so the two guards agree rather than
+    # deadlock: keep the row and the deletion passes both, drop it and this check fails.
     changed = git("diff", "--name-only", base).stdout.split()  # committed + working tree
     touched = {f for f in changed if not f.startswith(FORK_OWNED)}
     unexpected = sorted(touched - ALLOWED.keys())
@@ -139,11 +166,13 @@ class TestSeamMarkers(unittest.TestCase):
 
   def test_no_region_only_removes_upstream_behavior(self):
     # A hunk with no additions has no line to carry a marker, so a pure deletion is invisible to the
-    # check above and to the filename guard alike -- the two halves of the same question ("is this
-    # edit fork-owned?") both answer yes by default. Measured clean when this was written: 63 hunks,
-    # 24 removals, none of them removal-only.
-    diff = self.tree_diff()
-    bad = silent_removal_hunks(diff, ALLOWED)
+    # check above -- both halves of the same question ("is this edit fork-owned?") answer yes by
+    # default. Whole-file deletions are the one shape excused, and the file-name guard is what keeps
+    # those honest: the path it lists has to be an ALLOWED one. Measured clean when this was written,
+    # and the number lives here rather than in AGENTS.md so there is one copy of it: 61 regions in
+    # allowed files, 21 carrying removals, none of them removal-only.
+    base = git("merge-base", "HEAD", UPSTREAM).stdout.strip()
+    bad = silent_removal_hunks(self.tree_diff(), ALLOWED, skip=deleted_paths(base))
     assert not bad, "upstream behavior removed with nothing added back:\n  " + "\n  ".join(f"{path}: {lines[0].strip()[:90]}" for path, lines in bad)
 
   @staticmethod
@@ -154,11 +183,12 @@ class TestSeamMarkers(unittest.TestCase):
     return git("diff", "-U0", base).stdout  # committed + working tree
 
   def test_an_unmarked_region_is_caught(self):
-    # Seven regions, in the shapes the tree actually has: the marker at a new block's head (first,
+    # Eight regions, in the shapes the tree actually has: the marker at a new block's head (first,
     # fifth), the marker ending a rewritten multi-line statement -- the common case, since `#` cannot
     # sit inside a call's parentheses (second); two ways a region can be mistaken for marked -- a
-    # data name that looks like one, and the value form (third, seventh); a region that dropped
-    # upstream code and added nothing back (sixth); and one that simply forgot (fourth).
+    # data name that looks like one, and the value form (third, seventh); two regions that dropped
+    # upstream code and added nothing back, the last of them the whole file (sixth, eighth); and one
+    # that simply forgot (fourth).
     diff = (
       "+++ b/openpilot/foo.py\n"
       "@@ -1 +1,2 @@\n"
@@ -180,12 +210,20 @@ class TestSeamMarkers(unittest.TestCase):
       "+++ b/.gitmodules\n"
       "@@ -3 +4 @@\n"
       "+  url = ../moonpilot-panda.git\n"
+      "diff --git a/openpilot/gone.py b/openpilot/gone.py\n"
+      "deleted file mode 100644\n"
+      "--- a/openpilot/gone.py\n"
+      "+++ /dev/null\n"
+      "@@ -1 +0,0 @@\n"
+      "-def upstream_gone():\n"
     )
     hole, forgot = ("sm = messaging.SubMaster(['carState', 'radarState', 'moonpilotState'])", "def g():")
 
-    # Every hunk is a region, replaced or not: six in the Python file, one in the git config.
-    self.assertEqual([len(added) + len(removed) for _, added, removed in hunks(diff)], [2, 2, 1, 2, 2, 1, 1])
-    self.assertEqual(sum(len(removed) for _, _, removed in hunks(diff)), 2)
+    # Every hunk is a region, replaced or not: six in the Python file, one in the git config, one
+    # deleted file. The last is the case `+++ /dev/null` would otherwise hide: it resolves to the
+    # path the file had, which is what puts it in scope for the removal check below.
+    self.assertEqual([path for path, _, _ in hunks(diff)], ["openpilot/foo.py"] * 6 + [".gitmodules", "openpilot/gone.py"])
+    self.assertEqual([len(added) + len(removed) for _, added, removed in hunks(diff)], [2, 2, 1, 2, 2, 1, 1, 1])
 
     # The third region is the masking hole the prose token closes: `'moonpilotState'` is a service
     # name, not a marker, so a reformat that moved the real marker off this line has to fail. The
@@ -198,11 +236,23 @@ class TestSeamMarkers(unittest.TestCase):
     self.assertEqual([lines[0].strip() for _, lines in unmarked_hunks(diff, {".gitmodules", "openpilot/foo.py"})], [hole, forgot])
     self.assertEqual(unmarked_hunks(diff, {"openpilot/other.py"}), [])
 
-    # Only the sixth region comes back: the fifth rewrites an upstream function and adds a marked
-    # line, which is a fork edit like any other, and the seventh adds one. (`removed` holds the text
-    # with the diff's `-` stripped.)
-    self.assertEqual([lines[0].strip() for _, lines in silent_removal_hunks(diff, {"openpilot/foo.py", ".gitmodules"})], ["def upstream_alert():"])
+    # The sixth and eighth regions, and only those: the fifth rewrites an upstream function and adds
+    # a marked line, which is a fork edit like any other, and the seventh adds one. A deleted file is
+    # in this set, or its path would be the one place the two guards disagreed. (`removed` holds the
+    # text with the diff's `-` stripped.)
+    both = {"openpilot/foo.py", ".gitmodules", "openpilot/gone.py"}
+    self.assertEqual(
+      [lines[0].strip() for _, lines in silent_removal_hunks(diff, both)],
+      ["def upstream_alert():", "def upstream_gone():"],
+    )
     self.assertEqual(silent_removal_hunks(diff, {"openpilot/other.py"}), [])
+
+    # A whole-file deletion is the one shape excused, and the exemption is per path: the deleted file
+    # drops out while the partial removal in the surviving file stays, and skipping a *surviving* path
+    # leaves the deleted one flagged rather than switching the check off. The file-name guard is what
+    # keeps the exemption honest -- the deleted path still has to be an ALLOWED one.
+    self.assertEqual([lines[0].strip() for _, lines in silent_removal_hunks(diff, both, skip={"openpilot/gone.py"})], ["def upstream_alert():"])
+    self.assertEqual([lines[0].strip() for _, lines in silent_removal_hunks(diff, both, skip={"openpilot/foo.py"})], ["def upstream_gone():"])
 
 
 if __name__ == "__main__":

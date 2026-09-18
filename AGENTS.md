@@ -252,7 +252,9 @@ The test matches the full prose marker `moonpilot seam`, and deliberately not th
 
 Two things follow. A region with no marker in it is either a region needing its marker or an upstream edit that should not be there. And because this check reads lines rather than file names, a formatter run over an already-allowed upstream file fails it — the one guard in the tree that sees an edit *inside* a file the seam table has already approved.
 
-A region that only *removes* upstream code is the same question with no line to answer it on — no addition, so no marker can be carried. That direction has its own assertion in the same test class, and it costs nothing because the fork replaces rather than deletes: at the time of writing, 63 regions in allowed files, 24 of them carrying removals, none removal-only. It fails the first time that stops being true, which is the shape a silently dropped upstream alert or check would take.
+A region that only *removes* upstream code is the same question with no line to answer it on — no addition, so no marker can be carried. That direction has its own assertion in the same test class, and it separates the two shapes: a removal-only region inside a file that survives is refused, while a whole-file deletion is excused — git labels it `deleted file mode`, and the file check is what sanctions it, since the deleted path still has to be an `ALLOWED` one. So deleting an upstream file the fork never hooked fails, and retiring a seam it owns passes.
+
+A fork's *own* deletion keeps its row, and keeps it for good. `base` is `merge-base(HEAD, upstream/master)`, which by construction contains no fork commit, so the deleted path never leaves the diff and dropping the row would fail the file check. The sync table's "deletes a file the fork hooked" row is upstream's deletion instead: that commit lands in `base` once the merge is made, the path leaves the diff, and the row goes with it.
 
 Capnp seams carry the invariant they must not break, since a wrong edit there corrupts recorded data:
 
@@ -317,7 +319,7 @@ The `import` line is not decoration. Upstream renaming a symbol the fork imports
 | Rewrites a line a seam sits on — the brand string, `COMMA_VERSION`, the wheel `packages` list, a `PanelType` entry | conflict | take upstream's version on their line, keep the fork's intent on ours, re-add the `# moonpilot` marker |
 | Adds rows/lines near a seam — a param, a proc, a `SConscript`, a settings panel | usually clean | rebuild and re-check. A new settings panel is clean to merge but shifts the fork panel down the tizi sidebar (it sits at y 960–1070 of 1080); re-verify it is not clipped. The mici scroller scrolls, so it absorbs the extra entry |
 | Renames or removes a symbol the fork imports | clean | the `import moonpilot…` line fails. Fix `moonpilot/`, never upstream |
-| Deletes a file the fork hooked | modify/delete conflict | re-attach the seam at the nearest equivalent point, then drop the dead row from the table above and from `ALLOWED` |
+| Deletes a file the fork hooked | modify/delete conflict | re-attach the seam at the nearest equivalent point, then drop the dead row from the table above and from `ALLOWED` — upstream's commit reaches the merge base with the merge, so the path leaves the diff then and the row goes with it |
 | Renames or restructures the safety layer the fork forked | clean in the superproject | the fork's `opendbc_repo` merge is where it lands, and `moonpilot/engage.py` is what breaks if a symbol it imports is gone. Merge the submodule first, then the superproject |
 | Adds its own `AGENTS.md` | add/add conflict | this file stays fork-owned; fold in anything useful from upstream's |
 | Wants a reserved struct or param name the fork also uses | conflict | upstream's ids and names win — move the fork to the next free `CustomReservedN`, never the reverse |
