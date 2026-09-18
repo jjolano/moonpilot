@@ -31,7 +31,7 @@ New fork behavior: write it under `moonpilot/`, hook it at the seam that already
 | `openpilot/selfdrive/controls/controlsd.py` | `moonpilot_latcontrol()` picks the torque lateral controller, `moonpilot_longcontrol()` the acceleration controller |
 | `openpilot/selfdrive/car/card.py` | `moonpilot_engage_safety_param()` before `CarParams` is written |
 | `openpilot/selfdrive/pandad/pandad.cc` | `PandaState.controlsAllowedLateral` from the panda health flag |
-| `openpilot/selfdrive/selfdrived/selfdrived.py` | `moonpilot_engage()`; `LateralEngage.update()` after every event source; the panda cross-check |
+| `openpilot/selfdrive/selfdrived/selfdrived.py` | `moonpilot_engage()`; `LateralEngage.update()` after every event source; the panda cross-check; `is_fork_build()` picks the startup banner |
 | `openpilot/selfdrive/test/process_replay/process_replay.py` | `moonpilotState` in plannerd's `pubs` |
 | `openpilot/selfdrive/ui/ui_state.py` | `moonpilotState` subscription |
 | `openpilot/selfdrive/ui/onroad/model_renderer.py` | lead path draw (tizi) |
@@ -55,6 +55,7 @@ A feature is code under `moonpilot/` reached through an existing seam. Whether i
 
 - **Shape every seam to delegate, not replace.** `brand = moonpilot_brand() or "openpilot"  # moonpilot` leaves upstream's value in the line, so stock behavior still exists to fall back to. `brand = "moonpilot"` deletes it, and there is nothing left to toggle back to. Both are one line; only one keeps the option.
 - **Add a toggle only for behavior you would actually flip.** Every toggle is a second code path you now have to keep working. A feature that is always on costs nothing to leave always on — most should be.
+- **Fork identity takes no toggle either.** `brand()`, `version()` and `is_fork_build()` in `moonpilot/features.py` are always-on fork facts the seams read directly. `is_fork_build()` is the one of them that gates behavior: comma tests comma's branches, so upstream's "WARNING: This branch is not tested" startup banner would otherwise sit on the road at the top of every drive, and the seam swaps in upstream's normal startup alert instead.
 
 When a feature does get one, it is a param plus a control, all inside `moonpilot/`:
 
@@ -151,7 +152,7 @@ The control law is upstream's family — PI on the accel error, feedforward of t
 
 One trap is worth naming: `log.LongitudinalPersonality.standard` is a plain `int`, but the same enum read off a message is a capnp `_DynamicEnum` whose hash is not that int, so a dict keyed by the enum's members never matches a value read off `selfdriveState` — `MOONPILOT_T_FOLLOW` is keyed by the raw value for that reason. `moonpilot/tests/test_longitudinal.py` pins it, along with the properties above, and ends by running upstream's own maneuver suite — all 15 maneuvers × 4 `(e2e, force_decel)` combinations from `openpilot/selfdrive/test/longitudinal_maneuvers/test_longitudinal.py`, patched onto the plant — against the fork planner, which is the end-to-end statement that the strategy drives the stock scenarios without a crash, without stalling at a stop, and while still decelerating under `forceDecel`. `moonpilot/tests/test_longcontrol.py` holds the controller to controlsd's call contract and to the three things the fork owns in it.
 
-`process_replay` reference logs differ for plannerd and controlsd with the feature on; that test needs route data and is in `tools/test_runner.py`'s `IGNORED` list, so a run of it would need regenerated refs or the param flipped off.
+`process_replay` reference logs differ for plannerd and controlsd with the feature on, and for selfdrived on every fork build regardless of any param — `subs=["selfdriveState", "onroadEvents"]` with only `logMonoTime` ignored, so the startup alert the banner seam swaps in is in the recorded frames too. That test needs route data and is in `tools/test_runner.py`'s `IGNORED` list, so a run of it would need regenerated refs or the param flipped off.
 
 ### Lateral-only engagement
 
@@ -225,15 +226,37 @@ Both panels build their rows by iterating `FEATURES`, so a new row appears in ti
 
 ### Seam markers
 
-Every fork line inside an upstream file carries the marker `moonpilot seam, see AGENTS.md`, in that file's comment syntax (`#`, `//`, or capnp's trailing `#`). The marker is what tells anyone — human or agent — that the line is fork-owned and why it is there.
+Every fork region inside an upstream file carries the marker `moonpilot seam, see AGENTS.md`, in that file's comment syntax (`#`, `//`, or capnp's trailing `#`) — or, where that line's syntax has no room for a comment, the fork's name in the value. The marker is what tells anyone — human or agent — that the region is fork-owned and why it is there.
 
     brand = moonpilot_brand() or "openpilot"  # moonpilot seam, see AGENTS.md
+
+**One marker per region, not one per line.** Where it sits inside the region is dictated by syntax, and the check is region-level: `moonpilot/tests/test_upstream_touches.py` runs `git diff -U0` against the merge base, splits the fork's work into contiguous runs of added lines, and requires every run in an allowed upstream file to carry the prose marker — or, in the one path `VALUE_MARKED` names, the value form below. Three shapes that rule takes:
+
+- **New code carries it at the head** — the `def`, the struct, the new statement:
+
+      def _draw_lead_path(self):  # moonpilot seam, see AGENTS.md
+
+- **A rewritten multi-line statement carries it at the end of that statement**, because `#` cannot sit inside a call's parentheses — which is the shape most of the fork's seams in upstream Python take:
+
+      sm = messaging.SubMaster(['carControl', 'carState', 'controlsState', ..., 'radarState',
+                                'moonpilotState'],  # moonpilot seam, see AGENTS.md
+
+- **A line whose syntax has no room for a comment carries the fork's name in the value**, with the prose marker on its own line beside it — git-config's `.gitmodules`:
+
+      # moonpilot seam, see AGENTS.md
+      url = ../moonpilot-panda.git
+
+That last shape is run by `-U0`: git-config only takes `#` on a line of its own, and `-U0` gives that line its own region, so the value it explains stands alone and `.gitmodules` is the **one** path the test accepts a value form for (`VALUE_MARKED`, matched on `moonpilot-`, the fork's repo URLs).
+
+The test matches the full prose marker `moonpilot seam`, and deliberately not the bare fork name. `'moonpilotState'` is a service name in plannerd's subscription list: a region whose real marker was dropped — by a formatter, or by a hand edit that moved the line — would still contain it, and matching the bare name would report that region as marked. `opendbc/safety`'s `MOONPILOT_*` identifiers are the same trap in C. So a region passes on the prose marker, or on the value form only where `VALUE_MARKED` lists its path; `MOONPILOT_PROCS` in `process_config.py` is not an exception, because that line carries the prose marker like any other.
+
+Two things follow. A region with no marker in it is either a region needing its marker or an upstream edit that should not be there. And because this check reads lines rather than file names, a formatter run over an already-allowed upstream file fails it — the one guard in the tree that sees an edit *inside* a file the seam table has already approved.
+
+A region that only *removes* upstream code is the same question with no line to answer it on — no addition, so no marker can be carried. That direction has its own assertion in the same test class, and it costs nothing because the fork replaces rather than deletes: at the time of writing, 63 regions in allowed files, 24 of them carrying removals, none removal-only. It fails the first time that stops being true, which is the shape a silently dropped upstream alert or check would take.
 
 Capnp seams carry the invariant they must not break, since a wrong edit there corrupts recorded data:
 
     moonpilotState @107 :Custom.MoonpilotState;  # moonpilot seam: do not change @107 or which struct it points to. See AGENTS.md before editing.
-
-`git diff` showing an unmarked change to a file under `openpilot/` means something is wrong: either the line is a seam and needs the marker, or it is an upstream edit that should not be there.
 
 ### Seams carry intent you cannot infer — ask
 

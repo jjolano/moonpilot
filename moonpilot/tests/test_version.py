@@ -1,6 +1,8 @@
 import re
 import unittest
+from unittest import mock
 
+from moonpilot import features
 from openpilot.common.version import OpenpilotMetadata, get_version
 
 # <upstream semver>-moonpilot.<fork revision>, e.g. "0.11.2-moonpilot.1". See AGENTS.md, Versioning.
@@ -39,6 +41,17 @@ class TestForkVersion(unittest.TestCase):
 
     assert len(parts) == 4, f"version upset the update description format: {description!r}"
     self.assertEqual(parts[0], version)
+
+  def test_is_fork_build_agrees_with_the_marker(self):
+    # is_fork_build() is fork identity that gates behavior: selfdrived reads it to keep upstream's
+    # "WARNING: This branch is not tested" banner off every build of this tree, because comma tests
+    # comma's branches and never ours (AGENTS.md, Features). A merge that drops the marker — or a
+    # version.h taken from upstream wholesale — would put that warning back on the road, so the two
+    # are pinned together here.
+    self.assertTrue(features.is_fork_build())
+
+    with mock.patch.object(features, "version", return_value="0.11.2"):
+      self.assertFalse(features.is_fork_build())
 
 
 if __name__ == "__main__":

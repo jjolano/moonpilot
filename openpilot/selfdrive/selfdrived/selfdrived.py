@@ -26,6 +26,7 @@ from openpilot.selfdrive.selfdrived.alertmanager import AlertManager, set_offroa
 from openpilot.common.version import get_build_metadata
 from openpilot.common.hardware import HARDWARE
 from moonpilot.engage import moonpilot_engage  # moonpilot seam, see AGENTS.md
+from moonpilot.features import is_fork_build  # moonpilot seam, see AGENTS.md
 
 REPLAY = "REPLAY" in os.environ
 SIMULATION = "SIMULATION" in os.environ
@@ -137,6 +138,10 @@ class SelfdriveD:
 
     # Determine startup event
     self.startup_event = EventName.startup if build_metadata.openpilot.comma_remote and build_metadata.tested_channel else EventName.startupMaster
+    if is_fork_build():  # moonpilot seam, see AGENTS.md
+      # comma tests comma's branches; this build is the fork's own, so upstream's normal startup
+      # alert stands in for the untested-branch warning. Before the mici check, which unsets it.
+      self.startup_event = EventName.startup
     if HARDWARE.get_device_type() == 'mici':
       self.startup_event = None
     if not car_recognized:

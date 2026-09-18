@@ -89,3 +89,11 @@ def version() -> str:
   # get_version() reads version.h directly, so this is right outside the manager too, where the
   # Version param is unset. See AGENTS.md, Versioning.
   return get_version()
+
+
+def is_fork_build() -> bool:
+  # The one identity helper that gates behavior: comma tests comma's branches, so upstream's
+  # "WARNING: This branch is not tested" startup banner would sit on the road at the top of every
+  # drive in a build of this tree. Keyed on the COMMA_VERSION marker rather than on the git remote,
+  # because the marker is what every fork build carries however it was installed. See AGENTS.md.
+  return "-moonpilot." in version()
