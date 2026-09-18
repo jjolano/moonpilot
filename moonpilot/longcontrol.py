@@ -5,7 +5,9 @@ that is the right family — the car is the plant, and the only thing that makes
 schedule the car ships. The fork keeps the shape and the car's own `longitudinalTuning.kiV` table
 (the same reason `moonpilot/latcontrol.py` keeps `lateralTuning.torque`) and owns the rest:
 
-  - the commanded accel is rate limited, so a step in the plan is not a step at the actuator;
+  - the commanded accel is rate limited, so a step in the plan is not a step at the actuator — except
+    at the handover out of the stopping state, whose held value is a brake command rather than one
+    being tracked, so the baseline resets instead;
   - the integrator freezes at standstill and while the driver is on the pedals, where neither the
     error nor the measurement means anything;
   - the stopping ramp is a rate limit toward `CP.stopAccel` rather than a fixed step per frame.
@@ -51,11 +53,38 @@ class MoonpilotLongControl:
     """Update longitudinal control. This updates the state machine and runs a PID loop"""
     self.pid.neg_limit, self.pid.pos_limit = accel_limits
 
+    previous_state = self.long_control_state
     self.long_control_state = long_control_state_trans(active, self.long_control_state, should_stop, CS.brakePressed, CS.cruiseState.standstill)
     if self.long_control_state == LongCtrlState.off:
       self.reset()
       self.last_output_accel = 0.0
       return 0.0
+
+    if previous_state == LongCtrlState.stopping and self.long_control_state == LongCtrlState.pid:
+      # Leaving the stop hold, and the one place the fork's rate limit is the wrong shape. Everything
+      # the stopping branch produces is a brake command, so carrying `last_output_accel` into the pid
+      # branch commands braking while the plan is already asking for motion — at the floor, -2.0 m/s^2
+      # walked off at MOONPILOT_ACCEL_JERK * DT_CTRL, 25 frames and 240 ms. Upstream has no rate limit
+      # here at all; it steps straight to the feedforward.
+      #
+      # Both of `long_control_state_trans`'s pins — `brakePressed` and `cruiseState.standstill` — hold
+      # the state in stopping outright, so the hold sits at the floor for as long as either is set and
+      # the release pays the full 240 ms the moment it clears. That is a car waiting at a light with
+      # its own ACC holding the standstill bit, which is exactly when the driver is watching for it to
+      # move: measured from the `stopping -> pid` edge, pre-fix commands -1.92, -1.84, -1.76, -1.68
+      # where the plan asks +0.15, and turns positive 240 ms later; with the reset it commands +0.08,
+      # already on the plan's side, on the first frame. Same on the free path from a 10 s dwell up.
+      # The depth does not change the rule: a half-ramped hold is still a brake command, so the
+      # mid-ramp window is the same defect, just a smaller one, and it clears too — measured from the
+      # same edge, 100 ms at a 10 s dwell and 230 ms at 11 s.
+      #
+      # The cost is one MOONPILOT_ACCEL_JERK frame at each edge of the plan's creep dither, which was
+      # where the state flipped stopping<->pid ~13 times a second behind a lead creeping below ~0.33 m/s
+      # (peak jerk 22.0 m/s^3 against 8.0 without the reset, a 3 mm/s velocity ripple). That dither was
+      # the planner's and is now gated there — `MoonpilotLongitudinalPlanner` does not declare
+      # should-stop while it is trailing a moving lead — so on that regime this edge no longer arises.
+      # The reset is still what the saturated hold needs.
+      self.last_output_accel = 0.0
 
     if self.long_control_state == LongCtrlState.stopping:
       output_accel = max(min(self.last_output_accel, 0.0) - MOONPILOT_STOPPING_JERK * DT_CTRL, self.CP.stopAccel)

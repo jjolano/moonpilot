@@ -10,11 +10,12 @@ problem. The policy is three candidates, and the smallest wins:
     path — the fork's lateral prediction reaches the longitudinal policy here, since there is no
     MPC danger zone to scale;
   - a time-to-collision approach term that takes over once the headway it wants passes the
-    regulator's braking authority, and then holds the closing rate inside what the remaining slack
-    affords at ``TTC_TARGET`` seconds — one number, no solver. It is a proportional term, not a
-    profile, so it saturates at the actuator's decel limit on a stopped lead; the handover into it is
-    a step in the candidate, and it is arbitration that keeps that step out of the output while the
-    jerk limit turns what remains into a rate;
+    regulator's braking authority, and behind it a stopping floor — the old kinematic term kept as a
+    bound, since a proportional TTC term ramps rather than stops and binds too late above ~34 m/s.
+    The deeper of the two wins, so the fork's closing-rate response reaches the plan wherever it asks
+    for more than stopping needs, and the floor covers the rest. The handover into either is a step in
+    the candidate; it is arbitration that keeps that step out of the output while the jerk limit turns
+    what remains into a rate;
   - the cruise term, and in experimental mode the model's own accel, the same candidates upstream
     arbitrates between.
 
@@ -77,10 +78,18 @@ MOONPILOT_K_V = 0.6  # 1/s on the relative speed
 MOONPILOT_APPROACH_DECEL = 1.0  # m/s^2; the spacing regulator's braking authority, and the
 # decel the approach term binds past — one number, so the
 # two terms meet at the same output
-MOONPILOT_TTC_TARGET = 5.0  # s; headway the approach term holds the closing rate inside
+MOONPILOT_TTC_TARGET = 3.0  # s; headway the approach term holds the closing rate inside. Lower is
+# shallower — a_ttc = -K*(closing - slack/T) deepens with T, so this
+# is the dial between the floor's plateau (T below ~2 the term never
+# governs at all) and a hard late ramp: peak on a 25 m/s approach to a
+# stopped lead is 1.23 here against 1.42 at 5.0 and 1.57 at 8.0, and the
+# narrower window is also the *smoother* one, 4 command reversals over
+# the maneuver against 13 at 5.0. What it gives up is coverage: TTC
+# governs gaps 22-65 m at 25 m/s rather than 20-117 m, so a gently
+# closing lead is the floor's business either way (measured: TTC governs
+# 4 of 500 frames at T=3 on a -2 m/s^2 lead brake, 20 at T=5)
 MOONPILOT_K_TTC = 1.0  # 1/s on the excess closing rate
-MOONPILOT_MIN_SLACK = 0.5  # m; unused since the approach term went time-to-collision —
-# kept because removing a fork constant costs merge surface and buys nothing
+MOONPILOT_MIN_SLACK = 0.5  # m; floor on the stopping term's braking-distance denominator
 MOONPILOT_LEAD_PREVIEW_T = 1.0  # s of the lead's own braking credited to the safety term
 MOONPILOT_A_LEAD_MIN = -10.0  # m/s^2; bounds on a lead's accel estimate, upstream's (long_mpc.process_lead)
 MOONPILOT_A_LEAD_MAX = 5.0
@@ -92,7 +101,17 @@ MOONPILOT_A_CRUISE_MAX_V = [1.6, 1.2, 0.8, 0.6]  # m/s^2
 MOONPILOT_A_TOTAL_MAX_BP = [20.0, 40.0]  # m/s
 MOONPILOT_A_TOTAL_MAX_V = [1.7, 3.2]  # m/s^2 combined accel budget
 MOONPILOT_JERK_UP = 1.5  # m/s^3
-MOONPILOT_JERK_DOWN = 4.0  # m/s^3
+MOONPILOT_JERK_DOWN = 2.0  # m/s^3; the comfort jerk, and it is the approach's onset edge: stepping
+# from the cruise term onto the floor's -1.0 m/s^2 takes 0.50 s here
+# against 0.25 s at 4.0, which is what the step reads as from the seat.
+# `jerk_limit` interpolates from this at -2.0 m/s^2 to JERK_EMERGENCY at
+# ACCEL_MIN, so this softens the gentle onset and leaves emergency braking
+# at 10.0 m/s^3 untouched — a command past -2.0 is on that ramp already.
+# It costs one frame of brake-onset latency (-1.0 m/s^2 at 0.30 s instead
+# of 0.25 s) and nothing in the delivered stopping distance: the ramp is
+# shorter than the floor's own headroom, measured 6.05 m of end gap and no
+# contact at 90 / 118.8 / 129.6 / 144 kph against both a stopped and a
+# braking lead.
 MOONPILOT_JERK_EMERGENCY = 10.0  # m/s^3, reached at ACCEL_MIN
 MOONPILOT_ALLOW_THROTTLE_THRESHOLD = 0.4
 MOONPILOT_MIN_ALLOW_THROTTLE_SPEED = 2.5  # m/s
@@ -100,6 +119,12 @@ MOONPILOT_CRASH_DISTANCE = 0.25  # m; FCW contact margin
 MOONPILOT_FCW_DECEL = -4.0  # m/s^2 required decel that means it cannot be avoided
 MOONPILOT_FCW_COUNT = 2  # frames above threshold before FCW latches
 MOONPILOT_FCW_MODEL_PROB = 0.9
+# m/s; the standstill deadband `should_stop` is gated on, applied to the ego's own speed and to the
+# speed of the lead the policy is actually following. Above it on both counts the plan is asking the car
+# to move, so declaring rest is wrong; at or below it on either — a parked car, or a stopped lead — the
+# upstream predicate is untouched, which is the parked-behind-a-stopped-lead case it was written for.
+# Matches the fork's own standstill convention (`MOONPILOT_STANDSTILL_SPEED`).
+MOONPILOT_SHOULD_STOP_SPEED = 0.1
 MOONPILOT_CONTROL_T_IDX = np.array(ModelConstants.T_IDXS[:CONTROL_N])  # 0 … 2.5 s, 17 points
 
 
@@ -129,26 +154,35 @@ def lead_accel(v_ego, gap, v_lead, a_lead, t_follow) -> float:
   its braking authority is capped at the approach decel, so large speed errors do not turn into hard
   braking through the gain.
 
-  The approach term is time-to-collision: it holds the closing rate inside what the slack affords at
+  The approach is two terms, and the deeper one wins against the regulator's capped output.
+
+  The first is time-to-collision: it holds the closing rate inside what the slack affords at
   TTC_TARGET seconds of headway — ``closing <= slack / TTC_TARGET`` — and binds once honoring that
   needs more than the approach decel, i.e. ``slack < TTC_TARGET * (closing - APPROACH_DECEL /
-  K_TTC)``: with the shipped numbers, ``slack < 5 * (closing - 1)``. So closing at 25 m/s on a
-  stopped lead binds at a 126 m gap, on a 20 m/s lead at 26 m; below 1 m/s of closing rate nothing
-  binds and the regulator alone owns the creep.
+  K_TTC)``: with the shipped numbers, ``slack < 3 * (closing - 1)``, which is a 78 m gap at 25 m/s
+  on a stopped lead. Binding is not governing, though: it reaches the output only where it is also
+  deeper than the floor below, which on that same approach is the gap window 22 m … 65 m — and it is
+  only deeper than the floor for T above 2, below which this term never governs at all. Inside that
+  window it is what makes the approach respond to a lead that starts slowing, because it reads the
+  closing rate, which the lead's own speed history drives.
 
-  The handover into it is a step, not a crossover: where the TTC term binds the regulator's output is
-  whatever the spacing error says, positive while the gap is still wide — +10.1 m/s^2 at 25 m/s and
-  126 m — and the TTC term replaces it from there. That step is only safe because it is a *candidate*:
-  `policy` takes the minimum, so while the lead asks for more than the cruise term the cruise term
-  governs and the output never sees it. What the output steps by is therefore cruise's cap minus the
-  approach decel, and the caller's jerk limit turns that into a rate.
+  The second is the stopping floor, the old kinematic term kept as a bound rather than as the
+  approach: the exact decel that arrives at STOP_DISTANCE with the lead's preview-corrected speed,
+  which binds from ``slack == v_ego^2 / 2``. It is not redundant. A TTC term is proportional on the
+  closing rate, so it ramps — and ramping is not stopping: TTC_TARGET = 5 binds at a slack of
+  ``5 * (v - 1)``, which above ~34 m/s is *inside* the ``v^2 / 7`` that stopping at ACCEL_MIN needs,
+  and on the TTC term alone this car reaches a stopped lead at 14 m/s from 36 m/s. The floor binds
+  earlier than the stopping distance and `min` cannot out-vote it, so it holds where the TTC term
+  asks for less; where the TTC term asks for more, the TTC term wins, which is how the fork's
+  response reaches the plan. Below 1 m/s of closing rate neither binds and the regulator alone owns
+  the creep.
 
-  The TTC term keeps ramping as the gap closes — it is a proportional controller on the excess
-  closing rate, not a profile — so on a stopped lead it reaches the actuator's own decel limit and
-  holds there: past a bind the command is saturated, and what shapes the last meters is the regulator
-  taking back over as the closing rate falls. That is the accepted cost of the law: this term buys
-  its response to a lead that starts slowing (it reads the closing rate, which the lead's own speed
-  history drives) at the price of using the full decel budget on a parked lead.
+  The handover in either case is a step, not a crossover: at the crossing the regulator's output is
+  whatever the spacing error says, positive while the gap is still wide — +67.9 m/s^2 at 25 m/s and
+  the 318.5 m stopping crossing — and the approach terms replace it from there. That step is only
+  safe because it is a *candidate*: `policy` takes the minimum, so while the lead asks for more than
+  the cruise term the cruise term governs and the output never sees it. What the output steps by is
+  therefore cruise's cap minus the approach decel, and the caller's jerk limit turns that into a rate.
   """
   gap = max(float(gap), 0.0)
   v_lead = max(float(v_lead), 0.0)
@@ -159,7 +193,19 @@ def lead_accel(v_ego, gap, v_lead, a_lead, t_follow) -> float:
     return a_track  # not closing: nothing to brake for
   slack = max(gap - MOONPILOT_STOP_DISTANCE, 0.0)
   a_ttc = -MOONPILOT_K_TTC * (closing - slack / MOONPILOT_TTC_TARGET)
-  return min(a_track, a_ttc) if a_ttc < -MOONPILOT_APPROACH_DECEL else a_track
+  a = min(a_track, a_ttc) if a_ttc < -MOONPILOT_APPROACH_DECEL else a_track
+  # The stopping floor, and it is what makes this law safe rather than merely responsive. The TTC term
+  # is proportional on the closing rate, so against a lead the ego is gaining on fast it ramps — and
+  # ramping is not stopping: at 36 m/s with TTC_TARGET = 5 it binds 175 m out, where coming to rest
+  # behind a stopped lead needs 185 m, and the car reaches the lead at 14 m/s. Nothing upstream of
+  # this reaches that regime — the maneuver suite's fastest stopped-lead approach is 25 m/s — so the
+  # floor is what covers it. It is the old kinematic term kept as a bound rather than as the approach:
+  # the exact decel that arrives at STOP_DISTANCE with the lead's speed, binding from a slack of
+  # v_ego^2 / 2, which is always inside the stopping distance. `min` cannot out-vote it, so it holds
+  # where the TTC term asks for less — and where the TTC term asks for more, the TTC term wins, which
+  # is the fork's own response and the reason both are here.
+  a_stop = -(v_ego**2 - v_lead_eff**2) / (2 * max(gap - MOONPILOT_STOP_DISTANCE, MOONPILOT_MIN_SLACK))
+  return min(a, a_stop) if a_stop < -MOONPILOT_APPROACH_DECEL else a
 
 
 def jerk_limit(a_cmd, a_prev, dt) -> float:
@@ -312,10 +358,32 @@ class MoonpilotLongitudinalPlanner:
 
     # Delay compensation by state prediction: where the car and the leads will be when this command
     # reaches the actuator. The policy is evaluated there, not inverted back through the plan.
+    #
+    # The two inputs are not the same age, and `action_t` projects both by the same amount. radarState
+    # lands ~one full cycle behind the modelV2 tick that polls it — measured over 22.8k ticks on 25
+    # routes, median age 46.2 ms against carState's 4.1 ms, and radar the staler input on 100 % of
+    # them — so the gap the message reports is from before `lead_age` of closing. Ageing the lead by
+    # exactly that and the ego by nothing is what closes the difference; it needs no new constant
+    # because upstream's own `commIssue` disengages at ten periods, so `lead_age` cannot usefully
+    # exceed ~0.5 s, and the correction is self-limiting well before that (a stopped lead at 1 s of
+    # staleness moves the stop by 0.42 m, against 3.54 m uncorrected).
+    #
+    # Defaulted rather than required: the maneuver plant hands a bare `dict` with no `logMonoTime` at
+    # all, and a missing or equal stamp has to give the zero correction this planner applied before
+    # it existed.
+    log_mono = getattr(sm, 'logMonoTime', None) or {}
+    model_mono = log_mono.get('modelV2')
+    radar_mono = log_mono.get('radarState')
+    lead_age = max(0.0, (model_mono - radar_mono) / 1e9) if model_mono and radar_mono else 0.0
+    # Both halves of the stale interval, not just the lead's: the message's `dRel` predates the
+    # command by `lead_age`, and `x_pred` carries only the travel over `action_t`. The lead's own
+    # travel over `lead_age` rides on the extra time; the ego's rides on `x_stale`.
+    x_stale = v_ego * lead_age
+
     a_prev = float(self.output_a_target)
     v_pred = max(0.0, v_ego + a_prev * self.action_t)
     x_pred = 0.5 * (v_ego + v_pred) * self.action_t
-    lead_states = [(source, *lead_state_at(lead, self.action_t, x_pred, a_lead, a_lead_tau)) for source, lead, a_lead, a_lead_tau in leads]
+    lead_states = [(source, *lead_state_at(lead, self.action_t + lead_age, x_pred + x_stale, a_lead, a_lead_tau)) for source, lead, a_lead, a_lead_tau in leads]
     a_cmd, source = policy(v_pred, lead_states, v_cruise, t_follow, e2e, model_accel, steer_angle, self.CP, accel_coast, self.allow_throttle)
 
     a_target = float(np.clip(jerk_limit(a_cmd, a_prev, self.dt), ACCEL_MIN, ACCEL_MAX))
@@ -324,7 +392,7 @@ class MoonpilotLongitudinalPlanner:
       a_target = 0.0
 
     self.v_desired_trajectory, self.a_desired_trajectory = self._trajectory(
-      v_ego, a_target, leads, v_cruise, t_follow, e2e, model_accel, steer_angle, accel_coast
+      v_ego, a_target, leads, v_cruise, t_follow, e2e, model_accel, steer_angle, accel_coast, lead_age
     )
     self.j_desired_trajectory = np.gradient(self.a_desired_trajectory, MOONPILOT_CONTROL_T_IDX)
 
@@ -337,23 +405,49 @@ class MoonpilotLongitudinalPlanner:
       cloudlog.info("moonpilot FCW triggered")
     self.fcw = fcw
 
-    self.output_should_stop = should_stop(v_ego, a_target) or (e2e and sm['modelV2'].action.shouldStop)
+    # `should_stop`'s predicate is upstream's, and so is its `v_ego < 0.3` gate — but upstream's planner
+    # only reaches those speeds on the way to rest, where declaring a stop is right. The fork's spacing
+    # regulator trails a lead at whatever speed the lead is doing, and while it does the plan is asking
+    # for motion: the command sits on zero, inside the predicate's 0.1 threshold, so the state machine
+    # is thrown into `stopping` ~13 times a second and the stopping ramp spends the creep fighting the
+    # plan. Measured against a lead creeping at 0.30 m/s the car parked 0.37 m behind its own setpoint
+    # with 202 mm/s of speed ripple, and the command dithering -0.14..+0.11 where the plan wanted ~0;
+    # with the gate the same car sits on the setpoint to three decimals with 1.2 mm/s of ripple.
+    #
+    # Gated on the lead the policy actually followed — `source` is the candidate that won the minimum,
+    # so the `lead_states` entry in that slot is the one being trailed — never on every present lead. A
+    # moving `leadTwo` in the next lane while parked behind a stopped `leadOne` would otherwise lift
+    # should-stop and with it `LongControlState.stopping`'s brake hold, and the car rolls: measured, the
+    # delivered command went from CP.stopAccel to 0.00 on that case alone.
+    #
+    # The ego's own speed is required too, so a stationary car whose lead's reported speed jitters over
+    # the deadband cannot lose that hold either. At a standstill the gate is therefore inert and the
+    # upstream predicate decides on its own, exactly as it did before this existed.
+    #
+    # Everything else is untouched: a stopped or absent lead is the case the predicate was written for,
+    # and resume still works because a lead that pulls away lifts the command over the 0.1 threshold by
+    # itself — both `long_control_state_trans`'s cruise-standstill pin and controlsd's resume read this
+    # flag, so the car releases on the first frame rather than waiting for the gap to open.
+    trailing = v_ego > MOONPILOT_SHOULD_STOP_SPEED and any(s == source and v_lead > MOONPILOT_SHOULD_STOP_SPEED for s, _, v_lead, _ in lead_states)
+    self.output_should_stop = (should_stop(v_ego, a_target) and not trailing) or (e2e and sm['modelV2'].action.shouldStop)
     self.output_a_target = a_target
     self.source = source
     self.solve_time = time.monotonic() - start
 
-  def _trajectory(self, v_ego, a_target, leads, v_cruise, t_follow, e2e, model_accel, steer_angle, accel_coast):
+  def _trajectory(self, v_ego, a_target, leads, v_cruise, t_follow, e2e, model_accel, steer_angle, accel_coast, lead_age=0.0):
     """The same policy rolled forward over the published horizon, from (v_ego, a_target). The ego's
     own travel is carried in x, so the gap the leads are rolled against is the gap this plan
     produces. The old loop advanced the state by the *backward* interval and rolled the leads against
     a gap recomputed from the initial speed and the loop's current accel: on a closing lead at
-    25 m/s, its speeds sat up to 0.42 m/s away from the consistent rollout's."""
+    25 m/s, its speeds sat up to 0.42 m/s away from the consistent rollout's. `lead_age` carries the
+    same staleness correction `update` applies, so the published plan is the same prediction the
+    command was taken from rather than a fresher one."""
     speeds = np.zeros(CONTROL_N)
     accels = np.zeros(CONTROL_N)
     v, a, x, t_prev = v_ego, a_target, 0.0, 0.0
     for i, t_idx in enumerate(MOONPILOT_CONTROL_T_IDX):
       t = float(t_idx)
-      states = [(source, *lead_state_at(lead, t, x, a_lead, a_lead_tau)) for source, lead, a_lead, a_lead_tau in leads]
+      states = [(source, *lead_state_at(lead, t + lead_age, x + v_ego * lead_age, a_lead, a_lead_tau)) for source, lead, a_lead, a_lead_tau in leads]
       a_cmd, _ = policy(v, states, v_cruise, t_follow, e2e, model_accel, steer_angle, self.CP, accel_coast, self.allow_throttle)
       a = float(np.clip(jerk_limit(a_cmd, a, t - t_prev), ACCEL_MIN, ACCEL_MAX))
       speeds[i] = v
