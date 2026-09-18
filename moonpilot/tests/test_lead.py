@@ -17,6 +17,7 @@ from moonpilot.lead import (
   MOONPILOT_INPATH_GRID,
   MOONPILOT_INPATH_RC,
   MOONPILOT_LEAD_ACCEL_MIN_SAMPLES,
+  MOONPILOT_LEAD_ACCEL_TAU,
   MOONPILOT_LEAD_ACCEL_WINDOW,
   MOONPILOT_LEAD_SPEED_JUMP,
   MOONPILOT_MIN_Y_STD,
@@ -115,13 +116,26 @@ class TestResample(unittest.TestCase):
     assert resample([0.0], [1.0], [0.0, 1.0]).size == 0
 
 
-class TestRadarOffset(unittest.TestCase):
-  def test_matches_radard(self):
-    # lead.py mirrors this constant instead of importing it, so pin them: upstream changing
-    # radard's value must fail here rather than silently shifting published x.
+class TestRadardMirrors(unittest.TestCase):
+  """Every constant lead.py mirrors instead of importing, pinned to the radard line it copies.
+
+  The reason to mirror rather than import is that `radard.py` pulls messaging and opendbc while this
+  module is on plannerd's and both renderers' import path — but that only holds if drift fails
+  loudly. `_LEAD_ACCEL_TAU` has a module-level constant in radard to compare against; the filter's
+  time constant and the reset threshold are inline literals there (`radard.py:55,76`), so nothing can
+  be asserted about them and the estimator's docstring is the only record.
+  """
+
+  def test_radar_to_camera_matches_radard(self):
+    # upstream changing radard's value must fail here rather than silently shifting published x
     from openpilot.selfdrive.controls.radard import RADAR_TO_CAMERA
 
     self.assertEqual(MOONPILOT_RADAR_TO_CAMERA, RADAR_TO_CAMERA)
+
+  def test_lead_accel_tau_matches_radard(self):
+    from openpilot.selfdrive.controls.radard import _LEAD_ACCEL_TAU
+
+    self.assertEqual(MOONPILOT_LEAD_ACCEL_TAU, _LEAD_ACCEL_TAU)
 
 
 class TestLeadAccelEstimator(unittest.TestCase):
@@ -133,24 +147,29 @@ class TestLeadAccelEstimator(unittest.TestCase):
 
   @staticmethod
   def _feed(estimator, v0=20.0, a=-3.0, frames=MOONPILOT_LEAD_ACCEL_WINDOW, a_lead=0.0, track_id=0, present=True, radar=True):
-    """Feed `frames` samples of v = v0 + a*i*DT_MDL, oldest first; returns the last estimate."""
+    """Feed `frames` samples of v = v0 + a*i*DT_MDL, oldest first; returns the last (accel, tau)."""
     out = None
     for i in range(frames):
       out = estimator.update(FusedLead(35.0, 0.0, v_lead=v0 + a * i * DT_MDL, a_lead=a_lead, present=present, radar=radar, track_id=track_id))
     return out
 
+  @classmethod
+  def _accel(cls, *args, **kwargs):
+    """Just the accel, for the cases whose subject is the slope rather than the decay."""
+    return cls._feed(*args, **kwargs)[0]
+
   def test_a_braking_lead_is_recognized_within_the_window(self):
     """The whole point: a -3 m/s^2 ramp reads as -3 m/s^2 after three frames, where radard's filter
     is at -0.12 m/s^2 on that same frame and needs 1.2 s to reach 90 % of it."""
-    self.assertAlmostEqual(self._feed(LeadAccelEstimator(), frames=MOONPILOT_LEAD_ACCEL_WINDOW), -3.0, delta=0.01)
-    self.assertLess(self._feed(LeadAccelEstimator(), frames=MOONPILOT_LEAD_ACCEL_MIN_SAMPLES), -2.0)
+    self.assertAlmostEqual(self._accel(LeadAccelEstimator(), frames=MOONPILOT_LEAD_ACCEL_WINDOW), -3.0, delta=0.01)
+    self.assertLess(self._accel(LeadAccelEstimator(), frames=MOONPILOT_LEAD_ACCEL_MIN_SAMPLES), -2.0)
 
   def test_noise_is_averaged_not_amplified(self):
     """0.05 m/s of measurement noise on a steady follower: bounded, and far below the jerk limits.
     A one-frame difference would put 1.4 m/s^2 of jitter on the same input."""
     estimator = LeadAccelEstimator()
     rng = np.random.default_rng(0)
-    estimates = np.array([estimator.update(FusedLead(35.0, 0.0, v_lead=20.0 + rng.normal(0.0, 0.05))) for _ in range(200)])
+    estimates = np.array([estimator.update(FusedLead(35.0, 0.0, v_lead=20.0 + rng.normal(0.0, 0.05)))[0] for _ in range(200)])
     self.assertLess(float(np.abs(estimates).max()), 0.6)
     self.assertLess(float(estimates[MOONPILOT_LEAD_ACCEL_MIN_SAMPLES:].std()), 0.25)
 
@@ -158,35 +177,102 @@ class TestLeadAccelEstimator(unittest.TestCase):
     """Only a radar-matched lead has a speed history to fit; the model's own accel is already there."""
     estimator = LeadAccelEstimator()
     for frame in range(10):
-      self.assertEqual(self._feed(estimator, frames=1, a_lead=-1.7, radar=False, v0=20.0 - 3.0 * frame * DT_MDL), -1.7)
+      self.assertEqual(self._accel(estimator, frames=1, a_lead=-1.7, radar=False, v0=20.0 - 3.0 * frame * DT_MDL), -1.7)
 
   def test_a_new_track_does_not_inherit_the_old_one(self):
     estimator = LeadAccelEstimator()
     step = 3.0 * DT_MDL
-    self.assertAlmostEqual(self._feed(estimator), -3.0, delta=0.01)
+    self.assertAlmostEqual(self._accel(estimator), -3.0, delta=0.01)
     # a different radar track entirely: radard's value stands until this track's own window fills
-    self.assertEqual(self._feed(estimator, frames=1, v0=20.0 - step, a_lead=0.0, track_id=1), 0.0)
-    self.assertAlmostEqual(self._feed(estimator, frames=2, v0=20.0 - 2 * step, track_id=1), -3.0, delta=0.01)
+    self.assertEqual(self._accel(estimator, frames=1, v0=20.0 - step, a_lead=0.0, track_id=1), 0.0)
+    self.assertAlmostEqual(self._accel(estimator, frames=2, v0=20.0 - 2 * step, track_id=1), -3.0, delta=0.01)
 
   def test_a_speed_jump_is_reassociation_not_braking(self):
     """A lead that re-associates 3.5 m/s away is a new object, not a 70 m/s^2 brake."""
     estimator = LeadAccelEstimator()
     step = 3.0 * DT_MDL
-    self.assertAlmostEqual(self._feed(estimator), -3.0, delta=0.01)
+    self.assertAlmostEqual(self._accel(estimator), -3.0, delta=0.01)
     jumped = 20.0 - 3.0 * (MOONPILOT_LEAD_ACCEL_WINDOW - 1) * DT_MDL - (MOONPILOT_LEAD_SPEED_JUMP + 1.0)
-    self.assertEqual(self._feed(estimator, frames=1, v0=jumped, a_lead=-9.9), -9.9)
-    self.assertEqual(self._feed(estimator, frames=1, v0=jumped - step, a_lead=-9.9), -9.9)  # still two samples
-    self.assertAlmostEqual(self._feed(estimator, frames=1, v0=jumped - 2 * step, a_lead=-9.9), -3.0, delta=0.01)
+    self.assertEqual(self._accel(estimator, frames=1, v0=jumped, a_lead=-9.9), -9.9)
+    self.assertEqual(self._accel(estimator, frames=1, v0=jumped - step, a_lead=-9.9), -9.9)  # still two samples
+    self.assertAlmostEqual(self._accel(estimator, frames=1, v0=jumped - 2 * step, a_lead=-9.9), -3.0, delta=0.01)
+
+  def test_the_decay_describes_the_estimate_it_travels_with(self):
+    """The decay must match the accel it is returned with, and the fork's estimate goes deep before
+    radard's Kalman does: on a -3.5 m/s^2 onset the fork crosses the 0.5 m/s^2 reset on its third
+    sample (0.10 s) where `aLeadK` needs ~0.25 s, so pairing radard's `aLeadTau` with the fork's
+    accel is what let the published plan's tail decay the braking away."""
+    estimator = LeadAccelEstimator()
+    tau = []
+    for i in range(MOONPILOT_LEAD_ACCEL_WINDOW):
+      a_lead, a_lead_tau = estimator.update(FusedLead(35.0, 0.0, v_lead=20.0 - 3.5 * i * DT_MDL, a_lead_tau=0.3, radar=True))
+      tau.append((round(a_lead, 2), round(a_lead_tau, 4)))
+
+    # the first two frames have no window yet: radard's own pair, untouched
+    self.assertEqual(tau[0], (0.0, 0.3))
+    self.assertEqual(tau[1], (0.0, 0.3))
+    # from the third frame the fork's accel is deep, so its own decay takes over. Not a reset to 1.5
+    # on that frame: radard decays from 1.5 too (radard.py:76-79), it just starts 0.15 s later
+    self.assertLess(tau[2][0], -2.0)
+    self.assertEqual(tau[2][1], MOONPILOT_LEAD_ACCEL_TAU * 0.9)
+    self.assertTrue(all(a_lead_tau < MOONPILOT_LEAD_ACCEL_TAU for _, a_lead_tau in tau[3:]))
+    self.assertTrue(all(later < earlier for (_, earlier), (_, later) in zip(tau[3:], tau[4:], strict=False)))
+
+    # and a lead that is not braking keeps the long decay, radard's own judgment
+    settled = LeadAccelEstimator()
+    for _ in range(MOONPILOT_LEAD_ACCEL_WINDOW + 5):
+      _, a_lead_tau = settled.update(FusedLead(35.0, 0.0, v_lead=20.0, radar=True))
+    self.assertEqual(a_lead_tau, MOONPILOT_LEAD_ACCEL_TAU)
+
+  def test_the_decay_re_arms_so_one_brake_does_not_flatten_it_for_the_drive(self):
+    """radard re-arms its filter's own state when |a| falls back under the reset threshold
+    (`radard.py:77`), not merely the value it reports. Setting only the reported value leaves the
+    filter ratcheting toward 0, so after the first hard brake every later onset — and every later
+    lead — would report tau ~ 0 and the rollout would be told the accel holds for the whole horizon.
+    """
+    estimator = LeadAccelEstimator()
+    v_lead = 20.0
+    for _ in range(40):  # a long brake, which drives the filter's state to ~0
+      v_lead -= 3.5 * DT_MDL
+      estimator.update(FusedLead(35.0, 0.0, v_lead=v_lead, radar=True))
+    self.assertLess(estimator._tau.x, 0.1)  # the state really did collapse
+
+    for _ in range(40):  # two seconds of holding speed
+      _, a_lead_tau = estimator.update(FusedLead(35.0, 0.0, v_lead=v_lead, radar=True))
+    self.assertEqual(a_lead_tau, MOONPILOT_LEAD_ACCEL_TAU)
+    self.assertEqual(estimator._tau.x, MOONPILOT_LEAD_ACCEL_TAU)  # re-armed, not just reported
+
+    # so a second onset decays from the long tau again, rather than from the first brake's residue
+    for _ in range(MOONPILOT_LEAD_ACCEL_MIN_SAMPLES):
+      v_lead -= 3.5 * DT_MDL
+      _, a_lead_tau = estimator.update(FusedLead(35.0, 0.0, v_lead=v_lead, radar=True))
+    self.assertGreater(a_lead_tau, 1.0)
+
+  def test_a_new_track_starts_its_decay_fresh(self):
+    """radard builds a whole new `Track`, filter included, for a new `radarTrackId`. Inheriting the
+    previous lead's collapsed decay would describe this lead's accel as holding far longer than
+    anything known about it."""
+    estimator = LeadAccelEstimator()
+    v_lead = 20.0
+    for _ in range(40):
+      v_lead -= 3.5 * DT_MDL
+      estimator.update(FusedLead(35.0, 0.0, v_lead=v_lead, radar=True, track_id=1))
+    self.assertLess(estimator._tau.x, 0.1)
+
+    for i in range(MOONPILOT_LEAD_ACCEL_MIN_SAMPLES):
+      _, a_lead_tau = estimator.update(FusedLead(35.0, 0.0, v_lead=13.0 - 3.5 * i * DT_MDL, radar=True, track_id=2))
+    # the third frame's estimate is -3.5, so the decay has begun — from 1.5, not from the old track's
+    self.assertEqual(a_lead_tau, MOONPILOT_LEAD_ACCEL_TAU * 0.9)
 
   def test_an_absent_slot_clears_the_window(self):
     """The planner ticks every instance every frame for this reason: an absent or replaced lead may
     not leave samples behind for the next one to inherit."""
     estimator = LeadAccelEstimator()
     step = 3.0 * DT_MDL
-    self.assertAlmostEqual(self._feed(estimator), -3.0, delta=0.01)
-    self.assertEqual(self._feed(estimator, frames=1, present=False, a_lead=-9.9), -9.9)
-    self.assertEqual(self._feed(estimator, frames=MOONPILOT_LEAD_ACCEL_MIN_SAMPLES - 1, v0=20.0 - step, a_lead=-9.9), -9.9)
-    self.assertAlmostEqual(self._feed(estimator, frames=1, v0=20.0 - 3 * step, a_lead=-9.9), -3.0, delta=0.01)
+    self.assertAlmostEqual(self._accel(estimator), -3.0, delta=0.01)
+    self.assertEqual(self._accel(estimator, frames=1, present=False, a_lead=-9.9), -9.9)
+    self.assertEqual(self._accel(estimator, frames=MOONPILOT_LEAD_ACCEL_MIN_SAMPLES - 1, v0=20.0 - step, a_lead=-9.9), -9.9)
+    self.assertAlmostEqual(self._accel(estimator, frames=1, v0=20.0 - 3 * step, a_lead=-9.9), -3.0, delta=0.01)
 
 
 class TestNormalizeLead(unittest.TestCase):

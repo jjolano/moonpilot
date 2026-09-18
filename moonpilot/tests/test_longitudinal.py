@@ -26,6 +26,7 @@ from openpilot.selfdrive.car.cruise import V_CRUISE_UNSET
 import openpilot.selfdrive.test.longitudinal_maneuvers.plant as plant_mod
 from openpilot.selfdrive.test.longitudinal_maneuvers.test_longitudinal import create_maneuvers
 
+from moonpilot.lead import MOONPILOT_LEAD_ACCEL_TAU, LeadAccelEstimator
 from moonpilot.longitudinal import (
   MOONPILOT_APPROACH_DECEL,
   MOONPILOT_CONTROL_T_IDX,
@@ -72,6 +73,15 @@ def _cp(car=CAR.HONDA_CIVIC, openpilot_longitudinal=True):
 
 
 def _lead(d_rel, v_lead, a_lead=0.0, a_lead_tau=1.5, model_prob=1.0, present=True):
+  """One radarState lead.
+
+  `a_lead` and `a_lead_tau` are the *message's* fields, and the planner no longer reads either for a
+  radar lead: `LeadAccelEstimator` fits the accel from `vLead` across frames and carries its own
+  decay. They still matter where the estimator falls back to radard's pair — the first two frames of
+  a track, and a vision-only lead — and for the `lead_state_at` calls below that pass an accel in
+  directly. A test that wants the planner to see a lead decelerating has to rebuild `vLead` every
+  frame, as the FCW tests do.
+  """
   lead = log.RadarState.LeadData.new_message()
   lead.present = present
   lead.dRel = float(d_rel)
@@ -281,15 +291,15 @@ class TestPolicyFunctions(unittest.TestCase):
     stop time and then walked it backwards, clamping the 12.5 m it had covered to 0.5 m by the end
     of this sweep."""
     lead = _lead(50.0, 10.0, a_lead=-4.0, a_lead_tau=0.0)
-    travel = [lead_state_at(lead, float(t), 0.0, -4.0)[0] - 50.0 for t in np.arange(0.05, 5.0, 0.05)]
+    travel = [lead_state_at(lead, float(t), 0.0, -4.0, 0.0)[0] - 50.0 for t in np.arange(0.05, 5.0, 0.05)]
     self.assertTrue(all(later >= earlier - 1e-9 for earlier, later in zip(travel, travel[1:], strict=False)))
     self.assertAlmostEqual(travel[-1], 10.0**2 / (2 * 4.0), delta=1e-6)
-    self.assertAlmostEqual(lead_state_at(lead, 1.0, 0.0, -4.0)[1], 6.0, delta=1e-6)
-    self.assertEqual(lead_state_at(lead, 5.0, 0.0, -4.0)[1], 0.0)
+    self.assertAlmostEqual(lead_state_at(lead, 1.0, 0.0, -4.0, 0.0)[1], 6.0, delta=1e-6)
+    self.assertEqual(lead_state_at(lead, 5.0, 0.0, -4.0, 0.0)[1], 0.0)
 
   def test_the_lead_accel_estimate_is_bounded(self):
     """A stepped lead speed differentiates into hundreds of m/s^2; upstream clips it, so does this."""
-    self.assertAlmostEqual(lead_state_at(_lead(50.0, 20.0, a_lead_tau=0.0), 1.0, 0.0, -400.0)[1], 10.0, delta=1e-6)
+    self.assertAlmostEqual(lead_state_at(_lead(50.0, 20.0, a_lead_tau=0.0), 1.0, 0.0, -400.0, 0.0)[1], 10.0, delta=1e-6)
 
   def test_required_decel_counts_a_braking_lead(self):
     """FCW's input: a lead braking hard at matched speed is a threat even at zero relative speed,
@@ -382,7 +392,7 @@ class TestPlanner(unittest.TestCase):
     required decel is zero for every frame."""
     planner = _planner()
     for i in range(10):
-      lead = _lead(20.0, 20.0 - 8.0 * i * DT_MDL, a_lead=0.0, a_lead_tau=0.0, model_prob=0.95)
+      lead = _lead(20.0, 20.0 - 8.0 * i * DT_MDL, a_lead=0.0, model_prob=0.95)
       planner.update(_inputs(v_ego=20.0, lead=lead, standstill=False))
     self.assertTrue(planner.fcw)
 
@@ -391,7 +401,7 @@ class TestPlanner(unittest.TestCase):
     frames: by vLead ~ 10 m/s the required decel legitimately passes -4.0."""
     planner = _planner()
     for i in range(20):
-      lead = _lead(35.0, 20.0 - 5.0 * i * DT_MDL, a_lead=0.0, a_lead_tau=0.0, model_prob=0.95)
+      lead = _lead(35.0, 20.0 - 5.0 * i * DT_MDL, a_lead=0.0, model_prob=0.95)
       planner.update(_inputs(v_ego=20.0, lead=lead, standstill=False))
     self.assertFalse(planner.fcw)
 
@@ -509,6 +519,64 @@ class TestPlanner(unittest.TestCase):
     self.assertLessEqual(reached[-1.0], 0.30)
     self.assertLessEqual(reached[-2.0], 0.45)
 
+  def test_the_rollout_decays_the_estimators_accel_on_the_estimators_terms(self):
+    """The applied plan is rolled forward over 2.5 s, and the decay it applies has to describe the
+    accel it is applied to.
+
+    This is the one place the fork's estimate and radard's `aLeadTau` disagree in a way that reaches
+    the published plan: `aLeadTau` comes from radard's own, slower `aLeadK`, so at the onset of a
+    brake it says "transient" (1.5 s) about an accel the fork already reads as sustained, and the
+    2.5 s tail decays the braking away.
+
+    What this pins is *which* decay the rollout reads, not what sign comes out of it: the tail is not
+    monotone in `aLeadTau` (0 -> -2.63, 0.5 -> -0.70, 1.0 -> +0.17, 1.5 -> -1.08 at 0.30 s), and the
+    shipped pairing's own value there is -0.15, close enough to zero that asserting its sign would be
+    pinning noise. The pairing was a real defect and fixing it halves the window in which the tail
+    contradicts the command (0.25-0.40 s to 0.20-0.25 s) but does not close it — the residue is the
+    decay model itself, exp(-aLeadTau t^2 / 2), which assumes a lead's accel is a transient.
+    """
+
+    def fly(tau_override=None):
+      """Flights 2 s of settled following then a -3.5 m/s^2 onset; returns (tail, command, tau) at
+      0.30 s past the onset. `tau_override` replaces the estimator's own decay."""
+      if tau_override is None:
+        planner = _planner()
+      else:
+
+        class ForcedTau(LeadAccelEstimator):
+          def update(self, lead):
+            a_lead, _ = super().update(lead)
+            return a_lead, tau_override
+
+        with mock.patch("moonpilot.longitudinal.LeadAccelEstimator", ForcedTau):
+          planner = _planner()
+          return _fly(planner)
+
+      return _fly(planner)
+
+    def _fly(planner):
+      t_follow = MOONPILOT_T_FOLLOW[int(Personality.standard)]
+      v_ego, v_lead = 20.0, 20.0
+      gap = MOONPILOT_STOP_DISTANCE + t_follow * v_ego
+      for frame in range(120):
+        onset = frame * DT_MDL - 2.0
+        if onset >= 0.0:
+          v_lead = max(0.0, v_lead - 3.5 * DT_MDL)
+        planner.update(_inputs(v_ego=v_ego, v_cruise_kph=108.0, lead=_lead(gap, v_lead, model_prob=0.95), standstill=v_ego < 0.1))
+        if abs(onset - 0.30) < 1e-9:
+          return float(planner.a_desired_trajectory[-1]), float(planner.output_a_target), planner.lead_accel[0].a_lead_tau
+        v_ego = max(0.0, v_ego + planner.output_a_target * DT_MDL)
+        gap = max(0.0, gap - (v_ego - v_lead) * DT_MDL)
+      raise AssertionError("the onset never arrived")
+
+    tail, command, estimator_tau = fly()
+    self.assertLess(command, -1.0)  # the onset really is being braked for
+    self.assertLess(estimator_tau, MOONPILOT_LEAD_ACCEL_TAU)  # the estimate went deep, so it decayed
+
+    # `_lead`'s default is what the message carries, and what a revert to `lead.aLeadTau` would read
+    msg_tail, _, _ = fly(tau_override=MOONPILOT_LEAD_ACCEL_TAU)
+    self.assertNotAlmostEqual(tail, msg_tail, delta=0.5, msg="the rollout is reading the message's decay, not the estimator's")
+
   def test_publish_fills_what_consumers_read(self):
     planner = _planner()
     sm = _inputs(v_ego=20.0, lead=_lead(35.0, 20.0))
@@ -540,17 +608,23 @@ class TestPlanner(unittest.TestCase):
       planner.update(sm)
     self.assertAlmostEqual(planner.v_desired_trajectory[0], 25.0, delta=1e-6)
     self.assertAlmostEqual(planner.a_desired_trajectory[0], planner.output_a_target, delta=1e-6)
-    # a decaying lead closes the gap, so the plan must not be asking for acceleration by the end
+    # a stopped lead 60 m ahead closes as the ego approaches, so the plan must not be asking for
+    # acceleration by the end of the horizon
     self.assertLess(planner.v_desired_trajectory[-1], planner.v_desired_trajectory[0])
 
   def test_the_published_speeds_are_the_integral_of_the_published_accels(self):
     """The plan has to be self-consistent: its speeds integrate its own accels on the published
     grid. They were one grid step apart, which also meant the gap the rollout used was not the gap
-    this plan produces."""
+    this plan produces.
+
+    The lead decelerates and its message is rebuilt every frame, so this runs against a real ramp
+    rather than a constant speed the estimator would read as zero accel.
+    """
     planner = _planner()
-    sm = _inputs(v_ego=25.0, v_cruise_kph=108.0, lead=_lead(60.0, 20.0, a_lead=-2.0, a_lead_tau=0.0))
-    for _ in range(20):
-      planner.update(sm)
+    for i in range(20):
+      lead = _lead(60.0, 20.0 - 2.0 * i * DT_MDL, a_lead_tau=0.0)
+      planner.update(_inputs(v_ego=25.0, v_cruise_kph=108.0, lead=lead))
+    self.assertLess(planner.output_a_target, 0.0)  # the ramp really is being braked for
     for i in range(CONTROL_N - 1):
       dt = float(MOONPILOT_CONTROL_T_IDX[i + 1] - MOONPILOT_CONTROL_T_IDX[i])
       expected = max(0.0, float(planner.v_desired_trajectory[i] + planner.a_desired_trajectory[i] * dt))

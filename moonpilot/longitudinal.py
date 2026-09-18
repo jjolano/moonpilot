@@ -162,23 +162,26 @@ def lead_accel_estimate(a_lead: float) -> float:
   return min(max(float(a_lead), MOONPILOT_A_LEAD_MIN), MOONPILOT_A_LEAD_MAX)
 
 
-def lead_state_at(lead, t, x_ego, a_lead) -> tuple[float, float, float]:
+def lead_state_at(lead, t, x_ego, a_lead, a_lead_tau) -> tuple[float, float, float]:
   """Gap, lead speed and lead accel at time t, given the ego's own travel x_ego by then.
 
   Lead accel decays as exp(-aLeadTau t^2 / 2) — radard's own decay model — and the lead's travel is
   the integral of its *clamped* speed: a lead that brakes to a stop inside the horizon has covered
   its stopping distance, where the unclamped integral walked it backwards and then clamped the travel
-  to zero. Exact whenever aLeadTau == 0, which is what radard reports for anything braking hard
-  enough to matter: aLeadTau is driven to 0 while |aLeadK| >= 0.5 (radard.py:76-79). The accel itself
-  is the caller's estimate (`moonpilot.lead.LeadAccelEstimator`), not `aLeadK`; only the decay is
-  radard's. Against a decaying accel it is the trapezoid — measured against exact integration over
-  aLeadTau's reachable range (0.3 from the vision path, otherwise a FirstOrderFilter decaying toward 0
-  from 1.5, radard.py:18,55,145) within 0.1 m across the 0.55 s command horizon, and 6.2 m at the
-  2.5 s tail at the clip's own -10 m/s^2 bound (3.1 m for |aLeadK| <= 5) — and that tail is the
-  published plan, not the command.
+  to zero. Exact whenever aLeadTau == 0, which is what the estimator reports for anything braking
+  hard enough to matter: the decay is dropped while |a| >= 0.5, radard's own rule (`radard.py:76-79`)
+  applied to the fork's estimate instead of radard's `aLeadK`.
+
+  Both accel and decay are the caller's, from `moonpilot.lead.LeadAccelEstimator` — they are one
+  judgment, and pairing the fork's accel with radard's decay is what let the published plan's tail
+  decay a brake onset away. Against a decaying accel the travel below is the trapezoid, measured
+  against exact integration over aLeadTau's reachable range (0.3 from the vision path, otherwise a
+  FirstOrderFilter decaying toward 0 from 1.5) within 0.1 m across the 0.55 s command horizon, and
+  6.2 m at the 2.5 s tail at the clip's own -10 m/s^2 bound (3.1 m for |a| <= 5) — and that tail is
+  the published plan, not the command.
   """
   a_lead = lead_accel_estimate(a_lead)
-  a_traj = a_lead * math.exp(-lead.aLeadTau * t**2 / 2.0)
+  a_traj = a_lead * math.exp(-a_lead_tau * t**2 / 2.0)
   a_avg = 0.5 * (a_lead + a_traj)
   v_lead = max(0.0, float(lead.vLead))
   v_end = v_lead + a_avg * t
@@ -283,16 +286,16 @@ class MoonpilotLongitudinalPlanner:
       ((LongitudinalPlanSource.lead0, sm['radarState'].leadOne), (LongitudinalPlanSource.lead1, sm['radarState'].leadTwo)),
       strict=True,
     ):
-      a_lead = estimator.update(lead)  # every frame, present or not: that is what resets the window
+      a_lead, a_lead_tau = estimator.update(lead)  # every frame, present or not: that is what resets the window
       if lead.present:
-        leads.append((source, lead, a_lead))
+        leads.append((source, lead, a_lead, a_lead_tau))
 
     # Delay compensation by state prediction: where the car and the leads will be when this command
     # reaches the actuator. The policy is evaluated there, not inverted back through the plan.
     a_prev = float(self.output_a_target)
     v_pred = max(0.0, v_ego + a_prev * self.action_t)
     x_pred = 0.5 * (v_ego + v_pred) * self.action_t
-    lead_states = [(source, *lead_state_at(lead, self.action_t, x_pred, a_lead)) for source, lead, a_lead in leads]
+    lead_states = [(source, *lead_state_at(lead, self.action_t, x_pred, a_lead, a_lead_tau)) for source, lead, a_lead, a_lead_tau in leads]
     a_cmd, source = policy(v_pred, lead_states, v_cruise, t_follow, e2e, model_accel, steer_angle, self.CP, accel_coast, self.allow_throttle)
 
     a_target = float(np.clip(jerk_limit(a_cmd, a_prev, self.dt), ACCEL_MIN, ACCEL_MAX))
@@ -306,7 +309,7 @@ class MoonpilotLongitudinalPlanner:
     self.j_desired_trajectory = np.gradient(self.a_desired_trajectory, MOONPILOT_CONTROL_T_IDX)
 
     crash = any(
-      lead.modelProb > MOONPILOT_FCW_MODEL_PROB and required_decel(v_ego, lead.dRel, lead.vLead, a_lead) < MOONPILOT_FCW_DECEL for _, lead, a_lead in leads
+      lead.modelProb > MOONPILOT_FCW_MODEL_PROB and required_decel(v_ego, lead.dRel, lead.vLead, a_lead) < MOONPILOT_FCW_DECEL for _, lead, a_lead, _ in leads
     )
     self.crash_cnt = self.crash_cnt + 1 if crash else 0
     fcw = self.crash_cnt > MOONPILOT_FCW_COUNT and not CS.standstill
@@ -330,7 +333,7 @@ class MoonpilotLongitudinalPlanner:
     v, a, x, t_prev = v_ego, a_target, 0.0, 0.0
     for i, t_idx in enumerate(MOONPILOT_CONTROL_T_IDX):
       t = float(t_idx)
-      states = [(source, *lead_state_at(lead, t, x, a_lead)) for source, lead, a_lead in leads]
+      states = [(source, *lead_state_at(lead, t, x, a_lead, a_lead_tau)) for source, lead, a_lead, a_lead_tau in leads]
       a_cmd, _ = policy(v, states, v_cruise, t_follow, e2e, model_accel, steer_angle, self.CP, accel_coast, self.allow_throttle)
       a = float(np.clip(jerk_limit(a_cmd, a, t - t_prev), ACCEL_MIN, ACCEL_MAX))
       speeds[i] = v

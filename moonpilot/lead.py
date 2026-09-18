@@ -13,6 +13,7 @@ from collections import deque
 
 import numpy as np
 
+from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.params import Params
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.modeld.constants import ModelConstants
@@ -39,6 +40,13 @@ MOONPILOT_INPATH_GRID = np.arange(0.0, 4.0 + 1e-9, 0.25)
 MOONPILOT_LEAD_ACCEL_WINDOW = 7  # samples, 0.35 s at DT_MDL
 MOONPILOT_LEAD_ACCEL_MIN_SAMPLES = 3  # below this the slope is noise, so radard's value stands
 MOONPILOT_LEAD_SPEED_JUMP = 2.5  # m/s in one frame: re-association, not motion (50 m/s^3)
+# radard's accel-decay model, mirrored rather than imported: `radard.py` pulls messaging and opendbc,
+# and this module is on plannerd's and both renderers' import path. `MOONPILOT_LEAD_ACCEL_TAU` is
+# pinned to radard's own constant by test_lead; the two below copy inline literals there
+# (`radard.py:55,76`), so they have nothing to assert against and this comment is their only record.
+MOONPILOT_LEAD_ACCEL_TAU = 1.5  # s; the decay a lead believed to be holding its accel gets
+MOONPILOT_LEAD_ACCEL_TAU_RC = 0.45  # s; time constant of the filter that gives that belief up
+MOONPILOT_LEAD_ACCEL_TAU_RESET = 0.5  # m/s^2; |a| above this is braking, not a transient
 
 LEAD_T_IDXS = ModelConstants.LEAD_T_IDXS
 LEAD_T_OFFSETS = ModelConstants.LEAD_T_OFFSETS
@@ -72,9 +80,22 @@ class LeadAccelEstimator:
   difference. The lead's *speed* is left alone — `vLead` has no filter lag to remove, and this
   fit's endpoint value would add a transient bias exactly at the onset of braking.
 
-  Returns radard's own `aLeadK` whenever the window cannot speak: a vision-only lead (there
-  `aLeadK` is the model's own unfiltered accel), fewer than MOONPILOT_LEAD_ACCEL_MIN_SAMPLES
-  samples, a new `radarTrackId`, a source flip, or a `vLead` jump past MOONPILOT_LEAD_SPEED_JUMP.
+  Returns radard's own `aLeadK` and `aLeadTau` whenever the window cannot speak: a vision-only lead
+  (there `aLeadK` is the model's own unfiltered accel, paired with its own 0.3 s decay), fewer than
+  MOONPILOT_LEAD_ACCEL_MIN_SAMPLES samples, a new `radarTrackId`, a source flip, or a `vLead` jump
+  past MOONPILOT_LEAD_SPEED_JUMP. Both are returned because they are one judgment: the decay says how
+  long the accel is expected to hold, and it must describe the accel it travels with.
+
+  The decay is radard's rule — MOONPILOT_LEAD_ACCEL_TAU until |a| passes
+  MOONPILOT_LEAD_ACCEL_TAU_RESET, then a filter toward 0 — driven by *this* estimate rather than by
+  radard's `aLeadK`. That matters because the two disagree exactly where it counts: at the onset of a
+  brake the fork's estimate is already deep while radard's Kalman is still under the reset threshold,
+  so pairing the fork's accel with radard's decay says "transient" about a sustained brake, and the
+  published plan's 2.5 s tail decays the braking away — it contradicts the command for 0.25-0.40 s
+  past a -3.5 m/s^2 onset, worst +0.24 m/s^2 against a -1.8 m/s^2 command. On this estimate's decay
+  that window is 0.20-0.25 s. The command itself never sees either: the action horizon is 0.20 s,
+  where the decay is 3 %. The residue is the decay *model* — exp(-aLeadTau t^2 / 2) assumes a lead's
+  accel is a transient — and 2.5 s is where that assumption is wrong.
 
   One instance per radarState slot, updated every frame *including* the frames where the slot is
   absent — the reset is what keeps a new lead from inheriting the previous one's samples. Sample
@@ -85,23 +106,40 @@ class LeadAccelEstimator:
   def __init__(self, dt: float = DT_MDL, window: int = MOONPILOT_LEAD_ACCEL_WINDOW):
     self._samples: deque[float] = deque(maxlen=window)
     self._track: tuple[bool, bool, int] | None = None
+    self._tau = FirstOrderFilter(MOONPILOT_LEAD_ACCEL_TAU, MOONPILOT_LEAD_ACCEL_TAU_RC, dt)
+    self.a_lead_tau = MOONPILOT_LEAD_ACCEL_TAU
     # slope = sum(w_i * v_i) for a uniform grid: w_i = 12 (i - (n-1)/2) / (dt n (n^2 - 1)).
     self._weights = {n: (np.arange(n) - (n - 1) / 2.0) * (12.0 / (dt * n * (n * n - 1))) for n in range(MOONPILOT_LEAD_ACCEL_MIN_SAMPLES, window + 1)}
 
-  def update(self, lead) -> float:
+  def update(self, lead) -> tuple[float, float]:
     track = (bool(lead.present), bool(lead.radar), int(lead.radarTrackId))
     v_lead = float(lead.vLead)
     if track != self._track or (self._samples and abs(v_lead - self._samples[-1]) > MOONPILOT_LEAD_SPEED_JUMP):
       self._samples.clear()
+      # A new lead's decay is new too: radard builds a fresh `Track` — and a fresh filter — for a new
+      # `radarTrackId`, so carrying the old track's value over would tell the rollout that this lead's
+      # accel holds for a length the previous lead earned.
+      self._tau.x = MOONPILOT_LEAD_ACCEL_TAU
     self._track = track
 
+    # No window to read from: hand back radard's own pair, which is self-consistent by construction.
     if not (lead.present and lead.radar):
-      return float(lead.aLeadK)
+      return float(lead.aLeadK), float(lead.aLeadTau)
     self._samples.append(v_lead)
     if len(self._samples) < MOONPILOT_LEAD_ACCEL_MIN_SAMPLES:
-      return float(lead.aLeadK)
+      return float(lead.aLeadK), float(lead.aLeadTau)
+
     n = len(self._samples)
-    return float(self._weights[n] @ np.fromiter(self._samples, float, n))
+    a_lead = float(self._weights[n] @ np.fromiter(self._samples, float, n))
+    if abs(a_lead) < MOONPILOT_LEAD_ACCEL_TAU_RESET:
+      # `radard.py:77` re-arms the filter's own state here, not just the value it reports, and that
+      # is what lets the *next* onset decay from the long tau. Assigning only `a_lead_tau` leaves
+      # `_tau.x` ratcheting toward 0, so one hard brake would flatten the decay for the whole drive.
+      self._tau.x = MOONPILOT_LEAD_ACCEL_TAU
+      self.a_lead_tau = MOONPILOT_LEAD_ACCEL_TAU
+    else:
+      self.a_lead_tau = self._tau.update(0.0)
+    return a_lead, self.a_lead_tau
 
 
 def lead_yaw_rel(t, y, v) -> list[float]:
