@@ -79,9 +79,9 @@ class TestStatusColor(unittest.TestCase):
 
     Half-engaged, the driver's hands on the wheel are doing the steering, so the car goes back to
     the neutral reading rather than claiming openpilot is driving. The safety layer cannot do this
-    on Toyota — its steering-override term is upstream's `steering_disengage`, which only Tesla's
-    rx hook sets — and it keeps granting lateral authority throughout, which is why the grant alone
-    is not enough.
+    on any brand the rule is enabled for — its steering-override term is upstream's
+    `steering_disengage`, which only Tesla's rx hook sets — and it keeps granting lateral authority
+    throughout, which is why the grant alone is not enough.
     """
     self.assertTrue(lateral_only(GRANTED))
     self.assertEqual(moonpilot_status_color(_UIState(OVERRIDE, GRANTED, steering_pressed=True), PALETTE), PALETTE[OVERRIDE])

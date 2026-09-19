@@ -9,14 +9,18 @@ import unittest
 from typing import cast
 
 from opendbc.car.structs import car
+from opendbc.car.honda.values import HondaSafetyFlags
 from opendbc.car.toyota.values import ToyotaFlags, ToyotaSafetyFlags
+from opendbc.car.volkswagen.values import VolkswagenFlags, VolkswagenSafetyFlags
 from openpilot.cereal import log
 from openpilot.common.params import Params
 from openpilot.common.realtime import DT_CTRL
-from openpilot.selfdrive.selfdrived.events import ET, Events
+from openpilot.selfdrive.selfdrived.events import ET, EVENTS, Events
 from openpilot.selfdrive.selfdrived.state import SOFT_DISABLE_TIME, StateMachine
 
-from moonpilot.engage import LateralEngage, moonpilot_engage, moonpilot_engage_safety_param
+from moonpilot.features import LATERAL_ENGAGE, SLAM
+from moonpilot.engage import (LateralEngage, car_unavailable_reason, moonpilot_engage,
+                              moonpilot_engage_safety_param)
 
 ButtonType = car.CarState.ButtonEvent.Type
 EventName = log.OnroadEvent.EventName
@@ -69,18 +73,26 @@ LKAS_PRESS = ((ButtonType.lkas, True), (ButtonType.lkas, False))
 
 
 class TestEngageSafetyParam(unittest.TestCase):
+  # One row per brand the gate accepts, with the bit its own mode header reads. A flag that did not
+  # match the C would be a param the car never enables, so the two are tested together.
+  BRAND_FLAGS = (('toyota', ToyotaSafetyFlags.LATERAL_ENGAGE, 0xFF),
+                 ('honda', HondaSafetyFlags.LATERAL_ENGAGE, None),
+                 ('volkswagen', VolkswagenSafetyFlags.LATERAL_ENGAGE, None))
+
   def test_available_car_gets_the_flag(self):
-    cp = _cp()
-    moonpilot_engage_safety_param(cp, _params(on=True))
+    for brand, flag, mask in self.BRAND_FLAGS:
+      with self.subTest(brand=brand):
+        cp = _cp(brand=brand)
+        moonpilot_engage_safety_param(cp, _params(on=True))
 
-    param = cp.safetyConfigs[0].safetyParam
-    self.assertEqual(param, 73 | int(ToyotaSafetyFlags.LATERAL_ENGAGE))
-    # Nothing else of the fork's: the flag is the only bit added over the car's own param.
-    self.assertEqual(param & ~0xFF, int(ToyotaSafetyFlags.LATERAL_ENGAGE))
+        param = cp.safetyConfigs[0].safetyParam
+        self.assertEqual(param, 73 | int(flag))
+        # Nothing else of the fork's: the flag is the only bit added over the car's own param.
+        self.assertEqual(param & ~(mask or 0xFFFF), int(flag) & ~(mask or 0xFFFF))
 
-    # Idempotent, so a second call cannot corrupt the param
-    moonpilot_engage_safety_param(cp, _params(on=True))
-    self.assertEqual(cp.safetyConfigs[0].safetyParam, param)
+        # Idempotent, so a second call cannot corrupt the param
+        moonpilot_engage_safety_param(cp, _params(on=True))
+        self.assertEqual(cp.safetyConfigs[0].safetyParam, param)
 
   def test_param_off_leaves_carparams_alone(self):
     cp = _cp()
@@ -89,13 +101,17 @@ class TestEngageSafetyParam(unittest.TestCase):
 
   def test_out_of_scope_cars_are_untouched(self):
     for cp in (
-      _cp(brand='honda'),
+      _cp(brand='hyundai'),
       _cp(pcm_cruise=False),
       # Card replaces safetyConfigs with a noOutput config before the seam runs, so a
       # passive car's config must stay untouched however Toyota-shaped the params look
       _cp(passive=True),
       _cp(flags=ToyotaFlags.UNSUPPORTED_DSU),
       _cp(flags=ToyotaFlags.TSS2 | ToyotaFlags.UNSUPPORTED_DSU),
+      # Volkswagen's other two platforms: their safety hooks never set acc_main_on in the
+      # stock-ACC configuration this feature is for
+      _cp(brand='volkswagen', flags=VolkswagenFlags.PQ),
+      _cp(brand='volkswagen', flags=VolkswagenFlags.MLB),
     ):
       moonpilot_engage_safety_param(cp, _params(on=True))
       self.assertEqual(cp.safetyConfigs[0].safetyParam, 73, cp.flags)
@@ -111,10 +127,11 @@ class TestEngageScope(unittest.TestCase):
   def test_inert_when_out_of_scope_or_off(self):
     for cp, params in (
       (_cp(), _params(on=False)),
-      (_cp(brand='honda'), _params(on=True)),
+      (_cp(brand='hyundai'), _params(on=True)),
       (_cp(pcm_cruise=False), _params(on=True)),
       (_cp(passive=True), _params(on=True)),
       (_cp(flags=ToyotaFlags.UNSUPPORTED_DSU), _params(on=True)),
+      (_cp(brand='volkswagen', flags=VolkswagenFlags.PQ), _params(on=True)),
     ):
       engage = moonpilot_engage(cp, params)
       self.assertFalse(engage.enabled)
@@ -128,8 +145,13 @@ class TestEngageScope(unittest.TestCase):
       self.assertEqual(events.events, [EventName.pedalPressed, EventName.pcmDisable])
       self.assertFalse(engage.controls_allowed(_ps(controls_allowed_lateral=True)))
 
-  def test_enabled_for_a_stock_acc_toyota(self):
-    self.assertTrue(moonpilot_engage(_cp(flags=ToyotaFlags.TSS2), _params(on=True)).enabled)
+  def test_enabled_for_a_stock_acc_car(self):
+    # Per-brand flags: the two brands' numbers overlap, so a Toyota flag on a Volkswagen is the
+    # MLA platform as far as that gate is concerned.
+    # Volkswagen MQB is the platform with no platform flag set; PQ and MLB are the ones excluded.
+    for brand, flags in (('toyota', ToyotaFlags.TSS2), ('honda', 0), ('volkswagen', 0)):
+      with self.subTest(brand=brand):
+        self.assertTrue(moonpilot_engage(_cp(brand=brand, flags=flags), _params(on=True)).enabled)
 
 
 class TestEngagePolicy(unittest.TestCase):
@@ -379,6 +401,134 @@ class TestScriptedDrive(unittest.TestCase):
 
     # Closed again: engaged, with no driver gesture
     self.assertEqual(self._step(_cs(available=True)), (State.enabled, True, True))
+
+
+class TestCarGate(unittest.TestCase):
+  """The car-side gate, which is also what the settings panels show a driver."""
+
+  def test_in_scope_cars_have_no_reason(self):
+    for brand in ('toyota', 'honda', 'volkswagen'):
+      with self.subTest(brand=brand):
+        self.assertIsNone(car_unavailable_reason(LATERAL_ENGAGE, _cp(brand=brand)))
+
+  def test_each_out_of_scope_car_says_why(self):
+    self.assertEqual(car_unavailable_reason(LATERAL_ENGAGE, _cp(brand='hyundai')),
+                     "Toyota, Lexus, Honda or Volkswagen only")
+    self.assertEqual(car_unavailable_reason(LATERAL_ENGAGE, _cp(passive=True)), "not in dashcam mode")
+    self.assertEqual(car_unavailable_reason(LATERAL_ENGAGE, _cp(pcm_cruise=False)), "stock ACC only")
+    self.assertEqual(car_unavailable_reason(LATERAL_ENGAGE, _cp(flags=ToyotaFlags.UNSUPPORTED_DSU)),
+                     "not supported on this car")
+    # Volkswagen's two platforms without a stock-ACC main switch in the safety layer
+    for flags in (VolkswagenFlags.PQ, VolkswagenFlags.MLB):
+      self.assertEqual(car_unavailable_reason(LATERAL_ENGAGE, _cp(brand='volkswagen', flags=flags)),
+                       "not supported on this car")
+
+  def test_the_panel_reason_and_the_behavior_are_the_same_gate(self):
+    """A row that says a car cannot do it while the feature runs on it would be worse than silence."""
+    for cp in (_cp(), _cp(brand='honda'), _cp(brand='volkswagen'), _cp(brand='hyundai'), _cp(passive=True),
+               _cp(pcm_cruise=False), _cp(flags=ToyotaFlags.UNSUPPORTED_DSU),
+               _cp(brand='volkswagen', flags=VolkswagenFlags.PQ)):
+      self.assertEqual(car_unavailable_reason(LATERAL_ENGAGE, cp) is None,
+                       moonpilot_engage(cp, _params(on=True)).enabled)
+
+  def test_features_without_a_car_requirement_are_unaffected(self):
+    self.assertIsNone(car_unavailable_reason(SLAM, _cp(brand='hyundai')))
+
+  def test_no_carparams_yet_is_not_a_reason(self):
+    """The panel renders before carParams lands, and an unloaded CP is not a verdict on the car."""
+    self.assertIsNone(car_unavailable_reason(LATERAL_ENGAGE, None))
+
+
+class TestHalfEngagementBanner(unittest.TestCase):
+  """The banner for a car that is armed and not steering.
+
+  It exists because the suppressors are also what make the latch silent: `pcmDisable` and
+  `pedalPressed` are the events upstream would have explained a disengagement with, so a latched
+  car looks exactly like a car with nothing switched on.
+  """
+
+  def setUp(self):
+    self.engage = moonpilot_engage(_cp(), _params(on=True))
+
+  def _run(self, cs, enabled=False, extra_events=()):
+    events = Events()
+    for name in extra_events:
+      events.add(name)
+    self.engage.update(cs, events, enabled)
+    return events
+
+  def _latch(self):
+    # controlsMismatch is an IMMEDIATE_DISABLE, and it is what a panda that never grants steering
+    # raises -- the failure this banner exists for. A steerOverride is not a disable at all.
+    return self._run(_cs(available=True), enabled=True, extra_events=(EventName.controlsMismatch,))
+
+  def test_the_banner_appears_once_the_latch_is_set(self):
+    events = self._latch()
+    self.assertTrue(self.engage._blocked)
+    self.assertTrue(EventName.lateralEngageOff in events.events)
+
+  def test_no_banner_while_it_works(self):
+    events = self._run(_cs(available=True), enabled=True)
+    self.assertFalse(self.engage._blocked)
+    self.assertNotIn(EventName.lateralEngageOff, events.events)
+
+  def test_the_banner_clears_on_re_arm(self):
+    self._latch()
+    events = self._run(_cs(available=True, buttons=((ButtonType.lkas, True),)))
+    self.assertFalse(self.engage._blocked)
+    self.assertNotIn(EventName.lateralEngageOff, events.events)
+
+  def test_no_banner_for_a_hold_upstream_already_explains(self):
+    """Narrow on purpose: a standstill or a loading model carries its own alert already."""
+    events = self._run(_cs(available=True), extra_events=(EventName.carNotReady,))
+    self.assertFalse(self.engage._blocked)
+    self.assertNotIn(EventName.lateralEngageOff, events.events)
+
+  def test_the_banner_cannot_feed_the_latch(self):
+    """It must carry no type the state machine acts on, or it would hold its own cause on."""
+    self._latch()
+    # A clean cycle with the latch still set: the banner is added, and nothing else is.
+    events = self._run(_cs(available=True))
+    self.assertTrue(EventName.lateralEngageOff in events.events)
+    for et in (ET.USER_DISABLE, ET.IMMEDIATE_DISABLE, ET.SOFT_DISABLE, ET.NO_ENTRY, ET.ENABLE):
+      self.assertFalse(events.contains(et), f"the banner must not carry {et}")
+
+  def test_the_event_has_an_alert(self):
+    """`create_alerts` does `EVENTS[e].keys()`, so a name with no entry is a selfdrived crash."""
+    self.assertTrue(EventName.lateralEngageOff in EVENTS)
+    self.assertTrue(ET.PERMANENT in EVENTS[EventName.lateralEngageOff])
+
+  def test_it_is_debounced_before_it_shows(self):
+    """A second of the condition before anything appears, so the frame or two an engage takes --
+    or a panda granting a frame late -- cannot flash the banner."""
+    engage = moonpilot_engage(_cp(), _params(on=True))
+    events = Events()
+
+    def cycle(enabled):
+      events.clear()
+      engage.update(_cs(available=True), events, enabled)
+      return events.create_alerts([ET.PERMANENT])
+
+    # Latch it, then hold the condition and watch the counter do the work
+    events.clear()
+    events.add(EventName.controlsMismatch)
+    engage.update(_cs(available=True), events, True)
+    self.assertTrue(engage._blocked)
+    self.assertEqual(cycle(False), [], "the first cycle must not flash it")
+
+    # Halfway through the delay it is still down...
+    for _ in range(int(0.5 / DT_CTRL)):
+      self.assertEqual(cycle(False), [])
+    # ...and a full second of the condition is enough to put it up, where it stays.
+    for _ in range(int(0.5 / DT_CTRL) + 2):
+      shown = cycle(False)
+    self.assertTrue(shown, "the banner should be up after a second of the condition")
+    self.assertEqual(shown[0].alert_text_1, "Lateral Engagement Off")
+    self.assertTrue(cycle(False), "and it stays up while the latch does")
+
+  def test_the_alert_is_permanent_so_it_stays_up(self):
+    """ET.PERMANENT is never in `clear_event_types`, unlike WARNING and NO_ENTRY."""
+    self.assertTrue(ET.PERMANENT in EVENTS[EventName.lateralEngageOff])
 
 
 if __name__ == "__main__":

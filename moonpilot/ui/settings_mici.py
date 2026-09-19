@@ -3,6 +3,7 @@ widget here swallows its own long press, so the description dialog carrying the 
 unreachable: the reason rides along as the always-visible sub-label instead."""
 
 from moonpilot import tailscale
+from moonpilot.engage import car_unavailable_reason
 from moonpilot.features import FEATURES, Feature, available, wanted
 from moonpilot.ui.tailscale_qr_mici import TailscaleSignInDialogMici
 from openpilot.selfdrive.ui.mici.widgets.button import BigButton, BigParamControl
@@ -14,7 +15,10 @@ from openpilot.system.ui.widgets.scroller import NavScroller
 
 def _feature_button(feature: Feature):
   button = BigParamControl(feature.title, feature.key, description=feature.description)
-  button.set_enabled(lambda f=feature: available(f) and (not f.offroad_only or ui_state.is_offroad()))
+  # Both gates, the same pair the tizi panel resolves per render: a missing dependency and the
+  # car itself. The value line only ever shows one of them (`_update_rows`).
+  button.set_enabled(lambda f=feature: available(f) and car_unavailable_reason(f, ui_state.CP) is None
+                     and (not f.offroad_only or ui_state.is_offroad()))
   return button
 
 
@@ -55,7 +59,9 @@ class MoonpilotLayoutMici(NavScroller):
   def _update_rows(self):
     # set_value is not callable-resolved, unlike set_enabled, so it needs pushing here.
     for feature, button in self._rows:
-      button.set_value("" if available(feature) else "unavailable")
+      # An unavailable widget here cannot open its long-press dialog, so the reason has to ride the
+      # value line: the car's own reason where there is one, and the dependency placeholder otherwise.
+      button.set_value(car_unavailable_reason(feature, ui_state.CP) or "unavailable")
       # BigParamControl reads get_bool, which ignores the declared default, so set the pill
       # from the driver's preference the way the feature itself reads it.
       button.set_checked(wanted(feature, self._params))

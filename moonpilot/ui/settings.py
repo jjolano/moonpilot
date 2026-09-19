@@ -3,7 +3,8 @@ here by existing in that table, and a feature whose dependencies are still missi
 as unavailable instead of silently doing nothing."""
 
 from moonpilot import tailscale
-from moonpilot.features import FEATURES, Feature, available, missing_modules, version, wanted
+from moonpilot.engage import car_unavailable_reason
+from moonpilot.features import FEATURES, Feature, missing_modules, version, wanted
 from moonpilot.ui.tailscale_qr import TailscaleSignInDialog
 from openpilot.common.params import Params
 from openpilot.selfdrive.ui.ui_state import ui_state
@@ -13,12 +14,21 @@ from openpilot.system.ui.widgets.list_view import button_item, text_item, toggle
 from openpilot.system.ui.widgets.scroller_tici import Scroller
 
 
-def _description(feature: Feature) -> str:
+def _unavailable_reason(feature: Feature) -> str | None:
+  """Why this feature cannot run, or None. Two gates, one message: the dependencies the device is
+  still missing, and the car itself."""
   modules = missing_modules(feature)
-  if not modules:
+  if modules:
+    return f"{feature.title} is currently unavailable until {', '.join(modules)} is installed, which happens automatically once the device is online."
+  car = car_unavailable_reason(feature, ui_state.CP)
+  return f"{feature.title} is unavailable on this car: {car}." if car else None
+
+
+def _description(feature: Feature) -> str:
+  reason = _unavailable_reason(feature)
+  if reason is None:
     return feature.description
   # Upstream's disabled-with-reason shape: bold reason, then the description (toggles.py).
-  reason = f"{feature.title} is currently unavailable until {', '.join(modules)} is installed, which happens automatically once the device is online."
   return "<b>" + reason + "</b><br><br>" + feature.description
 
 
@@ -31,7 +41,7 @@ def _feature_toggle(feature: Feature, params: Params):
     description=lambda f=feature: _description(f),
     initial_state=wanted(feature, params),
     callback=lambda state, key=feature.key: params.put_bool(key, state, block=True),
-    enabled=lambda f=feature: available(f) and (not f.offroad_only or ui_state.is_offroad()),
+    enabled=lambda f=feature: _unavailable_reason(f) is None and (not f.offroad_only or ui_state.is_offroad()),
   )
 
 

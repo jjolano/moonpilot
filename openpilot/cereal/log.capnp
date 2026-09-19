@@ -117,6 +117,7 @@ struct OnroadEvent @0xc4fa6047f024e718 {
     selfdrivedLagging @81;
     resumeBlocked @82;
     carNotReady @103;
+    lateralEngageOff @104;  # moonpilot seam, see AGENTS.md: the fork's half-engagement is armed but not steering
     steerTimeLimit @83;
     vehicleSensorsInvalid @84;
     locationdTemporaryError @85;

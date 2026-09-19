@@ -5,8 +5,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 UPSTREAM = "upstream/master"
 
-# moonpilot owns these outright.
-FORK_OWNED = ("moonpilot/", "AGENTS.md", "CLAUDE.md")
+# moonpilot owns these outright. `.agents/` has never existed upstream -- it is the fork's own
+# agent skills -- so a path under it is not an upstream file by construction. If upstream ever
+# grows one, this line is what would have to move.
+FORK_OWNED = ("moonpilot/", ".agents/", "AGENTS.md", "CLAUDE.md")
 
 # The prose marker. Deliberately not the bare fork name: `'moonpilotState'` is a service name in
 # plannerd's subscription list, so matching `moonpilot` would let a region whose real marker was
@@ -37,6 +39,7 @@ ALLOWED = {
   "openpilot/selfdrive/controls/controlsd.py": "moonpilot torque lateral controller, curvature preview, and acceleration controller",
   "openpilot/selfdrive/pandad/pandad.cc": "lateral-controls health flag",
   "openpilot/selfdrive/selfdrived/selfdrived.py": "lateral engagement events and panda cross-check, and the fork's startup alert",
+  "openpilot/selfdrive/selfdrived/events.py": "the half-engagement banner",
   "openpilot/selfdrive/test/process_replay/process_replay.py": "moonpilotState in plannerd pubs",
   "openpilot/selfdrive/ui/ui_state.py": "moonpilotState subscription",
   "openpilot/selfdrive/ui/onroad/augmented_road_view.py": "half-engaged border color",

@@ -450,6 +450,13 @@ EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
                                        priority=Priority.LOWEST),
   },
 
+  EventName.lateralEngageOff: {  # moonpilot seam, see AGENTS.md: the driver's gesture is the
+    # cruise main switch, not the button the fork's Toyota-only wording used to name -- Volkswagen
+    # emits no LKAS button at all, so a hint naming it would be an instruction that brand cannot follow.
+    ET.PERMANENT: NormalPermanentAlert("Lateral Engagement Off", "Turn cruise off and on to re-engage",
+                                       creation_delay=1.0),
+  },
+
   EventName.invalidLkasSetting: {
     ET.PERMANENT: invalid_lkas_setting_alert,
     ET.NO_ENTRY: NoEntryAlert("Invalid LKAS setting"),

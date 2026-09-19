@@ -18,7 +18,8 @@ expression on the line, and hand this module the tree's palette so it can name t
                     BORDER_COLORS.get(ui_state.status, BORDER_COLORS[UIStatus.DISENGAGED]))
 
 `None` means upstream's expression runs unchanged, so a car that is not half-engaged — every car
-with the feature off, unavailable, or simply not Toyota — cannot reach the fork's color at all.
+with the feature off, unavailable, or simply not one of the three brands — cannot reach the fork's
+color at all.
 Every frame that *is* half-engaged gets a color from here, which is the point: deferring to
 upstream for the driver-steering case would paint `ENGAGED` green on any frame where `carState` has
 the driver's hands on the wheel before `selfdriveState` has caught up with the override — and green
@@ -38,7 +39,7 @@ Blue is painted only while openpilot is the thing steering, which is three condi
   half-engaged car read as the same neutral, `palette[UIStatus.OVERRIDE]`, taken from the tree's
   own palette rather than copied here so the two cannot drift. It cannot come from the safety
   layer: the rule's steering-override term is upstream's `steering_disengage`, which only Tesla's
-  rx hook ever sets, so no Toyota can reach it. Blue here would claim openpilot is steering while
+  rx hook ever sets, so no car the fork enables the rule for can reach it. Blue here would claim openpilot is steering while
   the driver's own hands are on the wheel doing the work.
 
 `gasPressedOverride` deliberately does **not** drop the color, which is why this is not simply

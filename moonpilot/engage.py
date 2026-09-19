@@ -9,10 +9,13 @@ enabled state while the driver is only half-engaged.
 
 What the module does at runtime:
 
-  - `moonpilot_engage_safety_param`, called once by card before `CarParams` is written, sets the
-    Toyota safety-param flag that turns the panda rule on for this car. Only a Toyota with stock
-    ACC reaches it (see `_available`), so every other car's `CarParams` is upstream's byte for
-    byte.
+  - `moonpilot_engage_safety_param`, called once by card before `CarParams` is written, sets this
+    brand's safety-param flag (`LATERAL_ENGAGE_FLAGS`) that turns the panda rule on for this car.
+    Only a car in scope reaches it (see `_available`), so every other car's `CarParams` is
+    upstream's byte for byte.
+  - `car_unavailable_reason`, which is the panel's half of `_available`: why a driver cannot use
+    this feature on this car, or `None`. The settings rows are disabled with it, so a car that can
+    never be half-engaged says so instead of reading as on and doing nothing.
   - `LateralEngage.update`, called from selfdrived once every event source has contributed, is
     the engage/disengage policy. It suppresses the two events whose whole purpose is the behavior
     being replaced — `pcmDisable` (level-triggered whenever stock ACC is off) and `pedalPressed`
@@ -24,18 +27,30 @@ What the module does at runtime:
     cycling the main switch; a soft disable is left to upstream's own state machine, which returns
     to enabled by itself once the condition clears.
 
-    Two of upstream's disengages are inert here rather than suppressed: Toyota's cancel button
-    never reaches openpilot as `buttonCancel` (the car's wheel only wires the LKAS and distance
-    buttons), so the driver's ACC cancel drops to the half-engaged state with steering intact; and
-    `steerDisengage` — the panda rule's own `steering_disengage` — is a signal only Tesla's rx hook
-    ever sets, so on Toyota a driver's torque is upstream's blending path, not a disarm.
+    It also raises `lateralEngageOff` while the latch is set — a permanent banner, because the
+    suppressors above are exactly what make a latched car silent: the events upstream would have
+    explained the disengagement with are the ones filtered out. Keyed on the latch alone, so a
+    `NO_ENTRY` hold or a soft disable, which upstream already alerts on, does not double up.
+
+    Two of upstream's disengages are inert here rather than suppressed, and the first of the two
+    is a per-brand fact rather than a fork choice. Toyota's carstate emits no `ButtonType.cancel` at
+    all (its wheel wires only the LKAS and distance buttons), so an ACC cancel cannot reach
+    openpilot as `buttonCancel` and the driver's cancel drops to the half-engaged state with
+    steering intact. Honda and Volkswagen do emit it, and `car_events.py` turns any
+    `ButtonType.cancel` press into `buttonCancel` — a `USER_DISABLE` — for every brand but Hyundai,
+    so on those two a cancel disengages and latches like any other authoritative disable. The
+    second is `steerDisengage` — the panda rule's own `steering_disengage` — a signal only Tesla's
+    rx hook ever sets, so on all three brands a driver's torque is upstream's blending path rather
+    than a disarm.
 
 Scope, and the ceilings that come with it:
 
-  - Toyota/Lexus with stock longitudinal (`CP.pcmCruise`) only, and not `UNSUPPORTED_DSU` — those
-    read the cruise main switch out of `DSU_CRUISE` at 5 Hz, below panda's 10 Hz rx-check minimum,
-    so the feature is inert there by construction rather than by a runtime check that would fail
-    on the road.
+  - Three brands, and one platform caveat inside the third. Toyota/Lexus and Honda with stock
+    longitudinal (`CP.pcmCruise`), and Volkswagen MQB/MEB — where PQ is excluded because its safety
+    hook sets `acc_main_on` only under openpilot longitudinal control, and MLB never sets it.
+    Toyota's `UNSUPPORTED_DSU` cars are excluded too: they read the cruise main switch out of
+    `DSU_CRUISE` at 5 Hz, below panda's 10 Hz rx-check minimum, so the feature would be inert
+    there by construction rather than by a runtime check that would fail on the road.
   - The decision to be half-engaged is fixed at construction, like the fork's other behavior
     toggles: the module reads its param once, and the panel row says a restart is needed.
   - No fresh permission is invented for the acceleration side. `controlsAllowed` keeps upstream's
@@ -44,12 +59,14 @@ Scope, and the ceilings that come with it:
 """
 
 from opendbc.car.structs import car
+from opendbc.car.honda.values import HondaSafetyFlags
 from opendbc.car.toyota.values import ToyotaFlags, ToyotaSafetyFlags
+from opendbc.car.volkswagen.values import VolkswagenFlags, VolkswagenSafetyFlags
 from openpilot.cereal import log
 from openpilot.common.params import Params
 from openpilot.selfdrive.selfdrived.events import ET
 
-from moonpilot.features import LATERAL_ENGAGE, enabled
+from moonpilot.features import LATERAL_ENGAGE, Feature, enabled
 
 ButtonType = car.CarState.ButtonEvent.Type
 EventName = log.OnroadEvent.EventName
@@ -60,13 +77,70 @@ EventName = log.OnroadEvent.EventName
 # which is an override rather than a disable, so steering continues through it.
 SUPPRESSED_EVENTS = (EventName.pcmDisable, EventName.pedalPressed)
 
+# The brands the forked safety layer carries the permission for, and the safety-param bit that
+# turns it on for each. One row per brand, and the bit is a wire contract with that brand's own
+# mode header -- `HONDA_PARAM_LATERAL_ENGAGE`, `TOYOTA_PARAM_LATERAL_ENGAGE`,
+# `FLAG_VOLKSWAGEN_LATERAL_ENGAGE` -- so the two must change together (opendbc_repo/AGENTS.md).
+#
+# What a brand needs to be listed: its safety rx hook must decode the cruise main switch into
+# `acc_main_on`, and the message carrying it must already be rx-checked. Toyota's the fork added;
+# Honda's and Volkswagen's are upstream's own, which is why neither needs an rx check of its own.
+# Everyone else needs that decode written and its rate validated on the car.
+LATERAL_ENGAGE_FLAGS = {
+  'toyota': ToyotaSafetyFlags.LATERAL_ENGAGE,
+  'honda': HondaSafetyFlags.LATERAL_ENGAGE,
+  'volkswagen': VolkswagenSafetyFlags.LATERAL_ENGAGE,
+}
+
+
+def _unsupported_reason(CP) -> str | None:
+  """Why this car cannot be half-engaged, or `None` when it can.
+
+  The single gate: `_available` is this, and so is the settings panel's disabled-with-reason, so the
+  row a driver sees and the behavior they get cannot disagree. The strings are value-line sized --
+  mici puts them there, and only tizi has room to wrap -- so the detail lives in the feature's own
+  description rather than here.
+
+  `not CP.passive` is not redundant with card's placement: card sets `passive` and replaces
+  `safetyConfigs` with a single noOutput config *before* the seam runs, so without this a
+  dashcam-mode car would still have the flag ORed into a config that never reads it.
+  """
+  if CP is None:
+    # The panel's boot case: CarParams is not loaded yet, so say nothing rather than claim the car
+    # cannot do it. `_available` is only ever reached with the real thing, from card and selfdrived.
+    return None
+  if CP.brand not in LATERAL_ENGAGE_FLAGS:
+    return "Toyota, Lexus, Honda or Volkswagen only"
+  if CP.passive:
+    return "not in dashcam mode"
+  if not CP.pcmCruise:
+    return "stock ACC only"
+  if CP.brand == 'toyota' and CP.flags & ToyotaFlags.UNSUPPORTED_DSU:
+    # Those read the main switch out of DSU_CRUISE at 5 Hz, below panda's 10 Hz rx-check minimum.
+    return "not supported on this car"
+  if CP.brand == 'volkswagen' and CP.flags & (VolkswagenFlags.PQ | VolkswagenFlags.MLB):
+    # Their safety hooks never set `acc_main_on` in the stock-ACC configuration this feature is
+    # for: PQ's is set only under openpilot longitudinal control, and MLB's is not set at all.
+    return "not supported on this car"
+  return None
+
 
 def _available(CP) -> bool:
   """Whether this car is one the half-engaged state can be built for at all."""
-  # `not CP.passive` is not redundant with the caller's placement: card sets `passive` and
-  # replaces `safetyConfigs` with a single noOutput config *before* the seam runs, so without
-  # this a dashcam-mode Toyota would still have the flag ORed into a config that never reads it.
-  return CP.brand == 'toyota' and CP.pcmCruise and not CP.passive and not (CP.flags & ToyotaFlags.UNSUPPORTED_DSU)
+  return _unsupported_reason(CP) is None
+
+
+def car_unavailable_reason(feature: Feature, CP) -> str | None:
+  """Why a driver cannot use this feature on this car, or `None`. What the settings panels ask.
+
+  The dependency gate in `moonpilot/features.py` cannot see CarParams, so a feature with a car
+  requirement needs a second gate; this is it, and it lives here with the requirement itself rather
+  than as a per-feature branch inside both panel files. `ui_state.CP` is None until carParams
+  arrives offroad, which `_unsupported_reason` reads as "say nothing".
+  """
+  if feature is LATERAL_ENGAGE:
+    return _unsupported_reason(CP)
+  return None
 
 
 def moonpilot_engage_safety_param(CP, params: Params | None = None) -> None:
@@ -81,7 +155,7 @@ def moonpilot_engage_safety_param(CP, params: Params | None = None) -> None:
   # partial flag would put openpilot and panda out of agreement. Leave it alone.
   if len(CP.safetyConfigs) != 1:
     return
-  CP.safetyConfigs[0].safetyParam |= int(ToyotaSafetyFlags.LATERAL_ENGAGE)
+  CP.safetyConfigs[0].safetyParam |= int(LATERAL_ENGAGE_FLAGS[CP.brand])
 
 
 def moonpilot_engage(CP, params: Params | None = None) -> 'LateralEngage':
@@ -134,10 +208,16 @@ class LateralEngage:
       self._blocked = False
     self._acc_set_prev = CS.cruiseState.enabled
 
-    # The wheel's LKAS button is a free explicit on/off: Toyota TSS2 emits this press/release pair
-    # from the camera, and nothing in openpilot consumes it. Blocking has to disable through the
-    # first-class event rather than only dropping the engage request, since the state machine
-    # leaves the enabled state on a disable event and on nothing else.
+    # The wheel's LKAS button is a free explicit on/off, and this is brand-generic on purpose: the
+    # two brands in scope that emit `ButtonType.lkas` are Toyota (TSS2, from the camera) and Honda
+    # (SCM_BUTTONS' LKAS setting button), and nothing in openpilot or opendbc consumes the event on
+    # either --- no `ButtonType.lkas` reader exists in the tree. Volkswagen emits no such button at
+    # all, every one of its buttons being an ACC function, so there the re-arm gestures are the two
+    # that need no button: cycling the main switch above and ACC's rising edge.
+    #
+    # Blocking has to disable through the first-class event rather than only dropping the engage
+    # request, since the state machine leaves the enabled state on a disable event and on nothing
+    # else.
     if any(be.type == ButtonType.lkas and be.pressed for be in CS.buttonEvents):
       self._blocked = not self._blocked
       if self._blocked:
@@ -165,3 +245,22 @@ class LateralEngage:
       # holds; SOFT_DISABLE is excluded from the request itself so that a type without one cannot
       # engage and soft-disable in a loop.
       events.add(EventName.buttonEnable)
+
+    if self._blocked:
+      # The one state a driver cannot read off the road. The feature is on, nobody suppressed their
+      # switch, and the car does not steer: the suppressors that keep a brake tap from disengaging
+      # are also what make this latch silent, since the events upstream would have explained it with
+      # are exactly the ones filtered out above. A permanent banner says so until the driver re-arms.
+      #
+      # Deliberately *not* the broader "armed and not steering": a NO_ENTRY hold (a standstill with
+      # the brake, a model still loading) already carries upstream's own alert, and a soft disable is
+      # upstream's recoverable one, so a banner there would double up on a state the driver is being
+      # told about and can do nothing extra for. The latch is the one that says nothing by itself.
+      #
+      # It also covers the safety layer failing, which is the failure this feature cannot see
+      # otherwise: a panda that grants nothing -- an rx check that never settles, a config the
+      # forklift never flagged, a firmware without the health bit -- eventually raises
+      # controlsMismatch, which is an IMMEDIATE_DISABLE, so it lands *here*, as the latch. There is
+      # no reason string for it because there cannot be: the grant is cleared whenever openpilot is
+      # not engaged, so a latched car and an ungranted one are indistinguishable from the outside.
+      events.add(EventName.lateralEngageOff)
