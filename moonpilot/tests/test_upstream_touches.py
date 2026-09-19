@@ -20,6 +20,17 @@ MARKER = "moonpilot seam"
 VALUE_MARKED = {".gitmodules": ("moonpilot-",)}
 SUBMODULES = ("panda", "opendbc_repo")
 
+# The two checks docs/SAFETY.md forbids nerfing unconditionally, as path prefixes the fork may never
+# gain a seam in -- driver monitoring, and the excessive-actuation checks. AGENTS.md states the
+# claim; this is what holds it. The guard below reads `ALLOWED`, so it catches the drift the file
+# check cannot: a future fork adding a row here would have to delete this constant and that passage
+# together, which is a decision rather than a merge. The paths are also asserted to still exist, so
+# an upstream rename fails loudly instead of quietly leaving the guard pointed at nothing.
+NEVER_ALLOWED = (
+  "openpilot/selfdrive/monitoring/",
+  "openpilot/selfdrive/selfdrived/helpers.py",
+)
+
 # Upstream files moonpilot may modify, and the seam each one carries.
 ALLOWED = {
   ".gitmodules": "forked opendbc/panda submodules",
@@ -153,6 +164,23 @@ class TestUpstreamTouches(unittest.TestCase):
     touched = {f for f in changed if not f.startswith(FORK_OWNED)}
     unexpected = sorted(touched - ALLOWED.keys())
     assert not unexpected, "upstream files touched outside the moonpilot seams:\n  " + "\n  ".join(unexpected)
+
+  def test_the_unconditional_safety_paths_stay_unreachable(self):
+    """Driver monitoring and the excessive-actuation checks are the two prohibitions that attach to
+    every fork rather than to editing `opendbc/safety/`, and this fork honors them by absence.
+
+    Both halves matter. The paths must exist, or an upstream rename retires the guard while leaving
+    it green; and no `ALLOWED` row may reach them, which is the drift the file-name check above
+    cannot see -- that check reads a diff, this one reads the table that would sanction the diff.
+    `openpilot/selfdrive/modeld/dmonitoringmodeld.py` is deliberately not in this tuple: it is the
+    monitoring *model's* seam, and the marketplace substituting a network is a driver's choice with
+    its own admission gate, not a fork edit to the monitoring policy. AGENTS.md says so in prose.
+    """
+    for path in NEVER_ALLOWED:
+      with self.subTest(path=path):
+        self.assertTrue((ROOT / path.rstrip("/")).exists(), f"{path} is gone upstream; re-point this guard")
+    reaching = sorted(row for row in ALLOWED if any(row.startswith(path) for path in NEVER_ALLOWED))
+    assert not reaching, "an ALLOWED row reaches a path docs/SAFETY.md forbids nerfing:\n  " + "\n  ".join(reaching)
 
 
 class TestSeamMarkers(unittest.TestCase):
