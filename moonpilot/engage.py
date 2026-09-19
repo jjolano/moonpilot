@@ -40,23 +40,34 @@ What the module does at runtime:
     `NO_ENTRY` hold or a soft disable, which upstream already alerts on, does not double up.
 
     One of upstream's disengages is inert here rather than suppressed: `steerDisengage` — the panda
-    rule's own `steering_disengage` — is a signal only Tesla's rx hook ever sets, so on all three
-    brands a driver's torque is upstream's blending path rather than a disarm. Cancel used to be a
+    rule's own `steering_disengage` — is a signal only Tesla's rx hook ever sets, so on every other
+    brand a driver's torque is upstream's blending path rather than a disarm. Cancel used to be a
     per-brand fact worth this paragraph; it is a suppression now (see `SUPPRESSED_EVENTS`), which is
-    the same behavior on all three brands instead of a coincidence of which wheel is wired.
+    the same behavior on every brand instead of a coincidence of which wheel is wired.
 
 Scope, and the ceilings that come with it:
 
-  - Three brands, and one platform caveat inside the third. Toyota/Lexus, Honda and Volkswagen
-    MQB/MEB, which is what `CP.pcmCruise` is for: on Honda and Volkswagen it is `not
-    openpilotLongitudinalControl` and so does describe who owns speed, but on Toyota it is a default
-    that stays true under openpilot longitudinal control too. Those cars are therefore in scope, and
-    their half-engagement is steer-only — the driver's foot owns speed until ACC is set, which is
-    the grant the longitudinal half of the gate waits for. PQ is excluded because its safety hook
-    sets `acc_main_on` only under openpilot longitudinal control, and MLB never sets it.
-    Toyota's `UNSUPPORTED_DSU` cars are excluded too: they read the cruise main switch out of
-    `DSU_CRUISE` at 5 Hz, below panda's 10 Hz rx-check minimum, so the feature would be inert
-    there by construction rather than by a runtime check that would fail on the road.
+  - Every brand openpilot drives, with two car-level exclusions. The permission is granted in the
+    safety layer for all of them (`LATERAL_ENGAGE_FLAGS` below), so what is left is who owns speed
+    and which cars the panda can arm on. `CP.pcmCruise` is the first: on Honda, Hyundai and
+    Volkswagen it is `not openpilotLongitudinalControl` and so does describe who owns speed, but on
+    Toyota, and on every brand whose interface leaves it at upstream's default, it stays true even
+    under openpilot longitudinal control. Cars with `pcmCruise` false are excluded because the
+    half-engaged state cannot exist there — openpilot owning acceleration means engaging it owns
+    speed, which is the thing this feature is not. Where the state does exist the half-engagement is
+    steer-only: the driver's foot owns speed until ACC is set, which is the grant the longitudinal
+    half of the gate waits for. Toyota's `UNSUPPORTED_DSU` cars are excluded too: they read the
+    cruise main switch out of `DSU_CRUISE` at 5 Hz, below panda's 10 Hz rx-check minimum, so the
+    feature would be inert there by construction rather than by a runtime check that would fail on
+    the road.
+  - Two ways for the panda to arm, and only one of them needs the car. Where a brand's mode decodes
+    the cruise main switch into `acc_main_on` — Toyota, Honda, Volkswagen MQB/MEB — the driver's own
+    switch arms the permission, which is the strongest evidence available and the reason those
+    brands' rx checks matter. Every other brand arms on openpilot's own engaged heartbeat instead
+    (`LATERAL_ENGAGE_ARM_HOST` in `opendbc/safety/moonpilot/lateral_engage.h`), which is what makes
+    the coverage universal: the car corroborates nothing there, and the same trust sunnypilot's MADS
+    places in `heartbeat_engaged_mads` is taken deliberately, because the alternative is a CAN
+    decode per brand, each one a signal hunt validated on that car.
   - The decision to be half-engaged is fixed at construction, like the fork's other behavior
     toggles: the module reads its param once, and the panel row says a restart is needed.
   - No fresh permission is invented for the acceleration side. `controlsAllowed` keeps upstream's
@@ -65,9 +76,20 @@ Scope, and the ceilings that come with it:
 """
 
 from opendbc.car.structs import car
+from opendbc.car.chrysler.values import ChryslerSafetyFlags
+from opendbc.car.ford.values import FordSafetyFlags
+from opendbc.car.gm.values import GMSafetyFlags
 from opendbc.car.honda.values import HondaSafetyFlags
+from opendbc.car.hyundai.values import HyundaiSafetyFlags
+from opendbc.car.mazda.values import MazdaSafetyFlags
+from opendbc.car.mg.values import MgSafetyFlags
+from opendbc.car.nissan.values import NissanSafetyFlags
+from opendbc.car.psa.values import PsaSafetyFlags
+from opendbc.car.rivian.values import RivianSafetyFlags
+from opendbc.car.subaru.values import SubaruSafetyFlags
+from opendbc.car.tesla.values import TeslaSafetyFlags
 from opendbc.car.toyota.values import ToyotaFlags, ToyotaSafetyFlags
-from opendbc.car.volkswagen.values import VolkswagenFlags, VolkswagenSafetyFlags
+from opendbc.car.volkswagen.values import VolkswagenSafetyFlags
 from openpilot.cereal import log
 from openpilot.common.params import Params
 from openpilot.selfdrive.selfdrived.events import ET
@@ -98,16 +120,32 @@ SUPPRESSED_EVENTS = (EventName.pcmDisable, EventName.pedalPressed, EventName.but
 # The brands the forked safety layer carries the permission for, and the safety-param bit that
 # turns it on for each. One row per brand, and the bit is a wire contract with that brand's own
 # mode header -- `HONDA_PARAM_LATERAL_ENGAGE`, `TOYOTA_PARAM_LATERAL_ENGAGE`,
-# `FLAG_VOLKSWAGEN_LATERAL_ENGAGE` -- so the two must change together (opendbc_repo/AGENTS.md).
+# `FLAG_VOLKSWAGEN_LATERAL_ENGAGE`, and one `<BRAND>_PARAM_LATERAL_ENGAGE` per row below -- so the
+# two must change together: `moonpilot/tests/test_engage.py` reads the headers and fails if a row
+# drifts from the constant beside it.
 #
-# What a brand needs to be listed: its safety rx hook must decode the cruise main switch into
-# `acc_main_on`, and the message carrying it must already be rx-checked. Toyota's the fork added;
-# Honda's and Volkswagen's are upstream's own, which is why neither needs an rx check of its own.
-# Everyone else needs that decode written and its rate validated on the car.
+# Every brand openpilot drives is listed, because the permission no longer depends on a car signal
+# to arm. Three of them arm on the car's own cruise main switch and so do need that decode in
+# their rx hook, with the message rx-checked at pandad's 10 Hz minimum: Toyota, Honda, and
+# Volkswagen. Volkswagen's four platforms are one entry because the flag is shared, though only
+# MQB and MEB are switch-armed there — PQ populates `acc_main_on` only under openpilot
+# longitudinal control and MLB never does, so both arm on the host like every other brand
+# (`LATERAL_ENGAGE_ARM_HOST` in `opendbc/safety/moonpilot/lateral_engage.h`).
 LATERAL_ENGAGE_FLAGS = {
   'toyota': ToyotaSafetyFlags.LATERAL_ENGAGE,
   'honda': HondaSafetyFlags.LATERAL_ENGAGE,
   'volkswagen': VolkswagenSafetyFlags.LATERAL_ENGAGE,
+  'chrysler': ChryslerSafetyFlags.LATERAL_ENGAGE,
+  'ford': FordSafetyFlags.LATERAL_ENGAGE,
+  'gm': GMSafetyFlags.LATERAL_ENGAGE,
+  'hyundai': HyundaiSafetyFlags.LATERAL_ENGAGE,
+  'mazda': MazdaSafetyFlags.LATERAL_ENGAGE,
+  'mg': MgSafetyFlags.LATERAL_ENGAGE,
+  'nissan': NissanSafetyFlags.LATERAL_ENGAGE,
+  'psa': PsaSafetyFlags.LATERAL_ENGAGE,
+  'rivian': RivianSafetyFlags.LATERAL_ENGAGE,
+  'subaru': SubaruSafetyFlags.LATERAL_ENGAGE,
+  'tesla': TeslaSafetyFlags.LATERAL_ENGAGE,
 }
 
 
@@ -128,17 +166,15 @@ def _unsupported_reason(CP) -> str | None:
     # this itself; `_available` only ever sees the real thing, from card and selfdrived.
     return None
   if CP.brand not in LATERAL_ENGAGE_FLAGS:
-    return "Toyota, Lexus, Honda or Volkswagen only"
+    # A brand the safety layer has no bit for. Every brand openpilot drives is listed, so this is
+    # the non-car platforms (body, mock) rather than a supported car.
+    return "not supported on this car"
   if CP.passive:
     return "not in dashcam mode"
   if not CP.pcmCruise:
     return "stock ACC only"
   if CP.brand == 'toyota' and CP.flags & ToyotaFlags.UNSUPPORTED_DSU:
     # Those read the main switch out of DSU_CRUISE at 5 Hz, below panda's 10 Hz rx-check minimum.
-    return "not supported on this car"
-  if CP.brand == 'volkswagen' and CP.flags & (VolkswagenFlags.PQ | VolkswagenFlags.MLB):
-    # Their safety hooks never set `acc_main_on` in the stock-ACC configuration this feature is
-    # for: PQ's is set only under openpilot longitudinal control, and MLB's is not set at all.
     return "not supported on this car"
   return None
 
@@ -155,8 +191,7 @@ def _torque_steered(CP) -> bool:
   angle- or curvature-steered car never reaches the torque branch however its tuning reads
   (openpilot/selfdrive/controls/controlsd.py:64-71).
   """
-  return (CP.steerControlType not in (car.CarParams.SteerControlType.angle, car.CarParams.SteerControlType.curvature)
-          and CP.lateralTuning.which() == 'torque')
+  return CP.steerControlType not in (car.CarParams.SteerControlType.angle, car.CarParams.SteerControlType.curvature) and CP.lateralTuning.which() == 'torque'
 
 
 def car_unavailable_reason(feature: Feature, CP) -> str | None:

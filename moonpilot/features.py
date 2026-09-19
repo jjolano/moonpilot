@@ -75,7 +75,7 @@ SLAM = Feature(
 LATERAL_ENGAGE = Feature(
   key="MoonpilotLateralEngage",
   title="lateral engagement",
-  description="Steer from the main switch alone; ACC owns speed once set. Brake, gas or ACC cancel no longer disengage. Toyota/Lexus, Honda, VW. Restart.",
+  description="Steer from the main switch; brake, gas and cancel keep steering. Where panda cannot read the switch, the host's claim is trusted. Restart.",
   offroad_only=True,
 )
 

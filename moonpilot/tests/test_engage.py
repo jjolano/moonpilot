@@ -5,12 +5,13 @@ upstream's own `StateMachine`, so "half-engaged" is asserted as the (state, enab
 triple selfdrived would publish, not as a set of events the module happened to produce.
 """
 
+import re
 import unittest
+from pathlib import Path
 from typing import cast
 
 from opendbc.car.structs import car
-from opendbc.car.honda.values import HondaSafetyFlags
-from opendbc.car.toyota.values import ToyotaFlags, ToyotaSafetyFlags
+from opendbc.car.toyota.values import ToyotaFlags
 from opendbc.car.volkswagen.values import VolkswagenFlags, VolkswagenSafetyFlags
 from openpilot.cereal import log
 from openpilot.common.params import Params
@@ -19,12 +20,66 @@ from openpilot.selfdrive.selfdrived.events import ET, EVENTS, Events
 from openpilot.selfdrive.selfdrived.state import SOFT_DISABLE_TIME, StateMachine
 
 from moonpilot.features import LATERAL_ENGAGE, LONGITUDINAL, SLAM, TORQUE_LATERAL
-from moonpilot.engage import (LateralEngage, car_unavailable_reason, moonpilot_actuator_gate,
-                              moonpilot_engage, moonpilot_engage_safety_param)
+from moonpilot.engage import (
+  LATERAL_ENGAGE_FLAGS,
+  LateralEngage,
+  car_unavailable_reason,
+  moonpilot_actuator_gate,
+  moonpilot_engage,
+  moonpilot_engage_safety_param,
+)
 
 ButtonType = car.CarState.ButtonEvent.Type
 EventName = log.OnroadEvent.EventName
 State = log.SelfdriveState.OpenpilotState
+
+ROOT = Path(__file__).resolve().parents[2]
+MODES_DIR = ROOT / "opendbc_repo" / "opendbc" / "safety" / "modes"
+
+# `<NAME> = <expr>;` as the safety modes declare their param bits, and their `#define NAME VALUE`
+# form, which is how the modes that had no param reader at all spell it
+C_CONSTANT_RE = re.compile(r"\b([A-Z0-9_]+)\s*=\s*([^;]+);")
+C_DEFINE_RE = re.compile(r"#define\s+([A-Z0-9_]+)\s+([0-9A-Za-z_]+)\s*$", re.MULTILINE)
+
+
+def _mode_constant(brand: str) -> str:
+  """The name of the constant that brand's safety mode reads its lateral-engage bit from."""
+  return 'FLAG_VOLKSWAGEN_LATERAL_ENGAGE' if brand == 'volkswagen' else f'{brand.upper()}_PARAM_LATERAL_ENGAGE'
+
+
+def _declared_bits() -> set[str]:
+  """Every `*LATERAL_ENGAGE` constant the safety modes declare, in either declaration form."""
+  names: set[str] = set()
+  for path in sorted(MODES_DIR.glob("*.h")):
+    text = path.read_text()
+    for name, _ in (*C_CONSTANT_RE.findall(text), *C_DEFINE_RE.findall(text)):
+      if name.endswith("LATERAL_ENGAGE"):
+        names.add(name)
+  return names
+
+
+def _c_int(expr: str, constants: dict[str, str]) -> int:
+  """The integer a C constant's right-hand side denotes, for the shapes the fork's bits use:
+  a literal, a shift by a literal, and either of those through one named constant."""
+  expr = expr.strip()
+  if expr.startswith("(") and expr.endswith(")"):
+    return _c_int(expr[1:-1], constants)
+  if "<<" in expr:
+    left, right = expr.split("<<", 1)
+    return _c_int(left, constants) << _c_int(right, constants)
+  literal = expr.rstrip("uUlL")
+  return int(literal) if literal.isdigit() else _c_int(constants[expr], constants)
+
+
+def _mode_bit(name: str) -> int:
+  """`name`'s value as the mode headers declare it, searched across the whole modes directory so a
+  brand's bit may live in its own header or in a shared one."""
+  for path in sorted(MODES_DIR.glob("*.h")):
+    text = path.read_text()
+    constants = dict(C_CONSTANT_RE.findall(text)) | dict(C_DEFINE_RE.findall(text))
+    if name in constants:
+      return _c_int(constants[name], constants)
+  raise AssertionError(f"no safety mode declares {name}")
 
 
 class FakeParams:
@@ -41,8 +96,17 @@ def _params(on=True) -> Params:
   return cast(Params, FakeParams(on))
 
 
-def _cp(brand='toyota', pcm_cruise=True, flags=0, safety_param=73, safety_configs=1, passive=False,
-        lateral_tuning='pid', steer_control_type=None, openpilot_longitudinal=False):
+def _cp(
+  brand='toyota',
+  pcm_cruise=True,
+  flags=0,
+  safety_param=73,
+  safety_configs=1,
+  passive=False,
+  lateral_tuning='pid',
+  steer_control_type=None,
+  openpilot_longitudinal=False,
+):
   """A real CarParams message, so the safety-param write is the one card actually does."""
   cp = car.CarParams.new_message()
   cp.brand = brand
@@ -50,8 +114,7 @@ def _cp(brand='toyota', pcm_cruise=True, flags=0, safety_param=73, safety_config
   cp.passive = passive
   cp.flags = int(flags)
   cp.lateralTuning.init(lateral_tuning)
-  cp.steerControlType = (car.CarParams.SteerControlType.torque if steer_control_type is None
-                         else steer_control_type)
+  cp.steerControlType = car.CarParams.SteerControlType.torque if steer_control_type is None else steer_control_type
   cp.openpilotLongitudinalControl = openpilot_longitudinal
   configs = cp.init('safetyConfigs', safety_configs)
   for c in configs:
@@ -78,26 +141,31 @@ LKAS_PRESS = ((ButtonType.lkas, True), (ButtonType.lkas, False))
 
 
 class TestEngageSafetyParam(unittest.TestCase):
-  # One row per brand the gate accepts, with the bit its own mode header reads. A flag that did not
-  # match the C would be a param the car never enables, so the two are tested together.
-  BRAND_FLAGS = (('toyota', ToyotaSafetyFlags.LATERAL_ENGAGE, 0xFF),
-                 ('honda', HondaSafetyFlags.LATERAL_ENGAGE, None),
-                 ('volkswagen', VolkswagenSafetyFlags.LATERAL_ENGAGE, None))
-
+  # One row per brand the gate accepts, taken from the table itself, so a brand added without its
+  # bit reaching the param is caught here. `test_engage.py`'s wiring test holds the table to the C
+  # constants.
   def test_available_car_gets_the_flag(self):
-    for brand, flag, mask in self.BRAND_FLAGS:
+    for brand, flag in LATERAL_ENGAGE_FLAGS.items():
       with self.subTest(brand=brand):
-        cp = _cp(brand=brand)
+        # Built with an empty param, so the result is the fork's bit and nothing else: a fork that
+        # wrote a second bit, or one that wrote the wrong bit, fails here.
+        cp = _cp(brand=brand, safety_param=0)
         moonpilot_engage_safety_param(cp, _params(on=True))
 
         param = cp.safetyConfigs[0].safetyParam
-        self.assertEqual(param, 73 | int(flag))
-        # Nothing else of the fork's: the flag is the only bit added over the car's own param.
-        self.assertEqual(param & ~(mask or 0xFFFF), int(flag) & ~(mask or 0xFFFF))
+        self.assertEqual(param, int(flag))
 
         # Idempotent, so a second call cannot corrupt the param
         moonpilot_engage_safety_param(cp, _params(on=True))
         self.assertEqual(cp.safetyConfigs[0].safetyParam, param)
+
+  def test_the_volkswagen_platforms_that_used_to_be_excluded_get_it_too(self):
+    """PQ and MLB are host-armed, so nothing about their missing main-switch decode keeps them out."""
+    for flags in (VolkswagenFlags.PQ, VolkswagenFlags.MLB):
+      with self.subTest(flags=flags):
+        cp = _cp(brand='volkswagen', flags=flags)
+        moonpilot_engage_safety_param(cp, _params(on=True))
+        self.assertEqual(cp.safetyConfigs[0].safetyParam, 73 | int(VolkswagenSafetyFlags.LATERAL_ENGAGE))
 
   def test_param_off_leaves_carparams_alone(self):
     cp = _cp()
@@ -106,17 +174,13 @@ class TestEngageSafetyParam(unittest.TestCase):
 
   def test_out_of_scope_cars_are_untouched(self):
     for cp in (
-      _cp(brand='hyundai'),
+      _cp(brand='fakebrand'),
       _cp(pcm_cruise=False),
       # Card replaces safetyConfigs with a noOutput config before the seam runs, so a
       # passive car's config must stay untouched however Toyota-shaped the params look
       _cp(passive=True),
       _cp(flags=ToyotaFlags.UNSUPPORTED_DSU),
       _cp(flags=ToyotaFlags.TSS2 | ToyotaFlags.UNSUPPORTED_DSU),
-      # Volkswagen's other two platforms: their safety hooks never set acc_main_on in the
-      # stock-ACC configuration this feature is for
-      _cp(brand='volkswagen', flags=VolkswagenFlags.PQ),
-      _cp(brand='volkswagen', flags=VolkswagenFlags.MLB),
     ):
       moonpilot_engage_safety_param(cp, _params(on=True))
       self.assertEqual(cp.safetyConfigs[0].safetyParam, 73, cp.flags)
@@ -132,11 +196,10 @@ class TestEngageScope(unittest.TestCase):
   def test_inert_when_out_of_scope_or_off(self):
     for cp, params in (
       (_cp(), _params(on=False)),
-      (_cp(brand='hyundai'), _params(on=True)),
+      (_cp(brand='fakebrand'), _params(on=True)),
       (_cp(pcm_cruise=False), _params(on=True)),
       (_cp(passive=True), _params(on=True)),
       (_cp(flags=ToyotaFlags.UNSUPPORTED_DSU), _params(on=True)),
-      (_cp(brand='volkswagen', flags=VolkswagenFlags.PQ), _params(on=True)),
     ):
       engage = moonpilot_engage(cp, params)
       self.assertFalse(engage.enabled)
@@ -171,11 +234,10 @@ class TestActuatorGate(unittest.TestCase):
     # through whatever the panda says, including saying nothing at all.
     for cp, params in (
       (_cp(), _params(on=False)),
-      (_cp(brand='hyundai'), _params(on=True)),
+      (_cp(brand='fakebrand'), _params(on=True)),
       (_cp(pcm_cruise=False), _params(on=True)),
       (_cp(passive=True), _params(on=True)),
       (_cp(flags=ToyotaFlags.UNSUPPORTED_DSU), _params(on=True)),
-      (_cp(brand='volkswagen', flags=VolkswagenFlags.PQ), _params(on=True)),
     ):
       gate = moonpilot_actuator_gate(cp, params)
       for states in ([], [_ps()], [_ps(controls_allowed=True)], [_ps(controls_allowed_lateral=True)]):
@@ -476,29 +538,46 @@ class TestCarGate(unittest.TestCase):
   """The car-side gate, which is also what the settings panels show a driver."""
 
   def test_in_scope_cars_have_no_reason(self):
-    for brand in ('toyota', 'honda', 'volkswagen'):
+    """Every brand the safety layer carries a bit for, on a stock-ACC car, is in scope.
+
+    The permission no longer needs a car signal — a brand whose mode decodes no cruise main switch
+    arms on openpilot's own engaged heartbeat — so the brand list is now the whole of what could
+    keep a car out of the feature on the panda's side.
+    """
+    for brand in LATERAL_ENGAGE_FLAGS:
       with self.subTest(brand=brand):
         self.assertIsNone(car_unavailable_reason(LATERAL_ENGAGE, _cp(brand=brand)))
 
   def test_each_out_of_scope_car_says_why(self):
-    self.assertEqual(car_unavailable_reason(LATERAL_ENGAGE, _cp(brand='hyundai')),
-                     "Toyota, Lexus, Honda or Volkswagen only")
+    self.assertEqual(car_unavailable_reason(LATERAL_ENGAGE, _cp(brand='fakebrand')), "not supported on this car")
     self.assertEqual(car_unavailable_reason(LATERAL_ENGAGE, _cp(passive=True)), "not in dashcam mode")
     self.assertEqual(car_unavailable_reason(LATERAL_ENGAGE, _cp(pcm_cruise=False)), "stock ACC only")
-    self.assertEqual(car_unavailable_reason(LATERAL_ENGAGE, _cp(flags=ToyotaFlags.UNSUPPORTED_DSU)),
-                     "not supported on this car")
-    # Volkswagen's two platforms without a stock-ACC main switch in the safety layer
+    self.assertEqual(car_unavailable_reason(LATERAL_ENGAGE, _cp(flags=ToyotaFlags.UNSUPPORTED_DSU)), "not supported on this car")
+
+  def test_the_platforms_that_used_to_be_excluded_are_in_scope(self):
+    """Volkswagen PQ and MLB decode no usable main switch, which is why they are host-armed.
+
+    Their exclusion was about the safety layer's arm, not about the driver: the panda now arms
+    those cars on openpilot's own engagement, so the rows are live on them.
+    """
     for flags in (VolkswagenFlags.PQ, VolkswagenFlags.MLB):
-      self.assertEqual(car_unavailable_reason(LATERAL_ENGAGE, _cp(brand='volkswagen', flags=flags)),
-                       "not supported on this car")
+      with self.subTest(flags=flags):
+        self.assertIsNone(car_unavailable_reason(LATERAL_ENGAGE, _cp(brand='volkswagen', flags=flags)))
 
   def test_the_panel_reason_and_the_behavior_are_the_same_gate(self):
     """A row that says a car cannot do it while the feature runs on it would be worse than silence."""
-    for cp in (_cp(), _cp(brand='honda'), _cp(brand='volkswagen'), _cp(brand='hyundai'), _cp(passive=True),
-               _cp(pcm_cruise=False), _cp(flags=ToyotaFlags.UNSUPPORTED_DSU),
-               _cp(brand='volkswagen', flags=VolkswagenFlags.PQ)):
-      self.assertEqual(car_unavailable_reason(LATERAL_ENGAGE, cp) is None,
-                       moonpilot_engage(cp, _params(on=True)).enabled)
+    for cp in (
+      _cp(),
+      _cp(brand='honda'),
+      _cp(brand='volkswagen'),
+      _cp(brand='hyundai'),
+      _cp(passive=True),
+      _cp(pcm_cruise=False),
+      _cp(flags=ToyotaFlags.UNSUPPORTED_DSU),
+      _cp(brand='fakebrand'),
+      _cp(brand='volkswagen', flags=VolkswagenFlags.PQ),
+    ):
+      self.assertEqual(car_unavailable_reason(LATERAL_ENGAGE, cp) is None, moonpilot_engage(cp, _params(on=True)).enabled)
 
   def test_torque_steered_cars_have_no_reason(self):
     # The branch, not the brand: `TORQUE_LATERAL`'s seam has no brand list, unlike `LATERAL_ENGAGE`'s.
@@ -506,20 +585,18 @@ class TestCarGate(unittest.TestCase):
       self.assertIsNone(car_unavailable_reason(TORQUE_LATERAL, cp))
 
   def test_cars_off_the_torque_branch_say_why(self):
-    self.assertEqual(car_unavailable_reason(TORQUE_LATERAL, _cp(lateral_tuning='pid')),
-                     "torque-steered cars only")
+    self.assertEqual(car_unavailable_reason(TORQUE_LATERAL, _cp(lateral_tuning='pid')), "torque-steered cars only")
     # The case a `lateralTuning`-only check gets wrong: controlsd tests `steerControlType` first
     # (`controlsd.py:64-71`), so these never reach the torque branch however their tuning reads.
     for steer_control_type in (car.CarParams.SteerControlType.angle, car.CarParams.SteerControlType.curvature):
       with self.subTest(steer_control_type=steer_control_type):
-        self.assertEqual(car_unavailable_reason(TORQUE_LATERAL,
-                                                _cp(lateral_tuning='torque', steer_control_type=steer_control_type)),
-                         "torque-steered cars only")
+        self.assertEqual(
+          car_unavailable_reason(TORQUE_LATERAL, _cp(lateral_tuning='torque', steer_control_type=steer_control_type)), "torque-steered cars only"
+        )
 
   def test_longitudinal_needs_openpilot_longitudinal_control(self):
     self.assertIsNone(car_unavailable_reason(LONGITUDINAL, _cp(openpilot_longitudinal=True)))
-    self.assertEqual(car_unavailable_reason(LONGITUDINAL, _cp(openpilot_longitudinal=False)),
-                     "openpilot-longitudinal cars only")
+    self.assertEqual(car_unavailable_reason(LONGITUDINAL, _cp(openpilot_longitudinal=False)), "openpilot-longitudinal cars only")
 
   def test_features_without_a_car_requirement_are_unaffected(self):
     self.assertIsNone(car_unavailable_reason(SLAM, _cp(brand='hyundai')))
@@ -529,6 +606,30 @@ class TestCarGate(unittest.TestCase):
     for feature in (LATERAL_ENGAGE, TORQUE_LATERAL, LONGITUDINAL):
       with self.subTest(feature=feature.key):
         self.assertIsNone(car_unavailable_reason(feature, None))
+
+
+class TestLateralEngageFlagWiring(unittest.TestCase):
+  """The Python bits and the safety modes' constants are one wire contract each.
+
+  A drifted row is a param the car never enables: openpilot would OR a bit into `safetyParam` that
+  the mode does not read, and the row would read enabled while the panda granted nothing. The
+  constant is read out of the mode headers rather than imported, because that is where the mode
+  declares it; the `LATERAL_ENGAGE` mirror in `opendbc/car/<brand>/values.py` is the other half of
+  each pair, which is what `LATERAL_ENGAGE_FLAGS` is built from.
+  """
+
+  def test_every_python_bit_matches_its_mode_constant(self):
+    for brand, flag in LATERAL_ENGAGE_FLAGS.items():
+      with self.subTest(brand=brand):
+        self.assertEqual(int(flag), _mode_bit(_mode_constant(brand)), f"{brand}'s LATERAL_ENGAGE bit drifted from its safety mode header")
+
+  def test_every_mode_bit_has_a_python_row(self):
+    """A bit the safety layer carries with no row here is a permission nothing ever arms."""
+    declared = _declared_bits()
+    wired = {name.split('_PARAM_LATERAL_ENGAGE')[0].lower() for name in declared if name.endswith('_PARAM_LATERAL_ENGAGE')}
+    if 'FLAG_VOLKSWAGEN_LATERAL_ENGAGE' in declared:
+      wired.add('volkswagen')  # the one shared flag, named after the brand rather than the mode
+    self.assertEqual(wired, set(LATERAL_ENGAGE_FLAGS))
 
 
 class TestHalfEngagementBanner(unittest.TestCase):

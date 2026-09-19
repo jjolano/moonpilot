@@ -14,8 +14,11 @@
     // correction is not validated until someone drives it.
     {"MoonpilotSlam", {PERSISTENT, BOOL, "0"}},
     {"MoonpilotTailscale", {PERSISTENT, BOOL, "0"}},
-    // Off by default: it changes the safety model, and the PCM_CRUISE_2 rate on
-    // the car is not validated until someone drives it.
+    // Off by default: it changes the safety model. The permission is granted in
+    // the forked safety layer for every brand, arming on the car's own cruise
+    // main switch where the mode decodes it (Toyota, Honda, Volkswagen MQB/MEB)
+    // and on openpilot's own engaged heartbeat everywhere else, with neither
+    // rate validated on a car until someone drives one.
     {"MoonpilotLateralEngage", {PERSISTENT, BOOL, "0"}},
     // Off by default: it adds braking authority derived from the model's
     // predicted path, and the curve target is not validated until someone

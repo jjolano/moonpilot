@@ -52,8 +52,10 @@ class TestMiciValue(unittest.TestCase):
 
   def test_unsupported_car_carries_the_cars_own_reason(self):
     # A bug here is the car gate falling back to the placeholder, which tells the driver nothing.
-    with mock.patch.object(settings_mici, "ui_state", SimpleNamespace(CP=_cp(brand="hyundai"))):
-      self.assertEqual(settings_mici._unavailable_value(LATERAL_ENGAGE), "Toyota, Lexus, Honda or Volkswagen only")
+    # A dashcam-mode car is the case that survives every brand being in scope: the feature is off
+    # there because the panda has no car config to arm, not because of a dependency.
+    with mock.patch.object(settings_mici, "ui_state", SimpleNamespace(CP=_cp(passive=True))):
+      self.assertEqual(settings_mici._unavailable_value(LATERAL_ENGAGE), "not in dashcam mode")
 
   def test_unloaded_car_params_is_not_a_verdict(self):
     # The panel renders before CarParams lands; a bug here grays out and mislabels every row at boot.
