@@ -230,8 +230,10 @@ class TestEngagePolicy(unittest.TestCase):
     self.assertFalse(events.contains(ET.USER_DISABLE))
 
   def test_an_authoritative_disable_latches_until_rearmed(self):
-    # Cancel from the wheel: USER_DISABLE, and the engage request stops
-    events = self._run(_cs(available=True), extra_events=(EventName.buttonCancel,))
+    # The main switch dropping, which a stock-ACC car raises as `wrongCarMode` -- a USER_DISABLE.
+    # ACC's cancel button used to stand in here and no longer can, which is the point of
+    # `test_acc_cancel_leaves_the_steering_alone` below.
+    events = self._run(_cs(available=True), extra_events=(EventName.wrongCarMode,))
     self.assertTrue(EventName.buttonEnable not in events.events)
 
     # It stays latched across cycles, so the disable lasts longer than the frame it arrived in
@@ -241,6 +243,20 @@ class TestEngagePolicy(unittest.TestCase):
     # Setting ACC re-arms, which is the driver asking for the full stack
     events = self._run(_cs(available=True, enabled=True))
     self.assertTrue(EventName.buttonEnable in events.events)
+
+  def test_acc_cancel_leaves_the_steering_alone(self):
+    """Cancel stops the car's ACC; it is not a request to stop driving.
+
+    Every brand but Hyundai turns a cancel press into `buttonCancel` (`car_events.py`), so without
+    the suppression a cancel would disengage and latch where Toyota -- whose wheel emits no cancel
+    at all -- is unaffected. The event is the whole of what this module sees, so what it does about
+    the press is filter it. The LKAS button's own `buttonCancel`, added after that filter, is what
+    still turns the state off; `test_lkas_button_toggles` pins that half.
+    """
+    events = self._run(_cs(available=True), extra_events=(EventName.buttonCancel,))
+    self.assertNotIn(EventName.buttonCancel, events.events)
+    self.assertFalse(events.contains(ET.USER_DISABLE))
+    self.assertTrue(EventName.buttonEnable in events.events, "still asking to engage")
 
   def test_lkas_button_toggles(self):
     # Press with the release in the same frame: one toggle, not two
@@ -376,7 +392,11 @@ class TestScriptedDrive(unittest.TestCase):
     if acc_set and not self.acc_set:
       self.events.add(EventName.pcmEnable)
     elif self.acc_set and not acc_set:
+      # A real cancel is both of these at once: the ACC-off edge, and `buttonCancel` from
+      # car_events. Emitting only the first is what let the scripted drive read a cancel as
+      # harmless while a car would have latched.
       self.events.add(EventName.pcmDisable)
+      self.events.add(EventName.buttonCancel)
     self.acc_set = acc_set
 
     cs.cruiseState.available = main_switch

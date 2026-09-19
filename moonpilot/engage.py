@@ -20,11 +20,12 @@ What the module does at runtime:
     client that produced them. A frame the safety layer rejects is silent to the sender, so a
     half-engaged car has to command nothing the panda will refuse — see `ActuatorGate`.
   - `LateralEngage.update`, called from selfdrived once every event source has contributed, is
-    the engage/disengage policy. It suppresses the two events whose whole purpose is the behavior
-    being replaced — `pcmDisable` (level-triggered whenever stock ACC is off) and `pedalPressed`
-    (the brake/gas disengage) — and asks to engage when the driver turns the cruise main switch on.
-    Disengaging is upstream's: the cruise main switch, the LKAS button and every fault still land
-    in `wrongCarMode`, `buttonCancel` or a disable event. An authoritative disable — `USER_DISABLE`
+    the engage/disengage policy. It suppresses the three events whose whole purpose is the behavior
+    being replaced — `pcmDisable` (level-triggered whenever stock ACC is off), `pedalPressed` (the
+    brake/gas disengage) and `buttonCancel` (ACC's cancel button) — and asks to engage when the
+    driver turns the cruise main switch on. Disengaging is upstream's: the main switch, a fault and
+    a lane-keeping fault still land in `wrongCarMode` or a disable event, and the LKAS button's own
+    press adds the one `buttonCancel` that survives the filter. An authoritative disable — `USER_DISABLE`
     or `IMMEDIATE_DISABLE`, which on this car is the main switch, a steer fault or a lane-keeping
     fault — latches the half-engaged state off until the driver re-arms with the LKAS button or by
     cycling the main switch; a soft disable is left to upstream's own state machine, which returns
@@ -35,16 +36,11 @@ What the module does at runtime:
     explained the disengagement with are the ones filtered out. Keyed on the latch alone, so a
     `NO_ENTRY` hold or a soft disable, which upstream already alerts on, does not double up.
 
-    Two of upstream's disengages are inert here rather than suppressed, and the first of the two
-    is a per-brand fact rather than a fork choice. Toyota's carstate emits no `ButtonType.cancel` at
-    all (its wheel wires only the LKAS and distance buttons), so an ACC cancel cannot reach
-    openpilot as `buttonCancel` and the driver's cancel drops to the half-engaged state with
-    steering intact. Honda and Volkswagen do emit it, and `car_events.py` turns any
-    `ButtonType.cancel` press into `buttonCancel` — a `USER_DISABLE` — for every brand but Hyundai,
-    so on those two a cancel disengages and latches like any other authoritative disable. The
-    second is `steerDisengage` — the panda rule's own `steering_disengage` — a signal only Tesla's
-    rx hook ever sets, so on all three brands a driver's torque is upstream's blending path rather
-    than a disarm.
+    One of upstream's disengages is inert here rather than suppressed: `steerDisengage` — the panda
+    rule's own `steering_disengage` — is a signal only Tesla's rx hook ever sets, so on all three
+    brands a driver's torque is upstream's blending path rather than a disarm. Cancel used to be a
+    per-brand fact worth this paragraph; it is a suppression now (see `SUPPRESSED_EVENTS`), which is
+    the same behavior on all three brands instead of a coincidence of which wheel is wired.
 
 Scope, and the ceilings that come with it:
 
@@ -78,11 +74,23 @@ from moonpilot.features import LATERAL_ENGAGE, Feature, enabled
 ButtonType = car.CarState.ButtonEvent.Type
 EventName = log.OnroadEvent.EventName
 
-# The two events the half-engaged state is defined against: stock ACC being off (level-triggered,
-# so it is present in every frame the driver has not set ACC) and a brake or gas tap. Everything
-# else upstream raises keeps working — in particular gas keeps its softer `gasPressedOverride`,
-# which is an override rather than a disable, so steering continues through it.
-SUPPRESSED_EVENTS = (EventName.pcmDisable, EventName.pedalPressed)
+# The three events the half-engaged state is defined against: stock ACC being off (level-triggered,
+# so it is present in every frame the driver has not set ACC), a brake or gas tap, and ACC's cancel
+# button. Cancel belongs in that list for the reason the feature exists: it stops the car's ACC, not
+# the steering, and it is the one of the three a driver is most likely to press while expecting
+# openpilot to keep the lane. Honda and Volkswagen emit `ButtonType.cancel` -- Toyota's wheel emits
+# no cancel at all -- and `car_events.py` turns any such press into `buttonCancel` for every brand
+# but Hyundai, so suppressing the event is what makes cancel behave the same way on all three.
+#
+# The event carries `ET.NO_ENTRY` as well as `ET.USER_DISABLE`, so suppressing it also drops the
+# momentary "cancel blocks a new engage" hold. That is the same statement from the other side: on a
+# half-engaged car cancel is not a request to stop driving, and the driver's own off switch is the
+# LKAS button, which is still honored outright (see `update`).
+#
+# Everything else upstream raises keeps working — in particular gas keeps its softer
+# `gasPressedOverride`, which is an override rather than a disable, so steering continues through
+# it.
+SUPPRESSED_EVENTS = (EventName.pcmDisable, EventName.pedalPressed, EventName.buttonCancel)
 
 # The brands the forked safety layer carries the permission for, and the safety-param bit that
 # turns it on for each. One row per brand, and the bit is a wire contract with that brand's own
@@ -264,13 +272,21 @@ class LateralEngage:
     # Blocking has to disable through the first-class event rather than only dropping the engage
     # request, since the state machine leaves the enabled state on a disable event and on nothing
     # else.
-    if any(be.type == ButtonType.lkas and be.pressed for be in CS.buttonEvents):
+    lkas_pressed = any(be.type == ButtonType.lkas and be.pressed for be in CS.buttonEvents)
+    if lkas_pressed:
       self._blocked = not self._blocked
-      if self._blocked:
-        events.add(EventName.buttonCancel)
 
-    # The point of the feature: a brake or gas tap must not take the steering with it.
+    # The point of the feature: a brake or gas tap must not take the steering with it, and neither
+    # must ACC's cancel button.
     events.events = [e for e in events.events if e not in SUPPRESSED_EVENTS]
+
+    if lkas_pressed and self._blocked:
+      # Added after the filter, not with the rest of the button handling: this is the one
+      # `buttonCancel` that has to survive, because blocking has to disable through a first-class
+      # event rather than only dropping the engage request -- the state machine leaves the enabled
+      # state on a disable event and on nothing else. A latched car whose event was filtered would
+      # steer while the driver watched the button do nothing.
+      events.add(EventName.buttonCancel)
 
     if events.contains(ET.USER_DISABLE) or events.contains(ET.IMMEDIATE_DISABLE):
       # The main switch going off, a steer fault, and every authoritative disable latch it off

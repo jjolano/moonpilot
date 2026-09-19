@@ -571,7 +571,10 @@ struct PandaState @0xa7649e2575e4591e {
   # these fields are not used by openpilot, but they're
   # reserved for forks building alternate experiences.
   controlsAllowedLateral @38 :Bool;  # moonpilot seam: do not change @38 or its meaning. See AGENTS.md before editing.
-  controlsAllowedRESERVED2 @39 :Bool;
+  # moonpilot seam, see AGENTS.md: upstream's reserved slot for the longitudinal half of this
+  # split, named as sunnypilot names the same one. Always false on this fork -- full authority
+  # is @3, and the lateral grant this fork adds is @38.
+  controlsAllowedLongitudinal @39 :Bool;
 
   enum FaultStatus {
     none @0;

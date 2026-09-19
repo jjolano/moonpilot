@@ -75,7 +75,7 @@ SLAM = Feature(
 LATERAL_ENGAGE = Feature(
   key="MoonpilotLateralEngage",
   title="lateral engagement",
-  description="Steer from the main switch alone; ACC owns speed once set. Brake and gas no longer disengage. Toyota/Lexus, Honda, VW with stock ACC. Restart.",
+  description="Steer from the main switch alone; ACC owns speed once set. Brake, gas or ACC cancel no longer disengage. Toyota/Lexus, Honda, VW. Restart.",
   offroad_only=True,
 )
 
