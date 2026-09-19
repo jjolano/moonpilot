@@ -30,6 +30,7 @@ from openpilot.system.hardware.chestnut.monitoring import chestnut_state_thread
 from openpilot.system.hardware.chestnut.status import ChestnutStatus
 from openpilot.common.version import terms_version, training_version
 from openpilot.system.athena.registration import UNREGISTERED_DONGLE_ID
+from moonpilot.offroad import onroad_condition  # moonpilot seam, see AGENTS.md
 
 ThermalStatus = log.DeviceState.ThermalStatus
 NetworkType = log.DeviceState.NetworkType
@@ -205,6 +206,7 @@ def hardware_thread(end_event, hw_queue) -> None:
     "ignition": False,
     "not_onroad_cycle": True,
     "device_temp_good": True,
+    "moonpilot_onroad": True,  # moonpilot seam, see AGENTS.md
   }
   startup_conditions: dict[str, bool] = {}
   startup_conditions_prev: dict[str, bool] = {}
@@ -273,6 +275,9 @@ def hardware_thread(end_event, hw_queue) -> None:
       if onroad_conditions["ignition"]:
         onroad_conditions["ignition"] = False
         cloudlog.error("panda timed out onroad")
+
+    # moonpilot seam, see AGENTS.md
+    onroad_conditions["moonpilot_onroad"] = onroad_condition(params)
 
     # Run at 2Hz, plus either edge of ignition
     ign_edge = (started_ts is not None) != all(onroad_conditions.values())

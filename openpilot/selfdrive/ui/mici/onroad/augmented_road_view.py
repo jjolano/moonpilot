@@ -18,6 +18,7 @@ from openpilot.common.filter_simple import BounceFilter
 from openpilot.common.transformations.camera import DEVICE_CAMERAS, DeviceCameraConfig, view_frame_from_device_frame
 from openpilot.common.transformations.orientation import rot_from_euler
 from enum import IntEnum
+from moonpilot.ui.offroad_mode_mici import long_press  # moonpilot seam, see AGENTS.md
 
 OpState = log.SelfdriveState.OpenpilotState
 CALIBRATED = log.ExtrinsicsCalibration.Status.calibrated
@@ -158,6 +159,7 @@ class AugmentedRoadView(CameraView):
                                        alignment_vertical=TextAlignmentVertical.MIDDLE)
 
     self._fade_texture = gui_app.texture("icons_mici/onroad/onroad_fade.png")
+    self.set_long_press_callback(long_press)  # moonpilot seam, see AGENTS.md
 
   def is_swiping_left(self) -> bool:
     """Check if currently swiping left (for scroller to disable)."""

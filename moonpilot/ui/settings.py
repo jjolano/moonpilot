@@ -5,6 +5,7 @@ as unavailable instead of silently doing nothing."""
 from moonpilot import tailscale
 from moonpilot.engage import car_unavailable_reason
 from moonpilot.features import FEATURES, Feature, missing_modules, version, wanted
+from moonpilot.ui import offroad_mode
 from moonpilot.ui.tailscale_qr import TailscaleSignInDialog
 from openpilot.common.params import Params
 from openpilot.selfdrive.ui.ui_state import ui_state
@@ -53,6 +54,7 @@ class MoonpilotLayout(Widget):
       [
         text_item("version", version()),
         *(_feature_toggle(feature, self._params) for feature in FEATURES),
+        offroad_mode.row(self._params),
         # One row for tailscale's state and its sign-in: text, description and enabled are all
         # re-resolved every render, so it reads SIGN IN and is tappable exactly while a login URL
         # exists, and shows the state dimmed out otherwise. The description is where the URL and

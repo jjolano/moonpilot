@@ -13,6 +13,7 @@ from openpilot.system.ui.lib.application import gui_app
 from openpilot.common.transformations.camera import DEVICE_CAMERAS, DeviceCameraConfig, view_frame_from_device_frame
 from openpilot.common.transformations.orientation import rot_from_euler
 from moonpilot.ui.onroad import moonpilot_status_color  # moonpilot seam, see AGENTS.md
+from moonpilot.ui.offroad_mode import long_press  # moonpilot seam, see AGENTS.md
 
 OpState = log.SelfdriveState.OpenpilotState
 CALIBRATED = log.ExtrinsicsCalibration.Status.calibrated
@@ -49,6 +50,7 @@ class AugmentedRoadView(CameraView):
     self._hud_renderer = HudRenderer()
     self.alert_renderer = AlertRenderer()
     self.driver_state_renderer = DriverStateRenderer()
+    self.set_long_press_callback(long_press)  # moonpilot seam, see AGENTS.md
 
   def _render(self, rect):
     # Only render when system is started to avoid invalid data access

@@ -5,6 +5,7 @@ unreachable: the reason rides along as the always-visible sub-label instead."""
 from moonpilot import tailscale
 from moonpilot.engage import car_unavailable_reason
 from moonpilot.features import FEATURES, Feature, available, wanted
+from moonpilot.ui import offroad_mode_mici
 from moonpilot.ui.tailscale_qr_mici import TailscaleSignInDialogMici
 from openpilot.selfdrive.ui.mici.widgets.button import BigButton, BigParamControl
 from openpilot.selfdrive.ui.mici.widgets.dialog import BigDialog
@@ -33,7 +34,11 @@ class MoonpilotLayoutMici(NavScroller):
     self._tailscale = BigButton("tailscale")
     self._tailscale.set_click_callback(self._show_tailscale)
 
-    self._scroller.add_widgets([*[button for _, button in self._rows], self._tailscale])
+    # Same shape, and the same reason the value line is pushed: offroad mode is a device action
+    # whose label the manager and the ignition edge can change under the panel's feet.
+    self._offroad = offroad_mode_mici.row(self._params)
+
+    self._scroller.add_widgets([*[button for _, button in self._rows], self._offroad, self._tailscale])
     self._update_rows()
     ui_state.add_offroad_transition_callback(self._update_rows)
 
@@ -45,6 +50,7 @@ class MoonpilotLayoutMici(NavScroller):
     super()._update_state()
     # mici's values are pushed, not callable-resolved, so the state needs re-reading every frame.
     self._tailscale.set_value(tailscale.status_text(self._params)[0])
+    offroad_mode_mici.refresh(self._offroad, self._params)
 
   def _show_tailscale(self):
     # A QR while there is something to scan; otherwise the state detail, which does not fit the

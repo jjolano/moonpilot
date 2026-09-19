@@ -42,13 +42,15 @@ ALLOWED = {
   "openpilot/selfdrive/selfdrived/events.py": "the half-engagement banner",
   "openpilot/selfdrive/test/process_replay/process_replay.py": "moonpilotState in plannerd pubs",
   "openpilot/selfdrive/ui/ui_state.py": "moonpilotState subscription",
-  "openpilot/selfdrive/ui/onroad/augmented_road_view.py": "half-engaged border color",
+  "openpilot/selfdrive/ui/onroad/augmented_road_view.py": "half-engaged border color; offroad-mode hold gesture",
   "openpilot/selfdrive/ui/onroad/model_renderer.py": "lead path draw (tizi)",
+  "openpilot/selfdrive/ui/mici/onroad/augmented_road_view.py": "offroad-mode hold gesture (mici)",
   "openpilot/selfdrive/ui/mici/onroad/model_renderer.py": "lead path draw (mici)",
   "openpilot/selfdrive/ui/layouts/home.py": "brand string",
   "openpilot/selfdrive/ui/layouts/settings/settings.py": "moonpilot panel",
   "openpilot/selfdrive/ui/mici/layouts/home.py": "brand string",
   "openpilot/selfdrive/ui/mici/layouts/settings/settings.py": "moonpilot panel",
+  "openpilot/system/hardware/hardwared.py": "offroad mode member in onroad_conditions",
   "openpilot/system/manager/process_config.py": "MOONPILOT_PROCS",
   # The fork's own opendbc/panda: recorded as submodule pointer moves, so the paths of the
   # submodules themselves are the upstream paths here.

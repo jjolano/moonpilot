@@ -20,6 +20,7 @@ New fork behavior: write it under `moonpilot/`, hook it at the seam that already
 | `panda` (submodule) | `HEALTH_FLAG_CONTROLS_ALLOWED_LATERAL` in `board/health.h`, published in `board/main_comms.h` |
 | `opendbc_repo` (submodule) | the fork's safety layer: `opendbc/safety/moonpilot/lateral_engage.h`, `PCM_CRUISE_2` in `modes/toyota.h`, the 12 lateral reads in `lateral.h` |
 | `openpilot/common/params_keys.h` | `#include "moonpilot/params_keys.h"` — fork params, one row per key |
+| `openpilot/system/hardware/hardwared.py` | `onroad_conditions["moonpilot_onroad"]` — offroad mode holds the device offroad while the ignition is on |
 | `openpilot/system/manager/process_config.py` | `procs += MOONPILOT_PROCS` from `moonpilot/procs.py` |
 | `openpilot/cereal/custom.capnp` | `MoonpilotState` (upstream's reserved struct; never change the `@0x…` id) |
 | `openpilot/cereal/log.capnp` | `moonpilotState @107` event field; `PandaState.controlsAllowedLateral @38` and `controlsAllowedLongitudinal @39` — upstream's two slots reserved for forks, the first carrying this fork's lateral grant and the second named for the longitudinal half of the split, which this fork never populates |
@@ -35,8 +36,9 @@ New fork behavior: write it under `moonpilot/`, hook it at the seam that already
 | `openpilot/selfdrive/selfdrived/events.py` | `EventName.lateralEngageOff` — the half-engagement banner |
 | `openpilot/selfdrive/test/process_replay/process_replay.py` | `moonpilotState` in plannerd's `pubs` |
 | `openpilot/selfdrive/ui/ui_state.py` | `moonpilotState` subscription |
-| `openpilot/selfdrive/ui/onroad/augmented_road_view.py` | half-engaged border color from `moonpilot/ui/onroad.py`; the disengaged border color moves off blue |
+| `openpilot/selfdrive/ui/onroad/augmented_road_view.py` | half-engaged border color from `moonpilot/ui/onroad.py`; the disengaged border color moves off blue; the offroad-mode hold gesture |
 | `openpilot/selfdrive/ui/onroad/model_renderer.py` | lead path draw (tizi) |
+| `openpilot/selfdrive/ui/mici/onroad/augmented_road_view.py` | the offroad-mode hold gesture (mici) |
 | `openpilot/selfdrive/ui/mici/onroad/model_renderer.py` | lead path draw (mici); half-engaged lane-line color |
 | `openpilot/selfdrive/ui/layouts/home.py` | brand string (tizi) |
 | `openpilot/selfdrive/ui/mici/layouts/home.py` | brand label (mici) |
@@ -277,6 +279,70 @@ The permission itself is in the forked safety layer, `opendbc/safety/moonpilot/l
 - **A half-engaged car gets a color upstream had spent elsewhere, and that is `moonpilot/ui/onroad.py`'s whole job.** Upstream renders engagement as a palette keyed off `ui_state.status`, which is `selfdriveState.enabled` and nothing else: tizi's road-view border (`BORDER_COLORS`) and mici's lane lines (`LANE_LINE_COLORS`) each read disengaged / override / engaged. On a stock-ACC car that palette has always meant "openpilot steers and the ACC I set is holding speed", because openpilot never owns speed there — so half-engagement paints it with nobody holding speed, which is the one combination the car's visual grammar has no reading for, and the reading a driver is most likely to take from a lit-up car is that it is driving. Blue is the fork's answer, and the palette becomes one color per thing happening: **gray nothing on, blue steering without speed authority, green both** — blue taken from disengaged, which moves to a neutral gray (`0x3A3E40`, marked in `BORDER_COLORS`; it was `0x122839`, a dark navy). Leaving disengaged blue as well would have made the half-engaged state impossible to spot at a glance; a car doing nothing deserves the neutral reading and a car steering for you does not. Blue is painted only while **openpilot is the thing steering**, which is three conditions and no more. Something is on (`status != DISENGAGED` — not redundant with the grant below, because `selfdriveState` and `pandaStates` are separate messages, so for a frame or two after a disengage the last panda message still reports the grant). The safety layer is still granting lateral authority (`pandaStates.[].controlsAllowedLateral and not controlsAllowed` — the fork's own grant against stock ACC engagement, exact rather than inferred from `carState`, false on every car where the rule was never enabled). And **the driver is not steering** (`carState.steeringPressed`, which is what raises upstream's own `steerOverride`, so whatever makes a *fully* engaged car read as overridden makes a half-engaged car gray too; it cannot come from the safety layer, whose steering-override term is upstream's `steering_disengage`, set only by Tesla's rx hook). That last one is the whole point of the feature's honesty: blue would claim openpilot is steering while the driver's own hands are on the wheel doing the work. `gasPressedOverride` deliberately does **not** drop the color — in half-engagement the driver's foot owns the speed, so they are on the pedal much of the time and the car is steering for them throughout. Hence the predicate is not simply "status isn't OVERRIDE". For the frame where the driver's hands are on the wheel before `selfdriveState` has caught up, the fork returns the palette's own `OVERRIDE` color rather than `None`: deferring to upstream there would paint `ENGAGED` **green** on a car that is only steering, which is the reading the module exists to prevent, and in mici that same return is upstream's white lane color — each tree's own neutral, not a copy of it in fork code. Both call sites use the delegate shape (`... or BORDER_COLORS.get(status, ...)`), so upstream's expression stays on the line and `None` means it runs unchanged for every car that is not half-engaged — feature off, unavailable, or simply not one of the three brands. Deliberately **not** done by adding a fourth `UIStatus`: it is consumed as `== ENGAGED` or `.get(status, DISENGAGED)` in about eight places per tree, so a new value would paint mici's lane lines disengaged-black and tizi's border disengaged-gray while the car is steering. Only the two most salient channels are replaced — tizi's border, mici's lane lines; the DM arc, HUD `MAX` box, confidence ball, camera dim and wheel icon are left to upstream. `moonpilot/tests/test_onroad.py` pins the three conditions, the driver-steering neutral, the gas override and the fallback; the end-to-end values above were read from rendered frames of both trees.
 
 The ceiling is the car: **Toyota/Lexus, Honda and Volkswagen whose interface reports `CP.pcmCruise`**, not `passive`, and not `ToyotaFlags.UNSUPPORTED_DSU` (those read the main switch out of `DSU_CRUISE` at 5 Hz, below panda's 10 Hz rx-check minimum). That is the flag the gate tests, and on Honda and Volkswagen it is `not openpilotLongitudinalControl`, while **on Toyota it is a default that stays true under openpilot longitudinal control too** — so such a car is in scope and gets the steer-only half-engagement above, not an exclusion. `LATERAL_ENGAGE_FLAGS` in `moonpilot/engage.py` is the brand table and the gate both, so the row a driver sees and the behavior they get cannot disagree; it names the safety-param bit per brand, and those bits are a wire contract with each brand's own mode header (`HONDA_PARAM_LATERAL_ENGAGE`, `TOYOTA_PARAM_LATERAL_ENGAGE`, `FLAG_VOLKSWAGEN_LATERAL_ENGAGE`). **What a brand needs to be listed is that its safety rx hook already decodes the cruise main switch into `acc_main_on` and that the message carrying it is already rx-checked** — Toyota's decode is the fork's, Honda's (`SCM_FEEDBACK` 0x326 @10 Hz, `SCM_BUTTONS` 0x1A6 @25 Hz) and Volkswagen's MQB/MEB (`TSK_06` @50 Hz, `Motor_51` @50 Hz) are upstream's own. That is also why neither of the two new brands needed an rx check, which is the only part of this that a car has to validate: a wrong rate does not degrade the feature, it clears `controls_allowed` (`safety.h`'s `frequency < 10U` and lagging paths). Volkswagen is two platforms short of its name: **PQ and MLB are excluded by flag**, because neither sets `acc_main_on` in the stock-ACC configuration this feature is for (PQ's is set only under openpilot longitudinal control, MLB's is not set at all). Honda needed one more thing no other brand did: **its steering permit is its own, not `lateral.h`'s**. Every other steering brand calls `steer_torque_cmd_checks` / `steer_angle_cmd_checks` / `steer_curvature_cmd_checks`, which carry the widened test; Honda's `tx_hook` tests `controls_allowed` directly, so that one line reads `(controls_allowed || controls_allowed_lateral)` too. Without it the feature would be enabled and still unable to steer. The remaining brands need the decode written from their own CAN and the rate validated on the car, and `moonpilot/engage.py` is where that starts. The re-arm gestures are brand-generic in the code: `ButtonType.lkas` (emitted by Toyota TSS2 and by Honda's SCM_BUTTONS LKAS setting button, and consumed by nothing in either tree), ACC's rising edge, and cycling the main switch, which works everywhere. **Volkswagen has no spare button at all** — every one of its buttons is an ACC function — so it relies on the latter two.
+
+### Offroad mode
+
+`moonpilot/offroad.py` holds the device offroad while the car's ignition stays on, so the work that
+is offroad-only — the settings rows gated on `ui_state.is_offroad()`, uploads, a software update, the
+SSH and tailscale sessions — is reachable without turning the car off and waiting for the device to
+power down. Upstream already has the whole decision in one place: `hardwared`'s `onroad_conditions`,
+where every member is a reason the device *may* be onroad (`hardwared.py:206-210`) and
+`should_start = all(onroad_conditions.values())` (`:386`) is what reads them, so the mechanism there
+is one dict member and the line that refreshes it. Everything downstream follows
+`deviceState.started` with no fork edit: the manager stops `card`, `controlsd`, `selfdrived` and
+`loggerd`, `updated` starts, `IsOffroad` flips, and both UI trees switch to their offroad layout.
+
+- **The mode is a param, not a process state.** `MoonpilotOffroad`, read with `return_default=True`
+  (the fork's rule: `get_bool` ignores the declared default), declared
+  `CLEAR_ON_MANAGER_START | CLEAR_ON_IGNITION_ON`. Both flags are cleared by upstream's manager, not
+  by fork code — `manager_init()` for the first, and the ignition **rising** edge its 1 Hz loop sees
+  for the second (`manager.py:30,33,135`) — which is what makes a reboot and a new ignition cycle the
+  two automatic ends of the mode. The row deliberately does **not** carry
+  `CLEAR_ON_OFFROAD_TRANSITION`: entering the mode *is* an offroad transition, so that flag would
+  clear the request one frame after it was written. `moonpilot/tests/test_offroad.py` pins the flags.
+- **The seam is the dict member and the refresh.** `onroad_conditions["moonpilot_onroad"]` is
+  `onroad_condition(params)` — the inverse of the request — and the refresh sits above `ign_edge`, so
+  a flip of the param is published on that tick rather than at the next 2 Hz one. No subscription is
+  added: the entry gate is read in the UI, which is where the driver's hand is.
+- **Two entries, one gate.** The moonpilot panel's row and a hold on the driving view both reach
+  `can_enter` through their tree's own `parked()`: the car is on (`ui_state.started`, which is
+  `deviceState.started` *and* the ignition), it is not being driven (`v_ego` under
+  `MOONPILOT_OFFROAD_SPEED`, the fork's standstill convention, pinned equal to the planner's own two),
+  and openpilot is not engaged. The row is a `button_item` in `moonpilot/ui/settings.py` and a pushed
+  `BigButton` in `moonpilot/ui/settings_mici.py`; the gesture is tizi's
+  `moonpilot/ui/offroad_mode.py` and mici's `moonpilot/ui/offroad_mode_mici.py`, each with its own
+  dialog and its own widgets — self-contained per tree, like the tailscale QR dialogs. The gesture
+  offers **entering only**, so a hold can never take a device that is already offroad back onroad.
+- **Leaving is never gated.** The mode's own state is `started` false, so a gate on the way out would
+  strand the device on a screen with nothing to press: `enabled()` is `requested or parked`, and the
+  row is live whenever the request is set.
+- **The row is not in `FEATURES`.** It is not a swap between two behaviors but a device action with a
+  live label — `TURN ON`, `TURN OFF`, `OFFROAD` (already offroad, not because of this mode) or
+  `PARKED ONLY` (onroad and moving, or engaged) — and mici's value line has to be pushed from
+  `_update_state` where tizi's row re-resolves its callables every render. That is why it sits beside
+  the tailscale row in both panels rather than going through the feature table, and why the manager
+  clearing the param under the panel's feet is visible at all.
+- **The hold also toggles the sidebar in tizi**, which is upstream's own click handling and not
+  something the fork can avoid: this view fires its click callback on the *press*
+  (`_handle_mouse_press`), so holding the screen does both, with the confirm dialog over the sidebar
+  afterwards. In mici the click fires on release and the base class clears the press tracking before
+  a long press, so a hold does not also scroll to the home layout. While driving the gesture is inert
+  — `parked()` is false — so a resting hand only does what it already does today.
+- **What it costs on the road**, which is why the flags matter: while the mode is set there is no
+  assist and no camera logging, and the car moving does not end it — the exits are the row, the
+  ignition cycle and a reboot. A driver who parks, switches it on and then drives away gets a device
+  that is watching nothing, and the recovery is the row, which is reachable from the offroad UI the
+  mode produces. The manager will not power the device down while the ignition is on either
+  (`power_monitor.should_shutdown` ends with `&= not ignition`), so the mode does not become a
+  shutdown timer.
+- **The panda is safe in this state with nothing fork-owned added**: `pandad` runs offroad by design
+  and `panda_safety.configureSafetyMode(is_onroad=False)` puts it in NO_OUTPUT whenever
+  `deviceState.started` is false, so a parked car with the ignition on and no onroad processes cannot
+  be commanded.
+
+`moonpilot/tests/test_offroad.py` pins the policy, the four labels, both directions of the gate, the
+speed against the planner's own constants, and the two literals in `hardwared.py` — nothing in this
+tree imports that file, so a merge that drops them deletes the feature silently.
 
 ### Forked opendbc and panda
 

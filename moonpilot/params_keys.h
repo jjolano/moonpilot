@@ -37,3 +37,10 @@
     // what the model's path predicted. 1.0 is neutral, and the applied value is
     // clamped at or above it, so a learned bias only ever plans for less speed.
     {"MoonpilotCurveLatScale", {PERSISTENT, FLOAT, "1.0"}},
+    // Offroad mode, entered from the moonpilot panel's row or a hold on the
+    // driving view: while it is set the device stays offroad with the ignition
+    // on. CLEAR_ON_IGNITION_ON so a new drive always comes up onroad,
+    // CLEAR_ON_MANAGER_START so a reboot does too; both are cleared by
+    // openpilot/system/manager/manager.py, not by fork code.
+    {"MoonpilotOffroad",
+     {CLEAR_ON_MANAGER_START | CLEAR_ON_IGNITION_ON, BOOL, "0"}},
