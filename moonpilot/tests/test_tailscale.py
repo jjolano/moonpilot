@@ -1,4 +1,5 @@
 import io
+import json
 import os
 import shutil
 import signal
@@ -19,6 +20,19 @@ ROOT = Path(__file__).resolve().parents[2]
 
 # A URL-shaped login link, which is what `auth_url` insists on before the QR dialog opens.
 LOGIN_URL = "https://login.tailscale.com/a/abc123"
+
+# A fake stable release: install() takes whatever latest_release() returns, so the tests pin
+# nothing and assert the passed-through values land where they should.
+_VERSION = "9.9.9"
+_ASSET = f"tailscale_{_VERSION}_arm64.tgz"
+_URL = f"https://pkgs.tailscale.com/stable/{_ASSET}"
+_SHA = "ab12" * 16
+
+
+def _quick_install(payload: bytes | None = None) -> None:
+  """install() with the download mocked: the argv/binaries tests need files, not the network."""
+  with mock.patch.object(fetch, "download", return_value=payload or _tarball(tailscale.BINARIES)):
+    tailscale.install(_VERSION, _URL, _SHA)
 
 
 class FakeParams:
@@ -67,16 +81,16 @@ class TestInstall(unittest.TestCase):
       mock.patch.object(paths, "data_root", return_value=tmp),
       mock.patch.object(fetch, "download", return_value=payload) as download,
     ):
-      tailscale.install()
+      tailscale.install(_VERSION, _URL, _SHA)
 
-      self.assertEqual(download.call_args[0], (tailscale.URL, tailscale.SHA256))
+      self.assertEqual(download.call_args[0], (_URL, _SHA))
       for name in tailscale.BINARIES:
         path = os.path.join(tailscale.bin_dir(), name)
         self.assertTrue(os.path.isfile(path), path)
         self.assertEqual(os.stat(path).st_mode & 0o777, 0o755, path)
       # The unit file inside the archive shares no basename with either binary, so it is skipped.
       self.assertFalse(os.path.exists(os.path.join(tailscale.bin_dir(), "tailscaled.service")))
-      self.assertEqual(tailscale.marker_version(), tailscale.VERSION)
+      self.assertEqual(tailscale.marker_version(), _VERSION)
       self.assertTrue(tailscale.installed())
 
   def test_install_replaces_a_binary_that_is_being_executed(self):
@@ -102,7 +116,7 @@ class TestInstall(unittest.TestCase):
       running = subprocess.Popen([target, "-c", "while :; do :; done"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
       try:
         self.assertEqual(os.readlink(f"/proc/{running.pid}/exe"), target, "not executing the installed path")
-        tailscale.install()
+        tailscale.install(_VERSION, _URL, _SHA)
       finally:
         running.kill()
         running.wait(timeout=10)
@@ -111,6 +125,28 @@ class TestInstall(unittest.TestCase):
       with open(target, "rb") as f:
         self.assertEqual(f.read(), b"#!/bin/sh\n")
       self.assertEqual(running.returncode, -signal.SIGKILL)
+
+class TestLatestRelease(unittest.TestCase):
+  def test_track_json_and_sidecar_resolve_without_the_network(self):
+    track = json.dumps({"TarballsVersion": _VERSION, "Tarballs": {"arm64": _ASSET}}).encode()
+    with mock.patch.object(fetch.urllib.request, "urlopen", side_effect=[io.BytesIO(track), io.BytesIO(f"{_SHA}\n".encode())]) as urlopen:
+      self.assertEqual(tailscale.latest_release(), (_VERSION, _URL, _SHA))
+    called = [call[0][0] for call in urlopen.call_args_list]
+    self.assertEqual(called, [f"{tailscale.PKGS_BASE}/{tailscale.TRACK}/?mode=json&os=linux", f"{_URL}.sha256"])
+
+  def test_the_release_tuple_splats_straight_into_install(self):
+    # install() takes (version, url, sha256) in latest_release()'s order, so the supervisor's
+    # install(*latest_release()) cannot silently swap the url and the digest.
+    with (
+      tempfile.TemporaryDirectory() as tmp,
+      mock.patch.object(paths, "data_root", return_value=tmp),
+      mock.patch.object(tailscale, "latest_release", return_value=(_VERSION, _URL, _SHA)),
+      mock.patch.object(fetch, "download", return_value=_tarball(tailscale.BINARIES)) as download,
+    ):
+      tailscale.install(*tailscale.latest_release())
+      self.assertEqual(download.call_args[0], (_URL, _SHA))
+      self.assertEqual(tailscale.marker_version(), _VERSION)
+      self.assertTrue(tailscale.installed())
 
 
 class TestFetch(unittest.TestCase):
@@ -134,7 +170,7 @@ class TestArgv(unittest.TestCase):
 
   def test_daemon_args_carry_state_socket_and_no_logs(self):
     with tempfile.TemporaryDirectory() as tmp, mock.patch.object(paths, "data_root", return_value=tmp), self._with_tun(True):
-      tailscale.install()
+      _quick_install()
       args = tailscale.daemon_args()
       self.assertTrue("--state" in args)
       self.assertTrue(tailscale.state_path() in args)
@@ -147,7 +183,7 @@ class TestArgv(unittest.TestCase):
     # (cmd/tailscaled/tailscaled.go, ipnServerOpts). Left to that, a rename silently sends certs,
     # Taildrop and profile-data to HOME — the read-only rootfs on device.
     with tempfile.TemporaryDirectory() as tmp, mock.patch.object(paths, "data_root", return_value=tmp), self._with_tun(True):
-      tailscale.install()
+      _quick_install()
       args = tailscale.daemon_args()
       self.assertTrue("--statedir" in args)
       self.assertEqual(args[args.index("--statedir") + 1], tailscale.root())
@@ -156,7 +192,7 @@ class TestArgv(unittest.TestCase):
   def test_tun_mode_is_probed_not_assumed(self):
     # comma 3X's kernel has CONFIG_TUN=y; the comma four kernel is a different tree.
     with tempfile.TemporaryDirectory() as tmp, mock.patch.object(paths, "data_root", return_value=tmp):
-      tailscale.install()
+      _quick_install()
       with self._with_tun(False):
         self.assertTrue("userspace-networking" in tailscale.daemon_args())
       with self._with_tun(True):
@@ -172,7 +208,7 @@ class TestArgv(unittest.TestCase):
     # --accept-dns=false against a read-only rootfs: letting tailscaled own /etc/resolv.conf can
     # only fail. --netfilter-mode=off drops the need for an iptables binary on AGNOS.
     with tempfile.TemporaryDirectory() as tmp, mock.patch.object(paths, "data_root", return_value=tmp):
-      tailscale.install()
+      _quick_install()
       args = tailscale.up_args()
       self.assertTrue("--accept-dns=false" in args, "a read-only rootfs cannot survive tailscaled owning resolv.conf")
       self.assertTrue("--netfilter-mode=off" in args)
@@ -244,29 +280,29 @@ class TestAuthUrl(unittest.TestCase):
 
 class TestBinaries(unittest.TestCase):
   def test_a_system_pair_wins_and_is_never_managed(self):
-    # A distro's /usr/bin/tailscale is not ours to overwrite, so upgrade_pending() must stay False.
+    # A distro's /usr/bin/tailscale is not ours to overwrite, so upgrade_available() must stay False.
     with (
       tempfile.TemporaryDirectory() as tmp,
       mock.patch.object(paths, "data_root", return_value=tmp),
       mock.patch.object(tailscale.shutil, "which", side_effect=lambda name: f"/usr/bin/{name}"),
     ):
       self.assertEqual(tailscale.binaries(), ("/usr/bin/tailscale", "/usr/bin/tailscaled"))
-      self.assertFalse(tailscale.upgrade_pending())
+      self.assertFalse(tailscale.upgrade_available("9.9.99"))
 
   def test_a_stale_install_still_runs_while_the_upgrade_is_pending(self):
-    # "Can we run?" and "is this the pinned version?" are deliberately two questions: collapsing
-    # them would take the tunnel down the moment a new pin landed, before the replacement landed.
+    # "Can we run?" and "is this the latest release?" are deliberately two questions: collapsing
+    # them would take the tunnel down the moment a new release landed, before the replacement landed.
     with (
       tempfile.TemporaryDirectory() as tmp,
       mock.patch.object(paths, "data_root", return_value=tmp),
       mock.patch.object(tailscale.shutil, "which", return_value=None),
     ):
-      tailscale.install()
-      self.assertFalse(tailscale.upgrade_pending())
+      _quick_install()
+      self.assertFalse(tailscale.upgrade_available(_VERSION))
 
       with open(tailscale.marker_path(), "w") as f:
         f.write("0.0.0")
-      self.assertTrue(tailscale.upgrade_pending())
+      self.assertTrue(tailscale.upgrade_available(_VERSION))
       self.assertTrue(tailscale.installed())
       pair = tailscale.binaries()
       self.assertIsNotNone(pair)
@@ -280,7 +316,7 @@ class TestBinaries(unittest.TestCase):
     ):
       self.assertIsNone(tailscale.binaries())
       self.assertFalse(tailscale.installed())
-      self.assertFalse(tailscale.upgrade_pending())
+      self.assertFalse(tailscale.upgrade_available(_VERSION))
 
 
 class TestSupervisorKill(unittest.TestCase):
@@ -325,7 +361,7 @@ class TestSupervisorKill(unittest.TestCase):
       mock.patch.object(paths, "data_root", return_value=tmp),
       mock.patch.object(tailscale.shutil, "which", return_value=None),
     ):
-      tailscale.install()
+      _quick_install()
       self.assertTrue(tailscale.socket_path() in tailscale.daemon_args())
 
 

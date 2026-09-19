@@ -24,6 +24,7 @@ from moonpilot import tailscale
 
 POLL = 10.0  # status poll while the daemon is up
 WAIT = 30.0  # no network yet
+CHECK_INTERVAL = 6 * 3600  # stable-track version-check cadence
 BACKOFF_START = 30.0
 BACKOFF_MAX = 1800.0  # 30 min
 UP_RETRY = 30.0  # do not respawn `tailscale up` faster than this
@@ -60,6 +61,7 @@ def main() -> None:
   daemon: subprocess.Popen | None = None
   login: subprocess.Popen | None = None
   last_up = 0.0
+  last_check = -CHECK_INTERVAL  # first offroad+online tick checks immediately; gate is then "6 h between checks"
   backoff = BACKOFF_START
   autoupdate_disabled = False
 
@@ -78,33 +80,42 @@ def main() -> None:
         # remote access by flipping the toggle, and an LTE-only device is the one that wants it.
         tailscale.put_status(params, tailscale.INSTALLING)
         try:
-          tailscale.install()
-          cloudlog.event("moonpilot tailscale installed", version=tailscale.VERSION)
+          latest = tailscale.latest_release()
+          tailscale.install(*latest)
+          cloudlog.event("moonpilot tailscale installed", version=latest[0])
           backoff = BACKOFF_START
         except Exception:
           cloudlog.exception("moonpilot tailscale install failed")
           tailscale.put_status(params, tailscale.ERROR, "download failed")
           time.sleep(backoff)
           backoff = min(backoff * 2, BACKOFF_MAX)
-          continue
-
-      elif tailscale.upgrade_pending() and online and params.get_bool("IsOffroad"):
+      elif online and params.get_bool("IsOffroad") and time.monotonic() - last_check >= CHECK_INTERVAL:
         # Offroad only: this is ~35 MB down and a daemon restart, neither of which belongs
-        # mid-drive. The old binary keeps serving until the new one is on disk.
-        was = tailscale.marker_version()
-        tailscale.put_status(params, tailscale.INSTALLING)
+        # mid-drive. The old binary keeps serving until the new one is on disk. The latest
+        # fetch happens first so a network/parse failure leaves status and daemon untouched.
         try:
-          tailscale.install()
-          cloudlog.event("moonpilot tailscale upgraded", was=was, now=tailscale.VERSION)
-          backoff = BACKOFF_START
-          _stop(daemon)
-          daemon = None  # os.replace leaves a running process on the old inode
+          latest = tailscale.latest_release()
+          last_check = time.monotonic()
         except Exception:
-          cloudlog.exception("moonpilot tailscale upgrade failed")
+          cloudlog.exception("moonpilot tailscale version check failed")
           time.sleep(backoff)
           backoff = min(backoff * 2, BACKOFF_MAX)
-          # Deliberately no put_status(ERROR): a failed upgrade must not cost a working tunnel,
-          # and the poll below overwrites the status with what the daemon is actually doing.
+          continue
+        if tailscale.upgrade_available(latest[0]):
+          was = tailscale.marker_version()
+          tailscale.put_status(params, tailscale.INSTALLING)
+          try:
+            tailscale.install(*latest)
+            cloudlog.event("moonpilot tailscale upgraded", was=was, now=latest[0])
+            backoff = BACKOFF_START
+            _stop(daemon)
+            daemon = None  # os.replace leaves a running process on the old inode
+          except Exception:
+            cloudlog.exception("moonpilot tailscale upgrade failed")
+            time.sleep(backoff)
+            backoff = min(backoff * 2, BACKOFF_MAX)
+            # Deliberately no put_status(ERROR): a failed upgrade must not cost a working tunnel,
+            # and the poll below overwrites the status with what the daemon is actually doing.
 
       if daemon is None or daemon.poll() is not None:
         if daemon is not None:
@@ -122,10 +133,10 @@ def main() -> None:
       output = _query_status()
 
       if output and not autoupdate_disabled:
-        # A tailnet-wide "auto-update new devices" policy would otherwise have tailscaled replace
-        # the binaries it is running from and try to restart itself through systemd or init.d,
-        # neither of which the fork installs: new binaries on disk, an old process running, and a
-        # marker file that lies about both. Nothing else updates this client (AGENTS.md).
+        # The fork tracks TRACK itself (offroad, hash-verified, supervised restart), so tailscale's
+        # own updater stays off: it would replace the running binaries and restart via systemd or
+        # init.d, absent here — leaving new bytes on disk, the old process running, and the marker
+        # lying.
         try:
           done = subprocess.run(tailscale.cli_args("set", "--auto-update=false"), check=False, capture_output=True, timeout=10)
           autoupdate_disabled = done.returncode == 0

@@ -1,13 +1,14 @@
 """tailscale on the device: where its binaries live, how they are run, and what state means.
 
 The device has no tailscale and no package manager (AGENTS.md, How a dependency reaches the
-device), so `install()` fetches a pinned static tarball into `<data_root>/tailscale` and
-`moonpilot/tailscaled.py` supervises it. This module is the shared vocabulary for both, plus the
-encode/decode of the one string param the supervisor and the settings panels talk through.
+device), so `install()` fetches the stable-track static tarball into `<data_root>/tailscale`
+and `moonpilot/tailscaled.py` supervises it. This module is the shared vocabulary for both,
+plus the encode/decode of the one string param the supervisor and the settings panels talk
+through.
 
 It is imported by the UI and by the supervisor, so: standard library plus `openpilot` modules
-only, and nothing here creates a directory or runs a process — the path helpers are computed, the
-same rule and the same reason as deps.site_dir().
+only, and nothing here creates a directory or runs a process — the path helpers are computed,
+the same rule and the same reason as deps.site_dir().
 """
 
 import json
@@ -20,13 +21,11 @@ from openpilot.common.params import Params
 from moonpilot import paths
 from moonpilot.features import TAILSCALE
 
-# The pinned client. Bumping the device's tailscale is these two constants: the version from
-# https://pkgs.tailscale.com/stable/?mode=json and the digest from the .sha256 published beside
-# the asset. Nothing else updates it — see AGENTS.md, A binary the device doesn't ship.
-VERSION = "1.102.4"
-SHA256 = "9dd1e6a592a014bbaea0103167ffe299adeda4ba14e078ce9c2895364f6c4c3f"
-ASSET = f"tailscale_{VERSION}_arm64.tgz"
-URL = f"https://pkgs.tailscale.com/stable/{ASSET}"
+# The stable track. The supervisor resolves it via `latest_release()` at upgrade time; no
+# checkout change is needed to move the device's client forward.
+TRACK = "stable"
+PKGS_BASE = "https://pkgs.tailscale.com"
+ARCH = "arm64"
 
 BINARIES = ("tailscale", "tailscaled")
 HOSTNAME = "moonpilot"  # control suffixes a collision inside one tailnet, so no dongle id is sent
@@ -47,7 +46,7 @@ _MACHINE_AUTH_DETAIL = "approve this device in the tailscale admin console"
 
 
 def root() -> str:
-  """`<data_root>/tailscale`: the pinned binaries, tailscaled's state, and its var root."""
+  """`<data_root>/tailscale`: the installed binaries, tailscaled's state, and its var root."""
   return os.path.join(paths.data_root(), "tailscale")
 
 
@@ -76,7 +75,7 @@ def binaries() -> tuple[str, str] | None:
 
   A pair the OS ships wins, mirroring deps.uv()'s preference for a system uv: that is what makes
   the dev PC and the smoke test work without a download. The installed pair is returned whatever
-  its version — whether this is the pinned build is a separate question, `upgrade_pending()`.
+  its version — whether a newer stable release exists is a separate question, `upgrade_available()`.
   """
   system = (shutil.which("tailscale"), shutil.which("tailscaled"))
   if system[0] is not None and system[1] is not None:
@@ -103,25 +102,39 @@ def installed() -> bool:
   return binaries() is not None
 
 
-def upgrade_pending() -> bool:
-  """Installed under `bin_dir()` and not the version this checkout pins.
+def latest_release(timeout: float = 10.0) -> tuple[str, str, str]:
+  """`(version, tarball_url, sha256)` of the latest `TRACK` release for `ARCH`. Raises."""
+  import urllib.request
+
+  with urllib.request.urlopen(f"{PKGS_BASE}/{TRACK}/?mode=json&os=linux", timeout=timeout) as r:
+    payload = json.loads(r.read().decode())
+  version = payload["TarballsVersion"]
+  asset = payload["Tarballs"][ARCH]
+  url = f"{PKGS_BASE}/{TRACK}/{asset}"
+  with urllib.request.urlopen(f"{url}.sha256", timeout=timeout) as r:
+    sha256 = r.read().decode().strip()
+  return version, url, sha256
+
+
+def upgrade_available(latest: str) -> bool:
+  """Installed under `bin_dir()` and not `latest`.
 
   False for a pair the OS shipped: the fork does not manage an install it did not make.
   """
   pair = binaries()
   if pair is None or os.path.dirname(pair[0]) != bin_dir():
     return False
-  return marker_version() != VERSION
+  return marker_version() != latest
 
 
-def install() -> None:
-  """Download the pinned tarball and put both binaries in `bin_dir()`. Raises; the caller handles it."""
+def install(version: str, url: str, sha256: str) -> None:
+  """Download the given tarball and put both binaries in `bin_dir()`. Raises; the caller handles it."""
   from moonpilot import fetch  # fetch's heavy stdlib stays behind this import
 
   paths.data_dir("tailscale")  # the one place this tree is created
-  fetch.extract(fetch.download(URL, SHA256), BINARIES, bin_dir())
+  fetch.extract(fetch.download(url, sha256), BINARIES, bin_dir())
   with open(marker_path(), "w") as f:
-    f.write(VERSION)
+    f.write(version)
 
 
 def sudo() -> list[str]:
