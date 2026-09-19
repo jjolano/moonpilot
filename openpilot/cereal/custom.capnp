@@ -17,7 +17,9 @@ struct MoonpilotState @0x81c2f05a394cf4af {  # moonpilot seam: upstream's reserv
 
   struct LeadTrajectory {
     present @0 :Bool;
-    prob @1 :Float32;      # radard's filtered lead probability where radard has a counterpart, the raw model prob otherwise
+    prob @1 :Float32;      # radard's filtered lead probability where radard has a counterpart, the
+                           # model's own prob behind radard's filter otherwise (below
+                           # MOONPILOT_LEAD_PROB_GATE the slot is published empty instead)
     probTime @2 :Float32;  # s; the time prob refers to (ModelConstants.LEAD_T_OFFSETS[i])
     source @3 :Source;
 

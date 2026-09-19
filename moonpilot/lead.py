@@ -25,7 +25,7 @@ from moonpilot.features import LEAD_LATERAL, enabled
 # radard's messaging/opendbc imports — the planner seam and the renderers import it.
 MOONPILOT_RADAR_TO_CAMERA = 1.52  # m; radar is ~1.5m ahead of the camera mesh frame
 
-# Starting points, all fork-owned. Tune against logs: see the lead path ribbon in the UI and
+# Starting points, all fork-owned. Tune against logs: see the lead path line in the UI and
 # LeadTrajectory.inPathProb in PlotJuggler.
 MOONPILOT_PATH_HALF_WIDTH = 1.8  # m; half a typical lane
 MOONPILOT_MIN_SPEED_FOR_YAW = 1.0  # m/s; below this, yawRel is meaningless -> 0.0
@@ -33,7 +33,18 @@ MOONPILOT_MIN_Y_STD = 0.05  # m; floor on yStd so the Gaussian never collapses
 MOONPILOT_OUT_OF_PATH_DANGER = 0.4  # relaxed MPC danger factor for a fully out-of-path lead
 MOONPILOT_INPATH_RC = 1.0  # s; decay time constant of the asymmetric inPath filter
 # Dense where a cut-in matters, none of it past the ~4 s where a cut-in can still be avoided.
-MOONPILOT_INPATH_GRID = np.arange(0.0, 4.0 + 1e-9, 0.25)
+MOONPILOT_INPATH_HORIZON = 4.0  # s; the last sample the grid is evaluated at, and so the last one
+# the planner can act on. The renderers stop their lead line here too: past it the model's own
+# yStd is ~1 m and the drawn 10 s tail landed beyond the white path's own 100 m cap.
+MOONPILOT_INPATH_GRID = np.arange(0.0, MOONPILOT_INPATH_HORIZON + 1e-9, 0.25)
+# The model's own confidence in a slot, below which normalize_lead publishes it as empty rather
+# than as a lead. radard refuses a vision lead at this same threshold (radard.py:156-165) — and, as
+# there, only behind an asymmetric filter (MOONPILOT_LEAD_PROB_RC), because slot 0 crosses it in
+# runs whose median is 4 frames and 29 % of which are a single frame (corpus, 47k frames), so a raw
+# gate would blink at 20 Hz. The fail direction is upstream's own — no lead, inPath 1.0, base
+# t_follow — which is why nothing downstream has to know the slot was ever there.
+MOONPILOT_LEAD_PROB_GATE = 0.5
+MOONPILOT_LEAD_PROB_RC = 0.2  # s; radard's own gate-filter decay (radard.py:234-241)
 # The lead accel estimator's window. radard's aLeadK is a KF1D with fixed gains (radard.py:29-48),
 # tau = 0.49 s at DT_MDL, so 90 % of a -3 m/s^2 step takes 1.20 s. A least-squares slope over this
 # window reaches the same step in the window's own length and averages noise instead of lagging it.
@@ -263,10 +274,23 @@ def _empty(slot: int, filt) -> dict:
   }
 
 
-def normalize_lead(slot, model_lead, fused_lead, ego_path_x, ego_path_y, in_path_filter) -> dict:
+def _filtered_prob(prob: float, filt) -> float:
+  """radard's own gate filter: a rise is instant, a fall decays, so one low-prob frame cannot drop
+  a lead. Same shape as the inPath filter, and the same reason."""
+  if prob > filt.x:
+    filt.x = prob
+  else:
+    filt.update(prob)
+  return float(filt.x)
+
+
+def normalize_lead(slot, model_lead, fused_lead, ego_path_x, ego_path_y, in_path_filter, prob_filter) -> dict:
   """One leadsV3 slot as a LeadTrajectory dict, on the model's native 6-point t grid.
 
   `fused_lead` is radarState.leadOne/leadTwo, or None for slot 2 / when radard published none.
+  A vision-only slot whose filtered prob is below MOONPILOT_LEAD_PROB_GATE comes back as the empty
+  trajectory. A fused one is never gated here: its prob is radard's own filtered number, and radard
+  only publishes a lead it already believes.
   """
   if model_lead is None or len(model_lead.x) == 0 or len(ego_path_x) == 0:
     return _empty(slot, in_path_filter)
@@ -302,10 +326,17 @@ def normalize_lead(slot, model_lead, fused_lead, ego_path_x, ego_path_y, in_path
     y = float(fused_lead.yRel) + (-model_y + model_y[0])
     prob = float(fused_lead.modelProb)
   else:
-    # Vision-only: no fused state to anchor to, so publish in the raw radarState conventions.
+    # Vision-only: no fused state to anchor to, so publish in the raw radarState conventions, and
+    # this is the one branch that can be published as empty -- the model's own prob is the only
+    # confidence anyone here has, and the UI drew it and the planner scaled its time gap by its
+    # inPath. `present=False` is the upstream default everywhere downstream, so the gate only
+    # removes the fork's own state. The low-speed override above is exempt for the mirror reason:
+    # it is a track radard saw, not a slot the model rates.
+    prob = _filtered_prob(float(model_lead.prob), prob_filter)
+    if prob < MOONPILOT_LEAD_PROB_GATE:
+      return _empty(slot, in_path_filter)
     x = model_x - MOONPILOT_RADAR_TO_CAMERA
     y = -model_y
-    prob = float(model_lead.prob)
 
   t = np.asarray(model_lead.t, dtype=float) if len(model_lead.t) else np.asarray(LEAD_T_IDXS[: model_x.size], dtype=float)
   y_std = np.asarray(model_lead.yStd, dtype=float)

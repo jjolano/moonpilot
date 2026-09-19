@@ -18,11 +18,14 @@ from opendbc.car.honda.values import CAR
 from openpilot.selfdrive.modeld.constants import ModelConstants
 from moonpilot.lead import (
   MOONPILOT_INPATH_GRID,
+  MOONPILOT_INPATH_HORIZON,
   MOONPILOT_INPATH_RC,
   MOONPILOT_LEAD_ACCEL_MIN_SAMPLES,
   MOONPILOT_LEAD_ACCEL_FAST_STREAK,
   MOONPILOT_LEAD_ACCEL_TAU,
   MOONPILOT_LEAD_ACCEL_WINDOW,
+  MOONPILOT_LEAD_PROB_GATE,
+  MOONPILOT_LEAD_PROB_RC,
   MOONPILOT_LEAD_SPEED_JUMP,
   MOONPILOT_MIN_Y_STD,
   MOONPILOT_OUT_OF_PATH_DANGER,
@@ -110,6 +113,11 @@ def _params(on=True) -> Params:
 
 def _filter(x0=1.0):
   return FirstOrderFilter(x0, MOONPILOT_INPATH_RC, DT_MDL)
+
+
+def _prob_filter(x0=1.0):
+  """The gate's own filter (radard's shape), separate from the inPath one."""
+  return FirstOrderFilter(x0, MOONPILOT_LEAD_PROB_RC, DT_MDL)
 
 
 class TestResample(unittest.TestCase):
@@ -233,7 +241,6 @@ class TestLeadAccelEstimator(unittest.TestCase):
 
     np.testing.assert_array_equal(series[0], series[1])
 
-
   def test_noise_is_averaged_not_amplified(self):
     """0.05 m/s of measurement noise on a steady follower: bounded, and far below the jerk limits.
     A one-frame difference would put 1.4 m/s^2 of jitter on the same input."""
@@ -348,7 +355,7 @@ class TestLeadAccelEstimator(unittest.TestCase):
 class TestNormalizeLead(unittest.TestCase):
   def test_anchors_index_zero_to_fused_lead(self):
     model = ModelLead(x=[41.52, 61.52, 81.52], y=[-0.5, -0.6, -0.7])
-    out = normalize_lead(0, model, FusedLead(40.0, 0.5), STRAIGHT_PATH_X, STRAIGHT_PATH_Y, _filter())
+    out = normalize_lead(0, model, FusedLead(40.0, 0.5), STRAIGHT_PATH_X, STRAIGHT_PATH_Y, _filter(), _prob_filter())
 
     assert out["present"]
     self.assertAlmostEqual(out["x"][0], 40.0, places=6)
@@ -360,23 +367,26 @@ class TestNormalizeLead(unittest.TestCase):
   def test_model_y_is_right_positive(self):
     # model_y increasing = drifting right = published y decreases, heading turns negative.
     model = ModelLead(x=[41.52 + 20 * i for i in range(3)], y=[-0.5, 0.5, 1.5])
-    out = normalize_lead(0, model, FusedLead(40.0, 0.5), STRAIGHT_PATH_X, STRAIGHT_PATH_Y, _filter())
+    out = normalize_lead(0, model, FusedLead(40.0, 0.5), STRAIGHT_PATH_X, STRAIGHT_PATH_Y, _filter(), _prob_filter())
 
     assert out["y"][1] < out["y"][0]
     assert all(yaw < 0.0 for yaw in out["yawRel"])
 
   def test_vision_only_uses_raw_conventions(self):
     model = ModelLead(x=[41.52, 61.52], y=[-0.5, -0.5])
-    out = normalize_lead(2, model, None, STRAIGHT_PATH_X, STRAIGHT_PATH_Y, _filter())
+    out = normalize_lead(2, model, None, STRAIGHT_PATH_X, STRAIGHT_PATH_Y, _filter(), _prob_filter())
 
     self.assertEqual(out["source"], "vision")
     self.assertAlmostEqual(out["x"][0], 41.52 - 1.52, places=6)
     self.assertAlmostEqual(out["y"][0], 0.5, places=6)
 
   def test_radar_only_override_has_no_trajectory(self):
-    model = ModelLead(x=[41.52, 61.52], y=[-0.5, -0.5])
-    out = normalize_lead(0, model, FusedLead(12.0, 0.3, radar=True, model_prob=0.0), STRAIGHT_PATH_X, STRAIGHT_PATH_Y, _filter())
+    # A low model prob on purpose: radard's low-speed override is a track it saw, not a slot the
+    # model rates, so the gate below must not reach this branch.
+    model = ModelLead(x=[41.52, 61.52], y=[-0.5, -0.5], prob=0.0)
+    out = normalize_lead(0, model, FusedLead(12.0, 0.3, radar=True, model_prob=0.0), STRAIGHT_PATH_X, STRAIGHT_PATH_Y, _filter(), _prob_filter())
 
+    assert out["present"]
     self.assertEqual(out["source"], "radar")
     self.assertEqual(out["t"], [0.0])
     self.assertEqual(out["x"], [12.0])
@@ -384,16 +394,60 @@ class TestNormalizeLead(unittest.TestCase):
     self.assertEqual(out["inPathProb"], [])
     self.assertEqual(out["inPath"], 1.0)
 
+  def test_a_slot_the_model_does_not_believe_is_published_empty(self):
+    """The gate is what keeps a phantom slot off the line and out of the planner's time gap."""
+    model = ModelLead(x=[41.52, 61.52, 81.52], y=[-0.5, -0.6, -0.7], prob=MOONPILOT_LEAD_PROB_GATE - 0.01)
+    out = normalize_lead(0, model, None, STRAIGHT_PATH_X, STRAIGHT_PATH_Y, _filter(0.3), _prob_filter(0.0))
+
+    assert not out["present"]
+    self.assertEqual(out["source"], "none")
+    self.assertEqual(out["x"], [])
+    self.assertEqual(out["inPath"], 1.0)
+
+  def test_the_gate_is_the_models_own_probability(self):
+    for prob, present in ((MOONPILOT_LEAD_PROB_GATE, True), (MOONPILOT_LEAD_PROB_GATE - 1e-6, False)):
+      out = normalize_lead(0, ModelLead(x=[41.52, 61.52], y=[-0.5, -0.5], prob=prob), None, STRAIGHT_PATH_X, STRAIGHT_PATH_Y, _filter(), _prob_filter(0.0))
+      self.assertEqual(out["present"], present)
+
+  def test_a_lead_already_believed_survives_one_low_frame(self):
+    """Radard's filter shape is why: a rise is instant, a fall decays, so the gate cannot blink the
+    line on and off at 20 Hz -- measured on the corpus, 29 % of the crossings under the gate are a
+    single frame long."""
+    model = ModelLead(x=[41.52, 61.52], y=[-0.5, -0.5], prob=0.02)
+    prob_filter = _prob_filter(1.0)
+    out = normalize_lead(0, model, None, STRAIGHT_PATH_X, STRAIGHT_PATH_Y, _filter(), prob_filter)
+
+    assert out["present"]
+    assert MOONPILOT_LEAD_PROB_GATE <= out["prob"] < 1.0, out["prob"]
+
+  def test_a_sustained_low_prob_drops_the_lead(self):
+    model = ModelLead(x=[41.52, 61.52], y=[-0.5, -0.5], prob=0.02)
+    prob_filter = _prob_filter(1.0)
+    for _ in range(20):  # 1 s at DT_MDL, five times the filter's own time constant
+      out = normalize_lead(0, model, None, STRAIGHT_PATH_X, STRAIGHT_PATH_Y, _filter(), prob_filter)
+
+    assert not out["present"]
+    self.assertEqual(out["source"], "none")
+
+  def test_a_fused_lead_is_not_gated_on_the_models_prob(self):
+    """The other direction: a track radard published is not the model's to drop, whatever the model
+    thinks of the slot behind it."""
+    model = ModelLead(x=[41.52, 61.52], y=[-0.5, -0.5], prob=0.0)
+    out = normalize_lead(0, model, FusedLead(40.0, 0.5, model_prob=0.3), STRAIGHT_PATH_X, STRAIGHT_PATH_Y, _filter(), _prob_filter(0.0))
+
+    assert out["present"]
+    self.assertAlmostEqual(out["prob"], 0.3, places=6)
+
   def test_missing_data_is_a_planner_no_op(self):
     for model, fused in ((None, None), (ModelLead(x=[], y=[]), None)):
-      out = normalize_lead(0, model, fused, STRAIGHT_PATH_X, STRAIGHT_PATH_Y, _filter())
+      out = normalize_lead(0, model, fused, STRAIGHT_PATH_X, STRAIGHT_PATH_Y, _filter(), _prob_filter())
       assert not out["present"]
       self.assertEqual(out["source"], "none")
       self.assertEqual(out["inPath"], 1.0)
       self.assertEqual(out["inPathProb"], [])
       self.assertEqual(out["x"], [])
 
-    no_path = normalize_lead(0, ModelLead(x=[41.52], y=[-0.5]), None, [], [], _filter())
+    no_path = normalize_lead(0, ModelLead(x=[41.52], y=[-0.5]), None, [], [], _filter(), _prob_filter())
     assert not no_path["present"]
 
 
@@ -465,8 +519,8 @@ class TestLeadInPath(unittest.TestCase):
 
 
 class TestRendererLeadPath(unittest.TestCase):
-  """The on-device ribbon cannot be observed headlessly (EGL window init is unavailable here),
-  so project a synthetic lead through each tree's own renderer and check the ribbon."""
+  """The on-device line cannot be observed headlessly (EGL window init is unavailable here),
+  so project a synthetic lead through each tree's own renderer and check the line."""
 
   W, H = 1920, 1080
 
@@ -495,32 +549,62 @@ class TestRendererLeadPath(unittest.TestCase):
     return r
 
   @staticmethod
-  def _state(y, present=True, in_path=1.0):
+  def _state(y, present=True, in_path=1.0, y_std=None):
     state = type("State", (), {})()
     state.leads = []
     if present:
-      lead = ModelLead(x=[40.0, 45.0, 50.0, 55.0, 60.0, 65.0], y=y)
+      lead = ModelLead(x=[40.0, 45.0, 50.0, 55.0, 60.0, 65.0], y=y, y_std=y_std)
       lead.present = True
       lead.inPath = in_path
       state.leads = [lead]
     return state
 
-  def _projected(self, tree, y):
+  def _projected(self, tree, y, y_std=None):
     r = self._renderer(tree)
-    r._update_lead_path(self._state(y), np.linspace(0.0, 60.0, 33).astype(np.float32))
-    return r._lead_path.projected_points, r._lead_in_path
+    r._update_lead_path(self._state(y, y_std=y_std), np.linspace(0.0, 60.0, 33).astype(np.float32))
+    return r._lead_path.projected_points, r._lead_in_path, r._lead_path_widths
 
-  def test_projects_a_ribbon(self):
+  def test_projects_a_line(self):
     for tree in ("tizi", "mici"):
       with self.subTest(tree=tree):
-        points, in_path = self._projected(tree, [0.0] * 6)
+        points, in_path, widths = self._projected(tree, [0.0] * 6)
         assert points.ndim == 2 and points.shape[1] == 2, points.shape
-        assert points.shape[0] >= 4, points.shape
-        assert points.shape[0] % 2 == 0, points.shape
+        # One point per 0.5 s sample out to the planner's horizon, and one width per point.
+        assert 2 <= points.shape[0] <= int(MOONPILOT_INPATH_HORIZON / 0.5) + 1, points.shape
+        assert widths.shape[0] == points.shape[0], (widths.shape, points.shape)
         assert np.isfinite(points).all()
-        # Twenty-one densified samples minus clipping, doubled for the two ribbon edges.
-        assert points.shape[0] <= 42, points.shape
         self.assertEqual(in_path, 1.0)
+
+  def test_line_stops_at_the_planner_horizon(self):
+    # The lead's own grid runs 40..65 m over 10 s; the drawn line ends at the 4 s sample.
+    for tree in ("tizi", "mici"):
+      with self.subTest(tree=tree):
+        r = self._renderer(tree)
+        r._update_lead_path(self._state([0.0] * 6), np.linspace(0.0, 60.0, 33).astype(np.float32))
+        raw = r._lead_path.raw_points
+        self.assertAlmostEqual(float(raw[0, 0]), 40.0, places=4)
+        self.assertAlmostEqual(float(raw[-1, 0]), 50.0, places=4)
+
+  def test_width_comes_from_the_models_own_std(self):
+    for tree in ("tizi", "mici"):
+      with self.subTest(tree=tree):
+        r = self._renderer(tree)
+        floor, ceiling = r.MOONPILOT_LEAD_PATH_WIDTH
+        np.testing.assert_allclose(self._projected(tree, [0.0] * 6, y_std=[0.0] * 6)[2], floor)
+        np.testing.assert_allclose(self._projected(tree, [0.0] * 6, y_std=[10.0] * 6)[2], ceiling)
+        middle = np.clip(1.0 * r.MOONPILOT_LEAD_PATH_PX_PER_M, floor, ceiling)
+        np.testing.assert_allclose(self._projected(tree, [0.0] * 6, y_std=[1.0] * 6)[2], middle)
+
+  def test_a_short_y_std_falls_back_instead_of_raising(self):
+    # resample() is np.interp, which raises unless values is as long as t, so a partially
+    # populated yStd must not reach it.
+    for tree in ("tizi", "mici"):
+      with self.subTest(tree=tree):
+        r = self._renderer(tree)
+        points, _, widths = self._projected(tree, [0.0] * 6, y_std=[0.9])
+        assert points.shape[0] >= 2, points.shape
+        expected = np.clip(MOONPILOT_MIN_Y_STD * r.MOONPILOT_LEAD_PATH_PX_PER_M, *r.MOONPILOT_LEAD_PATH_WIDTH)
+        np.testing.assert_allclose(widths, expected)
 
   def test_lateral_prediction_reaches_the_projection(self):
     for tree in ("tizi", "mici"):
@@ -538,13 +622,15 @@ class TestRendererLeadPath(unittest.TestCase):
 
         r._update_lead_path(self._state([0.0] * 6, present=False), path_x)
         assert r._lead_path.projected_points.size == 0
+        assert r._lead_path_widths.size == 0
 
         single = self._state([0.0])
         r._update_lead_path(single, path_x)
         assert r._lead_path.projected_points.size == 0
+        assert r._lead_path_widths.size == 0
 
-  def test_toggle_off_clears_the_ribbon(self):
-    """The ribbon shows the inPath the fork planner acts on, so it follows that feature's toggle:
+  def test_toggle_off_clears_the_line(self):
+    """The line shows the inPath the fork planner acts on, so it follows that feature's toggle:
     with upstream's planner back in the line there is no decision for it to draw."""
     for tree in ("tizi", "mici"):
       with self.subTest(tree=tree):
@@ -556,6 +642,7 @@ class TestRendererLeadPath(unittest.TestCase):
         with mock.patch.object(ui_state, "params", _params(on=False)):
           r._update_lead_path(self._state([0.0] * 6), path_x)
         assert r._lead_path.projected_points.size == 0
+        assert r._lead_path_widths.size == 0
         self.assertEqual(r._lead_in_path, 1.0)
 
 

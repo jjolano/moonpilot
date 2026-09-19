@@ -12,7 +12,7 @@ from openpilot.system.ui.lib.application import gui_app
 from openpilot.system.ui.lib.shader_polygon import draw_polygon, Gradient
 from openpilot.system.ui.widgets import Widget
 from moonpilot.features import LEAD_LATERAL, enabled  # moonpilot seam, see AGENTS.md
-from moonpilot.lead import resample  # moonpilot seam, see AGENTS.md
+from moonpilot.lead import MOONPILOT_INPATH_HORIZON, MOONPILOT_MIN_Y_STD, resample  # moonpilot seam, see AGENTS.md
 
 CLIP_MARGIN = 500
 MIN_DRAW_DISTANCE = 10.0
@@ -45,6 +45,12 @@ class LeadVehicle:
 
 
 class ModelRenderer(Widget):
+  # moonpilot seam, see AGENTS.md: the lead path line's presentation. Width, not alpha, carries
+  # the model's uncertainty -- a faint band at a fixed 1 m read as a squiggle rather than as a
+  # measurement, and yStd is the model's own answer to "how much do I know here".
+  MOONPILOT_LEAD_PATH_PX_PER_M = 8.0  # px of line width per meter of yStd
+  MOONPILOT_LEAD_PATH_WIDTH = (2.0, 18.0)  # px clamp
+
   def __init__(self):
     super().__init__()
     self._longitudinal_control = False
@@ -56,8 +62,9 @@ class ModelRenderer(Widget):
     self._lead_vehicles = [LeadVehicle(), LeadVehicle()]
     self._path_offset_z = HEIGHT_INIT[0]
 
-    # moonpilot seam, see AGENTS.md: the lead's predicted path, drawn as a ribbon.
+    # moonpilot seam, see AGENTS.md: the lead's predicted path, drawn as a line.
     self._lead_path = ModelPoints()
+    self._lead_path_widths = np.empty((0,), dtype=np.float32)
     self._lead_in_path = 1.0
 
     # Initialize ModelPoints objects
@@ -310,47 +317,70 @@ class ModelRenderer(Widget):
       draw_polygon(self._rect, self._path.projected_points, gradient=gradient)
 
 
+  def _clear_lead_path(self):  # moonpilot seam, see AGENTS.md
+    self._lead_path = ModelPoints()
+    self._lead_path_widths = np.empty((0,), dtype=np.float32)
+
   def _update_lead_path(self, moonpilot_state, path_x_array):  # moonpilot seam, see AGENTS.md
-    """Project the nearest lead's predicted path into a ribbon."""
-    # Off with the feature: the ribbon draws the inPath the fork planner acts on, so with
-    # upstream's MPC back in the line there is no decision on screen to visualize. Reset rather
-    # than skip the update, so a ribbon drawn before the toggle went off does not linger.
+    """Project the nearest lead's predicted path into a line, out to the planner's horizon."""
+    # Off with the feature: the line shows the inPath the fork planner acts on, so with upstream's
+    # MPC back in the line there is no decision on screen to visualize. Reset rather than skip the
+    # update, so a line drawn before the toggle went off does not linger.
     if not enabled(LEAD_LATERAL, ui_state.params):
-      self._lead_path = ModelPoints()
+      self._clear_lead_path()
       self._lead_in_path = 1.0
       return
 
     lead = moonpilot_state.leads[0] if len(moonpilot_state.leads) else None
     if lead is None or not lead.present or len(lead.x) < 2:
-      self._lead_path = ModelPoints()
+      self._clear_lead_path()
       return
 
-    # Densify with the same helper the planner path uses, so both agree on the shape.
-    t_dense = np.arange(0.0, lead.t[-1] + 1e-9, 0.5)
+    # Densify with the same helper the planner path uses, so both agree on the shape, and stop at
+    # the horizon the planner reads: the 6-10 s tail is drawn from samples the model itself rates
+    # +-1 m on, and it landed past the end of the white path.
+    t_dense = np.arange(0.0, MOONPILOT_INPATH_HORIZON + 1e-9, 0.5)
     x_d = resample(lead.t, lead.x, t_dense)
     y_d = resample(lead.t, lead.y, t_dense)
+    s_d = (resample(lead.t, lead.yStd, t_dense) if len(lead.yStd) == len(lead.t)
+           else np.full(t_dense.shape, MOONPILOT_MIN_Y_STD))
     if x_d.size < 2 or y_d.size < 2:
-      self._lead_path = ModelPoints()
+      self._clear_lead_path()
       return
 
     # z follows the ego path at the lead's distance; y is negated back into the model's
     # right-positive convention the projection below works in.
     z = np.array([self._path.raw_points[self._get_path_length_idx(path_x_array, x), 2] for x in x_d], dtype=np.float32)
-    raw_points = np.array([x_d, -y_d, z], dtype=np.float32).T
+
+    # Projected point by point rather than as a ribbon: the width is per sample, and the ribbon
+    # helper returns the two chains interleaved with anything off screen silently dropped. Stop at
+    # the first point that is not visible -- a polyline must not bridge a hole.
+    points, widths = [], []
+    for x, y, zi, s in zip(x_d, -y_d, z, s_d, strict=True):
+      pt = self._map_to_screen(float(x), float(y), float(zi) + self._path_offset_z)
+      if pt is None:
+        break
+      points.append(pt)
+      widths.append(float(np.clip(s * self.MOONPILOT_LEAD_PATH_PX_PER_M, *self.MOONPILOT_LEAD_PATH_WIDTH)))
+
     self._lead_path = ModelPoints(
-      raw_points=raw_points,
-      projected_points=self._map_line_to_polygon(raw_points, 0.5, self._path_offset_z, len(raw_points) - 1, MAX_DRAW_DISTANCE),
+      raw_points=np.array([x_d, -y_d, z], dtype=np.float32).T,
+      projected_points=np.array(points, dtype=np.float32).reshape(-1, 2),
     )
+    self._lead_path_widths = np.array(widths, dtype=np.float32)
     self._lead_in_path = float(lead.inPath)
 
   def _draw_lead_path(self):  # moonpilot seam, see AGENTS.md
-    """Draw the lead's predicted path, fading with the in-path probability the planner acts on."""
-    if self._lead_path.projected_points.size == 0:
+    """Draw the lead's predicted path: a line that thickens with the model's own yStd, faded by the
+    in-path probability the planner acts on."""
+    points = self._lead_path.projected_points
+    if points.shape[0] < 2:
       return
 
     alpha = int(np.clip(self._lead_in_path, 0.0, 1.0) * 90)
-    points = self._lead_path.projected_points
-    draw_polygon(self._rect, points, rl.Color(218, 202, 37, alpha))
+    color = rl.Color(218, 202, 37, alpha)
+    for (x0, y0), (x1, y1), w in zip(points[:-1], points[1:], self._lead_path_widths[1:], strict=True):
+      rl.draw_line_ex(rl.Vector2(float(x0), float(y0)), rl.Vector2(float(x1), float(y1)), float(w), color)
 
   def _draw_lead_indicator(self):
     # Draw lead vehicles if available

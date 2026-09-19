@@ -17,7 +17,7 @@ from openpilot.common.realtime import DT_MDL
 from openpilot.common.swaglog import cloudlog
 
 from moonpilot import features
-from moonpilot.lead import MOONPILOT_INPATH_RC, normalize_lead
+from moonpilot.lead import MOONPILOT_INPATH_RC, MOONPILOT_LEAD_PROB_RC, normalize_lead
 from moonpilot.slam import MOONPILOT_SLAM_POSE_DELAY, Node, PriorChannel, RotatingPoseWindow, fill_ego_correction, invalid
 
 N_LEADS = 3
@@ -74,6 +74,8 @@ def main() -> None:
 
   # Owned here and created once: per-frame filters would silently drop the smoothing.
   in_path_filters = [FirstOrderFilter(1.0, MOONPILOT_INPATH_RC, DT_MDL) for _ in range(N_LEADS)]
+  # The confidence gate's own filter, radard's shape: 0.0 start so the first frame is a rise.
+  prob_filters = [FirstOrderFilter(0.0, MOONPILOT_LEAD_PROB_RC, DT_MDL) for _ in range(N_LEADS)]
 
   while True:
     sm.update()
@@ -121,7 +123,7 @@ def main() -> None:
       if radar is not None:
         fused_lead = (radar.leadOne, radar.leadTwo)[i] if i < 2 else None
 
-      for field, value in normalize_lead(i, model_lead, fused_lead, ego_path_x, ego_path_y, in_path_filters[i]).items():
+      for field, value in normalize_lead(i, model_lead, fused_lead, ego_path_x, ego_path_y, in_path_filters[i], prob_filters[i]).items():
         setattr(slot, field, value)
 
     fill_ego_correction(msg, corr)
