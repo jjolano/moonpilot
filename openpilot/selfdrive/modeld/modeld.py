@@ -190,7 +190,14 @@ class ModelState:
 def main(demo=False):
   cloudlog.warning("modeld init")
 
-  CHESTNUT = chestnut_present() and chestnut_compiled()
+  try:  # moonpilot seam, see AGENTS.md: the fork's model runtime, imported at call time so a broken one cannot stop the stock path
+    from moonpilot.modelruntime import moonpilot_model_runtime
+    runtime = moonpilot_model_runtime()
+  except Exception:
+    cloudlog.exception("moonpilot model runtime unavailable")
+    runtime = None
+
+  CHESTNUT = runtime is None and chestnut_present() and chestnut_compiled()
   if CHESTNUT:
     os.environ['HCQDEV_WAIT_TIMEOUT_MS'] = '3000'
   params = Params()
@@ -225,7 +232,11 @@ def main(demo=False):
   st = time.monotonic()
   cloudlog.warning("loading model")
   model = None
-  if CHESTNUT:
+  if runtime is not None:  # moonpilot seam, see AGENTS.md: a custom selection never enters the chestnut path
+    model = runtime.create_model(vipc_client_main.width, vipc_client_main.height)
+    if model is None:  # moonpilot seam, see AGENTS.md: a failed load leaves upstream's constants and decode in place
+      runtime = None
+  elif CHESTNUT:
     big_model = None
     def load_big():
       nonlocal big_model
@@ -277,7 +288,8 @@ def main(demo=False):
 
   # TODO this needs more thought, use .2s extra for now to estimate other delays
   # TODO Move smooth seconds to action function
-  long_delay = CP.longitudinalActuatorDelay + LONG_SMOOTH_SECONDS
+  lat_smooth, long_smooth = runtime.smoothness if runtime is not None else (LAT_SMOOTH_SECONDS, LONG_SMOOTH_SECONDS)  # moonpilot seam, see AGENTS.md
+  long_delay = CP.longitudinalActuatorDelay + long_smooth
   prev_action = log.ModelDataV2.Action()
 
   DH = DesireHelper()
@@ -320,7 +332,7 @@ def main(demo=False):
     is_rhd = sm["driverMonitoringState"].isRHD
     frame_id = sm["narrowRoadCameraState"].frameId
     v_ego = max(sm["carState"].vEgo, 0.)
-    lat_delay = sm["lateralDelay"].lateralDelay + LAT_SMOOTH_SECONDS
+    lat_delay = sm["lateralDelay"].lateralDelay + lat_smooth  # moonpilot seam, see AGENTS.md
     if sm.updated["extrinsicsCalibration"] and sm.seen['narrowRoadCameraState'] and sm.seen['deviceState']:
       device_from_calib_euler = np.array(sm["extrinsicsCalibration"].rpyCalib, dtype=np.float32)
       dc = DEVICE_CAMERAS[(str(sm['deviceState'].deviceType), str(sm['narrowRoadCameraState'].sensor))]
@@ -384,7 +396,8 @@ def main(demo=False):
       drivingdata_send = messaging.new_message('drivingModelData')
       posenet_send = messaging.new_message('cameraOdometry')
 
-      action = get_action_from_model(model_output, prev_action, lat_action_t, long_action_t, v_ego)
+      action = (runtime.get_action(model_output, prev_action, lat_action_t, long_action_t, v_ego) if runtime is not None
+                else get_action_from_model(model_output, prev_action, lat_action_t, long_action_t, v_ego))  # moonpilot seam, see AGENTS.md
       prev_action = action
       fill_model_msg(modelv2_send, model_output, action,
                      publish_state, meta_main.frame_id, meta_extra.frame_id, frame_id,

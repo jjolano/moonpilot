@@ -110,6 +110,13 @@ def get_driverstate_packet(model_output, frame_id: int, location_ts: int, exec_t
 def main():
   config_realtime_process(7, 5)
 
+  try:  # moonpilot seam, see AGENTS.md: the fork's monitoring runtime, imported at call time so a broken one cannot stop the stock path
+    from moonpilot.modelruntime import moonpilot_dm_runtime
+    runtime = moonpilot_dm_runtime()
+  except Exception:
+    cloudlog.exception("moonpilot monitoring runtime unavailable")
+    runtime = None
+
   cloudlog.warning("connecting to cabin stream")
   vipc_client = VisionIpcClient("camerad", VisionStreamType.VISION_STREAM_CABIN, True)
   while not vipc_client.connect(False):
@@ -117,7 +124,10 @@ def main():
   assert vipc_client.is_connected()
   cloudlog.warning(f"connected with buffer size: {vipc_client.buffer_len}")
 
-  model = ModelState(vipc_client.width, vipc_client.height)
+  model = runtime.create_model(vipc_client.width, vipc_client.height) if runtime is not None else None  # moonpilot seam, see AGENTS.md
+  if model is None:  # moonpilot seam, see AGENTS.md: a build that fails to load takes the whole runtime with it, so the parse below is upstream's too
+    runtime = None
+    model = ModelState(vipc_client.width, vipc_client.height)
   cloudlog.warning("models loaded, dmonitoringmodeld starting")
 
   sm = SubMaster(["extrinsicsCalibration"])
@@ -144,7 +154,7 @@ def main():
     t2 = time.perf_counter()
     raw_pred = model_output.tobytes() if SEND_RAW_PRED else b''
     model_output = slice_outputs(model_output, model.output_slices)
-    model_output = parse_model_output(model_output)
+    model_output = runtime.parse(model_output, model) if runtime is not None else parse_model_output(model_output)  # moonpilot seam, see AGENTS.md
     model_output['raw_pred'] = raw_pred
     msg = get_driverstate_packet(model_output, vipc_client.frame_id, vipc_client.timestamp_sof, t2 - t1, gpu_execution_time)
     pm.send("driverStateV2", msg)

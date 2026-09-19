@@ -79,9 +79,46 @@ LATERAL_ENGAGE = Feature(
   offroad_only=True,
 )
 
-# Behaviors the driver can swap back to upstream. The settings panel is built from this
-# table, so a feature is one row here, one row in params_keys.h, and its own code.
-FEATURES: tuple[Feature, ...] = (LEAD_LATERAL, TORQUE_LATERAL, PATH_PREVIEW, LONGITUDINAL, MODEL_BRAKING, CURVE_SPEED, SLAM, TAILSCALE, LATERAL_ENGAGE)
+@dataclass(frozen=True)
+class Group:
+  """A page of the panel: what its rows have in common, in the driver's terms.
+
+  The panel has one screen per group, because the flat list had grown past what a driver can read at
+  a glance -- and the grouping is by *what the row changes about the car*, not by which module owns
+  it, so the question a driver arrives with ("why does it steer like that") lands on one page."""
+
+  title: str
+  description: str
+  features: tuple[Feature, ...]
+
+
+# Behaviors the driver can swap back to upstream, grouped into the pages each panel renders. The
+# panels are built from this table, so a feature is one row here, one row in params_keys.h, and its
+# own code -- and a new page is one `Group` and no panel edit.
+STEERING = Group(
+  title="steering",
+  description="How openpilot moves the wheel: whose controller, when a curve is entered, and whether openpilot can steer at all.",
+  features=(LATERAL_ENGAGE, TORQUE_LATERAL, PATH_PREVIEW),
+)
+
+SPEED = Group(
+  title="speed & distance",
+  description="What the car does with the pedals: whose planner sets the speed, and how it reads the road ahead.",
+  # The lead's lateral prediction sits here rather than with the steering because the fork reaches
+  # it through the planner's time gap, not through a steering request.
+  features=(LONGITUDINAL, MODEL_BRAKING, CURVE_SPEED, LEAD_LATERAL, SLAM),
+)
+
+DEVICE = Group(
+  title="device",
+  description="What the device does for itself, off the road.",
+  features=(TAILSCALE,),
+)
+
+GROUPS: tuple[Group, ...] = (STEERING, SPEED, DEVICE)
+
+# Depth-first over the groups: every feature, once, in the order the pages show them.
+FEATURES: tuple[Feature, ...] = tuple(feature for group in GROUPS for feature in group.features)
 
 
 def missing_modules(feature: Feature) -> tuple[str, ...]:

@@ -1,10 +1,17 @@
 """moonpilot settings panel. Rows come from moonpilot/features.py, so a feature shows up
 here by existing in that table, and a feature whose dependencies are still missing reads
-as unavailable instead of silently doing nothing."""
+as unavailable instead of silently doing nothing.
+
+The panel itself is the root: what this device is running (the models row), one row per *group* of
+features, and the two device actions that own their own live labels. A group pushes its own page,
+which is the same rows the flat panel used to carry -- the toggle, its description and its gates are
+unchanged, so a feature moved between groups is a table edit and nothing else.
+"""
 
 from moonpilot import tailscale
 from moonpilot.engage import car_unavailable_reason
-from moonpilot.features import FEATURES, Feature, missing_modules, version, wanted
+from moonpilot.features import FEATURES, Group, GROUPS, Feature, missing_modules, version, wanted
+from moonpilot.ui import models as models_ui
 from moonpilot.ui import offroad_mode
 from moonpilot.ui.tailscale_qr import TailscaleSignInDialog
 from openpilot.common.params import Params
@@ -46,6 +53,40 @@ def _feature_toggle(feature: Feature, params: Params):
   )
 
 
+def _tailscale_row(params: Params):
+  # One row for tailscale's state and its sign-in: text, description and enabled are all
+  # re-resolved every render, so it reads SIGN IN and is tappable exactly while a login URL
+  # exists, and shows the state dimmed out otherwise. The description is where the URL and
+  # the explanatory line go — it wraps and expands on tap, which a right-aligned value
+  # would clip. Same shape as upstream's Pair Device row.
+  return button_item(
+    "tailscale",
+    lambda: "SIGN IN" if tailscale.auth_url(params) else tailscale.status_text(params)[0].upper(),
+    description=lambda: tailscale.status_text(params)[1],
+    callback=lambda: gui_app.push_widget(TailscaleSignInDialog()),
+    enabled=lambda: bool(tailscale.auth_url(params)),
+  )
+
+
+class GroupLayout(Widget):
+  """One group's page: the group's own name and description, then its toggles. Pushed, so the way
+  back is the leading row, and the toggles are the same objects the flat panel used to carry."""
+
+  def __init__(self, group: Group, params: Params):
+    super().__init__()
+    self._scroller = Scroller(
+      [
+        button_item(group.title, "BACK", description=group.description, callback=lambda: gui_app.pop_widget()),
+        *(_feature_toggle(feature, params) for feature in group.features),
+      ],
+      line_separator=True,
+      spacing=0,
+    )
+
+  def _render(self, rect):
+    self._scroller.render(rect)
+
+
 class MoonpilotLayout(Widget):
   def __init__(self):
     super().__init__()
@@ -53,24 +94,25 @@ class MoonpilotLayout(Widget):
     self._scroller = Scroller(
       [
         text_item("version", version()),
-        *(_feature_toggle(feature, self._params) for feature in FEATURES),
+        models_ui.row(self._params),
+        *[
+          button_item(
+            group.title,
+            "OPEN",
+            description=group.description,
+            callback=lambda group=group, params=self._params: gui_app.push_widget(GroupLayout(group, params)),
+          )
+          for group in GROUPS
+        ],
         offroad_mode.row(self._params),
-        # One row for tailscale's state and its sign-in: text, description and enabled are all
-        # re-resolved every render, so it reads SIGN IN and is tappable exactly while a login URL
-        # exists, and shows the state dimmed out otherwise. The description is where the URL and
-        # the explanatory line go — it wraps and expands on tap, which a right-aligned value
-        # would clip. Same shape as upstream's Pair Device row.
-        button_item(
-          "tailscale",
-          lambda: "SIGN IN" if tailscale.auth_url(self._params) else tailscale.status_text(self._params)[0].upper(),
-          description=lambda: tailscale.status_text(self._params)[1],
-          callback=lambda: gui_app.push_widget(TailscaleSignInDialog()),
-          enabled=lambda: bool(tailscale.auth_url(self._params)),
-        ),
+        _tailscale_row(self._params),
       ],
       line_separator=True,
       spacing=0,
     )
+    # Every feature row lives on a group page now; this is the one place that would notice a
+    # feature added to FEATURES but to no group (it cannot happen -- FEATURES is the flattening).
+    assert FEATURES, GROUPS
 
   def _render(self, rect):
     self._scroller.render(rect)

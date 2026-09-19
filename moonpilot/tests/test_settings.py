@@ -15,7 +15,8 @@ from unittest import mock
 
 from opendbc.car.structs import car
 
-from moonpilot.features import LATERAL_ENGAGE, Feature
+from moonpilot import models
+from moonpilot.features import FEATURES, GROUPS, LATERAL_ENGAGE, Feature
 from moonpilot.ui import settings, settings_mici
 
 # A name no distribution can provide, so `available()` is False without depending on the
@@ -79,6 +80,60 @@ class TestTiziDescription(unittest.TestCase):
       self.assertTrue(text.startswith("<b>"))
       self.assertTrue(ABSENT in text)
       self.assertTrue("test description" in text)
+
+
+if __name__ == "__main__":
+  unittest.main()
+
+class TestGrouping(unittest.TestCase):
+  """The panel's pages are the feature table's groups, so these two properties are what keeps a
+  regroup from losing a row: every feature is on exactly one page, and the flat `FEATURES` the old
+  panel iterated is the flattening of the pages."""
+
+  def test_every_feature_sits_on_exactly_one_page(self):
+    grouped = [feature for group in GROUPS for feature in group.features]
+    self.assertEqual(len(grouped), len(set(grouped)), "a feature is on two pages")
+    self.assertEqual(set(grouped), set(FEATURES), "FEATURES and the groups disagree")
+    self.assertEqual(tuple(grouped), FEATURES, "FEATURES is not the flattening of GROUPS")
+
+  def test_every_page_says_what_its_rows_have_in_common(self):
+    # A page with no description is a page whose rows have no reason to be together: the description
+    # is the only thing that tells a driver why they are looking at these toggles.
+    for group in GROUPS:
+      with self.subTest(group=group.title):
+        self.assertTrue(group.features)
+        self.assertTrue(group.description)
+
+  def test_the_pages_are_the_three_the_panel_shows(self):
+    self.assertEqual([group.title for group in GROUPS], ["steering", "speed & distance", "device"])
+
+
+class TestModelsStrings(unittest.TestCase):
+  """What the models panes print, which both trees share. The strings are the contract between the
+  two panels and `moonpilot/models.py`, so they are pinned here and not in either tree."""
+
+  def test_a_bundled_selection_reads_as_stock(self):
+    params = SimpleNamespace(get=lambda key, block=False, return_default=False: "" if key.startswith("MoonpilotModels") else None)
+    self.assertEqual(models.model_label(params, models.DRIVING), models.BUNDLED_LABEL)
+
+  def test_a_job_with_progress_names_both_numbers(self):
+    job = {"phase": "downloading", "received": 5 * 1024**2, "total": 10 * 1024**2, "op": "install", "recipe": "a" * 64}
+    text = models.job_text(job)
+    self.assertTrue("downloading" in text)
+    self.assertTrue(models.human_size(5 * 1024**2) in text)
+    self.assertTrue(models.human_size(10 * 1024**2) in text)
+    self.assertEqual(models.job_text({"phase": "building"}), "building")
+    self.assertEqual(models.job_text(None), "")
+
+  def test_a_catalog_with_no_revision_reads_as_never(self):
+    self.assertEqual(models.catalog_text({"revision": "", "generated_at": "", "error": None}), "never")
+    self.assertEqual(models.catalog_text({"revision": "a" * 64, "generated_at": "2026-09-19T06:48:29Z", "error": "boom"}), "stale")
+    self.assertEqual(models.catalog_text({"revision": "a" * 64, "generated_at": "2026-09-19T06:48:29Z", "error": None}), "2026-09-19")
+
+  def test_the_protocol_label_is_shorter_than_the_id(self):
+    for proto in models.PROTOCOLS:
+      with self.subTest(protocol=proto.id):
+        self.assertNotEqual(models.protocol_label(proto.id), proto.id)
 
 
 if __name__ == "__main__":

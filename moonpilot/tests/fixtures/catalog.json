@@ -1,0 +1,1897 @@
+{
+ "documents": {
+  "01420ce0c87bf29e75bcc57ea9618f7a7bb3a64c47866acc504fe9f68019103c": "{\"configuration\":{\"LAT_SMOOTH_SECONDS\":0.0,\"LONG_SMOOTH_SECONDS\":0.3,\"MODEL_CONTEXT_FREQ\":5,\"MODEL_RUN_FREQ\":20,\"frame_skip\":4},\"members\":{\"supercombo\":{\"artifact\":{\"format\":\"onnx\",\"sha256\":\"659727c4d4839adc4992a254409a54259a8756a743f2d567bf5fdc6579f8009b\",\"size\":60881999},\"configuration\":{\"LAT_SMOOTH_SECONDS\":0.0,\"LONG_SMOOTH_SECONDS\":0.3,\"MODEL_CONTEXT_FREQ\":5,\"MODEL_RUN_FREQ\":20,\"frame_skip\":4},\"inputs\":{\"features\":{\"dtype\":null,\"semantics\":null,\"shape\":[512]}},\"metadata\":{\"input_dtypes\":{\"action_t\":\"float16\",\"big_img\":\"uint8\",\"desire_pulse\":\"float16\",\"features_buffer\":\"float16\",\"img\":\"uint8\",\"traffic_convention\":\"float16\"},\"input_shapes\":{\"action_t\":[1,2],\"big_img\":[1,12,128,256],\"desire_pulse\":[1,25,8],\"features_buffer\":[1,24,512],\"img\":[1,12,128,256],\"traffic_convention\":[1,2]},\"lineage\":{\"checkpoints\":[\"6a7d09ad-bcc9-43bc-916d-29287e60cee2/200\",\"a27b3122-733e-4a65-938b-acfebebbe5e8/100\"],\"fused\":true,\"policy\":\"a27b3122-733e-4a65-938b-acfebebbe5e8/100\",\"vision\":\"6a7d09ad-bcc9-43bc-916d-29287e60cee2/200\"},\"model_checkpoint\":\"6a7d09ad-bcc9-43bc-916d-29287e60cee2/200/a27b3122-733e-4a65-938b-acfebebbe5e8/100\",\"operators\":[\"Add\",\"Cast\",\"Clip\",\"Concat\",\"Conv\",\"Div\",\"Expand\",\"Gather\",\"GatherND\",\"Gelu\",\"Gemm\",\"Identity\",\"LayerNormalization\",\"MatMul\",\"Mul\",\"ReduceL2\",\"ReduceMean\",\"Relu\",\"Reshape\",\"Sigmoid\",\"Slice\",\"Softmax\",\"Squeeze\",\"Sub\",\"Transpose\",\"Unsqueeze\",\"Where\"],\"opsets\":{\"ai.onnx\":20},\"output_dtypes\":{\"outputs\":\"float16\"},\"output_shapes\":{\"outputs\":[1,2576]},\"output_slices\":{\"desire_pred\":[55,87,null],\"desire_state\":[2566,2574,null],\"hidden_state\":[1064,1576,null],\"lane_lines\":[117,645,null],\"lane_lines_prob\":[645,653,null],\"lead\":[917,1061,null],\"lead_prob\":[1061,1064,null],\"meta\":[0,55,null],\"pad\":[-2,null,null],\"plan\":[1576,2566,null],\"pose\":[87,99,null],\"road_edges\":[653,917,null],\"road_transform\":[105,117,null],\"wide_from_device_euler\":[99,105,null]},\"output_slices_error\":null},\"missing\":[\"MODEL_FREQ\"],\"outputs\":{\"features\":{\"dtype\":null,\"semantics\":null,\"shape\":[512]}},\"source\":{\"commit\":\"ba37c02c7c64225b8aec79411d1a8c2f5c1aa343\",\"constants_sources\":{\"LAT_SMOOTH_SECONDS\":\"openpilot/selfdrive/modeld/modeld.py:38\",\"LONG_SMOOTH_SECONDS\":\"openpilot/selfdrive/modeld/modeld.py:39\",\"MODEL_CONTEXT_FREQ\":\"openpilot/selfdrive/modeld/constants.py:18\",\"MODEL_RUN_FREQ\":\"openpilot/selfdrive/modeld/constants.py:17\",\"frame_skip\":\"derived: MODEL_RUN_FREQ // MODEL_CONTEXT_FREQ\"},\"license\":\"MIT\",\"path\":\"openpilot/selfdrive/modeld/models/driving_supercombo.onnx\",\"repository\":\"commaai/openpilot\"},\"targets\":[\"QCOM\"]}},\"profile\":\"b214c9240f3dd3934119b3e28f972bfb4a698acd3dfbae09ebbad3efe8104f7c\",\"schema\":1,\"type\":\"recipe\"}",
+  "016469e1b109c8028f29dbc5ee935bb76ca58f3ed31f30a3d2df8a2dc6b1cc2a": "{\"configuration\":{},\"members\":{\"dmonitoring\":{\"artifact\":{\"format\":\"onnx\",\"sha256\":\"35e4a5d4c4d481f915e42358af4665b2c92b8f5c1efd1c0731f21b876ad1d856\",\"size\":6954249},\"configuration\":{},\"inputs\":{},\"metadata\":{\"input_dtypes\":{\"calib\":\"float32\",\"input_img\":\"uint8\"},\"input_shapes\":{\"calib\":[1,3],\"input_img\":[1,1382400]},\"lineage\":null,\"model_checkpoint\":\"da4b8724-8998-45da-aa36-d8fb390492b9\",\"operators\":[\"Add\",\"Cast\",\"Concat\",\"Constant\",\"Conv\",\"Div\",\"Flatten\",\"Gemm\",\"GlobalAveragePool\",\"Mul\",\"Relu\",\"Reshape\",\"Sub\",\"Tanh\",\"Transpose\"],\"opsets\":{\"ai.onnx\":17},\"output_dtypes\":{\"outputs\":\"float16\"},\"output_shapes\":{\"outputs\":[1,551]},\"output_slices\":{\"face_descs_lhd\":[0,12,null],\"face_descs_rhd\":[19,31,null],\"face_prob_lhd\":[12,13,null],\"face_prob_rhd\":[31,32,null],\"features\":[39,551,null],\"left_blink_prob_lhd\":[16,17,null],\"left_blink_prob_rhd\":[35,36,null],\"left_eye_prob_lhd\":[13,14,null],\"left_eye_prob_rhd\":[32,33,null],\"right_blink_prob_lhd\":[17,18,null],\"right_blink_prob_rhd\":[36,37,null],\"right_eye_prob_lhd\":[14,15,null],\"right_eye_prob_rhd\":[33,34,null],\"sunglasses_prob_lhd\":[15,16,null],\"sunglasses_prob_rhd\":[34,35,null],\"using_phone_prob_lhd\":[18,19,null],\"using_phone_prob_rhd\":[37,38,null],\"wheel_on_right\":[38,39,null]},\"output_slices_error\":null},\"missing\":[],\"outputs\":{},\"source\":{\"commit\":\"d079f8d133e3916cbdd68e3f57da5681e9460a50\",\"constants_sources\":{},\"license\":\"MIT\",\"path\":\"selfdrive/modeld/models/dmonitoring_model.onnx\",\"repository\":\"commaai/openpilot\"},\"targets\":[\"QCOM\"]}},\"profile\":\"2fb745f53733aa7f65323a79d94b3af5220594f90dda2a7e48819c4a34cfbc8b\",\"schema\":1,\"type\":\"recipe\"}",
+  "03a42d6ffbf4518710a75706a3ecd9a91b8ddad0a8de2b1fca33c9fe10ddbd67": "{\"configuration\":{\"LAT_SMOOTH_SECONDS\":0.0,\"LONG_SMOOTH_SECONDS\":0.3,\"MODEL_CONTEXT_FREQ\":5,\"MODEL_RUN_FREQ\":20,\"frame_skip\":4},\"members\":{\"off_policy\":{\"artifact\":{\"format\":\"onnx\",\"sha256\":\"dff39ef4705f7dc092ea6a867d030c1092d40fa124f15c36ed01ee62877a1f21\",\"size\":18178659},\"configuration\":{\"LAT_SMOOTH_SECONDS\":0.0,\"LONG_SMOOTH_SECONDS\":0.3,\"MODEL_CONTEXT_FREQ\":5,\"MODEL_RUN_FREQ\":20,\"frame_skip\":4},\"inputs\":{\"features\":{\"dtype\":null,\"semantics\":null,\"shape\":[512]}},\"metadata\":{\"input_dtypes\":{\"action_t\":\"float16\",\"desire_pulse\":\"float16\",\"features_buffer\":\"float16\",\"traffic_convention\":\"float16\"},\"input_shapes\":{\"action_t\":[1,2],\"desire_pulse\":[1,25,8],\"features_buffer\":[1,25,512],\"traffic_convention\":[1,2]},\"lineage\":{\"checkpoints\":[\"eb7b226d-7e9f-4512-9b3d-0271fd158d2a/100\"],\"fused\":false,\"self\":\"eb7b226d-7e9f-4512-9b3d-0271fd158d2a/100\"},\"model_checkpoint\":\"eb7b226d-7e9f-4512-9b3d-0271fd158d2a/100\",\"operators\":[\"Add\",\"Concat\",\"Gather\",\"GatherND\",\"Gelu\",\"Gemm\",\"LayerNormalization\",\"MatMul\",\"Mul\",\"Reshape\",\"Sigmoid\",\"Slice\",\"Softmax\",\"Squeeze\",\"Transpose\",\"Where\"],\"opsets\":{\"ai.onnx\":20},\"output_dtypes\":{\"outputs\":\"float16\"},\"output_shapes\":{\"outputs\":[1,1948]},\"output_slices\":{\"desire_state\":[1937,1945,null],\"lane_lines\":[990,1518,null],\"lane_lines_prob\":[1518,1526,null],\"lead\":[1790,1934,null],\"lead_prob\":[1934,1937,null],\"pad\":[-3,null,null],\"plan\":[0,990,null],\"road_edges\":[1526,1790,null]},\"output_slices_error\":null},\"missing\":[\"MODEL_FREQ\"],\"outputs\":{},\"source\":{\"commit\":\"9757bf109e0673eb7481246d7dad91b3a70b51e9\",\"constants_sources\":{\"LAT_SMOOTH_SECONDS\":\"selfdrive/modeld/modeld.py:42\",\"LONG_SMOOTH_SECONDS\":\"selfdrive/modeld/modeld.py:43\",\"MODEL_CONTEXT_FREQ\":\"selfdrive/modeld/constants.py:18\",\"MODEL_RUN_FREQ\":\"selfdrive/modeld/constants.py:17\",\"frame_skip\":\"derived: MODEL_RUN_FREQ // MODEL_CONTEXT_FREQ\"},\"license\":\"MIT\",\"path\":\"selfdrive/modeld/models/driving_off_policy.onnx\",\"repository\":\"commaai/openpilot\"},\"targets\":[\"QCOM\"]},\"on_policy\":{\"artifact\":{\"format\":\"onnx\",\"sha256\":\"4e7e31a20e93c6e0fd37d29c339e6668a915e3550d971a17e6560b9227b7ffcd\",\"size\":16745129},\"configuration\":{\"LAT_SMOOTH_SECONDS\":0.0,\"LONG_SMOOTH_SECONDS\":0.3,\"MODEL_CONTEXT_FREQ\":5,\"MODEL_RUN_FREQ\":20,\"frame_skip\":4},\"inputs\":{\"features\":{\"dtype\":null,\"semantics\":null,\"shape\":[512]}},\"metadata\":{\"input_dtypes\":{\"action_t\":\"float16\",\"desire_pulse\":\"float16\",\"features_buffer\":\"float16\",\"traffic_convention\":\"float16\"},\"input_shapes\":{\"action_t\":[1,2],\"desire_pulse\":[1,25,8],\"features_buffer\":[1,25,512],\"traffic_convention\":[1,2]},\"lineage\":{\"checkpoints\":[\"c93fb62d-9de8-4ebf-8529-9784feac48a7/100\"],\"fused\":false,\"self\":\"c93fb62d-9de8-4ebf-8529-9784feac48a7/100\"},\"model_checkpoint\":\"c93fb62d-9de8-4ebf-8529-9784feac48a7/100\",\"operators\":[\"Add\",\"Gather\",\"GatherND\",\"Gelu\",\"Gemm\",\"LayerNormalization\",\"MatMul\",\"Mul\",\"Reshape\",\"Sigmoid\",\"Slice\",\"Softmax\",\"Squeeze\",\"Transpose\",\"Where\"],\"opsets\":{\"ai.onnx\":20},\"output_dtypes\":{\"outputs\":\"float16\"},\"output_shapes\":{\"outputs\":[1,4]},\"output_slices\":{\"action\":[0,4,null],\"pad\":[0,null,null]},\"output_slices_error\":null},\"missing\":[\"MODEL_FREQ\"],\"outputs\":{},\"source\":{\"commit\":\"9757bf109e0673eb7481246d7dad91b3a70b51e9\",\"constants_sources\":{\"LAT_SMOOTH_SECONDS\":\"selfdrive/modeld/modeld.py:42\",\"LONG_SMOOTH_SECONDS\":\"selfdrive/modeld/modeld.py:43\",\"MODEL_CONTEXT_FREQ\":\"selfdrive/modeld/constants.py:18\",\"MODEL_RUN_FREQ\":\"selfdrive/modeld/constants.py:17\",\"frame_skip\":\"derived: MODEL_RUN_FREQ // MODEL_CONTEXT_FREQ\"},\"license\":\"MIT\",\"path\":\"selfdrive/modeld/models/driving_on_policy.onnx\",\"repository\":\"commaai/openpilot\"},\"targets\":[\"QCOM\"]},\"vision\":{\"artifact\":{\"format\":\"onnx\",\"sha256\":\"50070f898ad223475fced42d12a8e67e57e7fac7b21ddc26b05e64f1ae536880\",\"size\":23210375},\"configuration\":{\"LAT_SMOOTH_SECONDS\":0.0,\"LONG_SMOOTH_SECONDS\":0.3,\"MODEL_CONTEXT_FREQ\":5,\"MODEL_RUN_FREQ\":20,\"frame_skip\":4},\"inputs\":{},\"metadata\":{\"input_dtypes\":{\"big_img\":\"uint8\",\"img\":\"uint8\"},\"input_shapes\":{\"big_img\":[1,12,128,256],\"img\":[1,12,128,256]},\"lineage\":{\"checkpoints\":[\"eb7b226d-7e9f-4512-9b3d-0271fd158d2a/100\"],\"fused\":false,\"self\":\"eb7b226d-7e9f-4512-9b3d-0271fd158d2a/100\"},\"model_checkpoint\":\"eb7b226d-7e9f-4512-9b3d-0271fd158d2a/100\",\"operators\":[\"Add\",\"Cast\",\"Concat\",\"Conv\",\"Div\",\"Gelu\",\"Gemm\",\"LayerNormalization\",\"Mul\",\"ReduceMean\",\"Relu\",\"Reshape\",\"Sigmoid\",\"Sub\"],\"opsets\":{\"ai.onnx\":20},\"output_dtypes\":{\"outputs\":\"float16\"},\"output_shapes\":{\"outputs\":[1,632]},\"output_slices\":{\"desire_pred\":[55,87,null],\"hidden_state\":[117,629,null],\"meta\":[0,55,null],\"pad\":[-3,null,null],\"pose\":[87,99,null],\"road_transform\":[105,117,null],\"wide_from_device_euler\":[99,105,null]},\"output_slices_error\":null},\"missing\":[\"MODEL_FREQ\"],\"outputs\":{\"features\":{\"dtype\":null,\"semantics\":null,\"shape\":[512]}},\"source\":{\"commit\":\"9757bf109e0673eb7481246d7dad91b3a70b51e9\",\"constants_sources\":{\"LAT_SMOOTH_SECONDS\":\"selfdrive/modeld/modeld.py:42\",\"LONG_SMOOTH_SECONDS\":\"selfdrive/modeld/modeld.py:43\",\"MODEL_CONTEXT_FREQ\":\"selfdrive/modeld/constants.py:18\",\"MODEL_RUN_FREQ\":\"selfdrive/modeld/constants.py:17\",\"frame_skip\":\"derived: MODEL_RUN_FREQ // MODEL_CONTEXT_FREQ\"},\"license\":\"MIT\",\"path\":\"selfdrive/modeld/models/driving_vision.onnx\",\"repository\":\"commaai/openpilot\"},\"targets\":[\"QCOM\"]}},\"profile\":\"910a924c491291717ff7f6017082088a9a626f323abd2408cc21ccfc77b4ed9d\",\"schema\":1,\"type\":\"recipe\"}",
+  "051a266d64675ba7ceda62671b6f4ad4395619014223817db002d97178e0a333": "{\"configuration\":{\"LAT_SMOOTH_SECONDS\":0.1,\"LONG_SMOOTH_SECONDS\":0.3,\"MODEL_CONTEXT_FREQ\":5,\"MODEL_RUN_FREQ\":20,\"frame_skip\":4},\"members\":{\"on_policy\":{\"artifact\":{\"format\":\"onnx\",\"sha256\":\"72e98a95541f200bd2faeae8d718997483696fd4801fc7d718c167b05854707d\",\"size\":12343535},\"configuration\":{\"LAT_SMOOTH_SECONDS\":0.1,\"LONG_SMOOTH_SECONDS\":0.3,\"MODEL_CONTEXT_FREQ\":5,\"MODEL_RUN_FREQ\":20,\"frame_skip\":4},\"inputs\":{\"features\":{\"dtype\":null,\"semantics\":null,\"shape\":[512]}},\"metadata\":{\"input_dtypes\":{\"desire_pulse\":\"float16\",\"features_buffer\":\"float16\",\"traffic_convention\":\"float16\"},\"input_shapes\":{\"desire_pulse\":[1,25,8],\"features_buffer\":[1,25,512],\"traffic_convention\":[1,2]},\"lineage\":{\"checkpoints\":[\"a8f96b93-bde2-4e28-a732-4df21ebba968/400\"],\"fused\":false,\"self\":\"a8f96b93-bde2-4e28-a732-4df21ebba968/400\"},\"model_checkpoint\":\"a8f96b93-bde2-4e28-a732-4df21ebba968/400\",\"operators\":[\"Add\",\"Concat\",\"Constant\",\"Elu\",\"Gather\",\"Gemm\",\"LayerNormalization\",\"MatMul\",\"Mul\",\"Relu\",\"Reshape\",\"Softmax\",\"Split\",\"Squeeze\",\"Transpose\",\"Unsqueeze\"],\"opsets\":{\"ai.onnx\":17},\"output_dtypes\":{\"outputs\":\"float16\"},\"output_shapes\":{\"outputs\":[1,1000]},\"output_slices\":{\"desire_state\":[990,998,null],\"pad\":[-2,null,null],\"plan\":[0,990,null]},\"output_slices_error\":null},\"missing\":[\"MODEL_FREQ\"],\"outputs\":{},\"source\":{\"commit\":\"d5d5a84625e065ee33e3ebb2deacccf0e044d38a\",\"constants_sources\":{\"LAT_SMOOTH_SECONDS\":\"selfdrive/modeld/modeld.py:43\",\"LONG_SMOOTH_SECONDS\":\"selfdrive/modeld/modeld.py:44\",\"MODEL_CONTEXT_FREQ\":\"selfdrive/modeld/constants.py:18\",\"MODEL_RUN_FREQ\":\"selfdrive/modeld/constants.py:17\",\"frame_skip\":\"derived: MODEL_RUN_FREQ // MODEL_CONTEXT_FREQ\"},\"license\":\"MIT\",\"path\":\"selfdrive/modeld/models/driving_policy.onnx\",\"repository\":\"commaai/openpilot\"},\"targets\":[\"QCOM\"]},\"vision\":{\"artifact\":{\"format\":\"onnx\",\"sha256\":\"e66bb8d53eced3786ed71a59b55ffc6810944cb217f0518621cc76303260a1ef\",\"size\":46271991},\"configuration\":{\"LAT_SMOOTH_SECONDS\":0.1,\"LONG_SMOOTH_SECONDS\":0.3,\"MODEL_CONTEXT_FREQ\":5,\"MODEL_RUN_FREQ\":20,\"frame_skip\":4},\"inputs\":{},\"metadata\":{\"input_dtypes\":{\"big_img\":\"uint8\",\"img\":\"uint8\"},\"input_shapes\":{\"big_img\":[1,12,128,256],\"img\":[1,12,128,256]},\"lineage\":{\"checkpoints\":[\"2454c1c0-faac-47a7-b0a4-244fa0aeb474/500\"],\"fused\":false,\"self\":\"2454c1c0-faac-47a7-b0a4-244fa0aeb474/500\"},\"model_checkpoint\":\"2454c1c0-faac-47a7-b0a4-244fa0aeb474/500\",\"operators\":[\"Add\",\"Cast\",\"Clip\",\"Concat\",\"Constant\",\"Conv\",\"Div\",\"Flatten\",\"Gemm\",\"GlobalAveragePool\",\"Mul\",\"ReduceMean\",\"ReduceSum\",\"Relu\",\"Sigmoid\",\"Sqrt\",\"Sub\",\"Tanh\"],\"opsets\":{\"ai.onnx\":17},\"output_dtypes\":{\"outputs\":\"float16\"},\"output_shapes\":{\"outputs\":[1,1576]},\"output_slices\":{\"desire_pred\":[55,87,null],\"hidden_state\":[1064,1576,null],\"lane_lines\":[117,645,null],\"lane_lines_prob\":[645,653,null],\"lead\":[917,1061,null],\"lead_prob\":[1061,1064,null],\"meta\":[0,55,null],\"pad\":[0,null,null],\"pose\":[87,99,null],\"road_edges\":[653,917,null],\"road_transform\":[105,117,null],\"wide_from_device_euler\":[99,105,null]},\"output_slices_error\":null},\"missing\":[\"MODEL_FREQ\"],\"outputs\":{\"features\":{\"dtype\":null,\"semantics\":null,\"shape\":[512]}},\"source\":{\"commit\":\"d5d5a84625e065ee33e3ebb2deacccf0e044d38a\",\"constants_sources\":{\"LAT_SMOOTH_SECONDS\":\"selfdrive/modeld/modeld.py:43\",\"LONG_SMOOTH_SECONDS\":\"selfdrive/modeld/modeld.py:44\",\"MODEL_CONTEXT_FREQ\":\"selfdrive/modeld/constants.py:18\",\"MODEL_RUN_FREQ\":\"selfdrive/modeld/constants.py:17\",\"frame_skip\":\"derived: MODEL_RUN_FREQ // MODEL_CONTEXT_FREQ\"},\"license\":\"MIT\",\"path\":\"selfdrive/modeld/models/driving_vision.onnx\",\"repository\":\"commaai/openpilot\"},\"targets\":[\"QCOM\"]}},\"profile\":\"66205aa165be91d19af5b6bd909df45d71eb225f75e00fca6c2cbba8707e0f30\",\"schema\":1,\"type\":\"recipe\"}",
+  "148c4b3658079ebb26053500fb55366fb63f804e0b976e1e99ff434d5ce795ec": "{\"configuration\":{\"LAT_SMOOTH_SECONDS\":0.0,\"LONG_SMOOTH_SECONDS\":0.3,\"MODEL_CONTEXT_FREQ\":5,\"MODEL_RUN_FREQ\":20,\"frame_skip\":4},\"members\":{\"off_policy\":{\"artifact\":{\"format\":\"onnx\",\"sha256\":\"978742c0da21bb97d74ec8fd50d20a871f03c6f74de834ff861c925588dbadd6\",\"size\":18178536},\"configuration\":{\"LAT_SMOOTH_SECONDS\":0.0,\"LONG_SMOOTH_SECONDS\":0.3,\"MODEL_CONTEXT_FREQ\":5,\"MODEL_RUN_FREQ\":20,\"frame_skip\":4},\"inputs\":{\"features\":{\"dtype\":null,\"semantics\":null,\"shape\":[512]}},\"metadata\":{\"input_dtypes\":{\"action_t\":\"float16\",\"desire_pulse\":\"float16\",\"features_buffer\":\"float16\",\"traffic_convention\":\"float16\"},\"input_shapes\":{\"action_t\":[1,2],\"desire_pulse\":[1,25,8],\"features_buffer\":[1,25,512],\"traffic_convention\":[1,2]},\"lineage\":{\"checkpoints\":[\"c84bafbe-d12b-43af-8f9b-be0bf37b203a/100\"],\"fused\":false,\"self\":\"c84bafbe-d12b-43af-8f9b-be0bf37b203a/100\"},\"model_checkpoint\":\"c84bafbe-d12b-43af-8f9b-be0bf37b203a/100\",\"operators\":[\"Add\",\"Concat\",\"Gather\",\"GatherND\",\"Gelu\",\"Gemm\",\"LayerNormalization\",\"MatMul\",\"Mul\",\"Reshape\",\"Sigmoid\",\"Slice\",\"Softmax\",\"Squeeze\",\"Transpose\",\"Where\"],\"opsets\":{\"ai.onnx\":20},\"output_dtypes\":{\"outputs\":\"float16\"},\"output_shapes\":{\"outputs\":[1,1948]},\"output_slices\":{\"desire_state\":[1937,1945,null],\"lane_lines\":[990,1518,null],\"lane_lines_prob\":[1518,1526,null],\"lead\":[1790,1934,null],\"lead_prob\":[1934,1937,null],\"pad\":[-3,null,null],\"plan\":[0,990,null],\"road_edges\":[1526,1790,null]},\"output_slices_error\":null},\"missing\":[\"MODEL_FREQ\"],\"outputs\":{},\"source\":{\"commit\":\"2e6856403473c7fb3a54c1dc94419f0877d352dd\",\"constants_sources\":{\"LAT_SMOOTH_SECONDS\":\"selfdrive/modeld/modeld.py:32\",\"LONG_SMOOTH_SECONDS\":\"selfdrive/modeld/modeld.py:33\",\"MODEL_CONTEXT_FREQ\":\"selfdrive/modeld/constants.py:18\",\"MODEL_RUN_FREQ\":\"selfdrive/modeld/constants.py:17\",\"frame_skip\":\"derived: MODEL_RUN_FREQ // MODEL_CONTEXT_FREQ\"},\"license\":\"MIT\",\"path\":\"selfdrive/modeld/models/driving_off_policy.onnx\",\"repository\":\"commaai/openpilot\"},\"targets\":[\"QCOM\"]},\"on_policy\":{\"artifact\":{\"format\":\"onnx\",\"sha256\":\"f5ee074d71004a6aa846387e62dff2494977eb9d7e40e810f6d385fa6f4292a7\",\"size\":16745042},\"configuration\":{\"LAT_SMOOTH_SECONDS\":0.0,\"LONG_SMOOTH_SECONDS\":0.3,\"MODEL_CONTEXT_FREQ\":5,\"MODEL_RUN_FREQ\":20,\"frame_skip\":4},\"inputs\":{\"features\":{\"dtype\":null,\"semantics\":null,\"shape\":[512]}},\"metadata\":{\"input_dtypes\":{\"action_t\":\"float16\",\"desire_pulse\":\"float16\",\"features_buffer\":\"float16\",\"traffic_convention\":\"float16\"},\"input_shapes\":{\"action_t\":[1,2],\"desire_pulse\":[1,25,8],\"features_buffer\":[1,25,512],\"traffic_convention\":[1,2]},\"lineage\":null,\"model_checkpoint\":\"34ef973b-00a1-4156-8431-bfc3a5b8a10b\",\"operators\":[\"Add\",\"Gather\",\"GatherND\",\"Gelu\",\"Gemm\",\"LayerNormalization\",\"MatMul\",\"Mul\",\"Reshape\",\"Sigmoid\",\"Slice\",\"Softmax\",\"Squeeze\",\"Transpose\",\"Where\"],\"opsets\":{\"ai.onnx\":20},\"output_dtypes\":{\"outputs\":\"float16\"},\"output_shapes\":{\"outputs\":[1,4]},\"output_slices\":{\"action\":[0,4,null],\"pad\":[0,null,null]},\"output_slices_error\":null},\"missing\":[\"MODEL_FREQ\"],\"outputs\":{},\"source\":{\"commit\":\"2e6856403473c7fb3a54c1dc94419f0877d352dd\",\"constants_sources\":{\"LAT_SMOOTH_SECONDS\":\"selfdrive/modeld/modeld.py:32\",\"LONG_SMOOTH_SECONDS\":\"selfdrive/modeld/modeld.py:33\",\"MODEL_CONTEXT_FREQ\":\"selfdrive/modeld/constants.py:18\",\"MODEL_RUN_FREQ\":\"selfdrive/modeld/constants.py:17\",\"frame_skip\":\"derived: MODEL_RUN_FREQ // MODEL_CONTEXT_FREQ\"},\"license\":\"MIT\",\"path\":\"selfdrive/modeld/models/driving_on_policy.onnx\",\"repository\":\"commaai/openpilot\"},\"targets\":[\"QCOM\"]},\"vision\":{\"artifact\":{\"format\":\"onnx\",\"sha256\":\"f53b7fc541cfc62f3ecadab87792cb56b219379556a5c13d2b84726564a83a08\",\"size\":23210690},\"configuration\":{\"LAT_SMOOTH_SECONDS\":0.0,\"LONG_SMOOTH_SECONDS\":0.3,\"MODEL_CONTEXT_FREQ\":5,\"MODEL_RUN_FREQ\":20,\"frame_skip\":4},\"inputs\":{},\"metadata\":{\"input_dtypes\":{\"big_img\":\"uint8\",\"img\":\"uint8\"},\"input_shapes\":{\"big_img\":[1,12,128,256],\"img\":[1,12,128,256]},\"lineage\":{\"checkpoints\":[\"c84bafbe-d12b-43af-8f9b-be0bf37b203a/100\"],\"fused\":false,\"self\":\"c84bafbe-d12b-43af-8f9b-be0bf37b203a/100\"},\"model_checkpoint\":\"c84bafbe-d12b-43af-8f9b-be0bf37b203a/100\",\"operators\":[\"Add\",\"Cast\",\"Concat\",\"Conv\",\"Div\",\"Gelu\",\"Gemm\",\"LayerNormalization\",\"Mul\",\"ReduceMean\",\"Relu\",\"Reshape\",\"Sigmoid\",\"Sub\"],\"opsets\":{\"ai.onnx\":20},\"output_dtypes\":{\"outputs\":\"float16\"},\"output_shapes\":{\"outputs\":[1,632]},\"output_slices\":{\"desire_pred\":[55,87,null],\"hidden_state\":[117,629,null],\"meta\":[0,55,null],\"pad\":[-3,null,null],\"pose\":[87,99,null],\"road_transform\":[105,117,null],\"wide_from_device_euler\":[99,105,null]},\"output_slices_error\":null},\"missing\":[\"MODEL_FREQ\"],\"outputs\":{\"features\":{\"dtype\":null,\"semantics\":null,\"shape\":[512]}},\"source\":{\"commit\":\"2e6856403473c7fb3a54c1dc94419f0877d352dd\",\"constants_sources\":{\"LAT_SMOOTH_SECONDS\":\"selfdrive/modeld/modeld.py:32\",\"LONG_SMOOTH_SECONDS\":\"selfdrive/modeld/modeld.py:33\",\"MODEL_CONTEXT_FREQ\":\"selfdrive/modeld/constants.py:18\",\"MODEL_RUN_FREQ\":\"selfdrive/modeld/constants.py:17\",\"frame_skip\":\"derived: MODEL_RUN_FREQ // MODEL_CONTEXT_FREQ\"},\"license\":\"MIT\",\"path\":\"selfdrive/modeld/models/driving_vision.onnx\",\"repository\":\"commaai/openpilot\"},\"targets\":[\"QCOM\"]}},\"profile\":\"910a924c491291717ff7f6017082088a9a626f323abd2408cc21ccfc77b4ed9d\",\"schema\":1,\"type\":\"recipe\"}",
+  "17b12acc43b4ee54e44cb9c7ea2a95a3f274b16d05499840f295610e659816fc": "{\"configuration\":{\"LAT_SMOOTH_SECONDS\":0.0,\"LONG_SMOOTH_SECONDS\":0.3,\"MODEL_CONTEXT_FREQ\":5,\"MODEL_RUN_FREQ\":20,\"frame_skip\":4},\"members\":{\"off_policy\":{\"artifact\":{\"format\":\"onnx\",\"sha256\":\"e5fe1fbb45cf59ccc2cc77d01d06168ca9e32276581170629877683b62e855ea\",\"size\":13393857},\"configuration\":{\"LAT_SMOOTH_SECONDS\":0.0,\"LONG_SMOOTH_SECONDS\":0.3,\"MODEL_CONTEXT_FREQ\":5,\"MODEL_RUN_FREQ\":20,\"frame_skip\":4},\"inputs\":{\"features\":{\"dtype\":null,\"semantics\":null,\"shape\":[512]}},\"metadata\":{\"input_dtypes\":{\"desire_pulse\":\"float16\",\"features_buffer\":\"float16\",\"traffic_convention\":\"float16\"},\"input_shapes\":{\"desire_pulse\":[1,25,8],\"features_buffer\":[1,25,512],\"traffic_convention\":[1,2]},\"lineage\":{\"checkpoints\":[\"4eaea7d4-23a3-47d1-b715-44324416ee31/200\"],\"fused\":false,\"self\":\"4eaea7d4-23a3-47d1-b715-44324416ee31/200\"},\"model_checkpoint\":\"4eaea7d4-23a3-47d1-b715-44324416ee31/200\",\"operators\":[\"Add\",\"Concat\",\"Gather\",\"GatherND\",\"Gelu\",\"Gemm\",\"LayerNormalization\",\"MatMul\",\"Mul\",\"Relu\",\"Reshape\",\"Sigmoid\",\"Slice\",\"Softmax\",\"Squeeze\",\"Transpose\",\"Where\"],\"opsets\":{\"ai.onnx\":20},\"output_dtypes\":{\"outputs\":\"float16\"},\"output_shapes\":{\"outputs\":[1,1940]},\"output_slices\":{\"lane_lines\":[990,1518,null],\"lane_lines_prob\":[1518,1526,null],\"lead\":[1790,1934,null],\"lead_prob\":[1934,1937,null],\"pad\":[-3,null,null],\"plan\":[0,990,null],\"road_edges\":[1526,1790,null]},\"output_slices_error\":null},\"missing\":[\"MODEL_FREQ\"],\"outputs\":{},\"source\":{\"commit\":\"db1d86b3757b0180859ae42472b63f9570bd0de9\",\"constants_sources\":{\"LAT_SMOOTH_SECONDS\":\"selfdrive/modeld/modeld.py:45\",\"LONG_SMOOTH_SECONDS\":\"selfdrive/modeld/modeld.py:46\",\"MODEL_CONTEXT_FREQ\":\"selfdrive/modeld/constants.py:18\",\"MODEL_RUN_FREQ\":\"selfdrive/modeld/constants.py:17\",\"frame_skip\":\"derived: MODEL_RUN_FREQ // MODEL_CONTEXT_FREQ\"},\"license\":\"MIT\",\"path\":\"selfdrive/modeld/models/driving_off_policy.onnx\",\"repository\":\"commaai/openpilot\"},\"targets\":[\"QCOM\"]},\"on_policy\":{\"artifact\":{\"format\":\"onnx\",\"sha256\":\"d637360e7268956fecca3d56d4f2039ad42d3ab628f403d936a35bb579a0772f\",\"size\":299},\"configuration\":{\"LAT_SMOOTH_SECONDS\":0.0,\"LONG_SMOOTH_SECONDS\":0.3,\"MODEL_CONTEXT_FREQ\":5,\"MODEL_RUN_FREQ\":20,\"frame_skip\":4},\"inputs\":{},\"metadata\":{},\"missing\":[\"MODEL_FREQ\"],\"outputs\":{},\"source\":{\"commit\":\"db1d86b3757b0180859ae42472b63f9570bd0de9\",\"constants_sources\":{\"LAT_SMOOTH_SECONDS\":\"selfdrive/modeld/modeld.py:45\",\"LONG_SMOOTH_SECONDS\":\"selfdrive/modeld/modeld.py:46\",\"MODEL_CONTEXT_FREQ\":\"selfdrive/modeld/constants.py:18\",\"MODEL_RUN_FREQ\":\"selfdrive/modeld/constants.py:17\",\"frame_skip\":\"derived: MODEL_RUN_FREQ // MODEL_CONTEXT_FREQ\"},\"license\":\"MIT\",\"path\":\"selfdrive/modeld/models/driving_policy.onnx\",\"repository\":\"commaai/openpilot\"},\"targets\":[\"QCOM\"]},\"vision\":{\"artifact\":{\"format\":\"onnx\",\"sha256\":\"7083cf21a9b10f8e13ed5da5afe8fa46a4b7065e0925467b189b7f39e392a115\",\"size\":300},\"configuration\":{\"LAT_SMOOTH_SECONDS\":0.0,\"LONG_SMOOTH_SECONDS\":0.3,\"MODEL_CONTEXT_FREQ\":5,\"MODEL_RUN_FREQ\":20,\"frame_skip\":4},\"inputs\":{},\"metadata\":{},\"missing\":[\"MODEL_FREQ\"],\"outputs\":{},\"source\":{\"commit\":\"db1d86b3757b0180859ae42472b63f9570bd0de9\",\"constants_sources\":{\"LAT_SMOOTH_SECONDS\":\"selfdrive/modeld/modeld.py:45\",\"LONG_SMOOTH_SECONDS\":\"selfdrive/modeld/modeld.py:46\",\"MODEL_CONTEXT_FREQ\":\"selfdrive/modeld/constants.py:18\",\"MODEL_RUN_FREQ\":\"selfdrive/modeld/constants.py:17\",\"frame_skip\":\"derived: MODEL_RUN_FREQ // MODEL_CONTEXT_FREQ\"},\"license\":\"MIT\",\"path\":\"selfdrive/modeld/models/driving_vision.onnx\",\"repository\":\"commaai/openpilot\"},\"targets\":[\"QCOM\"]}},\"profile\":\"910a924c491291717ff7f6017082088a9a626f323abd2408cc21ccfc77b4ed9d\",\"schema\":1,\"type\":\"recipe\"}",
+  "2fb745f53733aa7f65323a79d94b3af5220594f90dda2a7e48819c4a34cfbc8b": "{\"connections\":[],\"implementation_source\":{\"repository\":\"commaai/openpilot\",\"status\":\"historical archive\"},\"inputs\":{\"status\":\"source metadata only\"},\"name\":\"comma/archive/dmonitoring/dmonitoring/v1\",\"outputs\":{\"status\":\"source metadata only\"},\"required_configuration\":[],\"schema\":1,\"slot_sets\":[[\"dmonitoring\"]],\"state\":{\"status\":\"unresolved; requires an explicit execution profile\"},\"type\":\"profile\"}",
+  "3870150bbb21a19f29730ba327ce0595f425a37e17f51291700b54381f0d9032": "{\"configuration\":{},\"members\":{\"dmonitoring\":{\"artifact\":{\"format\":\"onnx\",\"sha256\":\"cdbcc4e78a1a6855986625a91b92c4a74cde490e4d7c111e11ed0f3774e01523\",\"size\":3791570},\"configuration\":{},\"inputs\":{},\"metadata\":{\"input_dtypes\":{\"calib\":\"float32\",\"input_img\":\"float32\"},\"input_shapes\":{\"calib\":[1,3],\"input_img\":[1,6,320,160]},\"lineage\":null,\"model_checkpoint\":null,\"operators\":[\"Add\",\"BatchNormalization\",\"Clip\",\"Concat\",\"Constant\",\"Conv\",\"Flatten\",\"Gemm\",\"Mul\",\"Relu\"],\"opsets\":{\"ai.onnx\":9},\"output_dtypes\":{\"outputs\":\"float32\"},\"output_shapes\":{\"outputs\":[1,45]},\"output_slices\":null,\"output_slices_error\":null},\"missing\":[],\"outputs\":{},\"source\":{\"commit\":\"8080f3edd7fc6e04923a0d64dfe2d6e0287ee168\",\"constants_sources\":{},\"license\":\"MIT\",\"path\":\"models/dmonitoring_model.onnx\",\"repository\":\"commaai/openpilot\"},\"targets\":[\"QCOM\"]}},\"profile\":\"2fb745f53733aa7f65323a79d94b3af5220594f90dda2a7e48819c4a34cfbc8b\",\"schema\":1,\"type\":\"recipe\"}",
+  "3fcfe14f14a2dc0e75ec37f91df42e702015cbe29eefaf755836781b0b11159f": "{\"configuration\":{\"LAT_SMOOTH_SECONDS\":0.0,\"LONG_SMOOTH_SECONDS\":0.3,\"MODEL_CONTEXT_FREQ\":5,\"MODEL_RUN_FREQ\":20,\"frame_skip\":4},\"members\":{\"on_policy\":{\"artifact\":{\"format\":\"onnx\",\"sha256\":\"78477124cbf3ffe30fa951ebada8410b43c4242c6054584d656f1d329b067e15\",\"size\":14060847},\"configuration\":{\"LAT_SMOOTH_SECONDS\":0.0,\"LONG_SMOOTH_SECONDS\":0.3,\"MODEL_CONTEXT_FREQ\":5,\"MODEL_RUN_FREQ\":20,\"frame_skip\":4},\"inputs\":{\"features\":{\"dtype\":null,\"semantics\":null,\"shape\":[512]}},\"metadata\":{\"input_dtypes\":{\"desire_pulse\":\"float16\",\"features_buffer\":\"float16\",\"traffic_convention\":\"float16\"},\"input_shapes\":{\"desire_pulse\":[1,25,8],\"features_buffer\":[1,25,512],\"traffic_convention\":[1,2]},\"lineage\":{\"checkpoints\":[\"a27b3122-733e-4a65-938b-acfebebbe5e8/100\"],\"fused\":false,\"self\":\"a27b3122-733e-4a65-938b-acfebebbe5e8/100\"},\"model_checkpoint\":\"a27b3122-733e-4a65-938b-acfebebbe5e8/100\",\"operators\":[\"Add\",\"Concat\",\"Gather\",\"GatherND\",\"Gelu\",\"Gemm\",\"LayerNormalization\",\"MatMul\",\"Mul\",\"Relu\",\"Reshape\",\"Sigmoid\",\"Slice\",\"Softmax\",\"Squeeze\",\"Transpose\",\"Unsqueeze\",\"Where\"],\"opsets\":{\"ai.onnx\":20},\"output_dtypes\":{\"outputs\":\"float16\"},\"output_shapes\":{\"outputs\":[1,1000]},\"output_slices\":{\"desire_state\":[990,998,null],\"pad\":[-2,null,null],\"plan\":[0,990,null]},\"output_slices_error\":null},\"missing\":[\"MODEL_FREQ\"],\"outputs\":{},\"source\":{\"commit\":\"4024d13ddabbb23aca2399603957096b0921b4d8\",\"constants_sources\":{\"LAT_SMOOTH_SECONDS\":\"selfdrive/modeld/modeld.py:32\",\"LONG_SMOOTH_SECONDS\":\"selfdrive/modeld/modeld.py:33\",\"MODEL_CONTEXT_FREQ\":\"selfdrive/modeld/constants.py:18\",\"MODEL_RUN_FREQ\":\"selfdrive/modeld/constants.py:17\",\"frame_skip\":\"derived: MODEL_RUN_FREQ // MODEL_CONTEXT_FREQ\"},\"license\":\"MIT\",\"path\":\"selfdrive/modeld/models/driving_on_policy.onnx\",\"repository\":\"commaai/openpilot\"},\"targets\":[\"QCOM\"]},\"vision\":{\"artifact\":{\"format\":\"onnx\",\"sha256\":\"ee29ee5bce84d1ce23e9ff381280de9b4e4d96d2934cd751740354884e112c66\",\"size\":46877473},\"configuration\":{\"LAT_SMOOTH_SECONDS\":0.0,\"LONG_SMOOTH_SECONDS\":0.3,\"MODEL_CONTEXT_FREQ\":5,\"MODEL_RUN_FREQ\":20,\"frame_skip\":4},\"inputs\":{},\"metadata\":{\"input_dtypes\":{\"big_img\":\"uint8\",\"img\":\"uint8\"},\"input_shapes\":{\"big_img\":[1,12,128,256],\"img\":[1,12,128,256]},\"lineage\":{\"checkpoints\":[\"6a7d09ad-bcc9-43bc-916d-29287e60cee2/200\"],\"fused\":false,\"self\":\"6a7d09ad-bcc9-43bc-916d-29287e60cee2/200\"},\"model_checkpoint\":\"6a7d09ad-bcc9-43bc-916d-29287e60cee2/200\",\"operators\":[\"Add\",\"Cast\",\"Clip\",\"Concat\",\"Conv\",\"Div\",\"Expand\",\"Gelu\",\"Gemm\",\"Mul\",\"ReduceL2\",\"ReduceMean\",\"Relu\",\"Reshape\",\"Sigmoid\",\"Sub\"],\"opsets\":{\"ai.onnx\":20},\"output_dtypes\":{\"outputs\":\"float16\"},\"output_shapes\":{\"outputs\":[1,1576]},\"output_slices\":{\"desire_pred\":[55,87,null],\"hidden_state\":[1064,1576,null],\"lane_lines\":[117,645,null],\"lane_lines_prob\":[645,653,null],\"lead\":[917,1061,null],\"lead_prob\":[1061,1064,null],\"meta\":[0,55,null],\"pad\":[0,null,null],\"pose\":[87,99,null],\"road_edges\":[653,917,null],\"road_transform\":[105,117,null],\"wide_from_device_euler\":[99,105,null]},\"output_slices_error\":null},\"missing\":[\"MODEL_FREQ\"],\"outputs\":{\"features\":{\"dtype\":null,\"semantics\":null,\"shape\":[512]}},\"source\":{\"commit\":\"4024d13ddabbb23aca2399603957096b0921b4d8\",\"constants_sources\":{\"LAT_SMOOTH_SECONDS\":\"selfdrive/modeld/modeld.py:32\",\"LONG_SMOOTH_SECONDS\":\"selfdrive/modeld/modeld.py:33\",\"MODEL_CONTEXT_FREQ\":\"selfdrive/modeld/constants.py:18\",\"MODEL_RUN_FREQ\":\"selfdrive/modeld/constants.py:17\",\"frame_skip\":\"derived: MODEL_RUN_FREQ // MODEL_CONTEXT_FREQ\"},\"license\":\"MIT\",\"path\":\"selfdrive/modeld/models/driving_vision.onnx\",\"repository\":\"commaai/openpilot\"},\"targets\":[\"QCOM\"]}},\"profile\":\"66205aa165be91d19af5b6bd909df45d71eb225f75e00fca6c2cbba8707e0f30\",\"schema\":1,\"type\":\"recipe\"}",
+  "5e8b3b3b3c0e2b1a2218671a4776f961a2ee7d63548143f1ab9431ae99799ca0": "{\"configuration\":{},\"members\":{\"dmonitoring\":{\"artifact\":{\"format\":\"onnx\",\"sha256\":\"dd299afabe7a3e0d04cbe2bd97fdb0c93bba8ad6d3cc3663a0e0ededaf243ac2\",\"size\":7497335},\"configuration\":{},\"inputs\":{},\"metadata\":{\"input_dtypes\":{\"calib\":\"float32\",\"input_img\":\"uint8\"},\"input_shapes\":{\"calib\":[1,3],\"input_img\":[1,1382400]},\"lineage\":null,\"model_checkpoint\":\"586aece6-afd8-4d8b-b7da-5634d6eae5e6\",\"operators\":[\"Add\",\"Cast\",\"Concat\",\"Conv\",\"Div\",\"Gelu\",\"Gemm\",\"Mul\",\"ReduceMean\",\"Relu\",\"Reshape\",\"Slice\",\"Sub\",\"Transpose\"],\"opsets\":{\"ai.onnx\":20},\"output_dtypes\":{\"outputs\":\"float16\"},\"output_shapes\":{\"outputs\":[1,553]},\"output_slices\":{\"face_descs_lhd\":[0,12,null],\"face_descs_rhd\":[20,32,null],\"face_prob_lhd\":[12,13,null],\"face_prob_rhd\":[32,33,null],\"features\":[41,553,null],\"left_blink_prob_lhd\":[16,17,null],\"left_blink_prob_rhd\":[36,37,null],\"left_eye_prob_lhd\":[13,14,null],\"left_eye_prob_rhd\":[33,34,null],\"right_blink_prob_lhd\":[17,18,null],\"right_blink_prob_rhd\":[37,38,null],\"right_eye_prob_lhd\":[14,15,null],\"right_eye_prob_rhd\":[34,35,null],\"sleep_prob_lhd\":[19,20,null],\"sleep_prob_rhd\":[39,40,null],\"sunglasses_prob_lhd\":[15,16,null],\"sunglasses_prob_rhd\":[35,36,null],\"using_phone_prob_lhd\":[18,19,null],\"using_phone_prob_rhd\":[38,39,null],\"wheel_on_right\":[40,41,null]},\"output_slices_error\":null},\"missing\":[],\"outputs\":{},\"source\":{\"commit\":\"d8e0a384ca5a7ca0d2c4e0ac33b18ea76d2435f0\",\"constants_sources\":{},\"license\":\"MIT\",\"path\":\"openpilot/selfdrive/modeld/models/dmonitoring_model.onnx\",\"repository\":\"commaai/openpilot\"},\"targets\":[\"QCOM\"]}},\"profile\":\"2fb745f53733aa7f65323a79d94b3af5220594f90dda2a7e48819c4a34cfbc8b\",\"schema\":1,\"type\":\"recipe\"}",
+  "5f533ea72befe84bebcb8d88062625404b43215f645ca9ce09b3a4bbb114f2bc": "{\"configuration\":{\"LAT_SMOOTH_SECONDS\":0.0,\"LONG_SMOOTH_SECONDS\":0.3,\"MODEL_CONTEXT_FREQ\":5,\"MODEL_RUN_FREQ\":20,\"frame_skip\":4},\"members\":{\"off_policy\":{\"artifact\":{\"format\":\"onnx\",\"sha256\":\"a1d9c0dd99a7ac8bba4f3caac93bd5575aefe5a614f5a5999ab45522078712d2\",\"size\":13393589},\"configuration\":{\"LAT_SMOOTH_SECONDS\":0.0,\"LONG_SMOOTH_SECONDS\":0.3,\"MODEL_CONTEXT_FREQ\":5,\"MODEL_RUN_FREQ\":20,\"frame_skip\":4},\"inputs\":{\"features\":{\"dtype\":null,\"semantics\":null,\"shape\":[512]}},\"metadata\":{\"input_dtypes\":{\"desire_pulse\":\"float16\",\"features_buffer\":\"float16\",\"traffic_convention\":\"float16\"},\"input_shapes\":{\"desire_pulse\":[1,25,8],\"features_buffer\":[1,25,512],\"traffic_convention\":[1,2]},\"lineage\":{\"checkpoints\":[\"4eaea7d4-23a3-47d1-b715-44324416ee31/200\"],\"fused\":false,\"self\":\"4eaea7d4-23a3-47d1-b715-44324416ee31/200\"},\"model_checkpoint\":\"4eaea7d4-23a3-47d1-b715-44324416ee31/200\",\"operators\":[\"Add\",\"Concat\",\"Gather\",\"GatherND\",\"Gelu\",\"Gemm\",\"LayerNormalization\",\"MatMul\",\"Mul\",\"Relu\",\"Reshape\",\"Sigmoid\",\"Slice\",\"Softmax\",\"Squeeze\",\"Transpose\",\"Where\"],\"opsets\":{\"ai.onnx\":20},\"output_dtypes\":{\"outputs\":\"float16\"},\"output_shapes\":{\"outputs\":[1,1940]},\"output_slices\":{\"lane_lines\":[990,1518,null],\"lane_lines_prob\":[1518,1526,null],\"lead\":[1790,1934,null],\"lead_prob\":[1934,1937,null],\"pad\":[-3,null,null],\"plan\":[0,990,null],\"road_edges\":[1526,1790,null]},\"output_slices_error\":null},\"missing\":[\"MODEL_FREQ\"],\"outputs\":{},\"source\":{\"commit\":\"11dfb2658b1b65a8d9d35cb32c0b4c5f2ca879c2\",\"constants_sources\":{\"LAT_SMOOTH_SECONDS\":\"selfdrive/modeld/modeld.py:45\",\"LONG_SMOOTH_SECONDS\":\"selfdrive/modeld/modeld.py:46\",\"MODEL_CONTEXT_FREQ\":\"selfdrive/modeld/constants.py:18\",\"MODEL_RUN_FREQ\":\"selfdrive/modeld/constants.py:17\",\"frame_skip\":\"derived: MODEL_RUN_FREQ // MODEL_CONTEXT_FREQ\"},\"license\":\"MIT\",\"path\":\"selfdrive/modeld/models/driving_off_policy.onnx\",\"repository\":\"commaai/openpilot\"},\"targets\":[\"QCOM\"]},\"on_policy\":{\"artifact\":{\"format\":\"onnx\",\"sha256\":\"6f886a16e813324af8e9021933ea4caac7a072828e60ab03b676839e38f8f00c\",\"size\":13022800},\"configuration\":{\"LAT_SMOOTH_SECONDS\":0.0,\"LONG_SMOOTH_SECONDS\":0.3,\"MODEL_CONTEXT_FREQ\":5,\"MODEL_RUN_FREQ\":20,\"frame_skip\":4},\"inputs\":{\"features\":{\"dtype\":null,\"semantics\":null,\"shape\":[512]}},\"metadata\":{\"input_dtypes\":{\"desire_pulse\":\"float16\",\"features_buffer\":\"float16\",\"traffic_convention\":\"float16\"},\"input_shapes\":{\"desire_pulse\":[1,25,8],\"features_buffer\":[1,25,512],\"traffic_convention\":[1,2]},\"lineage\":{\"checkpoints\":[\"a76ae294-e61a-43b8-b07e-c3496dbfc5ff/100\"],\"fused\":false,\"self\":\"a76ae294-e61a-43b8-b07e-c3496dbfc5ff/100\"},\"model_checkpoint\":\"a76ae294-e61a-43b8-b07e-c3496dbfc5ff/100\",\"operators\":[\"Add\",\"Concat\",\"Gather\",\"GatherND\",\"Gelu\",\"Gemm\",\"LayerNormalization\",\"MatMul\",\"Mul\",\"Relu\",\"Reshape\",\"Sigmoid\",\"Slice\",\"Softmax\",\"Squeeze\",\"Transpose\",\"Where\"],\"opsets\":{\"ai.onnx\":20},\"output_dtypes\":{\"outputs\":\"float16\"},\"output_shapes\":{\"outputs\":[1,1000]},\"output_slices\":{\"desire_state\":[990,998,null],\"pad\":[-2,null,null],\"plan\":[0,990,null]},\"output_slices_error\":null},\"missing\":[\"MODEL_FREQ\"],\"outputs\":{},\"source\":{\"commit\":\"11dfb2658b1b65a8d9d35cb32c0b4c5f2ca879c2\",\"constants_sources\":{\"LAT_SMOOTH_SECONDS\":\"selfdrive/modeld/modeld.py:45\",\"LONG_SMOOTH_SECONDS\":\"selfdrive/modeld/modeld.py:46\",\"MODEL_CONTEXT_FREQ\":\"selfdrive/modeld/constants.py:18\",\"MODEL_RUN_FREQ\":\"selfdrive/modeld/constants.py:17\",\"frame_skip\":\"derived: MODEL_RUN_FREQ // MODEL_CONTEXT_FREQ\"},\"license\":\"MIT\",\"path\":\"selfdrive/modeld/models/driving_policy.onnx\",\"repository\":\"commaai/openpilot\"},\"targets\":[\"QCOM\"]},\"vision\":{\"artifact\":{\"format\":\"onnx\",\"sha256\":\"7e9ccd538901af80da25a970a8cbb717a217e8a02a6ecce5af8e8cf9138b110f\",\"size\":23267519},\"configuration\":{\"LAT_SMOOTH_SECONDS\":0.0,\"LONG_SMOOTH_SECONDS\":0.3,\"MODEL_CONTEXT_FREQ\":5,\"MODEL_RUN_FREQ\":20,\"frame_skip\":4},\"inputs\":{},\"metadata\":{\"input_dtypes\":{\"big_img\":\"uint8\",\"img\":\"uint8\"},\"input_shapes\":{\"big_img\":[1,12,128,256],\"img\":[1,12,128,256]},\"lineage\":{\"checkpoints\":[\"4eaea7d4-23a3-47d1-b715-44324416ee31/200\"],\"fused\":false,\"self\":\"4eaea7d4-23a3-47d1-b715-44324416ee31/200\"},\"model_checkpoint\":\"4eaea7d4-23a3-47d1-b715-44324416ee31/200\",\"operators\":[\"Add\",\"Cast\",\"Concat\",\"Conv\",\"Div\",\"Gelu\",\"Gemm\",\"LayerNormalization\",\"Mul\",\"ReduceMean\",\"Relu\",\"Reshape\",\"Sigmoid\",\"Sub\"],\"opsets\":{\"ai.onnx\":20},\"output_dtypes\":{\"outputs\":\"float16\"},\"output_shapes\":{\"outputs\":[1,632]},\"output_slices\":{\"desire_pred\":[55,87,null],\"hidden_state\":[117,629,null],\"meta\":[0,55,null],\"pad\":[-3,null,null],\"pose\":[87,99,null],\"road_transform\":[105,117,null],\"wide_from_device_euler\":[99,105,null]},\"output_slices_error\":null},\"missing\":[\"MODEL_FREQ\"],\"outputs\":{\"features\":{\"dtype\":null,\"semantics\":null,\"shape\":[512]}},\"source\":{\"commit\":\"11dfb2658b1b65a8d9d35cb32c0b4c5f2ca879c2\",\"constants_sources\":{\"LAT_SMOOTH_SECONDS\":\"selfdrive/modeld/modeld.py:45\",\"LONG_SMOOTH_SECONDS\":\"selfdrive/modeld/modeld.py:46\",\"MODEL_CONTEXT_FREQ\":\"selfdrive/modeld/constants.py:18\",\"MODEL_RUN_FREQ\":\"selfdrive/modeld/constants.py:17\",\"frame_skip\":\"derived: MODEL_RUN_FREQ // MODEL_CONTEXT_FREQ\"},\"license\":\"MIT\",\"path\":\"selfdrive/modeld/models/driving_vision.onnx\",\"repository\":\"commaai/openpilot\"},\"targets\":[\"QCOM\"]}},\"profile\":\"82aa1ddad115c975c1dd2d5f095d9f369824b398f2dfda94ab6ee2e7b12be60c\",\"schema\":1,\"type\":\"recipe\"}",
+  "66205aa165be91d19af5b6bd909df45d71eb225f75e00fca6c2cbba8707e0f30": "{\"connections\":[{\"from\":\"vision\",\"input\":\"features\",\"output\":\"features\",\"to\":\"on_policy\"}],\"implementation_source\":{\"repository\":\"commaai/openpilot\",\"status\":\"historical archive\"},\"inputs\":{\"status\":\"source metadata only\"},\"name\":\"comma/archive/driving/on_policy-vision/v1\",\"outputs\":{\"status\":\"source metadata only\"},\"required_configuration\":[\"frame_skip\",\"LAT_SMOOTH_SECONDS\",\"LONG_SMOOTH_SECONDS\"],\"schema\":1,\"slot_sets\":[[\"on_policy\",\"vision\"]],\"state\":{\"status\":\"unresolved; requires an explicit execution profile\"},\"type\":\"profile\"}",
+  "82aa1ddad115c975c1dd2d5f095d9f369824b398f2dfda94ab6ee2e7b12be60c": "{\"connections\":[{\"from\":\"vision\",\"input\":\"features\",\"output\":\"features\",\"to\":\"off_policy\"},{\"from\":\"vision\",\"input\":\"features\",\"output\":\"features\",\"to\":\"on_policy\"},{\"from\":\"vision\",\"input\":\"features\",\"output\":\"features\",\"to\":\"on_policy\"}],\"implementation_source\":{\"repository\":\"commaai/openpilot\",\"status\":\"historical archive\"},\"inputs\":{\"status\":\"source metadata only\"},\"name\":\"comma/archive/driving/off_policy-on_policy-on_policy-vision/v1\",\"outputs\":{\"status\":\"source metadata only\"},\"required_configuration\":[\"frame_skip\",\"LAT_SMOOTH_SECONDS\",\"LONG_SMOOTH_SECONDS\"],\"schema\":1,\"slot_sets\":[[\"off_policy\",\"on_policy\",\"on_policy\",\"vision\"]],\"state\":{\"status\":\"unresolved; requires an explicit execution profile\"},\"type\":\"profile\"}",
+  "84dbb0fb5e2052fbe34cacf2f216de31d0478560b33bb59a4bbb306eb834eed4": "{\"configuration\":{\"LAT_SMOOTH_SECONDS\":0.0,\"LONG_SMOOTH_SECONDS\":0.3,\"frame_skip\":4},\"members\":{\"supercombo\":{\"artifact\":{\"format\":\"onnx\",\"sha256\":\"659727c4d4839adc4992a254409a54259a8756a743f2d567bf5fdc6579f8009b\",\"size\":60881999},\"configuration\":{\"LAT_SMOOTH_SECONDS\":0.0,\"LONG_SMOOTH_SECONDS\":0.3,\"frame_skip\":4},\"inputs\":{},\"metadata\":{\"input_shapes\":{\"action_t\":[1,2],\"big_img\":[1,12,128,256],\"desire_pulse\":[1,25,8],\"features_buffer\":[1,24,512],\"img\":[1,12,128,256],\"traffic_convention\":[1,2]},\"output_slices\":{\"desire_pred\":[55,87,null],\"desire_state\":[2566,2574,null],\"hidden_state\":[1064,1576,null],\"lane_lines\":[117,645,null],\"lane_lines_prob\":[645,653,null],\"lead\":[917,1061,null],\"lead_prob\":[1061,1064,null],\"meta\":[0,55,null],\"pad\":[2574,2576,null],\"plan\":[1576,2566,null],\"pose\":[87,99,null],\"road_edges\":[653,917,null],\"road_transform\":[105,117,null],\"wide_from_device_euler\":[99,105,null]}},\"missing\":[],\"outputs\":{},\"source\":{\"commit\":\"555f48c5d28709f039b79f3f6105e51305edd4b5\",\"license\":\"MIT\",\"path\":\"openpilot/selfdrive/modeld/models/driving_supercombo.onnx\",\"repository\":\"commaai/openpilot\"},\"targets\":[\"QCOM\"]}},\"profile\":\"b1dd9012490a17e56aee346053daed56bd673f53e05fd4624bc7ea3060d23180\",\"schema\":1,\"type\":\"recipe\"}",
+  "910a924c491291717ff7f6017082088a9a626f323abd2408cc21ccfc77b4ed9d": "{\"connections\":[{\"from\":\"vision\",\"input\":\"features\",\"output\":\"features\",\"to\":\"off_policy\"},{\"from\":\"vision\",\"input\":\"features\",\"output\":\"features\",\"to\":\"on_policy\"}],\"implementation_source\":{\"repository\":\"commaai/openpilot\",\"status\":\"historical archive\"},\"inputs\":{\"status\":\"source metadata only\"},\"name\":\"comma/archive/driving/off_policy-on_policy-vision/v1\",\"outputs\":{\"status\":\"source metadata only\"},\"required_configuration\":[\"frame_skip\",\"LAT_SMOOTH_SECONDS\",\"LONG_SMOOTH_SECONDS\"],\"schema\":1,\"slot_sets\":[[\"off_policy\",\"on_policy\",\"vision\"]],\"state\":{\"status\":\"unresolved; requires an explicit execution profile\"},\"type\":\"profile\"}",
+  "b1dd9012490a17e56aee346053daed56bd673f53e05fd4624bc7ea3060d23180": "{\"connections\":[],\"implementation_source\":{\"commit\":\"555f48c5d28709f039b79f3f6105e51305edd4b5\",\"repository\":\"commaai/openpilot\",\"tinygrad\":\"138fb4a783d82f4e877ad2fe3692aaf8d1de2e46\"},\"inputs\":{\"action_t\":{\"order\":[\"lateral\",\"longitudinal\"],\"shape\":[1,2],\"units\":\"seconds\"},\"desire\":{\"meaning\":\"upstream desire encoding; rising edges; index 0 ignored\",\"shape\":[8]},\"frames\":{\"allocation_bytes\":4804608,\"format\":\"NV12\",\"height\":1208,\"names\":[\"road\",\"wide\"],\"ownership\":\"borrowed until synchronous step returns\",\"stride\":2048,\"uv_offset\":2490368,\"width\":1928},\"timing\":{\"cadence_hz\":20,\"clock\":\"consumer monotonic nanoseconds\",\"max_camera_skew_ns\":10000000},\"traffic_convention\":{\"meaning\":\"left-hand then right-hand driving one-hot\",\"shape\":[1,2]},\"transforms\":{\"meaning\":\"model-to-camera inverse homographies; road then wide\",\"shape\":[2,3,3]}},\"name\":\"comma/driving-supercombo-555f48c5/v1\",\"outputs\":{\"decoded\":\"pinned Parser arrays; plan XYZ position/metres, velocity/metres per second, acceleration/metres per second squared, Euler/radians, angular rate/radians per second\",\"publication\":\"consumer-owned; no cereal messages or actuation\",\"raw\":{\"dtype\":\"float32\",\"shape\":[2576],\"slices\":{\"desire_pred\":[55,87,null],\"desire_state\":[2566,2574,null],\"hidden_state\":[1064,1576,null],\"lane_lines\":[117,645,null],\"lane_lines_prob\":[645,653,null],\"lead\":[917,1061,null],\"lead_prob\":[1061,1064,null],\"meta\":[0,55,null],\"pad\":[2574,2576,null],\"plan\":[1576,2566,null],\"pose\":[87,99,null],\"road_edges\":[653,917,null],\"road_transform\":[105,117,null],\"wide_from_device_euler\":[99,105,null]}},\"time_indices_seconds\":[0.0,0.009765625,0.0390625,0.087890625,0.15625,0.244140625,0.3515625,0.478515625,0.625,0.791015625,0.9765625,1.181640625,1.40625,1.650390625,1.9140625,2.197265625,2.5,2.822265625,3.1640625,3.525390625,3.90625,4.306640625,4.7265625,5.166015625,5.625,6.103515625,6.6015625,7.119140625,7.65625,8.212890625,8.7890625,9.384765625,10.0]},\"required_configuration\":[\"frame_skip\",\"LAT_SMOOTH_SECONDS\",\"LONG_SMOOTH_SECONDS\"],\"schema\":1,\"slot_sets\":[[\"supercombo\"]],\"state\":{\"context_hz\":5,\"discontinuity\":\"reject and reset on missing/reordered frames or cadence gap outside 25-75ms\",\"failure\":\"reset; no cached output\",\"first_result\":\"fifth consecutive frame pair\",\"frame_skip\":4,\"initialization\":\"zero queues and recurrent state\",\"skipped_evaluation\":\"unsupported; skipping step requires reset\",\"warmup\":\"execute a dummy inference then reset\"},\"type\":\"profile\"}",
+  "b214c9240f3dd3934119b3e28f972bfb4a698acd3dfbae09ebbad3efe8104f7c": "{\"connections\":[],\"implementation_source\":{\"repository\":\"commaai/openpilot\",\"status\":\"historical archive\"},\"inputs\":{\"status\":\"source metadata only\"},\"name\":\"comma/archive/driving/supercombo/v1\",\"outputs\":{\"status\":\"source metadata only\"},\"required_configuration\":[\"frame_skip\",\"LAT_SMOOTH_SECONDS\",\"LONG_SMOOTH_SECONDS\"],\"schema\":1,\"slot_sets\":[[\"supercombo\"]],\"state\":{\"status\":\"unresolved; requires an explicit execution profile\"},\"type\":\"profile\"}"
+ },
+ "entries": [
+  {
+   "kind": "dmonitoring",
+   "model": {
+    "archived": true,
+    "description": "model",
+    "family": "split",
+    "id": "commaai/7c95b2c448d5c247",
+    "links": [],
+    "model_class": "standard",
+    "name": "no calib"
+   },
+   "name": "no calib model",
+   "occurrences": [
+    {
+     "commit": "8080f3edd7fc6e04923a0d64dfe2d6e0287ee168",
+     "date": "2022-03-04T12:47:29-08:00",
+     "is_revert": false,
+     "name": "no calib model",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "no calib model"
+    }
+   ],
+   "publisher": "commaai",
+   "recipe": "3870150bbb21a19f29730ba327ce0595f425a37e17f51291700b54381f0d9032"
+  },
+  {
+   "kind": "driving",
+   "model": {
+    "archived": true,
+    "description": "model",
+    "family": "split",
+    "id": "commaai/a4e629a0a8eaae26",
+    "links": [],
+    "model_class": "standard",
+    "name": "Driving \u00b7 split \u00b7 standard \u00b7 2025-08-26 \u00b7 a4e629a0"
+   },
+   "name": "desire->desire_pulse",
+   "occurrences": [
+    {
+     "commit": "d5d5a84625e065ee33e3ebb2deacccf0e044d38a",
+     "date": "2025-08-26T18:20:25-07:00",
+     "is_revert": false,
+     "name": "desire->desire_pulse",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "desire->desire_pulse"
+    },
+    {
+     "commit": "4f3c712828c5c4db12467b426c0cba823f131ca0",
+     "date": "2025-08-27T13:24:31-07:00",
+     "is_revert": false,
+     "name": "consistent naming",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "consistent naming"
+    },
+    {
+     "commit": "f8ff156869f4abc64c595dc2a442071df4c8543d",
+     "date": "2025-08-27T13:48:23-07:00",
+     "is_revert": false,
+     "name": "modeld: desire->desire_pulse",
+     "pr": 36076,
+     "status": "merged",
+     "subject": "modeld: desire->desire_pulse (#36076)"
+    }
+   ],
+   "publisher": "commaai",
+   "recipe": "051a266d64675ba7ceda62671b6f4ad4395619014223817db002d97178e0a333"
+  },
+  {
+   "kind": "dmonitoring",
+   "model": {
+    "archived": true,
+    "description": "model",
+    "family": "split",
+    "id": "commaai/ba1313c3d0c22b24",
+    "links": [],
+    "model_class": "standard",
+    "name": "Driver monitoring \u00b7 split \u00b7 standard \u00b7 2026-01-21 \u00b7 ba1313c3"
+   },
+   "name": "da4b8724-8998-45da-aa36-d8fb390492b9",
+   "occurrences": [
+    {
+     "commit": "d079f8d133e3916cbdd68e3f57da5681e9460a50",
+     "date": "2026-01-21T20:46:32-08:00",
+     "is_revert": false,
+     "name": "da4b8724-8998-45da-aa36-d8fb390492b9",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "da4b8724-8998-45da-aa36-d8fb390492b9"
+    },
+    {
+     "commit": "1459d3519da2fdb2d981baf7811c2eaa2127eb80",
+     "date": "2026-01-22T18:41:08-08:00",
+     "is_revert": false,
+     "name": "DM: Ford GT model",
+     "pr": 37013,
+     "reverted_at": "2026-02-10T13:51:02-08:00",
+     "reverted_by_commit": "fe1cdf956134f5df208947492983b5aa56610b08",
+     "status": "reverted",
+     "subject": "DM: Ford GT model (#37013)"
+    },
+    {
+     "commit": "55f66e2246359c6593605399a0199d94d13ad90d",
+     "date": "2026-01-31T18:50:54-08:00",
+     "is_revert": false,
+     "name": "a27b3122-733e-4a65-938b-acfebebbe5e8/100",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "a27b3122-733e-4a65-938b-acfebebbe5e8/100"
+    },
+    {
+     "commit": "5b6436a90cf6902b8aaa71c2b6f3d7164d8ae391",
+     "date": "2026-02-03T19:14:02-08:00",
+     "is_revert": false,
+     "name": "CD210 model",
+     "pr": 37050,
+     "status": "merged",
+     "subject": "CD210 model (#37050)"
+    },
+    {
+     "commit": "0b410cb641b5ab69e6af5574e5ce4d5746d309d8",
+     "date": "2026-02-18T14:44:26-08:00",
+     "is_revert": false,
+     "name": "Merge branch 'master' into dm_fgt2",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "Merge branch 'master' into dm_fgt2"
+    }
+   ],
+   "publisher": "commaai",
+   "recipe": "016469e1b109c8028f29dbc5ee935bb76ca58f3ed31f30a3d2df8a2dc6b1cc2a"
+  },
+  {
+   "kind": "driving",
+   "model": {
+    "archived": true,
+    "description": "model",
+    "family": "split",
+    "id": "commaai/bf430805901d7964",
+    "links": [],
+    "model_class": "standard",
+    "name": "Driving \u00b7 split \u00b7 standard \u00b7 2026-03-26 \u00b7 bf430805"
+   },
+   "name": "6ab6fae5-fbbd-4ad0-928a-b33794f60dba/100",
+   "occurrences": [
+    {
+     "commit": "db1d86b3757b0180859ae42472b63f9570bd0de9",
+     "date": "2026-03-26T22:02:12-07:00",
+     "is_revert": false,
+     "name": "6ab6fae5-fbbd-4ad0-928a-b33794f60dba/100",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "6ab6fae5-fbbd-4ad0-928a-b33794f60dba/100"
+    },
+    {
+     "commit": "dcfbe5e8148008ff81ef966f409b53d0271b4b4e",
+     "date": "2026-03-31T19:16:47-07:00",
+     "is_revert": false,
+     "name": "6ab6fae5-fbbd-4ad0-928a-b33794f60dba/100",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "6ab6fae5-fbbd-4ad0-928a-b33794f60dba/100"
+    }
+   ],
+   "publisher": "commaai",
+   "recipe": "17b12acc43b4ee54e44cb9c7ea2a95a3f274b16d05499840f295610e659816fc"
+  },
+  {
+   "kind": "driving",
+   "model": {
+    "archived": true,
+    "description": "model",
+    "family": "split",
+    "id": "commaai/d32ed14ebc6d5b5f",
+    "links": [],
+    "model_class": "standard",
+    "name": "Driving \u00b7 split \u00b7 standard \u00b7 2026-04-03 \u00b7 d32ed14e"
+   },
+   "name": "recompile",
+   "occurrences": [
+    {
+     "commit": "11dfb2658b1b65a8d9d35cb32c0b4c5f2ca879c2",
+     "date": "2026-04-03T09:17:19-07:00",
+     "is_revert": false,
+     "name": "recompile",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "recompile"
+    }
+   ],
+   "publisher": "commaai",
+   "recipe": "5f533ea72befe84bebcb8d88062625404b43215f645ca9ce09b3a4bbb114f2bc"
+  },
+  {
+   "kind": "driving",
+   "model": {
+    "archived": true,
+    "description": "model",
+    "family": "split",
+    "id": "commaai/21535b5d6dc03cde",
+    "links": [],
+    "model_class": "standard",
+    "name": "Driving \u00b7 split \u00b7 standard \u00b7 2026-05-05 \u00b7 21535b5d"
+   },
+   "name": "c93fb62d-9de8-4ebf-8529-9784feac48a7/100",
+   "occurrences": [
+    {
+     "commit": "9757bf109e0673eb7481246d7dad91b3a70b51e9",
+     "date": "2026-05-05T19:17:59-07:00",
+     "is_revert": false,
+     "name": "c93fb62d-9de8-4ebf-8529-9784feac48a7/100",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "c93fb62d-9de8-4ebf-8529-9784feac48a7/100"
+    }
+   ],
+   "publisher": "commaai",
+   "recipe": "03a42d6ffbf4518710a75706a3ecd9a91b8ddad0a8de2b1fca33c9fe10ddbd67"
+  },
+  {
+   "kind": "driving",
+   "model": {
+    "archived": true,
+    "description": "model",
+    "family": "split",
+    "id": "commaai/f20c9c2c7c9b2b40",
+    "links": [],
+    "model_class": "standard",
+    "name": "Driving \u00b7 split \u00b7 standard \u00b7 2026-05-15 \u00b7 f20c9c2c"
+   },
+   "name": "modeld: RL driving model with 3-file split",
+   "occurrences": [
+    {
+     "commit": "2e6856403473c7fb3a54c1dc94419f0877d352dd",
+     "date": "2026-05-15T11:47:20-07:00",
+     "is_revert": false,
+     "name": "modeld: RL driving model with 3-file split",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "modeld: RL driving model with 3-file split"
+    },
+    {
+     "commit": "7da0fabf377f0b1b9ef805915b1594d01e148b92",
+     "date": "2026-06-02T18:14:34-07:00",
+     "is_revert": false,
+     "name": "modeld: RL driving model with 3-file split",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "modeld: RL driving model with 3-file split"
+    }
+   ],
+   "publisher": "commaai",
+   "recipe": "148c4b3658079ebb26053500fb55366fb63f804e0b976e1e99ff434d5ce795ec"
+  },
+  {
+   "kind": "driving",
+   "model": {
+    "archived": true,
+    "description": "model",
+    "family": "split",
+    "id": "commaai/8ef7372e702acd26",
+    "links": [],
+    "model_class": "standard",
+    "name": "Driving \u00b7 split \u00b7 standard \u00b7 2026-06-01 \u00b7 8ef7372e"
+   },
+   "name": "deep pre-req",
+   "occurrences": [
+    {
+     "commit": "ecc80d1e8c7fbfd0a8aa1cbb57ea7dc362b8262a",
+     "date": "2026-06-01T18:37:03-07:00",
+     "is_revert": false,
+     "name": "deep pre-req",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "deep pre-req"
+    },
+    {
+     "commit": "249cafe897deb433944c84fa6c3c6ce568f727e1",
+     "date": "2026-06-01T18:43:47-07:00",
+     "is_revert": false,
+     "name": "Prereqs deep models",
+     "pr": 38125,
+     "status": "merged",
+     "subject": "Prereqs deep models (#38125)"
+    },
+    {
+     "commit": "83d003ed5cd01abbacc6d982ebf79338f8a2ec15",
+     "date": "2026-06-11T08:02:16-07:00",
+     "is_revert": true,
+     "name": "Op model16 deep",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "Revert \"Op model16 deep (#38073)\""
+    },
+    {
+     "commit": "4024d13ddabbb23aca2399603957096b0921b4d8",
+     "date": "2026-06-11T09:32:24-07:00",
+     "is_revert": true,
+     "name": "Op model16 deep",
+     "pr": 38166,
+     "status": "merged",
+     "subject": "Revert \"Op model16 deep (#38073)\" (#38166)"
+    },
+    {
+     "commit": "79a1aca2fe590af1e838ff30a88a02b5fa99fb37",
+     "date": "2026-06-12T11:23:29-07:00",
+     "is_revert": false,
+     "name": "modeld: run the driving model as a single combined onnx",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "modeld: run the driving model as a single combined onnx"
+    }
+   ],
+   "publisher": "commaai",
+   "recipe": "3fcfe14f14a2dc0e75ec37f91df42e702015cbe29eefaf755836781b0b11159f"
+  },
+  {
+   "kind": "driving",
+   "model": {
+    "archived": true,
+    "description": "model",
+    "family": "supercombo",
+    "id": "commaai/1de3b89ae4d9f278",
+    "links": [],
+    "model_class": "standard",
+    "name": "Driving \u00b7 supercombo \u00b7 standard \u00b7 2026-06-12 \u00b7 1de3b89a"
+   },
+   "name": "reporter: link the policy checkpoint",
+   "occurrences": [
+    {
+     "commit": "31289c5d6a162d8118e2381f6ac9322bbba69206",
+     "date": "2026-06-12T18:23:29-07:00",
+     "is_revert": false,
+     "name": "reporter: link the policy checkpoint",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "reporter: link the policy checkpoint"
+    },
+    {
+     "commit": "a40fa3a0b0cfacb0010b50515bcd64aed3dbdac8",
+     "date": "2026-06-12T18:35:52-07:00",
+     "is_revert": false,
+     "name": "modeld: run the driving model as a single combined onnx",
+     "pr": 38173,
+     "status": "merged",
+     "subject": "modeld: run the driving model as a single combined onnx (#38173)"
+    },
+    {
+     "commit": "21da7a62f3001e848f1c90de7fefda73b52e6d59",
+     "date": "2026-06-20T16:58:12-07:00",
+     "is_revert": false,
+     "name": "move top level dirs into openpilot/",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "move top level dirs into openpilot/"
+    },
+    {
+     "commit": "a89ab38d60865f1b364327a9ae2835a2e0fe7c37",
+     "date": "2026-06-21T18:40:34-07:00",
+     "is_revert": false,
+     "name": "move root dirs into nested openpilot",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "move root dirs into nested openpilot"
+    },
+    {
+     "commit": "5edc0bd89d0830bc1ac86ee923d1d08d2915b770",
+     "date": "2026-06-21T18:49:46-07:00",
+     "is_revert": false,
+     "name": "mv root dirs into nested openpilot",
+     "pr": 38219,
+     "status": "merged",
+     "subject": "mv root dirs into nested openpilot (#38219)"
+    },
+    {
+     "commit": "7a8147dd7fab88db963d512ab4008de940714025",
+     "date": "2026-06-29T17:15:06-07:00",
+     "is_revert": false,
+     "name": "bigger big",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "bigger big"
+    },
+    {
+     "commit": "9c1645a7857dcde66578f30f286d037131cd8775",
+     "date": "2026-06-30T00:19:13-07:00",
+     "is_revert": true,
+     "name": "bigger big",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "Revert \"bigger big\""
+    },
+    {
+     "commit": "76aeb02bd2b63d37bd1eab62f587c059a7ef7ad7",
+     "date": "2026-07-01T00:26:58-07:00",
+     "is_revert": false,
+     "name": "bigger big",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "bigger big"
+    },
+    {
+     "commit": "4e4f0e52b499984339cdb39bd433d2f0c9b0e44e",
+     "date": "2026-07-01T00:27:16-07:00",
+     "is_revert": false,
+     "name": "faster",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "faster"
+    },
+    {
+     "commit": "fa0c6876d3cf070e91e25e5353ceadc68a5b3285",
+     "date": "2026-07-01T01:26:11-07:00",
+     "is_revert": false,
+     "name": "lebowski model",
+     "pr": 38268,
+     "status": "merged",
+     "subject": "lebowski model (#38268)"
+    },
+    {
+     "commit": "e52116b60ad29ba5f19fdb31ebd0ca28fc2a3d83",
+     "date": "2026-07-24T10:12:50-07:00",
+     "is_revert": true,
+     "name": "Rebel Legion model",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "Revert \"Rebel Legion model (#38164)\""
+    },
+    {
+     "commit": "9225dac4333215f048a86f29d950deb6d52b7ee4",
+     "date": "2026-07-24T10:21:01-07:00",
+     "is_revert": true,
+     "name": "Rebel Legion model",
+     "pr": 38449,
+     "status": "merged",
+     "subject": "Revert \"Rebel Legion model (#38164)\" (#38449)"
+    },
+    {
+     "commit": "d2314f0a09e549c6d1736f01e5caf4f59d4b0e15",
+     "date": "2026-08-04T10:55:36-07:00",
+     "is_revert": true,
+     "name": "Rebellious Hope model",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "Revert \"Rebellious Hope model (#38475)\""
+    },
+    {
+     "commit": "b361e952c9da023412c6744278cc9421b2c90b8c",
+     "date": "2026-08-04T10:58:56-07:00",
+     "is_revert": true,
+     "name": "Rebellious Hope model",
+     "pr": 38530,
+     "status": "merged",
+     "subject": "Revert \"Rebellious Hope model\" (#38530)"
+    },
+    {
+     "commit": "7d6e95bfbb96e4d41af8dce7e942ff1f385e401a",
+     "date": "2026-08-05T17:16:17-07:00",
+     "is_revert": false,
+     "name": "Merge branch 'master' into dmungate",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "Merge branch 'master' into dmungate"
+    },
+    {
+     "commit": "6ee3376d9e91770d065970cbb4f050a7758b80a7",
+     "date": "2026-08-05T17:30:56-07:00",
+     "is_revert": false,
+     "name": "base a62f9948-142d-4406-887b-81260951e71b",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "base a62f9948-142d-4406-887b-81260951e71b"
+    },
+    {
+     "commit": "4eb515b32d9ab416a2e9cb894f49af6800eb58d9",
+     "date": "2026-08-07T15:39:59-07:00",
+     "is_revert": false,
+     "name": "DM: Zoom Zoom Model",
+     "pr": 38554,
+     "reverted_at": "2026-08-16T18:38:51-07:00",
+     "reverted_by_commit": "044640668aa25d5c72f948ec072bfc259d1b269a",
+     "status": "reverted",
+     "subject": "DM: Zoom Zoom Model (#38554)"
+    },
+    {
+     "commit": "50c40a0929b9253661f6affbf695e7eb8d1493dd",
+     "date": "2026-08-07T17:58:17-07:00",
+     "is_revert": false,
+     "name": "dmvision c703670b-6a4a-4743-8f79-69d5486cadf7 (a62f9948 with new sleep head)",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "dmvision c703670b-6a4a-4743-8f79-69d5486cadf7 (a62f9948 with new sleep head)"
+    },
+    {
+     "commit": "d8e0a384ca5a7ca0d2c4e0ac33b18ea76d2435f0",
+     "date": "2026-08-10T10:00:32-07:00",
+     "is_revert": false,
+     "name": "dmvision c703670b-6a4a-4743-8f79-69d5486cadf7 (a62f9948 with new sleep head and same batchnorms)",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "dmvision c703670b-6a4a-4743-8f79-69d5486cadf7 (a62f9948 with new sleep head and same batchnorms)"
+    },
+    {
+     "commit": "eecff738506eafb38debb527c42cb65426aa2e02",
+     "date": "2026-08-10T10:21:16-07:00",
+     "is_revert": false,
+     "name": "Sleep shadow mode",
+     "pr": 38578,
+     "reverted_at": "2026-08-16T18:38:49-07:00",
+     "reverted_by_commit": "a8ff31e84f39be621aed037ea3e966beb8b4eb52",
+     "status": "reverted",
+     "subject": "Sleep shadow mode (#38578)"
+    },
+    {
+     "commit": "c7f7de69d6bc8c2d8fa6a201aa2ef143ce5c5e86",
+     "date": "2026-08-12T00:34:20-07:00",
+     "is_revert": true,
+     "name": "Sleep shadow mode",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "Revert \"Sleep shadow mode (#38578)\""
+    },
+    {
+     "commit": "154ae7524a2d55b1388096ca165dfe8b5ef8e23f",
+     "date": "2026-08-12T00:34:22-07:00",
+     "is_revert": true,
+     "name": "DM: Zoom Zoom Model",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "Revert \"DM: Zoom Zoom Model (#38554)\""
+    },
+    {
+     "commit": "b36500fba774c39909e2767ebba2bf7c66af6453",
+     "date": "2026-08-14T13:40:01-07:00",
+     "is_revert": false,
+     "name": "Revert big RL model",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "Revert big RL model"
+    },
+    {
+     "commit": "516ec1e68203439a73f340f1d0b3b91eabc626ee",
+     "date": "2026-08-14T13:45:22-07:00",
+     "is_revert": false,
+     "name": "Revert big RL model",
+     "pr": 38627,
+     "status": "merged",
+     "subject": "Revert big RL model (#38627)"
+    },
+    {
+     "commit": "a8ff31e84f39be621aed037ea3e966beb8b4eb52",
+     "date": "2026-08-16T18:38:49-07:00",
+     "is_revert": true,
+     "name": "Sleep shadow mode",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "Revert \"Sleep shadow mode (#38578)\""
+    },
+    {
+     "commit": "044640668aa25d5c72f948ec072bfc259d1b269a",
+     "date": "2026-08-16T18:38:51-07:00",
+     "is_revert": true,
+     "name": "DM: Zoom Zoom Model",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "Revert \"DM: Zoom Zoom Model (#38554)\""
+    },
+    {
+     "commit": "94a80e7b3ba90d1f93032539537498e9752c8e9d",
+     "date": "2026-08-16T22:36:28-07:00",
+     "is_revert": false,
+     "name": "big: bb895420-f830-e6b6-7461-84631913e7b0/12864",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "big: bb895420-f830-e6b6-7461-84631913e7b0/12864"
+    },
+    {
+     "commit": "0a4a8b0c48d977833cc926abe9af9613ba4c26e5",
+     "date": "2026-08-17T10:49:49-07:00",
+     "is_revert": false,
+     "name": "naive attention",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "naive attention"
+    },
+    {
+     "commit": "ea7f1b2db9ccc715bf49091615b97c1638a41750",
+     "date": "2026-08-17T15:52:32-07:00",
+     "is_revert": false,
+     "name": "only last feat",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "only last feat"
+    },
+    {
+     "commit": "b431bd4258d12d71c3683e35a50ee6be7b53ebc1",
+     "date": "2026-08-17T17:15:29-07:00",
+     "is_revert": false,
+     "name": "static pad",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "static pad"
+    },
+    {
+     "commit": "1d12f404b54dc8c5cadb73669ae27399ba35ba43",
+     "date": "2026-08-18T15:19:16-07:00",
+     "is_revert": false,
+     "name": "2733ecf4-086d-6c60-07d0-89ce994931e9/12864",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "2733ecf4-086d-6c60-07d0-89ce994931e9/12864"
+    },
+    {
+     "commit": "d41fc63678136240c4d6dfbea0f69d33e2d30961",
+     "date": "2026-08-18T17:13:33-07:00",
+     "is_revert": false,
+     "name": "best model",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "best model"
+    },
+    {
+     "commit": "34d44c85414fe2641ca3f81dfbc14298a03cdc30",
+     "date": "2026-08-18T17:17:04-07:00",
+     "is_revert": false,
+     "name": "version 2",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "version 2"
+    },
+    {
+     "commit": "ff27d6220e2869ede7ee3c83e7893ec06cb75551",
+     "date": "2026-08-18T22:31:57-07:00",
+     "is_revert": false,
+     "name": "no nan",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "no nan"
+    },
+    {
+     "commit": "8d67ac48d4f66a6d0ce4b86193cf027294fe628c",
+     "date": "2026-08-20T16:03:06-07:00",
+     "is_revert": false,
+     "name": "spatial supercombo: rldriving 26ef89ec + spatial features_buffer support",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "spatial supercombo: rldriving 26ef89ec + spatial features_buffer support"
+    },
+    {
+     "commit": "7e3ff7e914a40ac25399a2caedbce3580fdde6a2",
+     "date": "2026-08-20T16:18:43-07:00",
+     "is_revert": false,
+     "name": "spatial supercombo: rldriving 34417250-25e2-f847-f18f-172ef4f207f2",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "spatial supercombo: rldriving 34417250-25e2-f847-f18f-172ef4f207f2"
+    },
+    {
+     "commit": "6691f163a4ed8a9c4e2ca95efc29c04478ec0250",
+     "date": "2026-08-21T15:56:28-07:00",
+     "is_revert": false,
+     "name": "cf9a2ab0-ad14-0e4b-84a6-582e0dd47a08/12846",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "cf9a2ab0-ad14-0e4b-84a6-582e0dd47a08/12846"
+    },
+    {
+     "commit": "db06f5f36caa379e112bafd38423e37b66fa4149",
+     "date": "2026-08-24T10:20:12-07:00",
+     "is_revert": false,
+     "name": "32370a68-2d52-faf7-eea3-4d8e2c38c207/12864",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "32370a68-2d52-faf7-eea3-4d8e2c38c207/12864"
+    },
+    {
+     "commit": "ba37c02c7c64225b8aec79411d1a8c2f5c1aa343",
+     "date": "2026-08-24T19:40:36-07:00",
+     "is_revert": false,
+     "name": "spatial supercombo: rldriving 2004ef3b-0461-b0f9-a1c6-23f444b6ef71/12864",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "spatial supercombo: rldriving 2004ef3b-0461-b0f9-a1c6-23f444b6ef71/12864"
+    },
+    {
+     "commit": "d4220da32ddd1ac81acef8375bc01faa97dedfdb",
+     "date": "2026-08-24T19:49:13-07:00",
+     "is_revert": false,
+     "name": "fc8e35c0-0f34-4fa5-a245-b0feb34c880e",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "fc8e35c0-0f34-4fa5-a245-b0feb34c880e"
+    },
+    {
+     "commit": "339fd3a941085d3ab915ef6c93053b638402efe5",
+     "date": "2026-08-26T19:55:55-07:00",
+     "is_revert": false,
+     "name": "spatial supercombo: rldriving 26ef89ec + spatial features_buffer support",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "spatial supercombo: rldriving 26ef89ec + spatial features_buffer support"
+    },
+    {
+     "commit": "53bbc9af58f3bfe76df71a018f8c12c594c8a93e",
+     "date": "2026-08-26T19:56:17-07:00",
+     "is_revert": false,
+     "name": "spatial supercombo: rldriving 34417250-25e2-f847-f18f-172ef4f207f2",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "spatial supercombo: rldriving 34417250-25e2-f847-f18f-172ef4f207f2"
+    },
+    {
+     "commit": "6b5be8a761d641a44fb89b31461a55cde74c3aa5",
+     "date": "2026-08-26T19:56:27-07:00",
+     "is_revert": false,
+     "name": "spatial supercombo: rldriving 2004ef3b-0461-b0f9-a1c6-23f444b6ef71/12864",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "spatial supercombo: rldriving 2004ef3b-0461-b0f9-a1c6-23f444b6ef71/12864"
+    },
+    {
+     "commit": "b608ee434d9eb5db35199469c40b3b2527787117",
+     "date": "2026-08-26T19:56:37-07:00",
+     "is_revert": false,
+     "name": "45634de5-cf5a-418e-ad63-65498d0aaea3/12864",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "45634de5-cf5a-418e-ad63-65498d0aaea3/12864"
+    },
+    {
+     "commit": "30de303d5ffb63957f8acbdb256fd4c7d360455a",
+     "date": "2026-08-28T12:06:52-07:00",
+     "is_revert": false,
+     "name": "a204fc2e-9ae6-4f8b-a407-02e703209f58/12864",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "a204fc2e-9ae6-4f8b-a407-02e703209f58/12864"
+    },
+    {
+     "commit": "a11a58f6c0ade30b98966d358e0585c0f252deae",
+     "date": "2026-08-30T17:16:08-07:00",
+     "is_revert": false,
+     "name": "spatial supercombo: rldriving 26ef89ec + spatial features_buffer support",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "spatial supercombo: rldriving 26ef89ec + spatial features_buffer support"
+    },
+    {
+     "commit": "556e41df593c450bea6d4209d967b5387415adeb",
+     "date": "2026-08-30T17:16:30-07:00",
+     "is_revert": false,
+     "name": "spatial supercombo: rldriving 34417250-25e2-f847-f18f-172ef4f207f2",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "spatial supercombo: rldriving 34417250-25e2-f847-f18f-172ef4f207f2"
+    },
+    {
+     "commit": "bed2130fae729f565fab4ca418d3871e36ae359b",
+     "date": "2026-08-30T17:16:32-07:00",
+     "is_revert": false,
+     "name": "spatial supercombo: rldriving 2004ef3b-0461-b0f9-a1c6-23f444b6ef71/12864",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "spatial supercombo: rldriving 2004ef3b-0461-b0f9-a1c6-23f444b6ef71/12864"
+    },
+    {
+     "commit": "0680e74d8e59b5488b4f5a89466fd00f6f6b22aa",
+     "date": "2026-08-30T17:16:42-07:00",
+     "is_revert": false,
+     "name": "45634de5-cf5a-418e-ad63-65498d0aaea3/12864",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "45634de5-cf5a-418e-ad63-65498d0aaea3/12864"
+    },
+    {
+     "commit": "f877d7a0ccc3cce943c76e285214c020cd65c899",
+     "date": "2026-08-30T17:41:06-07:00",
+     "is_revert": false,
+     "name": "23e6a04e-e6e5-462b-a0bb-e4088275ee43/12864",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "23e6a04e-e6e5-462b-a0bb-e4088275ee43/12864"
+    },
+    {
+     "commit": "4adbb85742b465108ac579da680bcc633eedb2cc",
+     "date": "2026-08-31T09:25:32-07:00",
+     "is_revert": false,
+     "name": "BMRLNAP",
+     "pr": 38681,
+     "status": "merged",
+     "subject": "BMRLNAP (#38681)"
+    },
+    {
+     "commit": "5407e91e8fa2c9798b57a3c5c08d8db81bc74057",
+     "date": "2026-08-31T20:30:35-07:00",
+     "is_revert": false,
+     "name": "23e6a04e-e6e5-462b-a0bb-e4088275ee43/12864 tgc",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "23e6a04e-e6e5-462b-a0bb-e4088275ee43/12864 tgc"
+    },
+    {
+     "commit": "1e4e01ee0e5b9788f6e3db3461bd8a15adf0d3ec",
+     "date": "2026-08-31T21:51:01-07:00",
+     "is_revert": false,
+     "name": "here",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "here"
+    },
+    {
+     "commit": "a2e422eee0e92523101329437b24bafa09538aa7",
+     "date": "2026-08-31T22:30:28-07:00",
+     "is_revert": false,
+     "name": "TGC",
+     "pr": 38739,
+     "status": "merged",
+     "subject": "TGC (#38739)"
+    },
+    {
+     "commit": "9d683c06518c0358fb402f38468a7030700c38ac",
+     "date": "2026-09-01T15:26:01-07:00",
+     "is_revert": false,
+     "name": "4e6d9816-7774-4dd5-9fb1-7d478337f632/12864",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "4e6d9816-7774-4dd5-9fb1-7d478337f632/12864"
+    },
+    {
+     "commit": "6ad9ef9c4c6b706572bf14443a1ad831cb447779",
+     "date": "2026-09-01T19:41:13-07:00",
+     "is_revert": false,
+     "name": "precompile",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "precompile"
+    },
+    {
+     "commit": "68b5f8e48602f4f88041efd7de6c99e97fda454e",
+     "date": "2026-09-04T11:45:59-07:00",
+     "is_revert": false,
+     "name": "a4c5f1d1-1f5d-4807-9593-54afa27099d5/12864",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "a4c5f1d1-1f5d-4807-9593-54afa27099d5/12864"
+    },
+    {
+     "commit": "c51e3e5a71d6ea25e59c0683d683c1092c7c3f69",
+     "date": "2026-09-05T19:03:12-07:00",
+     "is_revert": false,
+     "name": "cinque terre model \ud83c\uddee\ud83c\uddf9",
+     "pr": 38771,
+     "status": "merged",
+     "subject": "cinque terre model \ud83c\uddee\ud83c\uddf9  (#38771)"
+    },
+    {
+     "commit": "37bfa1413edcdc2e8844984b83727c33f81d8f46",
+     "date": "2026-09-08T15:35:35-07:00",
+     "is_revert": false,
+     "name": "1a421175-db71-4e3d-9d62-e2166421b02b/12864",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "1a421175-db71-4e3d-9d62-e2166421b02b/12864"
+    },
+    {
+     "commit": "769dfdffeb93bd75b67c077ce0e2d275c72eb044",
+     "date": "2026-09-10T16:49:24-07:00",
+     "is_revert": false,
+     "name": "1a421175-db71-4e3d-9d62-e2166421b02b/12864",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "1a421175-db71-4e3d-9d62-e2166421b02b/12864"
+    },
+    {
+     "commit": "f37b754d28596266072915665a78e97ce2143f1b",
+     "date": "2026-09-10T19:22:59-07:00",
+     "is_revert": false,
+     "name": "1a421175-db71-4e3d-9d62-e2166421b02b/12864",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "1a421175-db71-4e3d-9d62-e2166421b02b/12864"
+    },
+    {
+     "commit": "6107da1cd655e3b2ac44c0b28728ab0619e42eb7",
+     "date": "2026-09-10T21:24:09-07:00",
+     "is_revert": false,
+     "name": "Cinque v2",
+     "pr": 38850,
+     "status": "merged",
+     "subject": "Cinque v2 (#38850)"
+    },
+    {
+     "commit": "e25da0a41090ded2bbf338993375984b0155e5c6",
+     "date": "2026-09-10T21:41:33-07:00",
+     "is_revert": false,
+     "name": "Ship precompiled big driving model for Chestnut",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "Ship precompiled big driving model for Chestnut"
+    },
+    {
+     "commit": "e55f31d83f261bf3ce61a59a8e10820315e453f5",
+     "date": "2026-09-11T15:25:17-07:00",
+     "is_revert": false,
+     "name": "Keep big model compilation in the openpilot build",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "Keep big model compilation in the openpilot build"
+    }
+   ],
+   "publisher": "commaai",
+   "recipe": "01420ce0c87bf29e75bcc57ea9618f7a7bb3a64c47866acc504fe9f68019103c"
+  },
+  {
+   "kind": "dmonitoring",
+   "model": {
+    "archived": true,
+    "description": "model",
+    "family": "split",
+    "id": "commaai/9a109374fd3b78e3",
+    "links": [],
+    "model_class": "standard",
+    "name": "Driver monitoring \u00b7 split \u00b7 standard \u00b7 2026-08-10 \u00b7 9a109374"
+   },
+   "name": "dmvision c703670b-6a4a-4743-8f79-69d5486cadf7 (a62f9948 with new sleep head and same batchnorms)",
+   "occurrences": [
+    {
+     "commit": "d8e0a384ca5a7ca0d2c4e0ac33b18ea76d2435f0",
+     "date": "2026-08-10T10:00:32-07:00",
+     "is_revert": false,
+     "name": "dmvision c703670b-6a4a-4743-8f79-69d5486cadf7 (a62f9948 with new sleep head and same batchnorms)",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "dmvision c703670b-6a4a-4743-8f79-69d5486cadf7 (a62f9948 with new sleep head and same batchnorms)"
+    },
+    {
+     "commit": "eecff738506eafb38debb527c42cb65426aa2e02",
+     "date": "2026-08-10T10:21:16-07:00",
+     "is_revert": false,
+     "name": "Sleep shadow mode",
+     "pr": 38578,
+     "reverted_at": "2026-08-16T18:38:49-07:00",
+     "reverted_by_commit": "a8ff31e84f39be621aed037ea3e966beb8b4eb52",
+     "status": "reverted",
+     "subject": "Sleep shadow mode (#38578)"
+    },
+    {
+     "commit": "a45f53278c758870e750dbfdd8b16344df9fb552",
+     "date": "2026-08-11T08:29:58-07:00",
+     "is_revert": false,
+     "name": "Merge remote-tracking branch 'origin/master' into rdf-driving",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "Merge remote-tracking branch 'origin/master' into rdf-driving"
+    },
+    {
+     "commit": "7fb03ca474f03e95e59ec0c8a6c5fba831bd5fd1",
+     "date": "2026-08-11T08:40:07-07:00",
+     "is_revert": false,
+     "name": "small 62c66bfb-6805-4be0-8e6f-0f5899ee46b0/400",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "small 62c66bfb-6805-4be0-8e6f-0f5899ee46b0/400"
+    },
+    {
+     "commit": "35703097905a122c9f3ddf0d12889b4873d7e2a2",
+     "date": "2026-08-11T14:14:10-07:00",
+     "is_revert": false,
+     "name": "small 42a55a96-99c7-4973-9f1c-d11f33a4802e/400",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "small 42a55a96-99c7-4973-9f1c-d11f33a4802e/400"
+    },
+    {
+     "commit": "4d911346cde4e0d2978a625f31679808284cc19d",
+     "date": "2026-08-12T16:16:31-07:00",
+     "is_revert": false,
+     "name": "ff6c424b-97e0-459c-b99e-dfc4077c8802/200",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "ff6c424b-97e0-459c-b99e-dfc4077c8802/200"
+    },
+    {
+     "commit": "b36500fba774c39909e2767ebba2bf7c66af6453",
+     "date": "2026-08-14T13:40:01-07:00",
+     "is_revert": false,
+     "name": "Revert big RL model",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "Revert big RL model"
+    },
+    {
+     "commit": "516ec1e68203439a73f340f1d0b3b91eabc626ee",
+     "date": "2026-08-14T13:45:22-07:00",
+     "is_revert": false,
+     "name": "Revert big RL model",
+     "pr": 38627,
+     "status": "merged",
+     "subject": "Revert big RL model (#38627)"
+    },
+    {
+     "commit": "0394d7284cfc229f772ee4fa73ff724ba8245110",
+     "date": "2026-08-15T00:17:58-07:00",
+     "is_revert": false,
+     "name": "small 393ea0ab-6b63-4ddd-839a-5b27834e8b54/200",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "small 393ea0ab-6b63-4ddd-839a-5b27834e8b54/200"
+    },
+    {
+     "commit": "94a80e7b3ba90d1f93032539537498e9752c8e9d",
+     "date": "2026-08-16T22:36:28-07:00",
+     "is_revert": false,
+     "name": "big: bb895420-f830-e6b6-7461-84631913e7b0/12864",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "big: bb895420-f830-e6b6-7461-84631913e7b0/12864"
+    },
+    {
+     "commit": "0a4a8b0c48d977833cc926abe9af9613ba4c26e5",
+     "date": "2026-08-17T10:49:49-07:00",
+     "is_revert": false,
+     "name": "naive attention",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "naive attention"
+    },
+    {
+     "commit": "ea7f1b2db9ccc715bf49091615b97c1638a41750",
+     "date": "2026-08-17T15:52:32-07:00",
+     "is_revert": false,
+     "name": "only last feat",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "only last feat"
+    },
+    {
+     "commit": "b431bd4258d12d71c3683e35a50ee6be7b53ebc1",
+     "date": "2026-08-17T17:15:29-07:00",
+     "is_revert": false,
+     "name": "static pad",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "static pad"
+    },
+    {
+     "commit": "1d12f404b54dc8c5cadb73669ae27399ba35ba43",
+     "date": "2026-08-18T15:19:16-07:00",
+     "is_revert": false,
+     "name": "2733ecf4-086d-6c60-07d0-89ce994931e9/12864",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "2733ecf4-086d-6c60-07d0-89ce994931e9/12864"
+    },
+    {
+     "commit": "d41fc63678136240c4d6dfbea0f69d33e2d30961",
+     "date": "2026-08-18T17:13:33-07:00",
+     "is_revert": false,
+     "name": "best model",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "best model"
+    },
+    {
+     "commit": "34d44c85414fe2641ca3f81dfbc14298a03cdc30",
+     "date": "2026-08-18T17:17:04-07:00",
+     "is_revert": false,
+     "name": "version 2",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "version 2"
+    },
+    {
+     "commit": "ff27d6220e2869ede7ee3c83e7893ec06cb75551",
+     "date": "2026-08-18T22:31:57-07:00",
+     "is_revert": false,
+     "name": "no nan",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "no nan"
+    },
+    {
+     "commit": "8d67ac48d4f66a6d0ce4b86193cf027294fe628c",
+     "date": "2026-08-20T16:03:06-07:00",
+     "is_revert": false,
+     "name": "spatial supercombo: rldriving 26ef89ec + spatial features_buffer support",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "spatial supercombo: rldriving 26ef89ec + spatial features_buffer support"
+    },
+    {
+     "commit": "7e3ff7e914a40ac25399a2caedbce3580fdde6a2",
+     "date": "2026-08-20T16:18:43-07:00",
+     "is_revert": false,
+     "name": "spatial supercombo: rldriving 34417250-25e2-f847-f18f-172ef4f207f2",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "spatial supercombo: rldriving 34417250-25e2-f847-f18f-172ef4f207f2"
+    },
+    {
+     "commit": "6691f163a4ed8a9c4e2ca95efc29c04478ec0250",
+     "date": "2026-08-21T15:56:28-07:00",
+     "is_revert": false,
+     "name": "cf9a2ab0-ad14-0e4b-84a6-582e0dd47a08/12846",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "cf9a2ab0-ad14-0e4b-84a6-582e0dd47a08/12846"
+    },
+    {
+     "commit": "db06f5f36caa379e112bafd38423e37b66fa4149",
+     "date": "2026-08-24T10:20:12-07:00",
+     "is_revert": false,
+     "name": "32370a68-2d52-faf7-eea3-4d8e2c38c207/12864",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "32370a68-2d52-faf7-eea3-4d8e2c38c207/12864"
+    },
+    {
+     "commit": "ba37c02c7c64225b8aec79411d1a8c2f5c1aa343",
+     "date": "2026-08-24T19:40:36-07:00",
+     "is_revert": false,
+     "name": "spatial supercombo: rldriving 2004ef3b-0461-b0f9-a1c6-23f444b6ef71/12864",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "spatial supercombo: rldriving 2004ef3b-0461-b0f9-a1c6-23f444b6ef71/12864"
+    },
+    {
+     "commit": "339fd3a941085d3ab915ef6c93053b638402efe5",
+     "date": "2026-08-26T19:55:55-07:00",
+     "is_revert": false,
+     "name": "spatial supercombo: rldriving 26ef89ec + spatial features_buffer support",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "spatial supercombo: rldriving 26ef89ec + spatial features_buffer support"
+    },
+    {
+     "commit": "53bbc9af58f3bfe76df71a018f8c12c594c8a93e",
+     "date": "2026-08-26T19:56:17-07:00",
+     "is_revert": false,
+     "name": "spatial supercombo: rldriving 34417250-25e2-f847-f18f-172ef4f207f2",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "spatial supercombo: rldriving 34417250-25e2-f847-f18f-172ef4f207f2"
+    },
+    {
+     "commit": "6b5be8a761d641a44fb89b31461a55cde74c3aa5",
+     "date": "2026-08-26T19:56:27-07:00",
+     "is_revert": false,
+     "name": "spatial supercombo: rldriving 2004ef3b-0461-b0f9-a1c6-23f444b6ef71/12864",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "spatial supercombo: rldriving 2004ef3b-0461-b0f9-a1c6-23f444b6ef71/12864"
+    },
+    {
+     "commit": "b608ee434d9eb5db35199469c40b3b2527787117",
+     "date": "2026-08-26T19:56:37-07:00",
+     "is_revert": false,
+     "name": "45634de5-cf5a-418e-ad63-65498d0aaea3/12864",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "45634de5-cf5a-418e-ad63-65498d0aaea3/12864"
+    },
+    {
+     "commit": "30de303d5ffb63957f8acbdb256fd4c7d360455a",
+     "date": "2026-08-28T12:06:52-07:00",
+     "is_revert": false,
+     "name": "a204fc2e-9ae6-4f8b-a407-02e703209f58/12864",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "a204fc2e-9ae6-4f8b-a407-02e703209f58/12864"
+    },
+    {
+     "commit": "a11a58f6c0ade30b98966d358e0585c0f252deae",
+     "date": "2026-08-30T17:16:08-07:00",
+     "is_revert": false,
+     "name": "spatial supercombo: rldriving 26ef89ec + spatial features_buffer support",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "spatial supercombo: rldriving 26ef89ec + spatial features_buffer support"
+    },
+    {
+     "commit": "556e41df593c450bea6d4209d967b5387415adeb",
+     "date": "2026-08-30T17:16:30-07:00",
+     "is_revert": false,
+     "name": "spatial supercombo: rldriving 34417250-25e2-f847-f18f-172ef4f207f2",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "spatial supercombo: rldriving 34417250-25e2-f847-f18f-172ef4f207f2"
+    },
+    {
+     "commit": "bed2130fae729f565fab4ca418d3871e36ae359b",
+     "date": "2026-08-30T17:16:32-07:00",
+     "is_revert": false,
+     "name": "spatial supercombo: rldriving 2004ef3b-0461-b0f9-a1c6-23f444b6ef71/12864",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "spatial supercombo: rldriving 2004ef3b-0461-b0f9-a1c6-23f444b6ef71/12864"
+    },
+    {
+     "commit": "0680e74d8e59b5488b4f5a89466fd00f6f6b22aa",
+     "date": "2026-08-30T17:16:42-07:00",
+     "is_revert": false,
+     "name": "45634de5-cf5a-418e-ad63-65498d0aaea3/12864",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "45634de5-cf5a-418e-ad63-65498d0aaea3/12864"
+    },
+    {
+     "commit": "f877d7a0ccc3cce943c76e285214c020cd65c899",
+     "date": "2026-08-30T17:41:06-07:00",
+     "is_revert": false,
+     "name": "23e6a04e-e6e5-462b-a0bb-e4088275ee43/12864",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "23e6a04e-e6e5-462b-a0bb-e4088275ee43/12864"
+    },
+    {
+     "commit": "4adbb85742b465108ac579da680bcc633eedb2cc",
+     "date": "2026-08-31T09:25:32-07:00",
+     "is_revert": false,
+     "name": "BMRLNAP",
+     "pr": 38681,
+     "status": "merged",
+     "subject": "BMRLNAP (#38681)"
+    },
+    {
+     "commit": "5407e91e8fa2c9798b57a3c5c08d8db81bc74057",
+     "date": "2026-08-31T20:30:35-07:00",
+     "is_revert": false,
+     "name": "23e6a04e-e6e5-462b-a0bb-e4088275ee43/12864 tgc",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "23e6a04e-e6e5-462b-a0bb-e4088275ee43/12864 tgc"
+    },
+    {
+     "commit": "1e4e01ee0e5b9788f6e3db3461bd8a15adf0d3ec",
+     "date": "2026-08-31T21:51:01-07:00",
+     "is_revert": false,
+     "name": "here",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "here"
+    },
+    {
+     "commit": "a2e422eee0e92523101329437b24bafa09538aa7",
+     "date": "2026-08-31T22:30:28-07:00",
+     "is_revert": false,
+     "name": "TGC",
+     "pr": 38739,
+     "status": "merged",
+     "subject": "TGC (#38739)"
+    },
+    {
+     "commit": "9d683c06518c0358fb402f38468a7030700c38ac",
+     "date": "2026-09-01T15:26:01-07:00",
+     "is_revert": false,
+     "name": "4e6d9816-7774-4dd5-9fb1-7d478337f632/12864",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "4e6d9816-7774-4dd5-9fb1-7d478337f632/12864"
+    },
+    {
+     "commit": "6ad9ef9c4c6b706572bf14443a1ad831cb447779",
+     "date": "2026-09-01T19:41:13-07:00",
+     "is_revert": false,
+     "name": "precompile",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "precompile"
+    },
+    {
+     "commit": "68b5f8e48602f4f88041efd7de6c99e97fda454e",
+     "date": "2026-09-04T11:45:59-07:00",
+     "is_revert": false,
+     "name": "a4c5f1d1-1f5d-4807-9593-54afa27099d5/12864",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "a4c5f1d1-1f5d-4807-9593-54afa27099d5/12864"
+    },
+    {
+     "commit": "c51e3e5a71d6ea25e59c0683d683c1092c7c3f69",
+     "date": "2026-09-05T19:03:12-07:00",
+     "is_revert": false,
+     "name": "cinque terre model \ud83c\uddee\ud83c\uddf9",
+     "pr": 38771,
+     "status": "merged",
+     "subject": "cinque terre model \ud83c\uddee\ud83c\uddf9  (#38771)"
+    },
+    {
+     "commit": "37bfa1413edcdc2e8844984b83727c33f81d8f46",
+     "date": "2026-09-08T15:35:35-07:00",
+     "is_revert": false,
+     "name": "1a421175-db71-4e3d-9d62-e2166421b02b/12864",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "1a421175-db71-4e3d-9d62-e2166421b02b/12864"
+    },
+    {
+     "commit": "769dfdffeb93bd75b67c077ce0e2d275c72eb044",
+     "date": "2026-09-10T16:49:24-07:00",
+     "is_revert": false,
+     "name": "1a421175-db71-4e3d-9d62-e2166421b02b/12864",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "1a421175-db71-4e3d-9d62-e2166421b02b/12864"
+    },
+    {
+     "commit": "f37b754d28596266072915665a78e97ce2143f1b",
+     "date": "2026-09-10T19:22:59-07:00",
+     "is_revert": false,
+     "name": "1a421175-db71-4e3d-9d62-e2166421b02b/12864",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "1a421175-db71-4e3d-9d62-e2166421b02b/12864"
+    },
+    {
+     "commit": "6107da1cd655e3b2ac44c0b28728ab0619e42eb7",
+     "date": "2026-09-10T21:24:09-07:00",
+     "is_revert": false,
+     "name": "Cinque v2",
+     "pr": 38850,
+     "status": "merged",
+     "subject": "Cinque v2 (#38850)"
+    },
+    {
+     "commit": "e25da0a41090ded2bbf338993375984b0155e5c6",
+     "date": "2026-09-10T21:41:33-07:00",
+     "is_revert": false,
+     "name": "Ship precompiled big driving model for Chestnut",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "Ship precompiled big driving model for Chestnut"
+    },
+    {
+     "commit": "e55f31d83f261bf3ce61a59a8e10820315e453f5",
+     "date": "2026-09-11T15:25:17-07:00",
+     "is_revert": false,
+     "name": "Keep big model compilation in the openpilot build",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "Keep big model compilation in the openpilot build"
+    },
+    {
+     "commit": "b8cb5cad85319fe51b8716bab937151e6fe317d8",
+     "date": "2026-09-14T16:12:35-07:00",
+     "is_revert": false,
+     "name": "modeld: move history queues into ONNX",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "modeld: move history queues into ONNX"
+    },
+    {
+     "commit": "662a5a80d9587d748a474270c452bea0ae707df7",
+     "date": "2026-09-14T17:03:57-07:00",
+     "is_revert": false,
+     "name": "Rename ONNX image input to new_img",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "Rename ONNX image input to new_img"
+    },
+    {
+     "commit": "63d956b78eb47c5e4da27ac4ab7f595d2b995b3c",
+     "date": "2026-09-14T17:49:21-07:00",
+     "is_revert": false,
+     "name": "Combine ONNX model history state",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "Combine ONNX model history state"
+    },
+    {
+     "commit": "64f9b47b6ea7b622967acd7042148e7a92f0ccc4",
+     "date": "2026-09-14T20:44:33-07:00",
+     "is_revert": false,
+     "name": "modeld: move history queues into ONNX",
+     "pr": 38916,
+     "status": "merged",
+     "subject": "modeld: move history queues into ONNX (#38916)"
+    },
+    {
+     "commit": "804ae7232cae22d35eeeb8c8541255c7882000ad",
+     "date": "2026-09-15T18:11:30-07:00",
+     "is_revert": false,
+     "name": "Ship precompiled eGPU model and camera warps",
+     "pr": null,
+     "status": "pr_only",
+     "subject": "Ship precompiled eGPU model and camera warps"
+    },
+    {
+     "commit": "6080cc6168023229437b0ff06cf35bead00a5d0d",
+     "date": "2026-09-16T08:13:45-07:00",
+     "is_revert": false,
+     "name": "Use a precompiled eGPU driving model",
+     "pr": 38930,
+     "status": "merged",
+     "subject": "Use a precompiled eGPU driving model (#38930)"
+    }
+   ],
+   "publisher": "commaai",
+   "recipe": "5e8b3b3b3c0e2b1a2218671a4776f961a2ee7d63548143f1ab9431ae99799ca0"
+  },
+  {
+   "kind": "driving",
+   "model": {
+    "archived": false,
+    "description": "model",
+    "family": "model",
+    "id": "84dbb0fb5e2052fb",
+    "links": [],
+    "model_class": "unknown",
+    "name": "Stock supercombo (555f48c5)"
+   },
+   "name": "Stock supercombo (555f48c5)",
+   "occurrences": [],
+   "publisher": "openmodels",
+   "recipe": "84dbb0fb5e2052fbe34cacf2f216de31d0478560b33bb59a4bbb306eb834eed4"
+  }
+ ],
+ "evidence": [
+  {
+   "artifacts": [
+    "72e98a95541f200bd2faeae8d718997483696fd4801fc7d718c167b05854707d",
+    "e66bb8d53eced3786ed71a59b55ffc6810944cb217f0518621cc76303260a1ef"
+   ],
+   "kind": "upstream_pairing",
+   "source": {
+    "bundle": "a4e629a0a8eaae26",
+    "occurrences": [
+     {
+      "commit": "d5d5a84625e065ee33e3ebb2deacccf0e044d38a",
+      "date": "2025-08-26T18:20:25-07:00",
+      "is_revert": false,
+      "name": "desire->desire_pulse",
+      "pr": null,
+      "status": "pr_only",
+      "subject": "desire->desire_pulse"
+     },
+     {
+      "commit": "4f3c712828c5c4db12467b426c0cba823f131ca0",
+      "date": "2025-08-27T13:24:31-07:00",
+      "is_revert": false,
+      "name": "consistent naming",
+      "pr": null,
+      "status": "pr_only",
+      "subject": "consistent naming"
+     },
+     {
+      "commit": "f8ff156869f4abc64c595dc2a442071df4c8543d",
+      "date": "2025-08-27T13:48:23-07:00",
+      "is_revert": false,
+      "name": "modeld: desire->desire_pulse",
+      "pr": 36076,
+      "status": "merged",
+      "subject": "modeld: desire->desire_pulse (#36076)"
+     }
+    ],
+    "repository": "commaai/openpilot"
+   }
+  },
+  {
+   "artifacts": [
+    "78477124cbf3ffe30fa951ebada8410b43c4242c6054584d656f1d329b067e15",
+    "ee29ee5bce84d1ce23e9ff381280de9b4e4d96d2934cd751740354884e112c66"
+   ],
+   "kind": "upstream_pairing",
+   "source": {
+    "bundle": "ca840c7058d05baa",
+    "occurrences": [
+     {
+      "commit": "55f66e2246359c6593605399a0199d94d13ad90d",
+      "date": "2026-01-31T18:50:54-08:00",
+      "is_revert": false,
+      "name": "a27b3122-733e-4a65-938b-acfebebbe5e8/100",
+      "pr": null,
+      "status": "pr_only",
+      "subject": "a27b3122-733e-4a65-938b-acfebebbe5e8/100"
+     },
+     {
+      "commit": "5b6436a90cf6902b8aaa71c2b6f3d7164d8ae391",
+      "date": "2026-02-03T19:14:02-08:00",
+      "is_revert": false,
+      "name": "CD210 model",
+      "pr": 37050,
+      "status": "merged",
+      "subject": "CD210 model (#37050)"
+     },
+     {
+      "commit": "fe1cdf956134f5df208947492983b5aa56610b08",
+      "date": "2026-02-10T13:51:02-08:00",
+      "is_revert": true,
+      "name": "DM: Ford GT model",
+      "pr": null,
+      "status": "pr_only",
+      "subject": "Revert \"DM: Ford GT model (#37013)\""
+     },
+     {
+      "commit": "e946e9de0b5a7c1be296d88336fad37155f683f8",
+      "date": "2026-02-10T13:56:07-08:00",
+      "is_revert": true,
+      "name": "DM: Ford GT model",
+      "pr": 37148,
+      "status": "merged",
+      "subject": "Revert \"DM: Ford GT model\" (#37148)"
+     },
+     {
+      "commit": "0b410cb641b5ab69e6af5574e5ce4d5746d309d8",
+      "date": "2026-02-18T14:44:26-08:00",
+      "is_revert": false,
+      "name": "Merge branch 'master' into dm_fgt2",
+      "pr": null,
+      "status": "pr_only",
+      "subject": "Merge branch 'master' into dm_fgt2"
+     },
+     {
+      "commit": "89f3824e547074e1221f2cb555b2d6cc09927352",
+      "date": "2026-02-18T14:45:49-08:00",
+      "is_revert": false,
+      "name": "53a2718f-206b-4400-a70b-16915de18472/200",
+      "pr": null,
+      "status": "pr_only",
+      "subject": "53a2718f-206b-4400-a70b-16915de18472/200"
+     },
+     {
+      "commit": "3c4ddba992b3ee52a9c881ee0eb9727d3a37af11",
+      "date": "2026-02-18T20:09:46-08:00",
+      "is_revert": false,
+      "name": "DM: Ford GT Le Mans Model",
+      "pr": 37257,
+      "status": "merged",
+      "subject": "DM: Ford GT Le Mans Model (#37257)"
+     },
+     {
+      "commit": "36dbebff13c87f19cfb176662960ec4140747f34",
+      "date": "2026-02-26T01:04:10-08:00",
+      "is_revert": false,
+      "name": "81248b12-6592-4a5c-9b59-a44c64123b2b",
+      "pr": null,
+      "status": "pr_only",
+      "subject": "81248b12-6592-4a5c-9b59-a44c64123b2b"
+     },
+     {
+      "commit": "04dcdf46bc7c3d84f8a20f6e81cfb5b38dab8689",
+      "date": "2026-02-26T16:10:57-08:00",
+      "is_revert": false,
+      "name": "DM: Le Mans GT3 Model",
+      "pr": 37425,
+      "status": "merged",
+      "subject": "DM: Le Mans GT3 Model (#37425)"
+     },
+     {
+      "commit": "f6f97dc0adcbdd52c35367aae85b9d0c2dc860d4",
+      "date": "2026-03-19T13:58:49-07:00",
+      "is_revert": false,
+      "name": "00c00ac7-7b6e-4546-b86f-7ddd5f0596b4",
+      "pr": null,
+      "status": "pr_only",
+      "subject": "00c00ac7-7b6e-4546-b86f-7ddd5f0596b4"
+     },
+     {
+      "commit": "d802362e393eafce41f2d5885809b76d235621d2",
+      "date": "2026-04-21T11:06:51-07:00",
+      "is_revert": true,
+      "name": "POP model",
+      "pr": null,
+      "status": "pr_only",
+      "subject": "Revert \"POP model (#37727)\""
+     },
+     {
+      "commit": "4988a62b310b536fb5336c35151eb2df56e37d97",
+      "date": "2026-04-21T11:20:33-07:00",
+      "is_revert": true,
+      "name": "POP model",
+      "pr": 37871,
+      "status": "merged",
+      "subject": "Revert \"POP model (#37727)\" (#37871)"
+     },
+     {
+      "commit": "c501169b41cdafbfdc530aac3d68430fed02004b",
+      "date": "2026-05-05T12:32:42-07:00",
+      "is_revert": false,
+      "name": "Merge branch 'master' into prerevert_dm",
+      "pr": null,
+      "status": "pr_only",
+      "subject": "Merge branch 'master' into prerevert_dm"
+     },
+     {
+      "commit": "a30a35a88f46bff7a41819b0cff9731a7894af9a",
+      "date": "2026-05-05T18:16:16-07:00",
+      "is_revert": true,
+      "name": "Add op11 split driving models",
+      "pr": null,
+      "status": "pr_only",
+      "subject": "Revert \"Add op11 split driving models\""
+     },
+     {
+      "commit": "2596de85439dd281f59ee71a3b1148ab81bef164",
+      "date": "2026-05-06T19:25:34-07:00",
+      "is_revert": true,
+      "name": "DM: Lancia Delta HF Integrale model",
+      "pr": 37971,
+      "status": "merged",
+      "subject": "Revert \"DM: Lancia Delta HF Integrale model (#37696)\" (#37971)"
+     },
+     {
+      "commit": "f096f4ccf34354be0f199b05f942363b06d6648e",
+      "date": "2026-05-06T19:25:40-07:00",
+      "is_revert": true,
+      "name": "Revert",
+      "pr": null,
+      "status": "pr_only",
+      "subject": "Revert \"Revert \"DM: Lancia Delta HF Integrale model (#37696)\" (#37971)\""
+     },
+     {
+      "commit": "77febaa64182dfd63eeb8e283e02d62bc807bfb2",
+      "date": "2026-05-11T13:48:20-07:00",
+      "is_revert": false,
+      "name": "zero ll patched big model",
+      "pr": null,
+      "status": "pr_only",
+      "subject": "zero ll patched big model"
+     },
+     {
+      "commit": "9100dee0cc8fd08e191b7abcb518f265ccbcd6f0",
+      "date": "2026-05-11T13:48:23-07:00",
+      "is_revert": false,
+      "name": "re-export with ll and road edges",
+      "pr": null,
+      "status": "pr_only",
+      "subject": "re-export with ll and road edges"
+     },
+     {
+      "commit": "63cf2e70630a5d5410a946f8a7e15b47b1a3c4fe",
+      "date": "2026-05-13T15:15:48-07:00",
+      "is_revert": false,
+      "name": "dreaming about a clean root",
+      "pr": null,
+      "status": "pr_only",
+      "subject": "dreaming about a clean root"
+     },
+     {
+      "commit": "e8acdabed21b34b9083701cd1eb536d93d9e6654",
+      "date": "2026-05-15T14:29:43-07:00",
+      "is_revert": false,
+      "name": "add parsing - 0963efe6-96e5-4408-8233-0fa565fc7510",
+      "pr": null,
+      "status": "pr_only",
+      "subject": "add parsing - 0963efe6-96e5-4408-8233-0fa565fc7510"
+     },
+     {
+      "commit": "5610c84a3ecc23e2bbff12774ff8883be4bfbd0a",
+      "date": "2026-05-17T19:16:22-07:00",
+      "is_revert": false,
+      "name": "8a4d3664-e618-4051-8e72-4e9522e40af0",
+      "pr": null,
+      "status": "pr_only",
+      "subject": "8a4d3664-e618-4051-8e72-4e9522e40af0"
+     },
+     {
+      "commit": "2ed88a1dff26c96076f1226ff1fa364ea68a7134",
+      "date": "2026-05-17T19:27:51-07:00",
+      "is_revert": false,
+      "name": "DM: add sleep prob logging",
+      "pr": 38049,
+      "status": "merged",
+      "subject": "DM: add sleep prob logging (#38049)"
+     },
+     {
+      "commit": "016331135119277b4091252d3c8dc3c8261c6a22",
+      "date": "2026-05-18T15:55:49-07:00",
+      "is_revert": false,
+      "name": "merge master",
+      "pr": null,
+      "status": "pr_only",
+      "subject": "merge master"
+     },
+     {
+      "commit": "52e182611d3f150ec620a7b9d08ddcb4322ab17b",
+      "date": "2026-05-19T22:41:57-07:00",
+      "is_revert": false,
+      "name": "initial usbgpu support",
+      "pr": 37906,
+      "status": "merged",
+      "subject": "initial usbgpu support (#37906)"
+     }
+    ],
+    "repository": "commaai/openpilot"
+   }
+  },
+  {
+   "artifacts": [
+    "78477124cbf3ffe30fa951ebada8410b43c4242c6054584d656f1d329b067e15",
+    "ee29ee5bce84d1ce23e9ff381280de9b4e4d96d2934cd751740354884e112c66"
+   ],
+   "kind": "upstream_pairing",
+   "source": {
+    "bundle": "8ef7372e702acd26",
+    "occurrences": [
+     {
+      "commit": "ecc80d1e8c7fbfd0a8aa1cbb57ea7dc362b8262a",
+      "date": "2026-06-01T18:37:03-07:00",
+      "is_revert": false,
+      "name": "deep pre-req",
+      "pr": null,
+      "status": "pr_only",
+      "subject": "deep pre-req"
+     },
+     {
+      "commit": "249cafe897deb433944c84fa6c3c6ce568f727e1",
+      "date": "2026-06-01T18:43:47-07:00",
+      "is_revert": false,
+      "name": "Prereqs deep models",
+      "pr": 38125,
+      "status": "merged",
+      "subject": "Prereqs deep models (#38125)"
+     },
+     {
+      "commit": "83d003ed5cd01abbacc6d982ebf79338f8a2ec15",
+      "date": "2026-06-11T08:02:16-07:00",
+      "is_revert": true,
+      "name": "Op model16 deep",
+      "pr": null,
+      "status": "pr_only",
+      "subject": "Revert \"Op model16 deep (#38073)\""
+     },
+     {
+      "commit": "4024d13ddabbb23aca2399603957096b0921b4d8",
+      "date": "2026-06-11T09:32:24-07:00",
+      "is_revert": true,
+      "name": "Op model16 deep",
+      "pr": 38166,
+      "status": "merged",
+      "subject": "Revert \"Op model16 deep (#38073)\" (#38166)"
+     },
+     {
+      "commit": "79a1aca2fe590af1e838ff30a88a02b5fa99fb37",
+      "date": "2026-06-12T11:23:29-07:00",
+      "is_revert": false,
+      "name": "modeld: run the driving model as a single combined onnx",
+      "pr": null,
+      "status": "pr_only",
+      "subject": "modeld: run the driving model as a single combined onnx"
+     }
+    ],
+    "repository": "commaai/openpilot"
+   }
+  }
+ ],
+ "generated_at": "2026-09-19T06:48:29Z",
+ "locations": {
+  "35e4a5d4c4d481f915e42358af4665b2c92b8f5c1efd1c0731f21b876ad1d856": {
+   "availability": "available",
+   "urls": [
+    "https://github.com/jjolano/openmodels/releases/download/blobs-0000/35e4a5d4c4d481f915e42358af4665b2c92b8f5c1efd1c0731f21b876ad1d856.onnx"
+   ]
+  },
+  "4e7e31a20e93c6e0fd37d29c339e6668a915e3550d971a17e6560b9227b7ffcd": {
+   "availability": "available",
+   "urls": [
+    "https://github.com/jjolano/openmodels/releases/download/blobs-0000/4e7e31a20e93c6e0fd37d29c339e6668a915e3550d971a17e6560b9227b7ffcd.onnx"
+   ]
+  },
+  "50070f898ad223475fced42d12a8e67e57e7fac7b21ddc26b05e64f1ae536880": {
+   "availability": "available",
+   "urls": [
+    "https://github.com/jjolano/openmodels/releases/download/blobs-0000/50070f898ad223475fced42d12a8e67e57e7fac7b21ddc26b05e64f1ae536880.onnx"
+   ]
+  },
+  "659727c4d4839adc4992a254409a54259a8756a743f2d567bf5fdc6579f8009b": {
+   "availability": "available",
+   "urls": [
+    "https://github.com/jjolano/openmodels/releases/download/blobs-0000/659727c4d4839adc4992a254409a54259a8756a743f2d567bf5fdc6579f8009b.onnx"
+   ]
+  },
+  "6f886a16e813324af8e9021933ea4caac7a072828e60ab03b676839e38f8f00c": {
+   "availability": "available",
+   "urls": [
+    "https://github.com/jjolano/openmodels/releases/download/blobs-0000/6f886a16e813324af8e9021933ea4caac7a072828e60ab03b676839e38f8f00c.onnx"
+   ]
+  },
+  "7083cf21a9b10f8e13ed5da5afe8fa46a4b7065e0925467b189b7f39e392a115": {
+   "availability": "available",
+   "urls": [
+    "https://github.com/jjolano/openmodels/releases/download/blobs-0000/7083cf21a9b10f8e13ed5da5afe8fa46a4b7065e0925467b189b7f39e392a115.onnx"
+   ]
+  },
+  "72e98a95541f200bd2faeae8d718997483696fd4801fc7d718c167b05854707d": {
+   "availability": "available",
+   "urls": [
+    "https://github.com/jjolano/openmodels/releases/download/blobs-0000/72e98a95541f200bd2faeae8d718997483696fd4801fc7d718c167b05854707d.onnx"
+   ]
+  },
+  "78477124cbf3ffe30fa951ebada8410b43c4242c6054584d656f1d329b067e15": {
+   "availability": "available",
+   "urls": [
+    "https://github.com/jjolano/openmodels/releases/download/blobs-0000/78477124cbf3ffe30fa951ebada8410b43c4242c6054584d656f1d329b067e15.onnx"
+   ]
+  },
+  "7e9ccd538901af80da25a970a8cbb717a217e8a02a6ecce5af8e8cf9138b110f": {
+   "availability": "available",
+   "urls": [
+    "https://github.com/jjolano/openmodels/releases/download/blobs-0000/7e9ccd538901af80da25a970a8cbb717a217e8a02a6ecce5af8e8cf9138b110f.onnx"
+   ]
+  },
+  "978742c0da21bb97d74ec8fd50d20a871f03c6f74de834ff861c925588dbadd6": {
+   "availability": "available",
+   "urls": [
+    "https://github.com/jjolano/openmodels/releases/download/blobs-0000/978742c0da21bb97d74ec8fd50d20a871f03c6f74de834ff861c925588dbadd6.onnx"
+   ]
+  },
+  "a1d9c0dd99a7ac8bba4f3caac93bd5575aefe5a614f5a5999ab45522078712d2": {
+   "availability": "available",
+   "urls": [
+    "https://github.com/jjolano/openmodels/releases/download/blobs-0000/a1d9c0dd99a7ac8bba4f3caac93bd5575aefe5a614f5a5999ab45522078712d2.onnx"
+   ]
+  },
+  "cdbcc4e78a1a6855986625a91b92c4a74cde490e4d7c111e11ed0f3774e01523": {
+   "availability": "available",
+   "urls": [
+    "https://github.com/jjolano/openmodels/releases/download/blobs-0000/cdbcc4e78a1a6855986625a91b92c4a74cde490e4d7c111e11ed0f3774e01523.onnx"
+   ]
+  },
+  "d637360e7268956fecca3d56d4f2039ad42d3ab628f403d936a35bb579a0772f": {
+   "availability": "available",
+   "urls": [
+    "https://github.com/jjolano/openmodels/releases/download/blobs-0000/d637360e7268956fecca3d56d4f2039ad42d3ab628f403d936a35bb579a0772f.onnx"
+   ]
+  },
+  "dd299afabe7a3e0d04cbe2bd97fdb0c93bba8ad6d3cc3663a0e0ededaf243ac2": {
+   "availability": "available",
+   "urls": [
+    "https://github.com/jjolano/openmodels/releases/download/blobs-0000/dd299afabe7a3e0d04cbe2bd97fdb0c93bba8ad6d3cc3663a0e0ededaf243ac2.onnx"
+   ]
+  },
+  "dff39ef4705f7dc092ea6a867d030c1092d40fa124f15c36ed01ee62877a1f21": {
+   "availability": "available",
+   "urls": [
+    "https://github.com/jjolano/openmodels/releases/download/blobs-0000/dff39ef4705f7dc092ea6a867d030c1092d40fa124f15c36ed01ee62877a1f21.onnx"
+   ]
+  },
+  "e5fe1fbb45cf59ccc2cc77d01d06168ca9e32276581170629877683b62e855ea": {
+   "availability": "available",
+   "urls": [
+    "https://github.com/jjolano/openmodels/releases/download/blobs-0000/e5fe1fbb45cf59ccc2cc77d01d06168ca9e32276581170629877683b62e855ea.onnx"
+   ]
+  },
+  "e66bb8d53eced3786ed71a59b55ffc6810944cb217f0518621cc76303260a1ef": {
+   "availability": "available",
+   "urls": [
+    "https://github.com/jjolano/openmodels/releases/download/blobs-0000/e66bb8d53eced3786ed71a59b55ffc6810944cb217f0518621cc76303260a1ef.onnx"
+   ]
+  },
+  "ee29ee5bce84d1ce23e9ff381280de9b4e4d96d2934cd751740354884e112c66": {
+   "availability": "available",
+   "urls": [
+    "https://github.com/jjolano/openmodels/releases/download/blobs-0000/ee29ee5bce84d1ce23e9ff381280de9b4e4d96d2934cd751740354884e112c66.onnx"
+   ]
+  },
+  "f53b7fc541cfc62f3ecadab87792cb56b219379556a5c13d2b84726564a83a08": {
+   "availability": "available",
+   "urls": [
+    "https://github.com/jjolano/openmodels/releases/download/blobs-0000/f53b7fc541cfc62f3ecadab87792cb56b219379556a5c13d2b84726564a83a08.onnx"
+   ]
+  },
+  "f5ee074d71004a6aa846387e62dff2494977eb9d7e40e810f6d385fa6f4292a7": {
+   "availability": "available",
+   "urls": [
+    "https://github.com/jjolano/openmodels/releases/download/blobs-0000/f5ee074d71004a6aa846387e62dff2494977eb9d7e40e810f6d385fa6f4292a7.onnx"
+   ]
+  }
+ },
+ "schema": 1,
+ "sources": {
+  "openpilot": "5ae0da0e465a21cb32b07eac0a987c24b2b7945e"
+ }
+}

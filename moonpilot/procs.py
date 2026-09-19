@@ -1,6 +1,6 @@
 from openpilot.system.manager.process import DaemonProcess, NativeProcess, PythonProcess
 
-from moonpilot import deps, features
+from moonpilot import deps, features, models
 
 
 def _only_onroad(started: bool, params, CP) -> bool:
@@ -22,6 +22,14 @@ def _tailscale_wanted(started: bool, params, CP) -> bool:
   return features.enabled(features.TAILSCALE, params)
 
 
+def _models_wanted(started: bool, params, CP) -> bool:
+  # Onroad and offroad: a request can arrive anywhere, and the first start of a boot is this
+  # process's only chance to publish the store listing the panels page. Then it is reaped -- see
+  # moonpilot/modelsd.py. `moonpilot.models` is stdlib-only on purpose, so this stays a top-level
+  # import like the two above.
+  return params.get(models.REQUEST_KEY) is not None or params.get(models.STATUS_KEY) is None
+
+
 # moonpilot processes, appended to upstream's procs in openpilot/system/manager/process_config.py.
 # Constructors: NativeProcess(name, cwd, cmdline, should_run, enabled=True) /
 #               PythonProcess(name, module, should_run, enabled=True) / DaemonProcess(name, module, param_name)
@@ -38,4 +46,8 @@ MOONPILOT_PROCS: list[DaemonProcess | NativeProcess | PythonProcess] = [
   # Installs and supervises tailscaled, and publishes MoonpilotTailscaleStatus for the panels.
   # Started and stopped by the toggle; see moonpilot/tailscaled.py.
   PythonProcess("tailscaled", "moonpilot.tailscaled", _tailscale_wanted),
+  # The model marketplace's worker: fetches, verifies and compiles what the driver picked, and
+  # publishes MoonpilotModelsStatus. Runs while a request is waiting or until this boot has
+  # published a status at all, then the manager reaps it; see moonpilot/modelsd.py.
+  PythonProcess("modelsd", "moonpilot.modelsd", _models_wanted),
 ]

@@ -43,6 +43,12 @@ def manager_init() -> None:
     if default_value is not None and params.get(k) is None:
       params.put(k, default_value, block=True)
 
+  try:  # moonpilot seam, see AGENTS.md
+    from moonpilot.models import commit_boot_selection
+    commit_boot_selection(params)
+  except Exception:  # moonpilot seam, see AGENTS.md
+    cloudlog.exception("failed to commit moonpilot model boot selection")
+
   # Create folders needed for msgq
   try:
     os.mkdir(Paths.shm_path())
