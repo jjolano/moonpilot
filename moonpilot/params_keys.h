@@ -36,6 +36,10 @@
     // measured yet, which is below the estimator's own ROI floor and so is
     // never applied.
     {"MoonpilotLongLag", {PERSISTENT, FLOAT, "0.0"}},
+    // Learned onroad from positive command ramps versus `carState.aEgo`.
+    // Tightens only the longitudinal comfort-side jerk; the braking and
+    // emergency ramps stay validated constants.
+    {"MoonpilotLongJerkScale", {PERSISTENT, FLOAT, "1.0"}},
     // Learned onroad by moonpilot/curve.py: realized lateral acceleration over
     // what the model's path predicted. 1.0 is neutral, and the applied value is
     // clamped at or above it, so a learned bias only ever plans for less speed.

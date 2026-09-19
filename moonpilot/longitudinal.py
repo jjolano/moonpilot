@@ -90,6 +90,13 @@ from moonpilot.latency import (
   MOONPILOT_LAG_PERSIST_EVERY,
   LongLagEstimator,
 )
+from moonpilot.jerk import (
+  MOONPILOT_LONG_JERK_MIN_SAMPLES,
+  MOONPILOT_LONG_JERK_PERSIST_EVERY,
+  MOONPILOT_LONG_JERK_SCALE_KEY,
+  LongitudinalComfortJerkEstimator,
+)
+
 from moonpilot.lead import LeadAccelEstimator, nearest_lead_in_path
 from moonpilot.slam import ego_speed_correction
 
@@ -128,6 +135,21 @@ MOONPILOT_TTC_TARGET = 3.0  # s; headway the approach term holds the closing rat
 MOONPILOT_K_TTC = 1.0  # 1/s on the excess closing rate
 MOONPILOT_MIN_SLACK = 0.5  # m; floor on the stopping term's braking-distance denominator
 MOONPILOT_LEAD_PREVIEW_T = 1.0  # s of the lead's own braking credited to the safety term
+MOONPILOT_LEAD_PREVIEW_T_ACCEL = 0.5  # s of the lead's own acceleration credited to the *regulator's*
+# lead-speed term, where the cruise cap already bounds what it can ask for. This is what makes the plan
+# answer a lead that is pulling away rather than only a lead that has already gone: the speed being
+# matched is the lead's next one, so the ego anticipates the gap opening instead of chasing it. It is
+# one-sided (a braking lead gets nothing here — that is `MOONPILOT_LEAD_PREVIEW_T`'s business, and it
+# deepens the safety terms instead), and it never reaches the safety terms, so no predicted launch can
+# release braking. Cost, by construction: while a lead accelerates at `a_lead` the regulator's
+# equilibrium moves from `gap == target` to `gap == target - (K_V / K_GAP) * a_lead * this` — 1 m
+# closer per m/s^2 of lead accel, held only as long as the estimate says the lead is still gaining.
+# Measured: a settled follow behind a lead holding 0.5 m/s^2 sits 0.35 m closer than the setpoint where
+# the uncredited law sits 0.13 m behind it, and a lead that launches at 1 m/s^2 for 3 s and then brakes
+# at -3 to rest ends 6 cm *further* back — the transient does not survive the approach. At a launch it
+# is a live term on its own against a slow lead — a 0.5 m/s^2 launch draws 0.292 m/s^2 at 0.25 s against
+# 0.165, and 0.15 m of gap by 2 s — while against a hard one (2 m/s^2) the comfort ramp is what binds
+# and this term moves 0.005 m until `MOONPILOT_JERK_LAUNCH` unlocks it.
 MOONPILOT_A_LEAD_MIN = -10.0  # m/s^2; bounds on a lead's accel estimate, upstream's (long_mpc.process_lead)
 MOONPILOT_A_LEAD_MAX = 5.0
 MOONPILOT_OUT_OF_PATH_T_FOLLOW = 0.7  # time-gap scale for a lead predicted to leave the path
@@ -138,6 +160,15 @@ MOONPILOT_A_CRUISE_MAX_V = [1.6, 1.2, 0.8, 0.6]  # m/s^2
 MOONPILOT_A_TOTAL_MAX_BP = [20.0, 40.0]  # m/s
 MOONPILOT_A_TOTAL_MAX_V = [1.7, 3.2]  # m/s^2 combined accel budget
 MOONPILOT_JERK_UP = 1.5  # m/s^3
+MOONPILOT_JERK_LAUNCH = 4.0  # m/s^3; the up-limit at and below MOONPILOT_JERK_LAUNCH_SPEED, tapering
+# back to `MOONPILOT_JERK_UP` at twice it, and only from the second frame of a ramp — `jerk_limit`
+# keeps the first step at the comfort value, which is what holds a parked car's brake hold out of one
+# frame of a lead's reported speed. What it buys, measured closed-loop from rest behind a lead pulling
+# away at 2 m/s^2: 0.5 m/s^2 at 0.15 s against the comfort ramp's 0.30 s, and 0.14 m of the gap by 2 s
+# (8.863 -> 8.721). In that case the regulator's anticipation credit is worth 0.005 m on its own,
+# because this ramp is what binds there, and the two together are worth 0.56 m (8.863 -> 8.299) with
+# the ask at 1.075 m/s^2 by 0.25 s. Only the up side moves, so every braking number below is untouched.
+MOONPILOT_JERK_LAUNCH_SPEED = 2.5  # m/s
 MOONPILOT_JERK_DOWN = 2.0  # m/s^3; the comfort jerk, and it is the approach's onset edge: stepping
 # from the cruise term onto the floor's -1.0 m/s^2 takes 0.50 s here
 # against 0.25 s at 4.0, which is what the step reads as from the seat.
@@ -212,8 +243,9 @@ def lead_accel(v_ego, gap, v_lead, a_lead, t_follow) -> float:
   closing rate, which the lead's own speed history drives.
 
   The second is the stopping floor, the old kinematic term kept as a bound rather than as the
-  approach: the exact decel that arrives at STOP_DISTANCE with the lead's preview-corrected speed,
-  which binds from ``slack == v_ego^2 / 2``. It is not redundant. A TTC term is proportional on the
+  approach: the exact decel that arrives at STOP_DISTANCE with the lead's *braking-credited* speed —
+  the acceleration credit is the regulator's, above — which binds from
+  ``slack == v_ego^2 / 2``. It is not redundant. A TTC term is proportional on the
   closing rate, so it ramps — and ramping is not stopping: TTC_TARGET = 5 binds at a slack of
   ``5 * (v - 1)``, which above ~34 m/s is *inside* the ``v^2 / 7`` that stopping at ACCEL_MIN needs,
   and on the TTC term alone this car reaches a stopped lead at 14 m/s from 36 m/s. The floor binds
@@ -231,9 +263,16 @@ def lead_accel(v_ego, gap, v_lead, a_lead, t_follow) -> float:
   """
   gap = max(float(gap), 0.0)
   v_lead = max(float(v_lead), 0.0)
+  # The lead's own accel, credited forward into the two different speeds it belongs in. Braking goes to
+  # the speed the safety terms below are measured against — the cautious direction, and the only one
+  # allowed to deepen them. Acceleration goes to the speed *this* regulator matches, because a lead
+  # that is pulling away has a higher next speed than the one on the message, and it must not reach the
+  # safety terms: crediting it there would release braking on nothing but a predicted launch. One-sided
+  # in both places, so neither can cancel the other.
   v_lead_eff = max(0.0, v_lead + min(float(a_lead), 0.0) * MOONPILOT_LEAD_PREVIEW_T)
+  v_lead_match = v_lead + max(float(a_lead), 0.0) * MOONPILOT_LEAD_PREVIEW_T_ACCEL
   gap_target = max(MOONPILOT_STOP_DISTANCE, t_follow * v_ego)
-  a_track = max(MOONPILOT_K_GAP * (gap - gap_target) + MOONPILOT_K_V * (v_lead - v_ego), -MOONPILOT_APPROACH_DECEL)
+  a_track = max(MOONPILOT_K_GAP * (gap - gap_target) + MOONPILOT_K_V * (v_lead_match - v_ego), -MOONPILOT_APPROACH_DECEL)
   closing = v_ego - v_lead_eff
   if closing <= 0.0:
     return a_track  # not closing: nothing to brake for
@@ -254,11 +293,26 @@ def lead_accel(v_ego, gap, v_lead, a_lead, t_follow) -> float:
   return min(a, a_stop) if a_stop < -MOONPILOT_APPROACH_DECEL else a
 
 
-def jerk_limit(a_cmd, a_prev, dt) -> float:
-  """Rate limit, asymmetric and urgency-scaled: comfort jerk normally, emergency jerk by the time
-  the command reaches ACCEL_MIN."""
+def jerk_limit(a_cmd, a_prev, dt, v_ego, comfort_scale=1.0) -> float:
+  """Rate limit, asymmetric and urgency-scaled.
+
+  The learned scale is deliberately only on the positive, comfort-side ramp. The braking-side
+  interpolation and its emergency endpoint are the stopping-distance-tested constants.
+  """
+  comfort_scale = float(np.clip(comfort_scale, 0.5, 1.0))
+  up = (
+    MOONPILOT_JERK_UP
+    if a_prev <= 0.0
+    else float(
+      np.interp(
+        v_ego,
+        [MOONPILOT_JERK_LAUNCH_SPEED, 2 * MOONPILOT_JERK_LAUNCH_SPEED],
+        [MOONPILOT_JERK_LAUNCH, MOONPILOT_JERK_UP],
+      )
+    )
+  ) * comfort_scale
   down = float(np.interp(a_cmd, [ACCEL_MIN, -2.0], [MOONPILOT_JERK_EMERGENCY, MOONPILOT_JERK_DOWN]))
-  return float(np.clip(a_cmd, a_prev - down * dt, a_prev + MOONPILOT_JERK_UP * dt))
+  return float(np.clip(a_cmd, a_prev - down * dt, a_prev + up * dt))
 
 
 def lead_accel_estimate(a_lead: float) -> float:
@@ -394,6 +448,11 @@ class MoonpilotLongitudinalPlanner:
     if isinstance(seeded, float) and seeded >= MOONPILOT_LAG_MIN:
       self.long_lag.seed(min(seeded, MOONPILOT_LAG_MAX), MOONPILOT_LAG_BLOCKS_NEEDED)
       self.long_lag_logged = self.long_lag.applied_delay()
+    self.long_jerk = LongitudinalComfortJerkEstimator(dt)
+    seeded_jerk = self.params.get(MOONPILOT_LONG_JERK_SCALE_KEY, return_default=True)
+    if isinstance(seeded_jerk, float) and seeded_jerk < 1.0:
+      self.long_jerk.seed(seeded_jerk, MOONPILOT_LONG_JERK_MIN_SAMPLES)
+
     self.action_t = self.long_lag.applied_delay() + dt
     # The curve speed control's per-car calibration (`moonpilot/curve.py`): realized lateral accel over
     # what the path predicted, one-sided so it can only ever plan for less speed. Seeded from the last
@@ -463,6 +522,9 @@ class MoonpilotLongitudinalPlanner:
       and not sm['controlsState'].forceDecel
     )
     self.long_lag.update(self.output_a_target, a_ego, lag_valid)
+    self.long_jerk.update(self.output_a_target, a_ego, self.long_lag.applied_delay(), lag_valid)
+    jerk_scale = self.long_jerk.applied()
+
     self.action_t = self.long_lag.applied_delay() + self.dt
 
     accel_coast = coast_accel(sm['carControl'].orientationNED[1]) if len(sm['carControl'].orientationNED) == 3 else ACCEL_MAX
@@ -551,14 +613,28 @@ class MoonpilotLongitudinalPlanner:
       v_hold=v_hold,
     )
 
-    a_target = float(np.clip(jerk_limit(a_cmd, a_prev, self.dt), ACCEL_MIN, ACCEL_MAX))
+    a_target = float(np.clip(jerk_limit(a_cmd, a_prev, self.dt, v_ego, jerk_scale), ACCEL_MIN, ACCEL_MAX))
+
     if not math.isfinite(a_target):
       # One guard, so that no input can latch a NaN into the command.
       a_target = 0.0
 
     self.v_desired_trajectory, self.a_desired_trajectory = self._trajectory(
-      v_ego, a_target, leads, v_cruise, t_follow, e2e, model_accel, steer_angle, accel_coast, lead_age, curve, v_hold
+      v_ego,
+      a_target,
+      leads,
+      v_cruise,
+      t_follow,
+      e2e,
+      model_accel,
+      steer_angle,
+      accel_coast,
+      lead_age,
+      curve,
+      v_hold,
+      jerk_scale,
     )
+
     self.j_desired_trajectory = np.gradient(self.a_desired_trajectory, MOONPILOT_CONTROL_T_IDX)
 
     crash = any(
@@ -607,6 +683,9 @@ class MoonpilotLongitudinalPlanner:
     self.frames += 1
     if self.frames % MOONPILOT_LAG_PERSIST_EVERY == 0 and self.long_lag.status == 'estimated':
       self._persist_lag()
+    if self.frames % MOONPILOT_LONG_JERK_PERSIST_EVERY == 0 and self.long_jerk.status == 'estimated':
+      self._persist_long_jerk()
+
     if self.lat_bias.frames % MOONPILOT_CURVE_BIAS_PERSIST_EVERY == 0 and self.lat_bias.status == 'estimated':
       self._persist_lat_scale()
     self.solve_time = time.monotonic() - start
@@ -618,6 +697,11 @@ class MoonpilotLongitudinalPlanner:
       cloudlog.info(f"moonpilot longitudinal lag {value:.3f} s over {self.long_lag.valid_blocks} blocks, action_t {self.action_t:.3f} s")
       self.long_lag_logged = value
 
+  def _persist_long_jerk(self):
+    value = round(self.long_jerk.estimate, 3)
+    self.params.put(MOONPILOT_LONG_JERK_SCALE_KEY, value)
+    cloudlog.info(f"moonpilot longitudinal comfort jerk scale {value:.3f} over {self.long_jerk.samples} paired ramps")
+
   def _persist_lat_scale(self):
     """Persist the learned value so the next boot plans with it from the first frame. Gated on a
     trusted estimate, so an unestimated or invalid one never becomes the next drive's scale."""
@@ -625,7 +709,22 @@ class MoonpilotLongitudinalPlanner:
     self.params.put(MOONPILOT_CURVE_BIAS_KEY, value)
     cloudlog.info(f"moonpilot curve lateral scale {value:.3f} over {self.lat_bias.samples} paired frames")
 
-  def _trajectory(self, v_ego, a_target, leads, v_cruise, t_follow, e2e, model_accel, steer_angle, accel_coast, lead_age=0.0, curve=None, v_hold=math.inf):
+  def _trajectory(
+    self,
+    v_ego,
+    a_target,
+    leads,
+    v_cruise,
+    t_follow,
+    e2e,
+    model_accel,
+    steer_angle,
+    accel_coast,
+    lead_age=0.0,
+    curve=None,
+    v_hold=math.inf,
+    comfort_scale=1.0,
+  ):
     """The same policy rolled forward over the published horizon, from (v_ego, a_target). The ego's
     own travel is carried in x, so the gap the leads are rolled against is the gap this plan
     produces. The old loop advanced the state by the *backward* interval and rolled the leads against
@@ -644,7 +743,7 @@ class MoonpilotLongitudinalPlanner:
       a_cmd, _ = policy(
         v, states, v_cruise, t_follow, e2e, model_accel, steer_angle, self.CP, accel_coast, self.allow_throttle, curve=curve, x_ego=x, v_hold=v_hold
       )
-      a = float(np.clip(jerk_limit(a_cmd, a, t - t_prev), ACCEL_MIN, ACCEL_MAX))
+      a = float(np.clip(jerk_limit(a_cmd, a, t - t_prev, v, comfort_scale), ACCEL_MIN, ACCEL_MAX))
       speeds[i] = v
       accels[i] = a
       dt = float(MOONPILOT_CONTROL_T_IDX[i + 1]) - t if i + 1 < CONTROL_N else 0.0

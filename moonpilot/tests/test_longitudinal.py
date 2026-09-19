@@ -40,6 +40,12 @@ from moonpilot.curve import (
   curve_targets,
   lat_accel_hold,
 )
+from moonpilot.jerk import (
+  MOONPILOT_LONG_JERK_MIN_SAMPLES,
+  MOONPILOT_LONG_JERK_PERSIST_EVERY,
+  MOONPILOT_LONG_JERK_SCALE_KEY,
+)
+
 from moonpilot.features import FEATURES
 from moonpilot.lead import MOONPILOT_LEAD_ACCEL_TAU, LeadAccelEstimator
 from moonpilot.longitudinal import (
@@ -47,10 +53,15 @@ from moonpilot.longitudinal import (
   MOONPILOT_CONTROL_T_IDX,
   MOONPILOT_FCW_DECEL,
   MOONPILOT_JERK_EMERGENCY,
+  MOONPILOT_JERK_DOWN,
+  MOONPILOT_JERK_LAUNCH,
+  MOONPILOT_JERK_LAUNCH_SPEED,
   MOONPILOT_JERK_UP,
   MOONPILOT_K_GAP,
   MOONPILOT_K_TTC,
   MOONPILOT_K_V,
+  MOONPILOT_LEAD_PREVIEW_T,
+  MOONPILOT_LEAD_PREVIEW_T_ACCEL,
   MOONPILOT_MODEL_BRAKE_THRESHOLD,
   MOONPILOT_OUT_OF_PATH_T_FOLLOW,
   MOONPILOT_STOP_DISTANCE,
@@ -58,6 +69,7 @@ from moonpilot.longitudinal import (
   MOONPILOT_TTC_TARGET,
   MoonpilotLongitudinalPlanner,
   cruise_accel,
+  jerk_limit,
   lead_accel,
   lead_state_at,
   model_candidate,
@@ -311,6 +323,70 @@ class TestPolicyFunctions(unittest.TestCase):
     for v_ego, gap, v_lead in ((25.0, 120.0, 0.0), (25.0, 8.0, 0.0), (25.0, 40.0, 20.0)):
       self.assertAlmostEqual(lead_accel(v_ego, gap, v_lead, 0.0, 1.45), a_stop(v_ego, gap, v_lead), delta=1e-6)
 
+  def test_the_lead_accel_credit_splits_by_direction_and_by_term(self):
+    """The lead's own accel is credited forward into two different speeds, one direction each, and
+    where each one lands is the whole contract. Braking goes into the speed the safety terms are
+    measured against (`MOONPILOT_LEAD_PREVIEW_T`) — the cautious direction, and the only one allowed
+    to deepen them. Acceleration goes into the speed the *regulator* matches
+    (`MOONPILOT_LEAD_PREVIEW_T_ACCEL`), and must not reach the safety terms at all: releasing braking
+    on a predicted launch is the fork braking for a prediction where the geometry had not moved.
+    Pinned by arithmetic on both halves, at states where each is the term that governs — every other
+    `lead_accel` call in this file passes `a_lead=0.0`, so this is the only coverage either has.
+    """
+    v_ego, gap, v_lead = 20.0, 40.0, 10.0
+    t_follow = MOONPILOT_T_FOLLOW[int(Personality.standard)]
+    self.assertLess(MOONPILOT_LEAD_PREVIEW_T_ACCEL, MOONPILOT_LEAD_PREVIEW_T)
+
+    # the floor reads the braking credit only, and it governs this state
+    for a_lead, credit in ((0.0, 0.0), (2.0, 0.0), (-2.0, MOONPILOT_LEAD_PREVIEW_T)):
+      v_lead_eff = v_lead + a_lead * credit
+      a_stop = -(v_ego**2 - v_lead_eff**2) / (2 * (gap - MOONPILOT_STOP_DISTANCE))
+      self.assertLess(a_stop, -MOONPILOT_APPROACH_DECEL)
+      self.assertAlmostEqual(lead_accel(v_ego, gap, v_lead, a_lead, t_follow), a_stop, places=9)
+
+    # the regulator reads the acceleration credit, one-sided, and this state is the early return's —
+    # the lead is faster than the ego, so there is nothing to brake for and `a_track` is the output
+    gap_target = max(MOONPILOT_STOP_DISTANCE, t_follow * 10.0)
+    a_track_free = MOONPILOT_K_GAP * (20.0 - gap_target) + MOONPILOT_K_V * 2.0
+    for a_lead, expected in (
+      (0.0, a_track_free),
+      (2.0, a_track_free + MOONPILOT_K_V * MOONPILOT_LEAD_PREVIEW_T_ACCEL * 2.0),
+      (-2.0, a_track_free),  # a braking lead adds nothing to what the car matches
+    ):
+      self.assertAlmostEqual(lead_accel(10.0, 20.0, 12.0, a_lead, t_follow), expected, places=9)
+
+    # And the ordering is the safety direction at every state: the acceleration credit can only ever
+    # raise the command, the braking credit can only ever lower it, and neither can cross the other.
+    for v_ego in (5.0, 15.0, 30.0):
+      for gap in (20.0, 60.0, 200.0):
+        with self.subTest(v_ego=v_ego, gap=gap):
+          neutral = lead_accel(v_ego, gap, 10.0, 0.0, 1.45)
+          self.assertLessEqual(neutral, lead_accel(v_ego, gap, 10.0, 2.0, 1.45))
+          self.assertGreaterEqual(neutral, lead_accel(v_ego, gap, 10.0, -2.0, 1.45))
+
+  def test_the_up_jerk_is_scheduled_on_speed_and_the_down_jerk_is_not(self):
+    """The up limit is `MOONPILOT_JERK_LAUNCH` at and below `MOONPILOT_JERK_LAUNCH_SPEED`, tapering
+    back to `MOONPILOT_JERK_UP` by twice it — a launch is the one place the plan's own ask outruns the
+    comfort limit, and the car's answer to a lead pulling away is the most visible thing this planner
+    does. The down side reads the *command* and never the speed: every braking number in the file was
+    measured against it, and the emergency ramp it interpolates into is untouched.
+    """
+    for v_ego, expected in (
+      (0.0, MOONPILOT_JERK_LAUNCH),
+      (MOONPILOT_JERK_LAUNCH_SPEED, MOONPILOT_JERK_LAUNCH),
+      (2 * MOONPILOT_JERK_LAUNCH_SPEED, MOONPILOT_JERK_UP),
+      (25.0, MOONPILOT_JERK_UP),
+    ):
+      # measured from a command already off zero: the first step of a ramp is the comfort step at
+      # every speed, which is what keeps `should_stop`'s 0.1 release threshold out of a single frame's
+      # reach — a parked car cannot lose its brake hold to a lead whose reported speed jitters, and
+      # `test_the_stop_gate_follows_the_governing_candidate_not_every_lead` pins that from the other end
+      self.assertAlmostEqual(jerk_limit(10.0, 0.05, DT_MDL, v_ego), 0.05 + expected * DT_MDL, places=9)
+    for v_ego in (0.0, MOONPILOT_JERK_LAUNCH_SPEED, 25.0):
+      self.assertAlmostEqual(jerk_limit(10.0, 0.0, DT_MDL, v_ego), MOONPILOT_JERK_UP * DT_MDL, places=9)
+    for v_ego in (0.0, MOONPILOT_JERK_LAUNCH_SPEED, 25.0):
+      self.assertAlmostEqual(jerk_limit(-1.0, 0.0, DT_MDL, v_ego), -MOONPILOT_JERK_DOWN * DT_MDL, places=9)
+
   def test_the_approach_stops_behind_a_stopped_lead_at_every_reachable_speed(self):
     """The safety property, and the one the TTC term alone does not have: the fork's car can reach
     V_CRUISE_MAX on openpilot longitudinal, and a proportional approach term binds *after* the
@@ -495,6 +571,47 @@ class TestPlanner(unittest.TestCase):
     for _ in range(10):
       planner.update(sm)
     self.assertGreaterEqual(planner.output_a_target, 0.1)
+
+  def test_a_launch_is_not_held_back_by_the_comfort_jerk(self):
+    """From a standstill behind a lead pulling away at 2 m/s^2, the ramp is the comfort step once and
+    then the launch jerk — 0.2 m/s^2 per frame against the comfort 0.075, which is what gets the
+    delivered command to 0.5 m/s^2 three frames sooner than the comfort limit alone reaches it (it
+    needs seven). The first step stays the comfort one on purpose: `should_stop` releases a standstill
+    hold when `a_target` crosses 0.1, so a step of 0.2 would let one frame of a lead's reported speed
+    lift a parked car's brake hold, which `test_the_stop_gate_follows_the_governing_candidate_not_every_lead`
+    pins from the other side.
+    """
+    planner = _planner()
+    a_lead, steps = 2.0, []
+    for frame in range(6):
+      t = frame * DT_MDL
+      lead = _lead(MOONPILOT_STOP_DISTANCE + 0.5 * a_lead * t**2, a_lead * t, a_lead=a_lead)
+      previous = planner.output_a_target
+      planner.update(_inputs(v_ego=0.0, v_cruise_kph=108.0, lead=lead, standstill=True))
+      steps.append(planner.output_a_target - previous)
+    self.assertAlmostEqual(steps[0], MOONPILOT_JERK_UP * DT_MDL, delta=1e-9)
+    self.assertAlmostEqual(steps[1], MOONPILOT_JERK_LAUNCH * DT_MDL, delta=1e-9)
+    self.assertGreater(planner.output_a_target, MOONPILOT_JERK_UP * DT_MDL * 6)  # past what six comfort frames could deliver
+
+  def test_a_launch_is_answered_through_the_projection_and_the_regulator(self):
+    """Both positive channels, and nothing else. `lead_state_at` projects the lead's own accel over
+    `action_t + lead_age`, so the gap the policy sees is the lead's future *position*; `lead_accel`'s
+    regulator then matches `v_lead + MOONPILOT_LEAD_PREVIEW_T_ACCEL * a_lead`, its future *speed*. The
+    safety terms stay on the raw speed (`v_ego - v_lead_eff` is still negative here, so no approach
+    term is even consulted) — that split is the point, because a launch is the one moment there is
+    nothing to brake for and a credit that reached the floor would be braking for a prediction anyway.
+    """
+    t_follow = MOONPILOT_T_FOLLOW[int(Personality.standard)]
+    gap, v_lead = 6.5, 0.3
+    projected = lead_state_at(_lead(gap, v_lead), 0.25, 0.0, 2.0, 0.0)
+    unprojected = lead_state_at(_lead(gap, v_lead), 0.25, 0.0, 0.0, 0.0)
+    self.assertGreater(projected[0], unprojected[0])  # further ahead by the time it counts
+    self.assertGreater(projected[1], unprojected[1])  # and faster
+
+    a_track = MOONPILOT_K_GAP * (gap - MOONPILOT_STOP_DISTANCE) + MOONPILOT_K_V * v_lead
+    for a_lead, expected in ((0.0, a_track), (2.0, a_track + MOONPILOT_K_V * MOONPILOT_LEAD_PREVIEW_T_ACCEL * 2.0)):
+      self.assertAlmostEqual(lead_accel(0.0, gap, v_lead, a_lead, t_follow), expected, places=9)
+    self.assertGreater(lead_accel(0.0, gap, v_lead, 2.0, t_follow), 0.0)
 
   def test_standstill_behind_a_stopped_lead_stays_stopped(self):
     planner = _planner()
@@ -800,7 +917,6 @@ class TestPlanner(unittest.TestCase):
     # stopped separating anything at all.
     self.assertLessEqual(reached[-0.5], 0.15)
     self.assertLessEqual(reached[-1.0], 0.20)
-    self.assertLessEqual(reached[-2.0], 1.00)
     self.assertLessEqual(reached[-2.0], 1.00)
 
   def test_a_stale_lead_is_planned_as_if_it_were_fresh(self):
@@ -1354,6 +1470,18 @@ class TestCurveSpeed(unittest.TestCase):
       measuring.update(_inputs())
     self.assertNotIn(MOONPILOT_CURVE_BIAS_KEY, measuring.params.puts)
 
+  def test_the_longitudinal_jerk_scale_persists_only_after_estimation(self):
+    planner = _planner()
+    planner.long_jerk.seed(0.75, MOONPILOT_LONG_JERK_MIN_SAMPLES)
+    for _ in range(MOONPILOT_LONG_JERK_PERSIST_EVERY):
+      planner.update(_inputs())
+    self.assertEqual(planner.params.puts.get(MOONPILOT_LONG_JERK_SCALE_KEY), 0.75)
+
+    measuring = _planner()
+    for _ in range(MOONPILOT_LONG_JERK_PERSIST_EVERY):
+      measuring.update(_inputs())
+    self.assertNotIn(MOONPILOT_LONG_JERK_SCALE_KEY, measuring.params.puts)
+
   def test_the_feature_rows_match_the_params_defaults(self):
     """Both behaviors ship off: each one is unvalidated on a car, and both are read with
     `enabled()`, so the row and the param default have to agree."""
@@ -1367,6 +1495,7 @@ class TestCurveSpeed(unittest.TestCase):
     # The learned scale is a value, not a toggle: nothing may gate on it, and its neutral default has
     # to be the neutral ratio rather than the "unset" the lag param uses.
     self.assertTrue('{"MoonpilotCurveLatScale", {PERSISTENT, FLOAT, "1.0"}}' in text)
+    self.assertTrue('{"MoonpilotLongJerkScale", {PERSISTENT, FLOAT, "1.0"}}' in text)
 
 
 class TestUpstreamManeuvers(unittest.TestCase):
