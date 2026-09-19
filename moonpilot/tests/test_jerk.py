@@ -12,11 +12,11 @@ from moonpilot.longitudinal import jerk_limit
 
 
 class TestLongitudinalComfortJerkEstimator(unittest.TestCase):
-  def _run(self, gain: float, base: float = 0.75, amplitude: float = 0.75):
+  def _run(self, gain: float, base: float = 0.75, amplitude: float = 0.75, noise: float = 0.0):
     estimator = LongitudinalComfortJerkEstimator()
     delay_frames = 3
     command = [base + amplitude * math.sin(2.0 * math.pi * i / 40.0) for i in range(600)]
-    actual = [gain * command[i - delay_frames] if i >= delay_frames else 0.0 for i in range(len(command))]
+    actual = [gain * command[i - delay_frames] + noise * math.sin(2.0 * math.pi * i / 7.0) if i >= delay_frames else 0.0 for i in range(len(command))]
     for cmd, acc in zip(command, actual, strict=True):
       estimator.update(cmd, acc, delay_frames * DT_MDL, True)
     return estimator
@@ -28,8 +28,13 @@ class TestLongitudinalComfortJerkEstimator(unittest.TestCase):
     self.assertGreaterEqual(estimator.applied(), MOONPILOT_LONG_JERK_SCALE_MIN)
 
     gentle = self._run(0.5)
-    self.assertEqual(gentle.status, "measuring")
-    self.assertEqual(gentle.applied(), 1.0)
+    self.assertEqual(gentle.status, "estimated")
+    self.assertAlmostEqual(gentle.applied(), 1.0, places=3)
+
+  def test_unit_gain_with_zero_mean_slope_noise_stays_neutral(self):
+    estimator = self._run(1.0, noise=0.005)
+    self.assertEqual(estimator.status, "estimated")
+    self.assertAlmostEqual(estimator.applied(), 1.0, places=3)
 
   def test_invalid_stretch_clears_pairing_history(self):
     estimator = LongitudinalComfortJerkEstimator()

@@ -698,7 +698,7 @@ class MoonpilotLongitudinalPlanner:
       self.long_lag_logged = value
 
   def _persist_long_jerk(self):
-    value = round(self.long_jerk.estimate, 3)
+    value = round(self.long_jerk.applied(), 3)
     self.params.put(MOONPILOT_LONG_JERK_SCALE_KEY, value)
     cloudlog.info(f"moonpilot longitudinal comfort jerk scale {value:.3f} over {self.long_jerk.samples} paired ramps")
 
