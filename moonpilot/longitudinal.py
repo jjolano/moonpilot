@@ -4,8 +4,9 @@ Upstream solves an acados MPC every frame. This is closed-form — no solver, no
 every number in it is fork-owned, so tuning happens here instead of inside a generated optimization
 problem. The policy is three candidates, and the smallest wins:
 
-  - a spacing regulator that holds ``gap == STOP_DISTANCE + t_follow * v_ego`` against the nearest
+  - a spacing regulator that holds ``gap == max(STOP_DISTANCE, t_follow * v_ego)`` against the nearest
     lead, gaining rigidity as the gap closes (all the slack is in the time gap, none in the gains);
+    the standstill distance is a floor under the headway rather than an offset on top of it;
   - the time gap itself, biased by ``MoonpilotLeadLateral`` when the lead is predicted to leave the
     path — the fork's lateral prediction reaches the longitudinal policy here, since there is no
     MPC danger zone to scale;
@@ -99,7 +100,8 @@ LongitudinalPlanSource = log.LongitudinalPlan.LongitudinalPlanSource
 Personality = log.LongitudinalPersonality
 
 # Starting points, all fork-owned. Tune against logs.
-MOONPILOT_STOP_DISTANCE = 6.0  # m; gap held behind a stopped lead
+MOONPILOT_STOP_DISTANCE = 6.0  # m; the standstill gap — the time-gap setpoint's floor, where the
+# stopping floor arrives, and the gap held behind a stopped lead
 # s; time gap per personality, keyed by the enum's raw value rather than the schema member:
 # `log.LongitudinalPersonality.standard` is a plain int, but the same enum read off a message is a
 # capnp _DynamicEnum whose hash is not that int, so a dict keyed by the members never matches.
@@ -189,9 +191,13 @@ def cruise_accel(v_ego, v_cruise, e2e, steer_angle_deg, CP, accel_coast, allow_t
 def lead_accel(v_ego, gap, v_lead, a_lead, t_follow) -> float:
   """Two terms, one number.
 
-  The spacing regulator holds gap == STOP_DISTANCE + t_follow * v_ego and matches the lead's speed;
-  its braking authority is capped at the approach decel, so large speed errors do not turn into hard
-  braking through the gain.
+  The spacing regulator holds gap == max(STOP_DISTANCE, t_follow * v_ego) and matches the lead's
+  speed; its braking authority is capped at the approach decel, so large speed errors do not turn
+  into hard braking through the gain. STOP_DISTANCE is a *floor* rather than an offset added to
+  every headway: added, the effective headway was ``t_follow + STOP_DISTANCE / v_ego`` — 1.65 s at
+  30 m/s where the driver chose 1.45, 2.05 s at 10 m/s, 3.45 s at 3 m/s — so the car hung back
+  further the slower it went. It only governs below ``STOP_DISTANCE / t_follow`` (4.1 m/s at the
+  standard personality), which is the region where there is no time gap left to hold.
 
   The approach is two terms, and the deeper one wins against the regulator's capped output.
 
@@ -217,7 +223,7 @@ def lead_accel(v_ego, gap, v_lead, a_lead, t_follow) -> float:
   the creep.
 
   The handover in either case is a step, not a crossover: at the crossing the regulator's output is
-  whatever the spacing error says, positive while the gap is still wide — +67.9 m/s^2 at 25 m/s and
+  whatever the spacing error says, positive while the gap is still wide — +69.7 m/s^2 at 25 m/s and
   the 318.5 m stopping crossing — and the approach terms replace it from there. That step is only
   safe because it is a *candidate*: `policy` takes the minimum, so while the lead asks for more than
   the cruise term the cruise term governs and the output never sees it. What the output steps by is
@@ -226,7 +232,8 @@ def lead_accel(v_ego, gap, v_lead, a_lead, t_follow) -> float:
   gap = max(float(gap), 0.0)
   v_lead = max(float(v_lead), 0.0)
   v_lead_eff = max(0.0, v_lead + min(float(a_lead), 0.0) * MOONPILOT_LEAD_PREVIEW_T)
-  a_track = max(MOONPILOT_K_GAP * (gap - MOONPILOT_STOP_DISTANCE - t_follow * v_ego) + MOONPILOT_K_V * (v_lead - v_ego), -MOONPILOT_APPROACH_DECEL)
+  gap_target = max(MOONPILOT_STOP_DISTANCE, t_follow * v_ego)
+  a_track = max(MOONPILOT_K_GAP * (gap - gap_target) + MOONPILOT_K_V * (v_lead - v_ego), -MOONPILOT_APPROACH_DECEL)
   closing = v_ego - v_lead_eff
   if closing <= 0.0:
     return a_track  # not closing: nothing to brake for
@@ -510,7 +517,7 @@ class MoonpilotLongitudinalPlanner:
     # exactly that and the ego by nothing is what closes the difference; it needs no new constant
     # because upstream's own `commIssue` disengages at ten periods, so `lead_age` cannot usefully
     # exceed ~0.5 s, and the correction is self-limiting well before that (a stopped lead at 1 s of
-    # staleness moves the stop by 0.42 m, against 3.54 m uncorrected).
+    # staleness moves the stop by 0.26 m, against 2.35 m uncorrected).
     #
     # Defaulted rather than required: the maneuver plant hands a bare `dict` with no `logMonoTime` at
     # all, and a missing or equal stamp has to give the zero correction this planner applied before

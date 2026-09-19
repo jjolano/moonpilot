@@ -251,12 +251,26 @@ def _planner(car=CAR.HONDA_CIVIC, params_on=True, params_overrides=None, **kwarg
   return planner
 
 
+def _gap_target(v_ego, t_follow):
+  """The spacing regulator's setpoint: the time gap, floored at the standstill distance.
+
+  A floor and not an offset — `STOP_DISTANCE + t_follow * v_ego` made the effective headway
+  `t_follow + STOP_DISTANCE / v_ego`, so the car hung back further the slower it went."""
+  return max(MOONPILOT_STOP_DISTANCE, t_follow * v_ego)
+
+
 class TestPolicyFunctions(unittest.TestCase):
-  def test_setpoint_is_stop_distance_plus_time_gap(self):
-    """Steady following holds gap == STOP_DISTANCE + t_follow * v_ego, for every personality."""
+  def test_setpoint_is_the_time_gap_floored_at_the_standstill_distance(self):
+    """Steady following holds gap == t_follow * v_ego, for every personality, and the standstill
+    distance only takes over below `STOP_DISTANCE / t_follow`. The old setpoint — the offset form —
+    is a *larger* gap above that speed, i.e. a positive accel ask: the leftover hang-back."""
     for t_follow in MOONPILOT_T_FOLLOW.values():
-      for v in (0.0, 5.0, 20.0, 33.0):
-        self.assertAlmostEqual(lead_accel(v, MOONPILOT_STOP_DISTANCE + t_follow * v, v, 0.0, t_follow), 0.0, delta=1e-9)
+      for v in (0.0, 3.0, 5.0, 20.0, 33.0):
+        self.assertAlmostEqual(lead_accel(v, _gap_target(v, t_follow), v, 0.0, t_follow), 0.0, delta=1e-9)
+      self.assertEqual(_gap_target(0.0, t_follow), MOONPILOT_STOP_DISTANCE)
+      for v in (5.0, 20.0, 33.0):  # above the floor the setpoint is the pure time gap
+        self.assertAlmostEqual(_gap_target(v, t_follow), t_follow * v, delta=1e-9)
+        self.assertGreater(lead_accel(v, MOONPILOT_STOP_DISTANCE + t_follow * v, v, 0.0, t_follow), 0.0)
 
   def test_the_approach_handover_has_the_stopping_geometry(self):
     """The regulator hands over to the approach term at gap == STOP_DISTANCE + (v^2 - v_lead^2) / 2,
@@ -268,7 +282,7 @@ class TestPolicyFunctions(unittest.TestCase):
     t_follow = MOONPILOT_T_FOLLOW[int(Personality.standard)]
     for v_ego, v_lead in ((25.0, 0.0), (30.0, 0.0), (20.0, 0.0), (25.0, 20.0), (10.0, 0.0)):
       gap_star = MOONPILOT_STOP_DISTANCE + (v_ego**2 - v_lead**2) / 2
-      a_track = max(MOONPILOT_K_GAP * (gap_star - MOONPILOT_STOP_DISTANCE - t_follow * v_ego) + MOONPILOT_K_V * (v_lead - v_ego), -MOONPILOT_APPROACH_DECEL)
+      a_track = max(MOONPILOT_K_GAP * (gap_star - _gap_target(v_ego, t_follow)) + MOONPILOT_K_V * (v_lead - v_ego), -MOONPILOT_APPROACH_DECEL)
       self.assertAlmostEqual(lead_accel(v_ego, gap_star - 1e-3, v_lead, 0.0, t_follow), -MOONPILOT_APPROACH_DECEL, delta=1e-3)
       self.assertAlmostEqual(lead_accel(v_ego, gap_star + 1e-3, v_lead, 0.0, t_follow), a_track, delta=1e-3)
 
@@ -373,7 +387,7 @@ class TestPolicyFunctions(unittest.TestCase):
     """The step that reaches the output, not the one the candidate makes.
 
     The crossing is where stopping first needs more than the approach decel, and at 25 m/s against a
-    stopped lead that is 318.5 m, where the regulator still wants +67.9 m/s^2 — a 68.9 m/s^2 step in
+    stopped lead that is 318.5 m, where the regulator still wants +69.7 m/s^2 — a 70.7 m/s^2 step in
     the lead candidate, and a case upstream's maneuver suite has no maneuver for. It cannot reach the
     output: while the lead asks for more than the cruise candidate, `min` picks cruise, so what the
     output steps by is cruise's cap minus the approach decel. Two invariants, and nothing else pins
@@ -426,6 +440,52 @@ class TestPolicyFunctions(unittest.TestCase):
     self.assertAlmostEqual(required_decel(20.0, 30.0, 0.0, 0.0), -(20.0**2) / (2 * (30.0 - 0.25)), delta=1e-9)
 
 
+class TestStalenessScope(unittest.TestCase):
+  """The scope of `lead_age`'s safety claim, which the AGENTS.md bullet states.
+
+  Structural, and stated as such: while the ego is closing (`v_lead <= v_ego`) on a lead that is not
+  speeding up (`a_lead <= 0`), the extra interval the correction adds shrinks the gap by
+  `(v_lead - v_ego) * age` and lowers the lead's predicted speed under the decay, so the closing rate
+  rises and `a_track`, `a_ttc` and `a_stop` are each non-increasing — and `min`, with the clip the
+  command passes through, preserves that. The grid here is the coarse copy of the 160k-state sweep the
+  bullet quotes (0 violations there at 46 ms, 0.2 s and 0.5 s), and it fails the moment `lead_state_at`
+  or a candidate stops being monotone in the age.
+  """
+
+  AGES = (0.046, 0.2)
+  V_EGO = (5.0, 12.0, 20.0, 30.0, 40.0)
+  GAPS = (8.0, 20.0, 45.0, 90.0, 200.0)
+  V_LEAD = (0.0, 5.0, 12.0, 20.0)
+  A_LEAD = (-6.0, -3.0, -1.0, 0.0)
+  ACTION_T = 0.2  # the test CP's longitudinalActuatorDelay + DT_MDL, as the planner computes it
+
+  def test_the_correction_never_reads_optimistic_where_the_ego_is_closing(self):
+    CP = _cp()
+    t_follow = MOONPILOT_T_FOLLOW[int(Personality.standard)]
+    differ = 0
+    for age in self.AGES:
+      for v_ego in self.V_EGO:
+        for gap in self.GAPS:
+          for v_lead in self.V_LEAD:
+            if v_lead > v_ego:
+              continue  # a lead faster than the ego is pulling away, and is not the case this claims
+            for a_lead in self.A_LEAD:
+              lead = _lead(gap, v_lead, a_lead=a_lead)
+              fresh = lead_state_at(lead, self.ACTION_T, v_ego * self.ACTION_T, a_lead, MOONPILOT_LEAD_ACCEL_TAU)
+              aged = lead_state_at(lead, self.ACTION_T + age, v_ego * (self.ACTION_T + age), a_lead, MOONPILOT_LEAD_ACCEL_TAU)
+              a_fresh = lead_accel(v_ego, *fresh, t_follow)
+              a_aged = lead_accel(v_ego, *aged, t_follow)
+              self.assertLessEqual(
+                a_aged, a_fresh + 1e-9, f"the lead candidate rose with the age at v_ego {v_ego}, gap {gap}, v_lead {v_lead}, a_lead {a_lead}"
+              )
+              self.assertLessEqual(
+                policy(v_ego, [(Source.lead0, *aged)], 30.0, t_follow, False, None, 0.0, CP, -0.3, True)[0],
+                policy(v_ego, [(Source.lead0, *fresh)], 30.0, t_follow, False, None, 0.0, CP, -0.3, True)[0] + 1e-9,
+              )
+              differ += a_aged < a_fresh - 1e-9
+    self.assertGreater(differ, 0)  # the arms are not identical over this grid, so the bound means something
+
+
 class TestPlanner(unittest.TestCase):
   def test_resume_from_a_standstill_commands_movement(self):
     """Upstream's stock-ACC resume spam releases only when the planner commands a_target >= 0.1,
@@ -460,7 +520,7 @@ class TestPlanner(unittest.TestCase):
     v_lead = 0.2
 
     # closed loop: trailing the creep, the flag must not toggle at all
-    v_ego, gap = v_lead, MOONPILOT_STOP_DISTANCE + t_follow * v_lead
+    v_ego, gap = v_lead, _gap_target(v_lead, t_follow)
     flips, previous = 0, None
     for _ in range(500):
       planner.update(_inputs(v_ego=v_ego, v_cruise_kph=108.0, lead=_lead(gap, v_lead)))
@@ -604,7 +664,9 @@ class TestPlanner(unittest.TestCase):
 
   def test_source_names_the_winning_candidate(self):
     planner = _planner()
-    planner.update(_inputs(v_ego=20.0, v_cruise_kph=108.0, lead=_lead(35.0, 20.0)))
+    # 29.0 m is the setpoint at 20 m/s (1.45 s, standard): the regulator's own ask ties at zero there
+    # and is the minimum against cruise's +1.2, so the lead is the candidate that governs.
+    planner.update(_inputs(v_ego=20.0, v_cruise_kph=108.0, lead=_lead(29.0, 20.0)))
     self.assertEqual(planner.source, Source.lead0)
 
     planner = _planner()
@@ -714,7 +776,7 @@ class TestPlanner(unittest.TestCase):
     planner = _planner()
     t_follow = MOONPILOT_T_FOLLOW[int(Personality.standard)]
     v_ego, v_lead = 20.0, 20.0
-    gap = MOONPILOT_STOP_DISTANCE + t_follow * v_ego
+    gap = _gap_target(v_ego, t_follow)
     reached = {}
     since_onset = None
     for frame in range(120):  # 2 s of settled following, then the lead brakes at -3.5 m/s^2
@@ -745,9 +807,9 @@ class TestPlanner(unittest.TestCase):
     stamp says so. Stamping a current gap as old instead would double-count, because the correction
     would then subtract closing distance that was never lost.
 
-    Measured stop gap against a fresh lead (5.9221 m), stopping at a stationary lead from 25 m/s:
-    with the correction 0.046 s keeps it to -0.005, 0.1 s -0.001, 0.2 s -0.008; without it the same
-    cases lose 0.062, 0.128 and 0.299 m. The invariant that holds all the way to the 0.5 s ceiling is
+    Measured stop gap against a fresh lead (5.2583 m), stopping at a stationary lead from 25 m/s:
+    with the correction 0.046 s keeps it to -0.003, 0.1 s -0.008, 0.2 s -0.026; without it the same
+    cases lose 0.035, 0.096 and 0.181 m. The invariant that holds all the way to the 0.5 s ceiling is
     weaker but load-bearing — corrected is never worse than uncorrected — which is what the second
     loop below pins, and what fails if `lead_age` is dropped.
     """
@@ -776,13 +838,13 @@ class TestPlanner(unittest.TestCase):
 
     fresh = corrected(0.0)
     self.assertGreater(fresh, 5.0)  # it stops
-    # realistic staleness: the stop is the fresh one to within 2 cm, up to 0.2 s — four times the
+    # realistic staleness: the stop is the fresh one to within 3 cm, up to 0.2 s — four times the
     # 46 ms measured on the corpus. The tight bound is calibrated to that range on purpose: past it
     # the correction loses accuracy because the lead's own acceleration over the stale interval is not
-    # modeled (0.3 s -0.019, 0.4 s -0.035, 0.5 s -0.058), which is graceful rather than broken.
+    # modeled (0.3 s -0.015, 0.4 s -0.026, 0.5 s -0.040), which is graceful rather than broken.
     for age in (0.05, 0.1, 0.2):
       with self.subTest(radar_age_s=age):
-        self.assertAlmostEqual(corrected(age), fresh, delta=0.02, msg=f"{age} s of lead staleness moved the stop")
+        self.assertAlmostEqual(corrected(age), fresh, delta=0.03, msg=f"{age} s of lead staleness moved the stop")
     # and the invariant that holds across the whole reachable range: corrected is never worse than
     # uncorrected. 0.5 s is the ceiling the correction is designed against, since upstream's own
     # `commIssue` disengages at ten radar periods; beyond it both degrade together and the car is
@@ -848,7 +910,7 @@ class TestPlanner(unittest.TestCase):
         planner = _planner()
         t_follow = MOONPILOT_T_FOLLOW[int(Personality.standard)]
         v_ego, v_lead = 20.0, 20.0
-        gap = MOONPILOT_STOP_DISTANCE + t_follow * v_ego
+        gap = _gap_target(v_ego, t_follow)
         for frame in range(200):
           onset = frame * DT_MDL - 2.0
           if onset >= 0.0:
@@ -887,7 +949,7 @@ class TestPlanner(unittest.TestCase):
     self.assertEqual(len(plan.speeds), CONTROL_N)
     self.assertEqual(len(plan.accels), CONTROL_N)
     self.assertEqual(len(plan.jerks), CONTROL_N)
-    self.assertAlmostEqual(plan.aTarget, planner.output_a_target, delta=1e-9)
+    self.assertAlmostEqual(plan.aTarget, planner.output_a_target, delta=1e-6)  # the field is Float32
     self.assertEqual(plan.shouldStop, planner.output_should_stop)
     self.assertEqual(plan.allowThrottle, planner.allow_throttle)
     self.assertTrue(plan.hasLead)
