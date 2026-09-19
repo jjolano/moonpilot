@@ -28,6 +28,29 @@ from typing import Any
 from moonpilot import models
 from moonpilot.vendor.openmodels import client, contracts, metadata
 
+CATALOG_PUBKEY: str = ""
+SIGNATURE_SUFFIX = ".sig"
+
+
+def verify_signature(payload: bytes, signature: bytes, pubkey_pem: str | None = None) -> None:
+  """Verify a catalog sidecar with the pinned Ed25519 key."""
+  key = CATALOG_PUBKEY if pubkey_pem is None else pubkey_pem
+  if not key:
+    raise ValueError("catalog signature requirement cannot be met: no public key is pinned")
+  try:
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+  except ImportError as exc:
+    raise ValueError("catalog signature verification cannot run: cryptography is not installed") from exc
+  try:
+    public_key = serialization.load_pem_public_key(key.encode("ascii"))
+    if not isinstance(public_key, Ed25519PublicKey):
+      raise ValueError("not an Ed25519 public key")
+    public_key.verify(signature, payload)
+  except Exception as exc:
+    raise ValueError("catalog signature verification failed: invalid signature or public key") from exc
+
+
 CATALOG_URL = "https://jjolano.github.io/openmodels/catalog.json"
 INTERFACE_MISMATCH = "downloaded artifact does not match its recorded interface"
 ARTIFACT_UNAVAILABLE = "artifact {availability}: this catalog has no bytes for it"
@@ -39,13 +62,20 @@ def load_catalog(path: str | None = None):
   return client.Catalog.load(path or models.catalog_file())
 
 
-def refresh(url: str = CATALOG_URL, *, timeout: int = 30):
+def refresh(url: str = CATALOG_URL, *, timeout: int = 30, require_signature: bool = False):
   """Fetch the catalog and store it. Returns `(revision, Catalog)`.
 
   The bytes are read into memory and written only once they validate, so a fetch that fails halfway
   leaves the previous snapshot exactly as it was -- which is what makes a failed refresh harmless.
   """
-  raw = client.read_url(url, client.MAX_SNAPSHOT, timeout=timeout)
+  if require_signature:
+    signature = client.read_url(url + SIGNATURE_SUFFIX, client.MAX_SNAPSHOT, timeout=timeout)
+    if not CATALOG_PUBKEY:
+      raise ValueError("catalog signature requirement cannot be met: no public key is pinned")
+    raw = client.read_url(url, client.MAX_SNAPSHOT, timeout=timeout)
+    verify_signature(raw, signature)
+  else:
+    raw = client.read_url(url, client.MAX_SNAPSHOT, timeout=timeout)
   catalog = client.Catalog(raw, base_url=url)
   from openpilot.common.utils import atomic_write
 
@@ -196,6 +226,13 @@ def verify_onnx(path: str) -> dict:
   return {"input_shapes": record["input_shapes"], "slices": record["output_slices"], "output_shapes": record.get("output_shapes") or {}}
 
 
+def _canonical_slice_bounds(value: Any) -> tuple[int | None, int | None, int | None] | None:
+  if not isinstance(value, (list, tuple)) or len(value) != 3 or any(part is not None and type(part) is not int for part in value):
+    return None
+  start, stop, step = value
+  return (None if start is None else int(start), None if stop is None else int(stop), None if step is None else int(step))
+
+
 def verify_downloaded(catalog, recipe: str) -> str | None:
   """Re-derive every member's interface from the bytes on disk and compare it with what the recipe
   recorded. `None` when they agree; the mismatch reason otherwise.
@@ -221,8 +258,13 @@ def verify_downloaded(catalog, recipe: str) -> str | None:
     for name, shape in (recorded.get("input_shapes") or {}).items():
       if list(actual["input_shapes"].get(name) or []) != list(shape):
         return INTERFACE_MISMATCH
-    if set(actual["slices"]) != set(recorded.get("output_slices") or {}):
+    recorded_slices = recorded.get("output_slices") or {}
+    if not isinstance(recorded_slices, dict) or set(actual["slices"]) != set(recorded_slices):
       return INTERFACE_MISMATCH
+    for name, bounds in recorded_slices.items():
+      actual_bounds = _canonical_slice_bounds(actual["slices"].get(name))
+      if actual_bounds is None or actual_bounds != _canonical_slice_bounds(bounds):
+        return INTERFACE_MISMATCH
   return None
 
 

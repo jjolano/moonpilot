@@ -5,21 +5,24 @@ AGNOS ships a read-only rootfs with a system `python3.12` and no venv, no `pip` 
 anything afterwards. So a fork feature that needs a package off that lock has to bring its own
 installer, and that is what `uv()` + `install()` are.
 
-The target directory is `<data_root>/deps/site-packages`, outside the checkout on purpose. The
-updater runs `git clean -xdff` + `git reset --hard` and then swaps the whole checkout directory,
-so a package installed under `/data/openpilot` is gone on the next update; `/data` is the only
-writable tree and survives (see moonpilot/paths.py). It is not on `sys.path`, hence the
-import-time append below.
+The target directory is `<data_root>/deps/current`, a symlink to the hash-named release under
+`<data_root>/deps/releases/`, outside the checkout on purpose. The updater runs `git clean -xdff` +
+`git reset --hard` and then swaps the whole checkout directory, so a package installed under
+`/data/openpilot` is gone on the next update; `/data` is the only writable tree and survives (see
+moonpilot/paths.py). It is not on `sys.path`, hence the import-time append below.
 
 This module is imported on init paths (the manager's process table, the UI, plannerd), so it
 imports only the standard library: everything heavier lives inside the function that needs it.
 """
 
+import hashlib
 import importlib.util
 import os
 import shutil
 import subprocess
 import sys
+import tempfile
+import time
 from dataclasses import dataclass
 
 from moonpilot import paths
@@ -33,6 +36,14 @@ UV_ASSET = "uv-aarch64-unknown-linux-gnu.tar.gz"
 UV_URL = f"https://github.com/astral-sh/uv/releases/download/{UV_VERSION}/{UV_ASSET}"
 
 _DEPS_NAME = "deps"
+STATUS_KEY = "MoonpilotDepsStatus"
+REQUEST_KEY = "MoonpilotDepsRequest"
+
+READY = "ready"
+WAITING_NETWORK = "waiting-network"
+WAITING_METERED = "waiting-metered"
+INSTALLING = "installing"
+ERROR = "error"
 
 
 @dataclass(frozen=True)
@@ -43,19 +54,16 @@ class Requirement:
   spec: str
 
 
-# Every package a fork feature may need. Empty today: a row here and a line in deps.lock land
-# together, or `--require-hashes` fails the install.
-REQUIREMENTS: tuple[Requirement, ...] = ()
+# Every package a fork feature may need. A row here and its line in deps.lock land together, or
+# `--require-hashes` fails the install.
+REQUIREMENTS: tuple[Requirement, ...] = (
+  Requirement("cryptography", "cryptography==50.0.1"),
+)
 
 
 def site_dir() -> str:
-  """`<data_root>/deps/site-packages`. Computed, never created — creating it is `install()`'s job.
-
-  Deliberately not `paths.data_dir()`: that mkdirs, and this module is imported by the UI and
-  plannerd, where a read-only or unmounted /data would turn a missing feature into a crash at
-  import time.
-  """
-  return os.path.join(paths.data_root(), _DEPS_NAME, "site-packages")
+  """`<data_root>/deps/current`, computed and never created."""
+  return os.path.join(paths.data_root(), _DEPS_NAME, "current")
 
 
 def lock_path() -> str:
@@ -77,7 +85,11 @@ def activate() -> None:
   feature would stay off until something restarted those processes.
   """
   target = site_dir()
-  if target not in sys.path and os.path.isdir(target):
+  try:
+    present = os.path.isdir(target)
+  except OSError:
+    present = False
+  if target not in sys.path and present:
     sys.path.append(target)
 
 
@@ -105,6 +117,53 @@ def missing() -> list[Requirement]:
   return [r for r in REQUIREMENTS if not available(r.module)]
 
 
+def put_status(params, state: str, detail: str = "") -> None:
+  """Publish a status string, avoiding a param write when it did not change."""
+  payload = f"{state} {detail}".strip()
+  if params.get(STATUS_KEY) != payload:
+    params.put(STATUS_KEY, payload)
+
+
+def read_status(params) -> tuple[str, str]:
+  """Return `(state, detail)` from the last published status."""
+  state, _, detail = (params.get(STATUS_KEY) or "").partition(" ")
+  return state, detail
+
+
+def status_text(params) -> tuple[str, str]:
+  """Return the driver-facing value and detail for the dependency status row."""
+  state, detail = read_status(params)
+  labels = {
+    READY: "ready",
+    WAITING_NETWORK: "waiting for network",
+    WAITING_METERED: "waiting for unmetered network",
+    INSTALLING: "installing",
+    ERROR: "error",
+  }
+  return labels.get(state, "starting"), detail
+
+
+_last_retry_nonce = 0
+
+
+def request_retry(params) -> str:
+  """Authorize one install attempt over a metered connection."""
+  global _last_retry_nonce
+  _last_retry_nonce = max(_last_retry_nonce + 1, time.monotonic_ns())
+  nonce = str(_last_retry_nonce)
+  params.put(REQUEST_KEY, nonce)
+  return nonce
+
+
+def take_retry(params) -> bool:
+  """Consume a pending retry authorization exactly once."""
+  raw = params.get(REQUEST_KEY)
+  if raw is None:
+    return False
+  params.remove(REQUEST_KEY)
+  return bool(raw)
+
+
 def uv() -> str:
   """Path to a usable uv, downloading the pinned static build if the system has none."""
   system_uv = shutil.which("uv")
@@ -122,26 +181,72 @@ def uv() -> str:
 
 
 def install() -> None:
-  """Install everything in deps.lock into `site_dir()`. Raises on failure; the caller handles it."""
-  target = site_dir()
-  os.makedirs(target, mode=0o775, exist_ok=True)
+  """Install `deps.lock` into a new release, then atomically promote it."""
+  deps_dir = os.path.join(paths.data_root(), _DEPS_NAME)
+  releases_dir = os.path.join(deps_dir, "releases")
+  os.makedirs(releases_dir, mode=0o775, exist_ok=True)
+
+  with open(lock_path(), "rb") as lock:
+    fingerprint = hashlib.sha256(lock.read()).hexdigest()[:16]
+  release = os.path.join(releases_dir, fingerprint)
+  if os.path.lexists(release):
+    # Never mutate a release that another process may still be using.
+    staging = tempfile.mkdtemp(prefix=f".{fingerprint}-", dir=releases_dir)
+    target = staging
+  else:
+    os.makedirs(release, mode=0o775)
+    staging = release
+    target = release
+  current_tmp = None
 
   env = dict(os.environ)
   # uv's cache and /data are different filesystems, which is exactly the hardlink warning uv emits.
   env["UV_LINK_MODE"] = "copy"
+  try:
+    subprocess.run(
+      [uv(), "pip", "install", "--target", target, "--require-hashes", "-r", lock_path()],
+      env=env,
+      check=True,
+      capture_output=True,
+      text=True,
+    )
 
-  subprocess.run(
-    [uv(), "pip", "install", "--target", target, "--require-hashes", "-r", lock_path()],
-    env=env,
-    check=True,
-    capture_output=True,
-    text=True,
-  )
+    if target != release:
+      shutil.rmtree(target)
+    staging = None
 
-  # Anything that already looked for a package under `target` cached the miss. Drop those, or
-  # `available()` keeps reporting what was true before the install.
-  importlib.invalidate_caches()
-  sys.path_importer_cache.pop(target, None)
+    current = site_dir()
+    current_tmp = f"{current}.tmp-{os.getpid()}-{time.monotonic_ns()}"
+    os.symlink(release, current_tmp)
+    os.replace(current_tmp, current)
+    current_tmp = None
+
+    for entry in os.scandir(releases_dir):
+      if entry.name == fingerprint:
+        continue
+      try:
+        if entry.is_dir(follow_symlinks=False):
+          shutil.rmtree(entry.path)
+        else:
+          os.unlink(entry.path)
+      except OSError:
+        pass
+
+    legacy = os.path.join(deps_dir, "site-packages")
+    if os.path.isdir(legacy) and not os.path.islink(legacy):
+      shutil.rmtree(legacy)
+
+    importlib.invalidate_caches()
+    sys.path_importer_cache.pop(current, None)
+    activate()
+  finally:
+    if staging is not None:
+      shutil.rmtree(staging, ignore_errors=True)
+    if current_tmp is not None:
+      try:
+        os.unlink(current_tmp)
+      except FileNotFoundError:
+        pass
 
 
 # Populates sys.path for everything that imports this module before the tree exists; see

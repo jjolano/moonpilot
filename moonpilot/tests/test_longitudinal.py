@@ -326,16 +326,16 @@ class TestPolicyFunctions(unittest.TestCase):
   def test_the_lead_accel_credit_splits_by_direction_and_by_term(self):
     """The lead's own accel is credited forward into two different speeds, one direction each, and
     where each one lands is the whole contract. Braking goes into the speed the safety terms are
-    measured against (`MOONPILOT_LEAD_PREVIEW_T`) — the cautious direction, and the only one allowed
-    to deepen them. Acceleration goes into the speed the *regulator* matches
-    (`MOONPILOT_LEAD_PREVIEW_T_ACCEL`), and must not reach the safety terms at all: releasing braking
-    on a predicted launch is the fork braking for a prediction where the geometry had not moved.
-    Pinned by arithmetic on both halves, at states where each is the term that governs — every other
-    `lead_accel` call in this file passes `a_lead=0.0`, so this is the only coverage either has.
+    measured against (`MOONPILOT_LEAD_PREVIEW_T`) — the cautious direction, and the only prediction
+    either term makes; the constant carries why it stops at half a second. Acceleration goes into the
+    speed the *regulator* matches (`MOONPILOT_LEAD_PREVIEW_T_ACCEL`), and must not reach the safety
+    terms at all: releasing braking on a predicted launch is the fork braking for a prediction where
+    the geometry had not moved. Pinned by arithmetic on both halves, at states where each is the term
+    that governs — every other `lead_accel` call in this file passes `a_lead=0.0`, so this is the only
+    coverage either has.
     """
     v_ego, gap, v_lead = 20.0, 40.0, 10.0
     t_follow = MOONPILOT_T_FOLLOW[int(Personality.standard)]
-    self.assertLess(MOONPILOT_LEAD_PREVIEW_T_ACCEL, MOONPILOT_LEAD_PREVIEW_T)
 
     # the floor reads the braking credit only, and it governs this state
     for a_lead, credit in ((0.0, 0.0), (2.0, 0.0), (-2.0, MOONPILOT_LEAD_PREVIEW_T)):
@@ -597,9 +597,10 @@ class TestPlanner(unittest.TestCase):
     """Both positive channels, and nothing else. `lead_state_at` projects the lead's own accel over
     `action_t + lead_age`, so the gap the policy sees is the lead's future *position*; `lead_accel`'s
     regulator then matches `v_lead + MOONPILOT_LEAD_PREVIEW_T_ACCEL * a_lead`, its future *speed*. The
-    safety terms stay on the raw speed (`v_ego - v_lead_eff` is still negative here, so no approach
-    term is even consulted) — that split is the point, because a launch is the one moment there is
-    nothing to brake for and a credit that reached the floor would be braking for a prediction anyway.
+    safety terms stay on the raw speed (`v_ego - v_lead_eff` is still positive here — the braking
+    credit is one-sided, and this lead is accelerating — so no approach term is even consulted); that
+    split is the point, because a launch is the one moment there is nothing to brake for and a credit
+    that reached the floor would be braking for a prediction anyway.
     """
     t_follow = MOONPILOT_T_FOLLOW[int(Personality.standard)]
     gap, v_lead = 6.5, 0.3
@@ -876,22 +877,54 @@ class TestPlanner(unittest.TestCase):
     self.assertLess(v_ego, 0.5)  # it stopped
     self.assertGreater(gap, 5.0)  # and it did not run into the lead
 
+  def test_a_fresh_matched_speed_radar_lead_stays_within_approach_decel(self):
+    """A new radar slot with no reported lead acceleration must not turn matched-speed following into
+    harder-than-approach braking on its first planner update."""
+    planner = _planner()
+    planner.update(_inputs(v_ego=20.0, v_cruise_kph=108.0, lead=_lead(15.0, 20.0)))
+    self.assertEqual(planner.source, Source.lead0)
+    self.assertAlmostEqual(planner.output_a_target, -MOONPILOT_JERK_DOWN * DT_MDL, delta=1e-9)
+    self.assertGreaterEqual(planner.output_a_target, -MOONPILOT_APPROACH_DECEL)
+
+  def test_a_vision_lead_accel_uses_the_half_second_preview(self):
+    """A vision-only matched-speed lead gets the half-second preview while jerk limiting shapes the
+    delivered braking command."""
+    gap, v_ego = 25.0, 20.0
+    zero_accel = _planner()
+    zero_accel.update(_inputs(v_ego=v_ego, v_cruise_kph=108.0, lead=_lead(gap, v_ego)))
+
+    vision_lead = _lead(gap, v_ego, a_lead=-4.0, a_lead_tau=0.3)
+    vision_lead.radar = False
+    vision = _planner()
+    vision_input = _inputs(v_ego=v_ego, v_cruise_kph=108.0, lead=vision_lead)
+    vision.update(vision_input)
+
+    self.assertEqual(zero_accel.source, Source.lead0)
+    self.assertEqual(vision.source, Source.lead0)
+    self.assertLess(vision.output_a_target, zero_accel.output_a_target)
+    self.assertAlmostEqual(vision.output_a_target, -0.2972136, delta=1e-7)
+
+    for _ in range(9):
+      vision.update(vision_input)
+    self.assertAlmostEqual(vision.output_a_target, -2.2863, delta=1e-4)
+    self.assertGreater(vision.output_a_target, ACCEL_MIN)
+
   def test_a_braking_lead_reaches_the_command_from_its_speed_history(self):
     """The observable statement of the estimator, closed-loop: the lead's speed history alone — every
     frame carries `a_lead=0.0` — has to bring the braking into the command.
 
-    Measured 0.15 s to -1.0 m/s^2 and 0.30 s to -2.0 m/s^2 on this loop's clock, against 0.60 s and
-    1.50 s for the same planner reading `aLeadK` directly (which is a revert's shape here, since
-    every `_lead` carries `a_lead=0.0`); the bounds sit between the arms, not on the measurement.
-    The onset window in `moonpilot/lead.py` took a frame off the front of that: with it the command
-    reaches -0.5 m/s^2 at 0.10 s, -1.0 at 0.15 and -2.0 at 0.30, and without it 0.20 / 0.25 / 0.35 —
-    so the bounds below separate the two, and reverting the window fails them at -1.0.
+    Measured on this loop's clock, a lead braking at -3.5 m/s^2 from a settled follow: -0.5 m/s^2 at
+    0.20 s, -1.0 at 0.30 and -2.0 at 0.50 through the fork's slope estimate, against 0.30 / 0.55 / 1.15
+    for the same planner reading radard's `aLeadK` directly (which is a revert's shape here, since
+    every `_lead` carries `a_lead=0.0`); the bounds sit between the arms, not on the measurement. The
+    onset window in `moonpilot/lead.py` is worth one frame at -0.5 s and none at -2.0 with the credit
+    at half a second, so what separates the arms below is the estimator itself, not the window.
 
-    The numbers are the kinematic law's own, one frame later — and that is worth knowing, because the
-    bare TTC approach term cost this test 0.45 s / 1.40 s: it keys off the closing rate, which only
-    grows once the lead's *speed* has fallen. The stopping floor is what gives it back, since a lead
-    braking in front of a settled follow puts `a_stop` past the approach decel almost at once. The one
-    remaining frame is `MOONPILOT_JERK_DOWN`, softened to 2.0 for the approach's onset edge.
+    The floor is what makes any of it that early: without a credit the same flight reaches -1.0 at
+    0.55 s and -2.0 at 0.95, and a *bare* TTC approach term is later still — it keys off the closing
+    rate, which only grows once the lead's *speed* has fallen. The credit is what buys the onset back,
+    and its length is the whole trade (see `MOONPILOT_LEAD_PREVIEW_T`): half a second here against the
+    full second's 0.15 / 0.30, which is what a lead tapping its brakes was paying for.
     """
     planner = _planner()
     t_follow = MOONPILOT_T_FOLLOW[int(Personality.standard)]
@@ -912,12 +945,11 @@ class TestPlanner(unittest.TestCase):
       gap = max(0.0, gap - (v_ego - v_lead) * DT_MDL)
     self.assertTrue(-1.0 in reached)
     self.assertTrue(-2.0 in reached)
-    # Between the arms with margin on both sides, and the -2.0 bound is the coarse one: the old 1.50
-    # is exactly the revert arm's own value now that the floor restored the fast onset, so it had
-    # stopped separating anything at all.
-    self.assertLessEqual(reached[-0.5], 0.15)
-    self.assertLessEqual(reached[-1.0], 0.20)
-    self.assertLessEqual(reached[-2.0], 1.00)
+    # Between the arms with margin on both sides: the aLeadK revert needs 0.55 s to -1.0 and 1.15 to
+    # -2.0, so these separate it, and the no-credit law needs 0.55 / 0.95.
+    self.assertLessEqual(reached[-0.5], 0.25)
+    self.assertLessEqual(reached[-1.0], 0.40)
+    self.assertLessEqual(reached[-2.0], 0.80)
 
   def test_a_stale_lead_is_planned_as_if_it_were_fresh(self):
     """radarState lands a full cycle behind the modelV2 tick that polls it, and both inputs get

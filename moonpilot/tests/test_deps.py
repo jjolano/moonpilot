@@ -1,3 +1,4 @@
+import hashlib
 import importlib
 import os
 import sys
@@ -25,6 +26,23 @@ class FakeParams:
 
   def get(self, key, return_default=False):
     return self._on
+
+
+
+class ParamStore:
+  def __init__(self):
+    self.values: dict[str, str] = {}
+    self.writes: list[tuple[str, str]] = []
+
+  def get(self, key, return_default=False):
+    return self.values.get(key)
+
+  def put(self, key, value, block=False):
+    self.values[key] = value
+    self.writes.append((key, value))
+
+  def remove(self, key):
+    self.values.pop(key, None)
 
 
 def _params(on=True) -> Params:
@@ -83,8 +101,8 @@ class TestPaths(unittest.TestCase):
     # read-only or unmounted /data into a crash at import time.
     with tempfile.TemporaryDirectory() as tmp, mock.patch.object(paths, "data_root", return_value=tmp):
       target = deps.site_dir()
-      self.assertEqual(target, os.path.join(tmp, "deps", "site-packages"))
-      self.assertFalse(os.path.exists(target))
+      self.assertEqual(target, os.path.join(tmp, "deps", "current"))
+      self.assertFalse(os.path.lexists(target))
 
 
 class TestActivation(unittest.TestCase):
@@ -103,9 +121,11 @@ class TestActivation(unittest.TestCase):
     # visible to them, not wait for a restart to be noticed.
     with tempfile.TemporaryDirectory() as tmp, mock.patch.object(paths, "data_root", return_value=tmp):
       target = deps.site_dir()
+      release = os.path.join(tmp, "deps", "releases", "first")
+      os.makedirs(release)
+      os.symlink(release, target)
       self.assertNotIn(target, sys.path)  # imported before depsd created anything
-      os.makedirs(target)
-      with open(os.path.join(target, "moonpilot_activation_probe.py"), "w") as f:
+      with open(os.path.join(release, "moonpilot_activation_probe.py"), "w") as f:
         f.write("value = 'installed'\n")
       try:
         self.assertTrue(deps.available("moonpilot_activation_probe"))
@@ -118,8 +138,10 @@ class TestActivation(unittest.TestCase):
     # earlier entry, or a fork package would silently replace one AGNOS already provides.
     with tempfile.TemporaryDirectory() as tmp, mock.patch.object(paths, "data_root", return_value=tmp):
       system = tempfile.mkdtemp()
-      for directory, value in ((system, "system"), (deps.site_dir(), "fork")):
-        os.makedirs(directory, exist_ok=True)
+      release = os.path.join(tmp, "deps", "releases", "first")
+      os.makedirs(release)
+      os.symlink(release, deps.site_dir())
+      for directory, value in ((system, "system"), (release, "fork")):
         with open(os.path.join(directory, "moonpilot_shadow_probe.py"), "w") as f:
           f.write(f"value = {value!r}\n")
       sys.path.insert(0, system)
@@ -129,6 +151,83 @@ class TestActivation(unittest.TestCase):
       finally:
         sys.modules.pop("moonpilot_shadow_probe", None)
         self._cleanup(system, deps.site_dir())
+
+
+
+
+class TestStatusAndRetry(unittest.TestCase):
+  def test_status_writes_only_when_changed(self):
+    params = ParamStore()
+    deps.put_status(params, deps.WAITING_NETWORK, "Waiting for a network.")
+    deps.put_status(params, deps.WAITING_NETWORK, "Waiting for a network.")
+    self.assertEqual(params.writes, [(deps.STATUS_KEY, "waiting-network Waiting for a network.")])
+    self.assertEqual(deps.read_status(params), (deps.WAITING_NETWORK, "Waiting for a network."))
+    self.assertEqual(deps.status_text(params), ("waiting for network", "Waiting for a network."))
+
+  def test_status_transitions_keep_state_and_detail(self):
+    params = ParamStore()
+    for state in (deps.READY, deps.WAITING_NETWORK, deps.WAITING_METERED, deps.INSTALLING, deps.ERROR):
+      with self.subTest(state=state):
+        deps.put_status(params, state, "cryptography is missing.")
+        self.assertEqual(deps.read_status(params), (state, "cryptography is missing."))
+
+  def test_retry_request_is_consumed_once(self):
+    params = ParamStore()
+    nonce = deps.request_retry(params)
+    self.assertEqual(params.values[deps.REQUEST_KEY], nonce)
+    self.assertTrue(deps.take_retry(params))
+    self.assertFalse(deps.take_retry(params))
+
+
+class TestInstall(unittest.TestCase):
+  def _fingerprint(self) -> str:
+    with open(deps.lock_path(), "rb") as lock:
+      return hashlib.sha256(lock.read()).hexdigest()[:16]
+
+  def test_failed_install_preserves_current_and_releases(self):
+    with tempfile.TemporaryDirectory() as tmp, mock.patch.object(paths, "data_root", return_value=tmp):
+      release = os.path.join(tmp, "deps", "releases", "old")
+      os.makedirs(release)
+      with open(os.path.join(release, "marker"), "w") as f:
+        f.write("old")
+      current = deps.site_dir()
+      os.symlink(release, current)
+      with (
+        mock.patch.object(deps, "uv", return_value="/usr/bin/uv"),
+        mock.patch.object(deps.subprocess, "run", side_effect=RuntimeError("offline")),
+      ):
+        with self.assertRaisesRegex(RuntimeError, "offline"):
+          deps.install()
+      self.assertEqual(os.readlink(current), release)
+      self.assertEqual(os.listdir(os.path.join(tmp, "deps", "releases")), ["old"])
+      with open(os.path.join(release, "marker")) as f:
+        self.assertEqual(f.read(), "old")
+
+  def test_success_promotes_release_and_removes_stale_state(self):
+    with tempfile.TemporaryDirectory() as tmp, mock.patch.object(paths, "data_root", return_value=tmp):
+      old = os.path.join(tmp, "deps", "releases", "old")
+      os.makedirs(old)
+      os.makedirs(os.path.join(tmp, "deps", "site-packages"))
+      with open(os.path.join(tmp, "deps", "site-packages", "stale"), "w") as f:
+        f.write("stale")
+
+      def install_into_target(argv, **kwargs):
+        target = argv[argv.index("--target") + 1]
+        with open(os.path.join(target, "moonpilot_install_probe.py"), "w") as f:
+          f.write("value = 'installed'\n")
+
+      with (
+        mock.patch.object(deps, "uv", return_value="/usr/bin/uv"),
+        mock.patch.object(deps.subprocess, "run", side_effect=install_into_target),
+      ):
+        deps.install()
+
+      release = os.path.join(tmp, "deps", "releases", self._fingerprint())
+      self.assertEqual(os.path.realpath(deps.site_dir()), release)
+      self.assertTrue(os.path.isfile(os.path.join(release, "moonpilot_install_probe.py")))
+      self.assertEqual(os.listdir(os.path.join(tmp, "deps", "releases")), [self._fingerprint()])
+      self.assertFalse(os.path.exists(os.path.join(tmp, "deps", "site-packages")))
+      self.assertTrue(deps.available("moonpilot_install_probe"))
 
 
 def _normalize(name: str) -> str:

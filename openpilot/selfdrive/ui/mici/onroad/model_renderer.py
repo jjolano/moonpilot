@@ -150,8 +150,11 @@ class ModelRenderer(Widget):
       self._update_model(lead_one, path_x_array)
       if render_lead_indicator:
         self._update_leads(radar_state, path_x_array)
-      if sm.valid['moonpilotState']:  # moonpilot seam, see AGENTS.md
+      if sm.valid['moonpilotState'] and sm.alive['moonpilotState']:  # moonpilot seam, see AGENTS.md
         self._update_lead_path(sm['moonpilotState'], path_x_array)
+      else:  # moonpilot seam, see AGENTS.md
+        self._clear_lead_path()
+        self._lead_in_path = 1.0
       self._transform_dirty = False
 
     # Draw elements (hide when disengaged)

@@ -115,6 +115,8 @@ class ModelsLayout(Page):
     job = ListItem(title="job", description=lambda: models.job_description(self._status()["job"], self._params),
                    action_item=_JobAction(self._params))
     job.set_visible(lambda: self._status()["job"] is not None)
+    cancel = button_item(models.LABEL_CANCEL, models.LABEL_CANCEL, description=models.DESCRIPTION_CANCEL, callback=self._cancel)
+    cancel.set_visible(lambda: models.job_active(self._status()["job"]))
     # A selection only takes effect at the next boot, so the row that acts on it is here, next to the
     # two rows it applies to, and only while a restart is owed (`models.restart_needed`).
     reboot = button_item(models.LABEL_REBOOT, models.LABEL_REBOOT, description=models.DESCRIPTION_REBOOT,
@@ -133,6 +135,7 @@ class ModelsLayout(Page):
           description=lambda: models.model_description(self._params, models.MONITORING),
         ),
         job,
+        cancel,
         reboot,
         button_item(
           models.TITLE_BROWSE, models.LABEL_OPEN, description=models.DESCRIPTION_BROWSE, callback=lambda: gui_app.push_widget(CatalogLayout(self._params))
@@ -161,6 +164,10 @@ class ModelsLayout(Page):
       models.TITLE_MODELS,
       models.DESCRIPTION_MODELS,
     )
+
+  def _cancel(self) -> None:
+    if models.job_active(self._status()["job"]):
+      _confirm(models.CONFIRM_CANCEL, models.LABEL_CANCEL, lambda: models.request(self._params, "cancel"))
 
   def _status(self) -> dict:
     return models.status(self._params)

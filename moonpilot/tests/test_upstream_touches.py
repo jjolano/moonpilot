@@ -33,6 +33,7 @@ NEVER_ALLOWED = (
 
 # Upstream files moonpilot may modify, and the seam each one carries.
 ALLOWED = {
+  "launch_chffrplus.sh": "boot-success rollback for the finalized swap",
   ".gitmodules": "forked opendbc/panda submodules",
   "SConstruct": "moonpilot/SConscript registration",
   "pyproject.toml": "moonpilot in the editable install",

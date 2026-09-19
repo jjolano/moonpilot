@@ -72,6 +72,13 @@ SLAM = Feature(
   offroad_only=True,
 )
 
+CATALOG_SIGNATURES = Feature(
+  key="MoonpilotCatalogSignatures",
+  title="catalog signatures",
+  description="Refuse a model catalog that fails its detached signature check against the key pinned in this build. Needs the cryptography package, installed automatically once the device is online. Off by default; an unsigned catalog is accepted until the fork pins a key.",
+  requires=("cryptography",),
+)
+
 LATERAL_ENGAGE = Feature(
   key="MoonpilotLateralEngage",
   title="lateral engagement",
@@ -112,7 +119,7 @@ SPEED = Group(
 DEVICE = Group(
   title="device",
   description="What the device does for itself, off the road.",
-  features=(TAILSCALE,),
+  features=(TAILSCALE, CATALOG_SIGNATURES),
 )
 
 GROUPS: tuple[Group, ...] = (STEERING, SPEED, DEVICE)

@@ -37,12 +37,14 @@ Four things about it are not obvious.
   their own message times and interpolates both onto that third time, and a frame whose pose time
   the prior cannot span is skipped rather than extrapolated.
 
-Two approximations are stage-1 on purpose. **The device frame is treated as the car frame**:
-`trans`/`rot` and the gyro are in the device frame, which is the car frame up to the camera's
-mounting rotation -- `locationd` rotates through calibration and this does not, so a few degrees of
-pitch is a sub-1 % scale error on the along-track channel. And **the outputs are clamped**, which
-means the two sources disagree by more than a sensor plausibly can; that is a tuning question the
-constants below own.
+Two approximations are stage-1 on purpose. **The device frame is still treated as the car frame**:
+for each newly ingested pose, trusted `extrinsicsCalibration.rpyCalib` rotates `trans`/`rot` from
+the calibration frame into the device frame with `rot_from_euler`, and rotates their stds with
+`rotate_std`; invalid, absent, malformed or out-of-bound calibration leaves that transform as
+identity. This uses the latest calibration even though the pose is 0.1 s older, which is acceptable
+while calibration converges over minutes, and a calibration change affects only new nodes rather than
+re-deriving older window samples. **The outputs are clamped**, which means the two sources disagree
+by more than a sensor plausibly can; that is a tuning question the constants below own.
 
 Only `dVel` has a consumer today, and it is the one the planner can act on: the fork planner's gaps
 are radar-measured, so shifting them by an odometry position offset would inject error rather than

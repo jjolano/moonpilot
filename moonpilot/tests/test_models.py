@@ -305,12 +305,20 @@ class TestCodecs(unittest.TestCase):
 
 
 class TestBootCommit(StoreCase):
+  def custom_params(self) -> tuple[FakeParams, str]:
+    digest = self.add_package("supercombo", input_shapes=SUPERCOMBO_INPUTS, slices=SUPERCOMBO_SLICES)
+    self.add_build(digest, models.SUPERCOMBO.id)
+    params = FakeParams({models.DRIVING_KEY: digest})
+    models.commit_boot_selection(params)
+    return params, digest
+
   def test_no_selection_commits_bundled(self):
     params = FakeParams()
     boot = models.commit_boot_selection(params)
     self.assertEqual(boot[models.DRIVING]["kind"], "bundled")
     self.assertEqual(boot[models.DRIVING]["requested"], "")
     self.assertEqual(models.boot(params), boot)
+    self.assertEqual(models.model_label(params, models.DRIVING), models.BUNDLED_LABEL)
 
   def test_manager_continues_after_boot_selection_failure(self):
     from openpilot.system.manager import manager
@@ -375,6 +383,20 @@ class TestBootCommit(StoreCase):
     self.assertTrue(os.path.isdir(entry["build"]))
     self.assertIsNone(entry["fallback"])
     self.assertFalse(models.restart_pending(params, models.DRIVING))
+  def test_a_custom_active_model_keeps_the_selection_label(self):
+    params, digest = self.custom_params()
+    params.put(models.ACTIVE_DRIVING_KEY, "custom (supercombo)")
+    self.assertEqual(
+      models.model_label(params, models.DRIVING),
+      f"{digest[:12]} ({models.protocol_label(models.SUPERCOMBO.id)})",
+    )
+
+  def test_a_custom_runtime_fallback_takes_over_the_short_label(self):
+    params, digest = self.custom_params()
+    params.put(models.ACTIVE_DRIVING_KEY, "stock: RuntimeError: broken model")
+    self.assertEqual(models.model_label(params, models.DRIVING), f"stock, {digest[:12]} did not load")
+    self.assertIn("RuntimeError: broken model", models.model_description(params, models.DRIVING))
+
 
   def test_a_failed_build_falls_back_with_the_compilers_message(self):
     digest = self.add_package("supercombo", input_shapes=SUPERCOMBO_INPUTS, slices=SUPERCOMBO_SLICES)
@@ -411,7 +433,7 @@ class TestBootCommit(StoreCase):
     self.assertFalse(models.restart_pending(params, models.DRIVING))
     models.select(params, models.DRIVING, RECIPE)
     self.assertTrue(models.restart_pending(params, models.DRIVING))
-    self.assertTrue(models.RESTART_NOTE in models.model_label(params, models.DRIVING))
+    self.assertEqual(models.model_label(params, models.DRIVING), f"{models.BUNDLED_LABEL} {models.RESTART_NOTE}")
     with self.assertRaises(ValueError):
       models.select(params, models.DRIVING, "nonsense")
 
@@ -504,6 +526,12 @@ class TestJobReporting(unittest.TestCase):
   published while a job runs (`Job.started_at`), so an older worker's snapshot has no `elapsed` and
   the line must read as it did before -- a panel that required it would show `None` to the driver.
   """
+  def test_job_active_matches_the_live_phases(self):
+    for phase in models.PHASES:
+      with self.subTest(phase=phase):
+        self.assertEqual(models.job_active({"phase": phase}), phase not in ("done", "error", "canceled"))
+    self.assertFalse(models.job_active(None))
+
 
   def test_the_patient_phases_carry_a_clock(self):
     for phase in models.PATIENT_PHASES:

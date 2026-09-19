@@ -66,6 +66,7 @@ MOONPILOT_CURVE_HOLD_MIN_CURVATURE = 1e-4  # 1/m (10 km radius); below it the me
 MOONPILOT_CURVE_BIAS_T = 1.0  # s between a prediction and the measurement it is scored against
 MOONPILOT_CURVE_BIAS_RC = 20.0  # s time constant of the ratio filter
 MOONPILOT_CURVE_BIAS_MIN_LAT_ACCEL = 1.0  # m/s^2; below this both signals are noise
+MOONPILOT_CURVE_BIAS_TRACKING_TOLERANCE = 0.5  # m/s^2; allow normal torque-tracking noise without learning saturation as model bias
 MOONPILOT_CURVE_BIAS_MIN_SPEED = 10.0  # m/s
 MOONPILOT_CURVE_BIAS_MIN = 0.7  # clamp on a single ratio sample
 MOONPILOT_CURVE_BIAS_MAX = 1.4

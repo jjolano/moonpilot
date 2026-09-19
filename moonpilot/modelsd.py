@@ -173,7 +173,11 @@ class Worker:
 
   # --- ops ---------------------------------------------------------------------------------------
   def _refresh(self, job: models.Job) -> None:
-    from moonpilot import modelcatalog
+    from moonpilot import deps, features, modelcatalog
+
+    require_signature = features.wanted(features.CATALOG_SIGNATURES, self.params)
+    if require_signature and not deps.available("cryptography"):
+      raise _Refused("catalog signature requirement cannot be met: cryptography package is not installed")
 
     # A catalog is 7 MB and not worth a metered connection, so an unusable network holds the
     # request rather than dropping it: the driver asked for this refresh, and it runs the moment
@@ -190,7 +194,7 @@ class Worker:
     job.phase = "downloading"
     self.publish(force=True)
     try:
-      _revision, catalog = modelcatalog.refresh()
+      _revision, catalog = modelcatalog.refresh(require_signature=require_signature)
     except Exception as exc:
       self.catalog_error = str(exc)
       raise _Refused(f"could not reach the catalog: {exc}") from exc

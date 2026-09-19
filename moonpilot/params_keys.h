@@ -76,3 +76,11 @@
     // because two processes write them, and a param has one writer.
     {"MoonpilotModelsActiveDriving", {CLEAR_ON_MANAGER_START, STRING}},
     {"MoonpilotModelsActiveMonitoring", {CLEAR_ON_MANAGER_START, STRING}},
+    // depsd writes this boot's state; the manager clears it at manager start.
+    {"MoonpilotDepsStatus", {CLEAR_ON_MANAGER_START, STRING}},
+    // The settings panel writes retry requests; depsd consumes and clears them this boot.
+    {"MoonpilotDepsRequest", {CLEAR_ON_MANAGER_START, STRING}},
+    // The settings panel writes this toggle; a user change or params reset clears it.
+    {"MoonpilotCatalogSignatures", {PERSISTENT, BOOL, "0"}},
+    // manager writes the boot rollback report; it clears it at manager start.
+    {"MoonpilotRollback", {CLEAR_ON_MANAGER_START, STRING}},

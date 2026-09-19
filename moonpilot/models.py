@@ -500,6 +500,11 @@ OPS = ("refresh", "install", "remove", "cancel")
 PHASES = ("waiting-network", "waiting-offroad", "downloading", "verifying", "building", "done", "error", "canceled")
 
 
+def job_active(job: dict | None) -> bool:
+  """Whether a published job can still be canceled."""
+  return bool(job) and job.get("phase") in PHASES[:5]
+
+
 def request(params: Any, op: str, selection: str = "") -> str:
   """Write a request and return its id. The id is what makes a request cancellable: the worker's
   `canceled()` re-reads the param and stops when it no longer holds this id."""
@@ -1297,12 +1302,14 @@ REBOOT_KEY = "DoReboot"  # upstream's own, read by the manager's power path (man
 CONFIRM_SELECT = "Use this model?"
 CONFIRM_REMOVE = "Remove this model?"
 CONFIRM_COMPOSE = "Compose this model?"
+CONFIRM_CANCEL = "Cancel the current model job?"
 SELECT_TEXT = "comma never tested this model, and neither has moonpilot. It changes how the car \
 steers and how it slows. It takes effect after a restart."
 REMOVE_TEXT = "This deletes the package and its build from the device. The model can be installed \
 again from the catalog."
 COMPOSE_TEXT = "These pieces were not shipped together by comma. Nothing here checks that they fit \
 beyond the ports their profiles declare."
+DESCRIPTION_CANCEL = "Canceling stops the current model job. You can start it again later."
 DESCRIPTION_REBOOT = "A selection takes effect when the device restarts, and the manager reads \
 DoReboot for that. Everything else in this panel is saved first."
 REASON_SELECTED = "in effect"
@@ -1484,8 +1491,9 @@ def model_label(params: Any, kind: str) -> str:
     if entry.get("fallback"):
       name = f"{BUNDLED_LABEL}, {entry['requested'][:12]} refused"
   else:
+    active = params.get(ACTIVE_KEY[kind]) or ""
     name = entry_name(entry["id"]) or entry["id"][:12]
-    name = f"{name} ({protocol_label(entry['protocol'])})"
+    name = f"{BUNDLED_LABEL}, {name} did not load" if active.startswith("stock: ") else f"{name} ({protocol_label(entry['protocol'])})"
   return f"{name} {RESTART_NOTE}" if restart_pending(params, kind) else name
 
 

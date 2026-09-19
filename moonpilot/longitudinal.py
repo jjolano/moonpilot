@@ -39,8 +39,9 @@ Two things are deliberately not upstream's:
 
   - the lead's acceleration is the fork's own estimate — the least-squares slope of ``vLead`` over
     ``moonpilot.lead.LeadAccelEstimator``'s window — because radard's ``aLeadK`` is a Kalman filter
-    with a 0.49 s time constant, and a lead braking at -3.5 m/s^2 reached -2.0 m/s^2 of command
-    0.25 s later through it than through the slope. ``aLeadK`` stays as the fallback.
+    with a 0.49 s time constant, and a lead braking at -3.5 m/s^2 from a settled follow reached
+    -2.0 m/s^2 of command 0.65 s later through it than through the slope (1.15 s against 0.50).
+    ``aLeadK`` stays as the fallback.
 
 The planner is picked once, at construction, so the toggle needs a restart, and it only exists on a
 car with ``openpilotLongitudinalControl`` — cars whose stock ACC owns acceleration never reach the
@@ -71,6 +72,7 @@ from moonpilot.curve import (
   MOONPILOT_CURVE_BIAS_MIN_SPEED,
   MOONPILOT_CURVE_BIAS_MIN_SAMPLES,
   MOONPILOT_CURVE_BIAS_PERSIST_EVERY,
+  MOONPILOT_CURVE_BIAS_TRACKING_TOLERANCE,
   LatAccelBiasEstimator,
   curve_accel,
   curve_targets,
@@ -130,18 +132,33 @@ MOONPILOT_TTC_TARGET = 3.0  # s; headway the approach term holds the closing rat
 # narrower window is also the *smoother* one, 4 command reversals over
 # the maneuver against 13 at 5.0. What it gives up is coverage: TTC
 # governs gaps 22-65 m at 25 m/s rather than 20-117 m, so a gently
-# closing lead is the floor's business either way (measured: TTC governs
-# 4 of 500 frames at T=3 on a -2 m/s^2 lead brake, 20 at T=5)
+# closing lead is the floor's business either way (measured on a
+# settled follow at 25 m/s behind a -2 m/s^2 lead brake, TTC is the
+# governing term on 14 % of the lead-term calls at T=3 and 17 % at T=5 —
+# a minority either way, which is what the dial is choosing between)
 MOONPILOT_K_TTC = 1.0  # 1/s on the excess closing rate
 MOONPILOT_MIN_SLACK = 0.5  # m; floor on the stopping term's braking-distance denominator
-MOONPILOT_LEAD_PREVIEW_T = 1.0  # s of the lead's own braking credited to the safety term
+MOONPILOT_LEAD_PREVIEW_T = 0.5  # s of the lead's own braking credited to the safety terms' lead speed
+# It is one-sided, and the only *prediction* in this function: a lead that is braking is matched as if
+# it had already shed this much speed, which is what makes the onset early — measured on a settled
+# follow at 20 m/s, a lead braking at -3.5 m/s^2 brings the command to -2.0 m/s^2 at 0.50 s here against
+# 0.95 s with no credit — and it is also the one thing here that can brake for a lead whose brake is not
+# real. It stops at this length rather than a full second on both counts: measured closed-loop from
+# 60 m at 30 m/s, a lead tapping -5 m/s^2 for 0.5 s peaks the command at 1.58 here against 3.36 at a
+# full second, and the ego stays 1.33 m/s above the slowest the lead ever went where the full second put
+# it 1.98 m/s below; while the margin on a *sustained* brake is untouched — from the 1.45 s follow gap
+# at 20 m/s, a lead holding -5 m/s^2 to rest leaves 5.77 m of end gap against 5.33 m at a full second
+# and 0.60 m with no credit at all. Nothing else about a lead's accel is predicted: the acceleration
+# credit below is the regulator's alone, and the TTC term reads the same credited speed this does. The
+# estimator's accel does still reach both terms one other way, and that is the delay match rather than a
+# credit — `update` hands the policy `lead_state_at`'s speed at `action_t + lead_age`, which carries
+# ~0.25 s of it. This constant is the extra prediction on top of that.
 MOONPILOT_LEAD_PREVIEW_T_ACCEL = 0.5  # s of the lead's own acceleration credited to the *regulator's*
 # lead-speed term, where the cruise cap already bounds what it can ask for. This is what makes the plan
 # answer a lead that is pulling away rather than only a lead that has already gone: the speed being
 # matched is the lead's next one, so the ego anticipates the gap opening instead of chasing it. It is
-# one-sided (a braking lead gets nothing here — that is `MOONPILOT_LEAD_PREVIEW_T`'s business, and it
-# deepens the safety terms instead), and it never reaches the safety terms, so no predicted launch can
-# release braking. Cost, by construction: while a lead accelerates at `a_lead` the regulator's
+# one-sided — a braking lead gets nothing here — and it never reaches the safety terms, so no predicted
+# launch can release braking. Cost, by construction: while a lead accelerates at `a_lead` the regulator's
 # equilibrium moves from `gap == target` to `gap == target - (K_V / K_GAP) * a_lead * this` — 1 m
 # closer per m/s^2 of lead accel, held only as long as the estimate says the lead is still gaining.
 # Measured: a settled follow behind a lead holding 0.5 m/s^2 sits 0.35 m closer than the setpoint where
@@ -244,7 +261,8 @@ def lead_accel(v_ego, gap, v_lead, a_lead, t_follow) -> float:
 
   The second is the stopping floor, the old kinematic term kept as a bound rather than as the
   approach: the exact decel that arrives at STOP_DISTANCE with the lead's *braking-credited* speed —
-  the acceleration credit is the regulator's, above — which binds from
+  the credit is `MOONPILOT_LEAD_PREVIEW_T`'s, above, and the acceleration credit is the regulator's —
+  which binds from
   ``slack == v_ego^2 / 2``. It is not redundant. A TTC term is proportional on the
   closing rate, so it ramps — and ramping is not stopping: TTC_TARGET = 5 binds at a slack of
   ``5 * (v - 1)``, which above ~34 m/s is *inside* the ``v^2 / 7`` that stopping at ACCEL_MIN needs,
@@ -263,12 +281,11 @@ def lead_accel(v_ego, gap, v_lead, a_lead, t_follow) -> float:
   """
   gap = max(float(gap), 0.0)
   v_lead = max(float(v_lead), 0.0)
-  # The lead's own accel, credited forward into the two different speeds it belongs in. Braking goes to
-  # the speed the safety terms below are measured against — the cautious direction, and the only one
-  # allowed to deepen them. Acceleration goes to the speed *this* regulator matches, because a lead
-  # that is pulling away has a higher next speed than the one on the message, and it must not reach the
-  # safety terms: crediting it there would release braking on nothing but a predicted launch. One-sided
-  # in both places, so neither can cancel the other.
+  # The lead's own accel, credited forward into the two speeds it belongs in, one direction each.
+  # Braking goes to the speed both terms below are measured against — the cautious direction, and the
+  # only prediction either of them makes (`MOONPILOT_LEAD_PREVIEW_T`) — while acceleration goes to the
+  # speed *this* regulator matches, and never to the safety terms: crediting it there would release
+  # braking on nothing but a predicted launch.
   v_lead_eff = max(0.0, v_lead + min(float(a_lead), 0.0) * MOONPILOT_LEAD_PREVIEW_T)
   v_lead_match = v_lead + max(float(a_lead), 0.0) * MOONPILOT_LEAD_PREVIEW_T_ACCEL
   gap_target = max(MOONPILOT_STOP_DISTANCE, t_follow * v_ego)
@@ -547,9 +564,26 @@ class MoonpilotLongitudinalPlanner:
     curve_allowed = enabled(CURVE_SPEED, self.params)
     # Only frames where the fork's own lateral control is what steers the car, at speed and off the
     # pedals: a disengaged or overridden stretch would pair a prediction of the model's path with a
-    # measurement of the driver's steering.
+    # measurement of the driver's steering. A zero torque-log version is the schema default from an
+    # older or different writer, so keep the pre-gate fallback on those cars.
+    lateral_state = getattr(sm['controlsState'], "lateralControlState", None)
+    tracking_valid = True
+    if lateral_state is not None and lateral_state.which() == "torqueState":
+      torque_state = lateral_state.torqueState
+      if getattr(torque_state, "version", 0):
+        tracking_valid = (
+          torque_state.active
+          and not torque_state.saturated
+          and abs(torque_state.actualLateralAccel - torque_state.desiredLateralAccel) <= MOONPILOT_CURVE_BIAS_TRACKING_TOLERANCE
+        )
     bias_valid = (
-      curve_allowed and vp.valid and sm['carControl'].latActive and not CS.steeringPressed and not CS.standstill and CS.vEgo > MOONPILOT_CURVE_BIAS_MIN_SPEED
+      curve_allowed
+      and vp.valid
+      and sm['carControl'].latActive
+      and not CS.steeringPressed
+      and not CS.standstill
+      and CS.vEgo > MOONPILOT_CURVE_BIAS_MIN_SPEED
+      and tracking_valid
     )
     self.lat_bias.update(predicted_lat_accel(sm['modelV2']), measured_curvature * CS.vEgo**2, bias_valid)
     scale = self.lat_bias.applied()
@@ -668,7 +702,13 @@ class MoonpilotLongitudinalPlanner:
     # Everything else is untouched: a stopped or absent lead is the case the predicate was written for,
     # and resume still works because a lead that pulls away lifts the command over the 0.1 threshold by
     # itself — both `long_control_state_trans`'s cruise-standstill pin and controlsd's resume read this
-    # flag, so the car releases on the first frame rather than waiting for the gap to open.
+    # flag. How fast depends on the lead, and the threshold is `0.3 * dgap + 0.6 * v_lead >= 0.1`, i.e.
+    # `dgap + 2 * v_lead >= 0.333 m`: a lead above ~0.17 m/s clears it on speed alone and the car moves
+    # within a frame, while a slower one has to open that third of a meter first — 1.6 s of it at
+    # 0.1 m/s, 5.4 s at 0.05, 16.6 s at 0.02, and the car is *meant* to sit there rather than creep off
+    # after a lead that has barely moved. Below ~0.1 m/s of lead speed the gate's own deadband then
+    # makes the flag chatter (measured 20-40 flips in 20 s), which is why `MOONPILOT_SHOULD_STOP_SPEED`
+    # is a deadband and not a liveness test.
     # The model's own `shouldStop` stays experimental-only, unlike its accel. It is
     # `should_stop(v_ego, desiredAcceleration)` computed in modeld (`modeld.py:59`), i.e. `v_ego <
     # 0.3 and a < 0.1` — precisely the creeping-behind-a-lead state the `trailing` gate above exists

@@ -96,6 +96,8 @@ class ModelsPage(NavScroller):
     self._driving = self._status_row(models.TITLE_DRIVING, models.DRIVING)
     self._monitoring = self._status_row(models.TITLE_MONITORING, models.MONITORING)
     self._job = _JobCard(params)
+    self._cancel = BigButton(models.LABEL_CANCEL, models.LABEL_CANCEL, description=models.DESCRIPTION_CANCEL)
+    self._cancel.set_click_callback(self._cancel_action)
     self._job.set_click_callback(lambda: _describe("job", models.job_description(models.status(self._params)["job"], self._params)))
     # A selection takes effect at the next boot, so the row that acts on it is here, beside the two
     # rows it applies to, and only while a restart is owed.
@@ -112,9 +114,13 @@ class ModelsPage(NavScroller):
     self._refresh = BigButton(models.TITLE_REFRESH, description=models.DESCRIPTION_REFRESH)
     self._refresh.set_click_callback(lambda: _request(self._params, "refresh"))
 
-    self._scroller.add_widgets([self._driving, self._monitoring, self._job, self._reboot, self._browse, self._installed,
+    self._scroller.add_widgets([self._driving, self._monitoring, self._job, self._cancel, self._reboot, self._browse, self._installed,
                                 self._compose, self._storage, self._refresh])
     self._update_rows()
+
+  def _cancel_action(self) -> None:
+    if models.job_active(models.status(self._params)["job"]):
+      _confirm(models.CONFIRM_CANCEL, ICON_REMOVE, lambda: _request(self._params, "cancel"), red=True)
 
   def _status_row(self, title: str, kind: str) -> BigButton:
     row = BigButton(title)
@@ -135,6 +141,7 @@ class ModelsPage(NavScroller):
     self._monitoring.set_value(models.model_label(self._params, models.MONITORING))
     self._job.set_text(models.job_text(status["job"]) or "job")
     self._job.set_enabled(status["job"] is not None)
+    self._cancel.set_visible(models.job_active(status["job"]))
     self._installed.set_value(str(len(status["installed"])))
     self._storage.set_value(models.storage_text(status["storage"]))
     self._refresh.set_value(models.catalog_text(status["catalog"]))

@@ -67,6 +67,29 @@ def _tailscale_row(params: Params):
     enabled=lambda: bool(tailscale.auth_url(params)),
   )
 
+def _dependencies_row(params: Params):
+  from moonpilot import deps
+
+  def retry():
+    if deps.read_status(params)[0] == deps.WAITING_METERED:
+      deps.request_retry(params)
+
+  return button_item(
+    "dependencies",
+    lambda: deps.status_text(params)[0],
+    description=lambda: deps.status_text(params)[1],
+    callback=retry,
+    enabled=lambda: deps.read_status(params)[0] == deps.WAITING_METERED,
+  )
+
+
+def _rollback_row(params: Params):
+  from moonpilot import boot
+
+  row = text_item("rollback", lambda: boot.rollback_text(params))
+  row.set_visible(lambda: bool(boot.rollback_text(params)))
+  return row
+
 
 class GroupLayout(Widget):
   """One group's page: the group's own name and description, then its toggles. Pushed, so the way
@@ -106,6 +129,8 @@ class MoonpilotLayout(Widget):
         ],
         offroad_mode.row(self._params),
         _tailscale_row(self._params),
+        _dependencies_row(self._params),
+        _rollback_row(self._params),
       ],
       line_separator=True,
       spacing=0,

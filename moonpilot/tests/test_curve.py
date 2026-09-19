@@ -28,6 +28,7 @@ from moonpilot.curve import (
   MOONPILOT_CURVE_BIAS_MIN_LAT_ACCEL,
   MOONPILOT_CURVE_BIAS_MIN_SAMPLES,
   MOONPILOT_CURVE_BIAS_RC,
+  MOONPILOT_CURVE_BIAS_TRACKING_TOLERANCE,
   MOONPILOT_CURVE_HOLD_MARGIN,
   MOONPILOT_CURVE_HOLD_MIN_CURVATURE,
   MOONPILOT_CURVE_HOLD_MIN_SPEED,
@@ -329,6 +330,58 @@ class TestLatAccelBiasEstimator(unittest.TestCase):
     than a sample count."""
     self.assertEqual(len(MOONPILOT_CURVE_T_IDX), len(T_IDXS))
     self.assertAlmostEqual(MOONPILOT_CURVE_MIN_PATH_SPEED, 1.0, delta=1e-12)
+
+class TestLatAccelBiasTrackingGate(unittest.TestCase):
+  """The planner only learns from the fork's torque logger when that logger says it tracked."""
+
+  @staticmethod
+  def _inputs():
+    from moonpilot.tests.test_longitudinal import _inputs, _path
+
+    return _inputs(
+      v_ego=20.0,
+      path=_path(20.0, 0.006),
+      steer_angle_deg=10.0,
+      vp_valid=True,
+      steer_ratio=15.0,
+      stiffness_factor=1.0,
+    )
+
+  @classmethod
+  def _samples(cls, torque=None):
+    from moonpilot.tests.test_longitudinal import _planner
+
+    sm = cls._inputs()
+    if torque is not None:
+      sm['controlsState'].lateralControlState.torqueState = torque
+    planner = _planner()
+    for _ in range(planner.lat_bias.delay_frames + MOONPILOT_CURVE_BIAS_MIN_SAMPLES):
+      planner.update(sm)
+    return planner.lat_bias.samples
+
+  def test_a_saturated_torque_log_does_not_teach_bias(self):
+    torque = log.ControlsState.LateralTorqueState.new_message(
+      version=1000,
+      active=True,
+      saturated=True,
+      actualLateralAccel=2.0,
+      desiredLateralAccel=2.0,
+    )
+    self.assertEqual(self._samples(torque), 0)
+
+  def test_an_in_tolerance_active_torque_log_teaches_bias(self):
+    torque = log.ControlsState.LateralTorqueState.new_message(
+      version=1000,
+      active=True,
+      saturated=False,
+      actualLateralAccel=2.0,
+      desiredLateralAccel=2.0 + MOONPILOT_CURVE_BIAS_TRACKING_TOLERANCE / 2,
+    )
+    self.assertGreater(self._samples(torque), 0)
+
+  def test_a_non_torque_union_member_keeps_learning(self):
+    self.assertGreater(self._samples(), 0)
+
 
 
 if __name__ == "__main__":

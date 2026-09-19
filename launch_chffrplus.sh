@@ -31,6 +31,13 @@ function agnos_init {
 }
 
 function launch {
+  if [ -f "${DIR}/moonpilot/boot.sh" ]; then  # moonpilot seam, see AGENTS.md
+    recovery="$(bash "${DIR}/moonpilot/boot.sh" recover "$STAGING_ROOT" "$DIR")"
+    if [ "$recovery" = "restart" ]; then
+      exec "${BASH_SOURCE[0]}"
+    fi
+  fi
+
   # Remove orphaned git lock if it exists on boot
   [ -f "$DIR/.git/index.lock" ] && rm -f "$DIR/.git/index.lock"
 
@@ -52,7 +59,7 @@ function launch {
         if [ ! -d /data/safe_staging/old_openpilot ]; then
           echo "Valid overlay update found, installing"
           LAUNCHER_LOCATION="${BASH_SOURCE[0]}"
-
+          printf '%s\n' "$(< "${MOONPILOT_BOOT_ID_PATH:-/proc/sys/kernel/random/boot_id}")" > "${STAGING_ROOT}/moonpilot_swap"  # moonpilot seam, see AGENTS.md
           mv "$DIR" /data/safe_staging/old_openpilot
           mv "${STAGING_ROOT}/finalized" "$DIR"
           cd "$DIR"

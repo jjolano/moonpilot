@@ -10,13 +10,14 @@ notice.
 """
 
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
 from opendbc.car.structs import car
 
 from moonpilot import models
-from moonpilot.features import FEATURES, GROUPS, LATERAL_ENGAGE, Feature
+from moonpilot.features import CATALOG_SIGNATURES, FEATURES, GROUPS, LATERAL_ENGAGE, Feature
 from moonpilot.ui import settings, settings_mici
 
 # A name no distribution can provide, so `available()` is False without depending on the
@@ -106,6 +107,15 @@ class TestGrouping(unittest.TestCase):
 
   def test_the_pages_are_the_three_the_panel_shows(self):
     self.assertEqual([group.title for group in GROUPS], ["steering", "speed & distance", "device"])
+
+  def test_catalog_signatures_is_grouped_and_declared(self):
+    grouped = [feature for group in GROUPS for feature in group.features]
+    self.assertEqual(tuple(grouped), FEATURES)
+    self.assertEqual(len(grouped), len(set(grouped)))
+    self.assertEqual(set(grouped), set(FEATURES))
+
+    text = (Path(__file__).resolve().parents[2] / "moonpilot" / "params_keys.h").read_text()
+    self.assertIn(f'{{"{CATALOG_SIGNATURES.key}", {{PERSISTENT, BOOL, "0"}}}}', text)
 
 
 class TestModelsStrings(unittest.TestCase):

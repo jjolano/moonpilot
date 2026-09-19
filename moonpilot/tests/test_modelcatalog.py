@@ -27,6 +27,13 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
+try:
+  import cryptography  # noqa: F401
+except ImportError:
+  CRYPTOGRAPHY_AVAILABLE = False
+else:
+  CRYPTOGRAPHY_AVAILABLE = True
+
 
 from moonpilot import modelcatalog, models
 from moonpilot.vendor.openmodels import client, contracts, metadata
@@ -242,7 +249,7 @@ class TestInterfaceVerification(unittest.TestCase):
     patcher.start()
     self.addCleanup(patcher.stop)
 
-  def package_from_onnx(self, *, tamper: bool = False) -> str:
+  def package_from_onnx(self, *, tamper: bool = False, slice_mutation: str | None = None) -> str:
     """A package whose single artifact is the bundled DM ONNX, symlinked so nothing is copied.
 
     The point is the *interface*: `verify_downloaded` re-reads it from those bytes and compares it
@@ -258,10 +265,15 @@ class TestInterfaceVerification(unittest.TestCase):
                                             "metadata": {"input_shapes": interface["input_shapes"],
                                                          "output_slices": interface["output_slices"]}}},
                 "configuration": {}}
+    slices = document["members"]["dmonitoring"]["metadata"]["output_slices"]
     if tamper:
       # A package that is internally consistent -- written under its own digest, like a real install
       # -- but whose recorded interface is not what its artifact declares.
-      document["members"]["dmonitoring"]["metadata"]["output_slices"]["not_a_head"] = [0, 1, None]
+      slices["not_a_head"] = [0, 1, None]
+    if slice_mutation is not None:
+      head = next(iter(slices))
+      index = 0 if slice_mutation == "bound" else 2
+      slices[head][index] = 1 if slices[head][index] is None else slices[head][index] + 1
     raw = json.dumps(document, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     recipe = hashlib.sha256(raw.encode()).hexdigest()
     os.makedirs(models.package_dir(recipe), exist_ok=True)
@@ -277,6 +289,14 @@ class TestInterfaceVerification(unittest.TestCase):
     self.assertEqual(modelcatalog.verify_downloaded(None, self.package_from_onnx(tamper=True)),
                      modelcatalog.INTERFACE_MISMATCH)
 
+  def test_a_shifted_existing_slice_bound_is_a_mismatch(self):
+    self.assertEqual(modelcatalog.verify_downloaded(None, self.package_from_onnx(slice_mutation="bound")),
+                     modelcatalog.INTERFACE_MISMATCH)
+
+  def test_a_changed_existing_slice_step_is_a_mismatch(self):
+    self.assertEqual(modelcatalog.verify_downloaded(None, self.package_from_onnx(slice_mutation="step")),
+                     modelcatalog.INTERFACE_MISMATCH)
+
   def test_verify_onnx_never_executes_the_file(self):
     # The only reader of a downloaded artifact: a hostile `output_slices` pickle cannot resolve
     # anything but `slice`, and an artifact with none is refused rather than trusted.
@@ -287,6 +307,90 @@ class TestInterfaceVerification(unittest.TestCase):
     self.assertTrue("input_img" in interface["input_shapes"])
     self.assertTrue("face_descs_lhd" in interface["slices"])
     self.assertEqual(len(interface["slices"]), 20)
+
+
+@unittest.skipUnless(CRYPTOGRAPHY_AVAILABLE, "cryptography is not importable")
+class TestCatalogSignature(unittest.TestCase):
+  def setUp(self):
+    self.tmp = tempfile.mkdtemp()
+    patcher = mock.patch.object(models.paths, "data_dir", lambda feature: os.path.join(self.tmp, feature))
+    patcher.start()
+    self.addCleanup(patcher.stop)
+    self.raw = FIXTURE.read_bytes()
+
+  def keypair(self):
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    private = Ed25519PrivateKey.generate()
+    public = private.public_key().public_bytes(serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo)
+    return private, public.decode("ascii")
+
+  def test_refresh_accepts_a_valid_catalog_signature(self):
+    private, public = self.keypair()
+    url = "https://catalog.invalid/catalog.json"
+    calls = []
+
+    def read_url(request_url, _limit, timeout=30):
+      calls.append(request_url)
+      return private.sign(self.raw) if request_url.endswith(modelcatalog.SIGNATURE_SUFFIX) else self.raw
+
+    with mock.patch.object(modelcatalog, "CATALOG_PUBKEY", public), mock.patch.object(client, "read_url", side_effect=read_url):
+      revision, catalog = modelcatalog.refresh(url, timeout=7, require_signature=True)
+    self.assertEqual(revision, contracts.sha256(self.raw))
+    self.assertEqual(catalog.revision, revision)
+    self.assertEqual(calls, [url + modelcatalog.SIGNATURE_SUFFIX, url])
+    self.assertEqual(Path(models.catalog_file()).read_bytes(), self.raw)
+
+  def test_a_bad_signature_leaves_the_previous_snapshot_untouched(self):
+    private, public = self.keypair()
+    path = Path(models.catalog_file())
+    path.parent.mkdir(parents=True)
+    path.write_bytes(self.raw)
+    url = "https://catalog.invalid/catalog.json"
+
+    def read_url(request_url, _limit, timeout=30):
+      return private.sign(b"not the catalog") if request_url.endswith(modelcatalog.SIGNATURE_SUFFIX) else self.raw
+
+    with mock.patch.object(modelcatalog, "CATALOG_PUBKEY", public), mock.patch.object(client, "read_url", side_effect=read_url):
+      with self.assertRaisesRegex(ValueError, "catalog signature verification failed"):
+        modelcatalog.refresh(url, require_signature=True)
+    self.assertEqual(path.read_bytes(), self.raw)
+
+  def test_an_absent_signature_sidecar_is_refused(self):
+    _, public = self.keypair()
+    url = "https://catalog.invalid/catalog.json"
+
+    def read_url(request_url, _limit, timeout=30):
+      if request_url.endswith(modelcatalog.SIGNATURE_SUFFIX):
+        raise OSError("sidecar absent")
+      return self.raw
+
+    with mock.patch.object(modelcatalog, "CATALOG_PUBKEY", public), mock.patch.object(client, "read_url", side_effect=read_url):
+      with self.assertRaises(OSError):
+        modelcatalog.refresh(url, require_signature=True)
+
+
+class TestCatalogNoPinnedKey(unittest.TestCase):
+  def setUp(self):
+    self.tmp = tempfile.mkdtemp()
+    patcher = mock.patch.object(models.paths, "data_dir", lambda feature: os.path.join(self.tmp, feature))
+    patcher.start()
+    self.addCleanup(patcher.stop)
+
+  def test_signature_requirement_without_a_pinned_key_is_refused(self):
+    url = "https://catalog.invalid/catalog.json"
+    calls = []
+
+    def read_url(request_url, _limit, timeout=30):
+      calls.append(request_url)
+      return b"unused sidecar"
+
+    with mock.patch.object(modelcatalog, "CATALOG_PUBKEY", ""), mock.patch.object(client, "read_url", side_effect=read_url):
+      with self.assertRaisesRegex(ValueError, "no public key is pinned"):
+        modelcatalog.refresh(url, require_signature=True)
+    self.assertEqual(calls, [url + modelcatalog.SIGNATURE_SUFFIX])
+    self.assertFalse(os.path.exists(models.catalog_file()))
 
 
 if __name__ == "__main__":

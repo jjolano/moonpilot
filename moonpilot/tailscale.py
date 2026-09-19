@@ -2,14 +2,18 @@
 
 The device has no tailscale and no package manager (AGENTS.md, How a dependency reaches the
 device), so `install()` fetches the stable-track static tarball into `<data_root>/tailscale`
-and `moonpilot/tailscaled.py` supervises it. This module is the shared vocabulary for both,
+and `moonpilot/tailscaled.py` supervises it. Binaries, the control socket and tailscaled's var
+root stay there; its node identity, login session and prefs live at `<persist_root>/tailscale`
+so a factory reset does not log the device out. This module is the shared vocabulary for both,
 plus the encode/decode of the one string param the supervisor and the settings panels talk
 through.
 
 It is imported by the UI and by the supervisor, so: standard library plus `openpilot` modules
 only, and nothing here creates a directory or runs a process — the path helpers are computed,
 the same rule and the same reason as deps.site_dir().
+
 """
+ 
 
 import json
 import os
@@ -45,9 +49,31 @@ STOPPED = "stopped"
 _MACHINE_AUTH_DETAIL = "approve this device in the tailscale admin console"
 
 
+_state_fallback: tuple[str, str] | None = None
+
+
 def root() -> str:
-  """`<data_root>/tailscale`: the installed binaries, tailscaled's state, and its var root."""
+  """`<data_root>/tailscale`: binaries, the control socket and tailscaled's var root."""
   return os.path.join(paths.data_root(), "tailscale")
+
+
+def legacy_state_path() -> str:
+  """The pre-persistence state path, kept as a migration fallback."""
+  return os.path.join(root(), "tailscaled.state")
+
+
+def persistent_state_path() -> str:
+  """The state path that survives a factory reset."""
+  return os.path.join(paths.persist_root(), "tailscaled.state")
+
+
+def _persist_writable() -> bool:
+  """Whether the existing persistent directory can accept a new state file."""
+  try:
+    mode = os.stat(paths.persist_root()).st_mode
+  except OSError:
+    return False
+  return bool(mode & 0o222) and os.access(paths.persist_root(), os.W_OK)
 
 
 def bin_dir() -> str:
@@ -66,8 +92,18 @@ def socket_path() -> str:
 
 
 def state_path() -> str:
-  """tailscaled's state file: node identity, login session and prefs."""
-  return os.path.join(root(), "tailscaled.state")
+  """tailscaled's persistent state, or the legacy path when migration cannot use `/persist`."""
+  persistent = persistent_state_path()
+  legacy = legacy_state_path()
+  if os.path.isfile(legacy) and (_state_fallback == (persistent, legacy) or not _persist_writable()):
+    return legacy
+  return persistent
+
+
+def use_legacy_state() -> None:
+  """Keep the daemon on its old state file after a failed persistent migration."""
+  global _state_fallback
+  _state_fallback = (persistent_state_path(), legacy_state_path())
 
 
 def binaries() -> tuple[str, str] | None:
@@ -155,7 +191,8 @@ def daemon_args() -> list[str]:
   # tailscaled sets its var root from `--state` only when that file's directory is named
   # `tailscale` (cmd/tailscaled/tailscaled.go, `ipnServerOpts`). Naming a directory is not a
   # contract, and an empty var root sends certs, Taildrop and profile-data to HOME — the
-  # read-only rootfs on device. The state *store* still comes from `--state`.
+  # read-only rootfs on device. The state *store* is the reset-surviving `--state` path; binaries,
+  # the socket and this var root remain under data-root `root()`.
   args = [*sudo(), pair[1], "--state", state_path(), "--statedir", root(), "--socket", socket_path(), "--no-logs-no-support"]
   if not os.path.exists("/dev/net/tun"):
     # comma 3X's kernel has CONFIG_TUN=y; the comma four kernel is a different tree, so probe

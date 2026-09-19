@@ -13,7 +13,10 @@ the thing that has to be restarted after an upgrade, and the status param is the
 read.
 """
 
+import os
+import shutil
 import subprocess
+import tempfile
 import time
 
 from openpilot.cereal import log, messaging
@@ -25,6 +28,80 @@ from moonpilot import tailscale
 POLL = 10.0  # status poll while the daemon is up
 WAIT = 30.0  # no network yet
 CHECK_INTERVAL = 6 * 3600  # stable-track version-check cadence
+
+LEGACY_STATE_ERROR = "persistent tailscale state unavailable; using legacy state"
+
+_MIGRATE_STATE = """\
+import os
+import shutil
+import sys
+import tempfile
+
+legacy, target = sys.argv[1:3]
+fd, staged = tempfile.mkstemp(prefix=".tailscaled.state.", dir=os.path.dirname(target))
+try:
+  with os.fdopen(fd, "wb") as destination:
+    with open(legacy, "rb") as source:
+      shutil.copyfileobj(source, destination)
+    os.fchmod(destination.fileno(), 0o600)
+    destination.flush()
+    os.fsync(destination.fileno())
+  os.replace(staged, target)
+  if not os.path.isfile(target):
+    raise OSError("tailscale state migration did not create its destination")
+  os.unlink(legacy)
+finally:
+  if os.path.exists(staged):
+    os.unlink(staged)
+"""
+
+
+def _copy_state(legacy: str, target: str) -> None:
+  """Copy and atomically install state on an unprivileged development machine."""
+  fd, staged = tempfile.mkstemp(prefix=".tailscaled.state.", dir=os.path.dirname(target))
+  try:
+    with os.fdopen(fd, "wb") as destination:
+      with open(legacy, "rb") as source:
+        shutil.copyfileobj(source, destination)
+      os.fchmod(destination.fileno(), 0o600)
+      destination.flush()
+      os.fsync(destination.fileno())
+    os.replace(staged, target)
+    if not os.path.isfile(target):
+      raise OSError("tailscale state migration did not create its destination")
+    os.unlink(legacy)
+  finally:
+    if os.path.exists(staged):
+      os.unlink(staged)
+
+
+def _migrate_state() -> str:
+  """Move a legacy state file, or return the detail shown when persistence is unavailable."""
+  legacy = tailscale.legacy_state_path()
+  target = tailscale.persistent_state_path()
+  if legacy == target or not os.path.isfile(legacy):
+    return ""
+
+  try:
+    if tailscale.sudo():
+      subprocess.run(
+        [*tailscale.sudo(), "python3", "-c", _MIGRATE_STATE, legacy, target],
+        check=True,
+      )
+    else:
+      _copy_state(legacy, target)
+  except (OSError, subprocess.CalledProcessError):
+    tailscale.use_legacy_state()
+    cloudlog.exception("moonpilot tailscale state migration failed")
+    return LEGACY_STATE_ERROR
+  return ""
+
+
+def _put_status(params: Params, state: str, detail: str = "", state_error: str = "") -> None:
+  if state_error:
+    tailscale.put_status(params, tailscale.ERROR, state_error)
+  else:
+    tailscale.put_status(params, state, detail)
 BACKOFF_START = 30.0
 BACKOFF_MAX = 1800.0  # 30 min
 UP_RETRY = 30.0  # do not respawn `tailscale up` faster than this
@@ -57,6 +134,9 @@ def _query_status() -> str:
 
 def main() -> None:
   params = Params()
+  state_error = _migrate_state()
+  if state_error:
+    _put_status(params, tailscale.ERROR, state_error, state_error)
   sm = messaging.SubMaster(['deviceState'])
   daemon: subprocess.Popen | None = None
   login: subprocess.Popen | None = None
@@ -72,13 +152,13 @@ def main() -> None:
 
       if tailscale.binaries() is None:
         if not online:
-          tailscale.put_status(params, tailscale.OFFLINE)
+          _put_status(params, tailscale.OFFLINE, state_error=state_error)
           time.sleep(WAIT)
           continue
 
         # Unlike depsd, a metered connection does not defer this install: the driver asked for
         # remote access by flipping the toggle, and an LTE-only device is the one that wants it.
-        tailscale.put_status(params, tailscale.INSTALLING)
+        _put_status(params, tailscale.INSTALLING, state_error=state_error)
         try:
           latest = tailscale.latest_release()
           tailscale.install(*latest)
@@ -86,7 +166,7 @@ def main() -> None:
           backoff = BACKOFF_START
         except Exception:
           cloudlog.exception("moonpilot tailscale install failed")
-          tailscale.put_status(params, tailscale.ERROR, "download failed")
+          _put_status(params, tailscale.ERROR, "download failed", state_error)
           time.sleep(backoff)
           backoff = min(backoff * 2, BACKOFF_MAX)
       elif online and params.get_bool("IsOffroad") and time.monotonic() - last_check >= CHECK_INTERVAL:
@@ -103,7 +183,7 @@ def main() -> None:
           continue
         if tailscale.upgrade_available(latest[0]):
           was = tailscale.marker_version()
-          tailscale.put_status(params, tailscale.INSTALLING)
+          _put_status(params, tailscale.INSTALLING, state_error=state_error)
           try:
             tailscale.install(*latest)
             cloudlog.event("moonpilot tailscale upgraded", was=was, now=latest[0])
@@ -120,7 +200,7 @@ def main() -> None:
       if daemon is None or daemon.poll() is not None:
         if daemon is not None:
           cloudlog.event("moonpilot tailscaled exited", code=daemon.returncode)
-          tailscale.put_status(params, tailscale.ERROR, "tailscaled exited")
+          _put_status(params, tailscale.ERROR, "tailscaled exited", state_error)
           time.sleep(backoff)
           backoff = min(backoff * 2, BACKOFF_MAX)
 
@@ -128,7 +208,7 @@ def main() -> None:
         # and a launch that never succeeds is debugged by running daemon_args() by hand over ssh.
         # A log file here would grow without a bound.
         daemon = subprocess.Popen(tailscale.daemon_args(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        tailscale.put_status(params, tailscale.STARTING)
+        _put_status(params, tailscale.STARTING, state_error=state_error)
 
       output = _query_status()
 
@@ -154,7 +234,7 @@ def main() -> None:
         login = subprocess.Popen(tailscale.up_args(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         last_up = time.monotonic()
 
-      tailscale.put_status(params, state, detail)
+      _put_status(params, state, detail, state_error)
       time.sleep(POLL)
   finally:
     # The manager sends SIGINT on stop (process.py:82), which lands here as KeyboardInterrupt.

@@ -1,10 +1,10 @@
 import contextlib
 import unittest
-from typing import cast
-from unittest import mock
-
 import numpy as np
 import pyray as rl
+from types import SimpleNamespace
+from typing import cast
+from unittest import mock
 
 from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.params import Params
@@ -89,6 +89,25 @@ class FakeSubMaster:
   @property
   def leads(self):
     return self._leads
+
+
+class RendererSubMaster:
+  def __init__(self, state, valid=True, alive=True):
+    self.recv_frame = {"extrinsicsCalibration": 1, "modelV2": 1}
+    self.updated = {"carParams": False, "modelV2": False, "radarState": False}
+    self.valid = {"moonpilotState": valid, "radarState": False}
+    self.alive = {"moonpilotState": alive}
+    self._values = {
+      "carOutput": SimpleNamespace(actuatorsOutput=SimpleNamespace(torque=0.0)),
+      "extrinsicsCalibration": SimpleNamespace(height=[0.0]),
+      "modelV2": SimpleNamespace(),
+      "moonpilotState": state,
+      "radarState": None,
+      "selfdriveState": SimpleNamespace(experimentalMode=False),
+    }
+
+  def __getitem__(self, service):
+    return self._values[service]
 
 
 class FakeLead:
@@ -564,6 +583,21 @@ class TestRendererLeadPath(unittest.TestCase):
     r._update_lead_path(self._state(y, y_std=y_std), np.linspace(0.0, 60.0, 33).astype(np.float32))
     return r._lead_path.projected_points, r._lead_in_path, r._lead_path_widths
 
+  def _render_lead_path(self, renderer, state, valid=True, alive=True):
+    renderer._transform_dirty = True
+    sm = RendererSubMaster(state, valid=valid, alive=alive)
+    rect = rl.Rectangle(0, 0, self.W, self.H)
+    with (
+      mock.patch.object(ui_state, "sm", sm),
+      mock.patch.object(ui_state, "started_frame", 0),
+      mock.patch.object(ui_state, "params", _params()),
+      mock.patch.object(renderer, "_update_model"),
+      mock.patch.object(renderer, "_draw_lane_lines"),
+      mock.patch.object(renderer, "_draw_path"),
+      mock.patch.object(renderer, "_draw_lead_path"),
+    ):
+      renderer._render(rect)
+
   def test_projects_a_line(self):
     for tree in ("tizi", "mici"):
       with self.subTest(tree=tree):
@@ -644,6 +678,25 @@ class TestRendererLeadPath(unittest.TestCase):
         assert r._lead_path.projected_points.size == 0
         assert r._lead_path_widths.size == 0
         self.assertEqual(r._lead_in_path, 1.0)
+
+
+  def test_invalid_or_dead_state_clears_and_redraws(self):
+    for valid, alive in ((False, True), (True, False)):
+      for tree in ("tizi", "mici"):
+        with self.subTest(tree=tree, valid=valid, alive=alive):
+          r = self._renderer(tree)
+          state = self._state([0.0] * 6)
+
+          self._render_lead_path(r, state)
+          assert r._lead_path.projected_points.size > 0
+
+          self._render_lead_path(r, state, valid=valid, alive=alive)
+          assert r._lead_path.projected_points.size == 0
+          assert r._lead_path_widths.size == 0
+          self.assertEqual(r._lead_in_path, 1.0)
+
+          self._render_lead_path(r, state)
+          assert r._lead_path.projected_points.size > 0
 
 
 class TestLeadDangerFactor(unittest.TestCase):

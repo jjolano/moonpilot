@@ -420,21 +420,93 @@ class TestPriorChannel(unittest.TestCase):
 
 
 class TestIngest(unittest.TestCase):
-  """The device frame is not the car frame, and this is the one place they meet.
+  """Calibration-frame odometry is rotated into the device frame before the window's car-frame
+  conversion.
 
-  `cameraOdometry.trans`/`rot` and the gyro are device-frame: x forward, y right, z down
-  (`openpilot/common/transformations/camera.py`). The window is written in the car's frame, x forward
-  y left and yaw left-positive. A dropped negation here is invisible to every other test in this
-  file -- they build `Node`s directly, already in car-frame units -- and on the road it makes a left
-  turn's gyro and odometry cancel each other instead of agreeing.
+  The device frame is x forward, y right, z down (`openpilot/common/transformations/camera.py`).
+  The window is written in the car's frame, x forward, y left and yaw left-positive. A dropped
+  negation here is invisible to every other test in this file -- they build `Node`s directly,
+  already in car-frame units -- and on the road it makes a left turn's gyro and odometry cancel
+  each other instead of agreeing.
   """
 
   class _Sm(dict):
-    def __init__(self, odometry, device_motion, car_state):
+    def __init__(self, odometry, device_motion, car_state, extrinsics_calibration=None, calibration_valid=True):
       super().__init__(cameraOdometry=odometry, deviceMotion=device_motion, carState=car_state)
+      if extrinsics_calibration is not None:
+        self["extrinsicsCalibration"] = extrinsics_calibration
       self.updated = {"cameraOdometry": True, "deviceMotion": True, "carState": True}
       self.valid = {"cameraOdometry": True, "deviceMotion": True, "carState": True}
+      if extrinsics_calibration is not None:
+        self.valid["extrinsicsCalibration"] = calibration_valid
       self.logMonoTime = {"cameraOdometry": int(ODOMETRY_MONO * 1e9), "deviceMotion": int(ODOMETRY_MONO * 1e9), "carState": int(ODOMETRY_MONO * 1e9)}
+
+  @staticmethod
+  def _calibration(rpy_calib):
+    calibration = messaging.new_message("extrinsicsCalibration")
+    calibration.extrinsicsCalibration.rpyCalib = rpy_calib
+    return calibration.extrinsicsCalibration
+
+  def test_calibration_rotates_vectors_and_stds_before_sign_conversion(self):
+    from moonpilot.leadd import _slam_node
+
+    odometry = messaging.new_message("cameraOdometry")
+    odometry.cameraOdometry.trans = [20.0, 1.0, 2.0]
+    odometry.cameraOdometry.rot = [0.1, 0.3, -0.2]
+    odometry.cameraOdometry.transStd = [0.02, 0.04, 0.06]
+    odometry.cameraOdometry.rotStd = [0.03, 0.04, 0.05]
+    device_motion = messaging.new_message("deviceMotion")
+    device_motion.deviceMotion.angularVelocityDevice.z = -0.2
+    car_state = messaging.new_message("carState")
+    car_state.carState.vEgo = 19.5
+    sm = self._Sm(
+      odometry.cameraOdometry,
+      device_motion.deviceMotion,
+      car_state.carState,
+      self._calibration([0.0, 0.1, 0.0]),
+    )
+
+    node = _slam_node(sm, self._priors(v_ego=19.5))
+    assert node is not None
+    c, s = math.cos(0.1), math.sin(0.1)
+    self.assertAlmostEqual(node.trans_x, c * 20.0 + s * 2.0)
+    self.assertAlmostEqual(node.trans_y, -1.0)
+    self.assertAlmostEqual(node.rot_z, s * 0.1 + c * 0.2)
+    self.assertAlmostEqual(node.trans_std_x, math.sqrt((c * 0.02) ** 2 + (s * 0.06) ** 2))
+    self.assertAlmostEqual(node.rot_std_z, math.sqrt((s * 0.03) ** 2 + (c * 0.05) ** 2))
+    self.assertAlmostEqual(node.yaw_rate, 0.2)  # gyro path remains device-frame and unchanged
+
+  def test_identity_and_untrusted_calibration_fall_back_to_identity(self):
+    from moonpilot.leadd import _slam_node
+
+    odometry = messaging.new_message("cameraOdometry")
+    odometry.cameraOdometry.trans = [20.0, 1.0, 2.0]
+    odometry.cameraOdometry.rot = [0.1, 0.3, -0.2]
+    odometry.cameraOdometry.transStd = [0.02, 0.04, 0.06]
+    odometry.cameraOdometry.rotStd = [0.03, 0.04, 0.05]
+    device_motion = messaging.new_message("deviceMotion")
+    device_motion.deviceMotion.angularVelocityDevice.z = -0.2
+    car_state = messaging.new_message("carState")
+    car_state.carState.vEgo = 19.5
+    priors = self._priors(v_ego=19.5)
+    common = (odometry.cameraOdometry, device_motion.deviceMotion, car_state.carState)
+    expected = _slam_node(self._Sm(*common), priors)
+    identity = _slam_node(self._Sm(*common, self._calibration([0.0, 0.0, 0.0])), self._priors(v_ego=19.5))
+    assert expected is not None and identity is not None
+    self.assertEqual(identity, expected)
+
+    for rpy_calib, calibration_valid in (
+      ([0.0, 0.1, 0.0], False),
+      ([0.0, 0.1], True),
+      ([0.0, 0.6, 0.0], True),
+    ):
+      actual = _slam_node(
+        self._Sm(*common, self._calibration(rpy_calib), calibration_valid),
+        self._priors(v_ego=19.5),
+      )
+      self.assertEqual(actual, expected)
+
+
 
   @staticmethod
   def _priors(v_ego=20.0, gyro_z=-0.2):

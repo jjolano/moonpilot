@@ -56,17 +56,21 @@ MOONPILOT_LEAD_SPEED_JUMP = 2.5  # m/s in one frame: re-association, not motion 
 # the window is still half full of pre-onset samples — and a real brake ramps in over a few tenths, so
 # the lead's own onset is what the estimate is chasing. The newest three samples read the step in
 # 0.10 s. Reading both and believing the short one only when it is persistently deeper is one-sided by
-# construction (the policy only ever uses a_lead to add braking — `min(a_lead, 0.0)` in
-# `moonpilot/longitudinal.py`'s preview), and the streak is what keeps radar noise out of the command:
+# construction (the policy only ever uses a_lead to add braking — `min(a_lead, 0.0)` against
+# `moonpilot/longitudinal.py`'s `MOONPILOT_LEAD_PREVIEW_T`), and the streak is what keeps radar noise
+# out of the command:
 # a single noisy frame cannot flip it, while an onset stays deep for many. Measured: on 51k settled
 # frames of the offline corpus (199 segments, the radar lead's own speed history) the estimate's error
 # against a centered reference is 0.188 -> 0.190 m/s^2 sd, and a spurious read past -1 m/s^2 goes
 # 0.19 % -> 0.21 % of frames — both inside a measurement whose radar vLead noise is 0.024-0.035 m/s,
 # so the design's own 0.05 m/s assumption is conservative. Closed loop
 # (`moonpilot/tests/test_longitudinal.py`), a lead braking at -3.5 m/s^2 from a settled follow: the
-# command reaches -1.0 m/s^2 at 0.15 s instead of 0.25, -2.0 at 0.30 instead of 0.35 and -3.0 at
-# 0.40 instead of 0.45 — and the arm with the lead's *true* accel instead of any estimate reaches
-# -1.0 at the same 0.15 s, so this closes the sensing side of that onset rather than chipping at it.
+# command reaches -1.0 m/s^2 at 0.30 s instead of 0.35 and -2.0 at 0.50 s either way — one frame at
+# the onset, where a full second of braking credit in `moonpilot/longitudinal.py` used to make it
+# 0.15 against 0.25 — and the arm carrying the lead's *true* accel instead of any estimate reaches
+# -1.0 at the same 0.30 s, so the sensing side of the onset is closed rather than chipped at. What
+# the arm still buys at this credit length is the published plan's tail and the FCW, both of which
+# read `a_lead` directly.
 MOONPILOT_LEAD_ACCEL_FAST = 3  # samples in the onset window, 0.10 s at DT_MDL
 MOONPILOT_LEAD_ACCEL_FAST_MARGIN = 1.0  # m/s^2 the onset window must read deeper than the full one
 MOONPILOT_LEAD_ACCEL_FAST_STREAK = 2  # consecutive frames the margin must hold before it is used

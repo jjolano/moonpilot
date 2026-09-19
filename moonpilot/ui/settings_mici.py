@@ -40,6 +40,29 @@ def _unavailable_value(feature: Feature) -> str:
     return reason
   return "" if available(feature) else "unavailable"
 
+def _dependencies_row(params: Params):
+  from moonpilot import deps
+
+  row = BigButton("dependencies", deps.status_text(params)[0])
+
+  def activate():
+    state = deps.read_status(params)[0]
+    if state == deps.WAITING_METERED:
+      deps.request_retry(params)
+    elif detail := deps.status_text(params)[1]:
+      gui_app.push_widget(BigDialog("dependencies", detail))
+
+  row.set_click_callback(activate)
+  return row
+
+
+def _rollback_row(params: Params):
+  from moonpilot import boot
+
+  row = BigButton("rollback", boot.rollback_text(params))
+  row.set_visible(lambda: bool(boot.rollback_text(params)))
+  return row
+
 
 class _FeatureRows:
   """The rows of one group, with the pushing mici needs.
@@ -123,7 +146,10 @@ class MoonpilotLayoutMici(NavScroller):
     # whose label the manager and the ignition edge can change under the panel's feet.
     self._offroad = offroad_mode_mici.row(self._params)
 
-    self._scroller.add_widgets([self._models_button, *[button for _group, button in self._group_buttons], self._offroad, self._tailscale])
+    self._dependencies = _dependencies_row(self._params)
+    self._rollback = _rollback_row(self._params)
+
+    self._scroller.add_widgets([self._models_button, *[button for _group, button in self._group_buttons], self._offroad, self._tailscale, self._dependencies, self._rollback])
     self._update_rows()
     ui_state.add_offroad_transition_callback(self._update_rows)
 
@@ -139,6 +165,9 @@ class MoonpilotLayoutMici(NavScroller):
   def _update_rows(self):
     self._models_button.set_value(models.model_label(self._params, models.DRIVING))
     self._tailscale.set_value(tailscale.status_text(self._params)[0])
+    from moonpilot import boot, deps
+    self._dependencies.set_value(deps.status_text(self._params)[0])
+    self._rollback.set_value(boot.rollback_text(self._params))
     offroad_mode_mici.refresh(self._offroad, self._params)
 
   def _show_tailscale(self):
