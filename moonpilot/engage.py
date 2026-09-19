@@ -16,6 +16,9 @@ What the module does at runtime:
   - `car_unavailable_reason`, which is the panel's half of `_available`: why a driver cannot use
     this feature on this car, or `None`. The settings rows are disabled with it, so a car that can
     never be half-engaged says so instead of reading as on and doing nothing.
+  - `moonpilot_actuator_gate`, built once by controlsd: the panda's two grants, read back by the
+    client that produced them. A frame the safety layer rejects is silent to the sender, so a
+    half-engaged car has to command nothing the panda will refuse — see `ActuatorGate`.
   - `LateralEngage.update`, called from selfdrived once every event source has contributed, is
     the engage/disengage policy. It suppresses the two events whose whole purpose is the behavior
     being replaced — `pcmDisable` (level-triggered whenever stock ACC is off) and `pedalPressed`
@@ -45,17 +48,21 @@ What the module does at runtime:
 
 Scope, and the ceilings that come with it:
 
-  - Three brands, and one platform caveat inside the third. Toyota/Lexus and Honda with stock
-    longitudinal (`CP.pcmCruise`), and Volkswagen MQB/MEB — where PQ is excluded because its safety
-    hook sets `acc_main_on` only under openpilot longitudinal control, and MLB never sets it.
+  - Three brands, and one platform caveat inside the third. Toyota/Lexus, Honda and Volkswagen
+    MQB/MEB, which is what `CP.pcmCruise` is for: on Honda and Volkswagen it is `not
+    openpilotLongitudinalControl` and so does describe who owns speed, but on Toyota it is a default
+    that stays true under openpilot longitudinal control too. Those cars are therefore in scope, and
+    their half-engagement is steer-only — the driver's foot owns speed until ACC is set, which is
+    the grant the longitudinal half of the gate waits for. PQ is excluded because its safety hook
+    sets `acc_main_on` only under openpilot longitudinal control, and MLB never sets it.
     Toyota's `UNSUPPORTED_DSU` cars are excluded too: they read the cruise main switch out of
     `DSU_CRUISE` at 5 Hz, below panda's 10 Hz rx-check minimum, so the feature would be inert
     there by construction rather than by a runtime check that would fail on the road.
   - The decision to be half-engaged is fixed at construction, like the fork's other behavior
     toggles: the module reads its param once, and the panel row says a restart is needed.
   - No fresh permission is invented for the acceleration side. `controlsAllowed` keeps upstream's
-    meaning, so `CC.longActive` stays false and the car's own ACC owns speed until the driver sets
-    it — which is the whole point of "half".
+    meaning, so `CC.longActive` waits for the panda's own longitudinal grant and the car's own ACC
+    owns speed until the driver sets it — which is the whole point of "half".
 """
 
 from opendbc.car.structs import car
@@ -156,6 +163,45 @@ def moonpilot_engage_safety_param(CP, params: Params | None = None) -> None:
   if len(CP.safetyConfigs) != 1:
     return
   CP.safetyConfigs[0].safetyParam |= int(LATERAL_ENGAGE_FLAGS[CP.brand])
+
+
+class ActuatorGate:
+  """The panda's own grants, read back by the client that produced them.
+
+  A frame the safety layer rejects is silent to the sender: the car simply never receives the
+  message. So a half-engaged car has to command nothing the panda will refuse, and it otherwise
+  does two such things. Steering dies on the `desired_torque_last` reset in
+  `steer_torque_cmd_checks`, which blocks every later frame until the command comes home within
+  `MAX_RATE_UP` of zero — the car's lane-keeping ECU reads the resulting silence as a message
+  dropout. And an ACC_CONTROL at `controls_allowed == false` never reaches the PCM, which on an
+  openpilot-longitudinal Toyota has no other ACC stream and faults.
+
+  True — upstream's behavior — on every car the feature is not enabled for, which is what keeps a
+  stock config unchanged. Built once, at construction, like the fork's other behavior toggles.
+  """
+
+  def __init__(self, CP, params: Params | None = None) -> None:
+    params = params if params is not None else Params()
+    self._gated = enabled(LATERAL_ENGAGE, params) and _available(CP)
+
+  def lateral(self, panda_states) -> bool:
+    """Whether openpilot may command steering: the panda's lateral grant, once armed."""
+    return (not self._gated) or any(ps.controlsAllowedLateral for ps in panda_states)
+
+  def longitudinal(self, panda_states) -> bool:
+    """Whether openpilot may command acceleration: the panda's own longitudinal grant.
+
+    Which is stock ACC engagement, so a half-engaged car keeps sending ACC_CONTROL — at
+    ACCEL_CMD=0, the inactive value `longitudinal_accel_checks` accepts — and the PCM keeps its
+    stream and cannot fault. The driver's foot owns speed until they set ACC, and setting it is
+    what raises this grant and gives the normal, fully longitudinal engagement.
+    """
+    return (not self._gated) or any(ps.controlsAllowed for ps in panda_states)
+
+
+def moonpilot_actuator_gate(CP, params: Params | None = None) -> ActuatorGate:
+  """The seam's fork side for controlsd. Always an instance; an inert one when out of scope."""
+  return ActuatorGate(CP, params)
 
 
 def moonpilot_engage(CP, params: Params | None = None) -> 'LateralEngage':

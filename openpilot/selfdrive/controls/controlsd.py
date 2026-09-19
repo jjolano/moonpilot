@@ -24,6 +24,7 @@ from openpilot.selfdrive.locationd.helpers import PoseCalibrator, Pose
 from moonpilot.latcontrol import moonpilot_latcontrol  # moonpilot seam, see AGENTS.md
 from moonpilot.curvature import moonpilot_curvature  # moonpilot seam, see AGENTS.md
 from moonpilot.longcontrol import moonpilot_longcontrol  # moonpilot seam, see AGENTS.md
+from moonpilot.engage import moonpilot_actuator_gate  # moonpilot seam, see AGENTS.md
 
 State = log.SelfdriveState.OpenpilotState
 LaneChangeState = log.LaneChangeState
@@ -43,7 +44,9 @@ class Controls:
 
     self.sm = messaging.SubMaster(['lateralDelay', 'vehicleParameters', 'lateralTorqueParameters', 'modelV2', 'selfdriveState',
                                    'extrinsicsCalibration', 'deviceMotion', 'longitudinalPlan', 'lateralManeuverPlan', 'carState', 'carOutput',
-                                   'driverMonitoringState', 'onroadEvents', 'driverAssistance'], poll='selfdriveState')
+                                   'driverMonitoringState', 'onroadEvents', 'driverAssistance',
+                                   'pandaStates'],  # moonpilot seam, see AGENTS.md
+                                   poll='selfdriveState')
     self.pm = messaging.PubMaster(['carControl', 'controlsState'])
 
     self.steer_limited_by_safety = False
@@ -54,6 +57,7 @@ class Controls:
     self.calibrated_pose: Pose | None = None
 
     self.LoC = moonpilot_longcontrol(self.CP) or LongControl(self.CP)  # moonpilot seam, see AGENTS.md
+    self.moonpilot_gate = moonpilot_actuator_gate(self.CP)  # moonpilot seam, see AGENTS.md
     self.curvature_preview = moonpilot_curvature()  # moonpilot seam, see AGENTS.md
     self.VM = VehicleModel(self.CP)
     self.LaC: LatControl
@@ -102,8 +106,10 @@ class Controls:
     # Check which actuators can be enabled
     standstill = abs(CS.vEgo) <= max(self.CP.minSteerSpeed, 0.3) or CS.standstill
     CC.latActive = self.sm['selfdriveState'].active and not CS.steerFaultTemporary and not CS.steerFaultPermanent and \
-                   (not standstill or self.CP.steerAtStandstill)
-    CC.longActive = CC.enabled and not any(e.overrideLongitudinal for e in self.sm['onroadEvents']) and self.CP.openpilotLongitudinalControl
+                   (not standstill or self.CP.steerAtStandstill) and \
+                   self.moonpilot_gate.lateral(self.sm['pandaStates'])  # moonpilot seam, see AGENTS.md
+    CC.longActive = CC.enabled and not any(e.overrideLongitudinal for e in self.sm['onroadEvents']) and \
+                    self.CP.openpilotLongitudinalControl and self.moonpilot_gate.longitudinal(self.sm['pandaStates'])  # moonpilot seam, see AGENTS.md
 
     actuators = CC.actuators
     actuators.longControlState = self.LoC.long_control_state

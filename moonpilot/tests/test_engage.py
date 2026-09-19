@@ -19,8 +19,8 @@ from openpilot.selfdrive.selfdrived.events import ET, EVENTS, Events
 from openpilot.selfdrive.selfdrived.state import SOFT_DISABLE_TIME, StateMachine
 
 from moonpilot.features import LATERAL_ENGAGE, SLAM
-from moonpilot.engage import (LateralEngage, car_unavailable_reason, moonpilot_engage,
-                              moonpilot_engage_safety_param)
+from moonpilot.engage import (LateralEngage, car_unavailable_reason, moonpilot_actuator_gate,
+                              moonpilot_engage, moonpilot_engage_safety_param)
 
 ButtonType = car.CarState.ButtonEvent.Type
 EventName = log.OnroadEvent.EventName
@@ -152,6 +152,50 @@ class TestEngageScope(unittest.TestCase):
     for brand, flags in (('toyota', ToyotaFlags.TSS2), ('honda', 0), ('volkswagen', 0)):
       with self.subTest(brand=brand):
         self.assertTrue(moonpilot_engage(_cp(brand=brand, flags=flags), _params(on=True)).enabled)
+
+
+class TestActuatorGate(unittest.TestCase):
+  """The gate controlsd puts upstream's two actuator permissions through.
+
+  A frame the safety layer rejects is silent to the sender, so what this pins is the direction of
+  the failure: out of scope it must be upstream exactly, and in scope it must be the panda's word.
+  """
+
+  def test_inert_when_out_of_scope_or_off(self):
+    # Upstream's behavior for every car the feature is not enabled on: both permissions pass
+    # through whatever the panda says, including saying nothing at all.
+    for cp, params in (
+      (_cp(), _params(on=False)),
+      (_cp(brand='hyundai'), _params(on=True)),
+      (_cp(pcm_cruise=False), _params(on=True)),
+      (_cp(passive=True), _params(on=True)),
+      (_cp(flags=ToyotaFlags.UNSUPPORTED_DSU), _params(on=True)),
+      (_cp(brand='volkswagen', flags=VolkswagenFlags.PQ), _params(on=True)),
+    ):
+      gate = moonpilot_actuator_gate(cp, params)
+      for states in ([], [_ps()], [_ps(controls_allowed=True)], [_ps(controls_allowed_lateral=True)]):
+        self.assertTrue(gate.lateral(states), states)
+        self.assertTrue(gate.longitudinal(states), states)
+
+  def test_half_engaged_follows_the_panda(self):
+    gate = moonpilot_actuator_gate(_cp(), _params(on=True))
+
+    # The half-engaged panda: steering armed, nothing longitudinal. That is the state of a car the
+    # driver has switched on without setting ACC, and its speed stays the car's own ACC's business.
+    half = [_ps(controls_allowed=False, controls_allowed_lateral=True)]
+    self.assertTrue(gate.lateral(half))
+    self.assertFalse(gate.longitudinal(half))
+
+    # Setting ACC is what raises the panda's longitudinal grant, and with it the full engagement
+    full = [_ps(controls_allowed=True, controls_allowed_lateral=True)]
+    self.assertTrue(gate.lateral(full))
+    self.assertTrue(gate.longitudinal(full))
+
+    # Nothing granted, including a pandaState that has not arrived yet: openpilot commands nothing
+    # rather than something the panda would refuse
+    for states in ([], [_ps()]):
+      self.assertFalse(gate.lateral(states), states)
+      self.assertFalse(gate.longitudinal(states), states)
 
 
 class TestEngagePolicy(unittest.TestCase):
