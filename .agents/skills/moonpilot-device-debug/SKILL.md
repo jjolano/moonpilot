@@ -83,7 +83,11 @@ with car.CarParams.from_bytes(raw) as CP:
 ```
 
    `lat` other than `torque` rules out the fork steering controller; `opLong False` rules out the
-   fork longitudinal; lateral engagement additionally needs Toyota stock ACC with `PCM_CRUISE_2`.
+   fork longitudinal; lateral engagement additionally needs `pcmCruise` — the car's own ACC
+   owning speed — and not `passive`. It is not brand-limited any more: where a mode decodes no
+   cruise main switch the panda arms on openpilot's own engaged heartbeat, so a car outside
+   Toyota/Honda/Volkswagen is in scope and a missing `controlsAllowedLateral` there means the
+   heartbeat, not the car, is the thing to look at.
    AGENTS.md, **The lateral controller** and **Lateral-only engagement**, hold the exact ceilings.
    `safetyParam` is a bitfield: `0x1049` on this RAV4 is the Toyota TSS2 flag plus the fork's
    `LATERAL_ENGAGE` (`16 << 8`), so the fork's safety param is present on the car.

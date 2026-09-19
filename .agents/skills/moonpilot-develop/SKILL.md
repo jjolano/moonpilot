@@ -103,6 +103,21 @@ root, never from inside `panda/`.
   rendering is an eyeball check on the device screen.
 - **Control path** — the full `tools/op.sh test moonpilot`, then the device import block above plus
   `ssh moonpilot 'pgrep -af moonpilot'` to see the fork's processes by name.
+- **Safety layer or firmware (`opendbc_repo`, `panda`)** — the superproject's loop proves nothing
+  about either. The gate that matters most is `opendbc_repo`'s mutation run: it mutates the safety C
+  and fails if the suite leaves a mutant alive, so a new branch needs a test that dies with it. Then
+  the panda suite with the fork's opendbc on the path, and a build that proves the firmware links:
+
+  ```bash
+  (cd opendbc_repo && .venv/bin/python opendbc/safety/tests/mutation.py)   # ~35 s, 3133 mutants
+  PYTHONPATH=opendbc_repo panda/.venv/bin/python -m unittest discover -s panda/tests
+  tools/op.sh build
+  ```
+
+  `opendbc_repo/AGENTS.md` holds the suite and the coverage gate, and names both ways that gate lies
+  — `gcovr` needs a venv of its own and consumes the data it reads. Keep hunks in those two trees as
+  small as the superproject's: nothing checks them for reformatting, where
+  `test_upstream_touches.py` checks the superproject.
 - **Param or registry row** — after a manager start the key is seeded on disk:
   `ssh moonpilot 'ls /data/params/d/ | grep Moonpilot'`. Absent means the manager never saw the
   declaration, so every `return_default=True` read is running on the fallback.
