@@ -40,6 +40,25 @@ MOONPILOT_INPATH_GRID = np.arange(0.0, 4.0 + 1e-9, 0.25)
 MOONPILOT_LEAD_ACCEL_WINDOW = 7  # samples, 0.35 s at DT_MDL
 MOONPILOT_LEAD_ACCEL_MIN_SAMPLES = 3  # below this the slope is noise, so radard's value stands
 MOONPILOT_LEAD_SPEED_JUMP = 2.5  # m/s in one frame: re-association, not motion (50 m/s^3)
+# The onset window. The full window's bias is what a braking lead costs us: at a step onto -3.5 m/s^2
+# the seven-sample slope needs 0.20 s to pass -2.0 and 0.25 s to pass -3.0, because that is how long
+# the window is still half full of pre-onset samples — and a real brake ramps in over a few tenths, so
+# the lead's own onset is what the estimate is chasing. The newest three samples read the step in
+# 0.10 s. Reading both and believing the short one only when it is persistently deeper is one-sided by
+# construction (the policy only ever uses a_lead to add braking — `min(a_lead, 0.0)` in
+# `moonpilot/longitudinal.py`'s preview), and the streak is what keeps radar noise out of the command:
+# a single noisy frame cannot flip it, while an onset stays deep for many. Measured: on 51k settled
+# frames of the offline corpus (199 segments, the radar lead's own speed history) the estimate's error
+# against a centered reference is 0.188 -> 0.190 m/s^2 sd, and a spurious read past -1 m/s^2 goes
+# 0.19 % -> 0.21 % of frames — both inside a measurement whose radar vLead noise is 0.024-0.035 m/s,
+# so the design's own 0.05 m/s assumption is conservative. Closed loop
+# (`moonpilot/tests/test_longitudinal.py`), a lead braking at -3.5 m/s^2 from a settled follow: the
+# command reaches -1.0 m/s^2 at 0.15 s instead of 0.25, -2.0 at 0.30 instead of 0.35 and -3.0 at
+# 0.40 instead of 0.45 — and the arm with the lead's *true* accel instead of any estimate reaches
+# -1.0 at the same 0.15 s, so this closes the sensing side of that onset rather than chipping at it.
+MOONPILOT_LEAD_ACCEL_FAST = 3  # samples in the onset window, 0.10 s at DT_MDL
+MOONPILOT_LEAD_ACCEL_FAST_MARGIN = 1.0  # m/s^2 the onset window must read deeper than the full one
+MOONPILOT_LEAD_ACCEL_FAST_STREAK = 2  # consecutive frames the margin must hold before it is used
 # radard's accel-decay model, mirrored rather than imported: `radard.py` pulls messaging and opendbc,
 # and this module is on plannerd's and both renderers' import path. `MOONPILOT_LEAD_ACCEL_TAU` is
 # pinned to radard's own constant by test_lead; the two below copy inline literals there
@@ -75,7 +94,10 @@ class LeadAccelEstimator:
   braking lead gives us. The least-squares slope over MOONPILOT_LEAD_ACCEL_WINDOW samples has no lag
   of its own — a clean ramp reads exactly as soon as MOONPILOT_LEAD_ACCEL_MIN_SAMPLES are on it,
   0.10 s — so the only latency it carries is the ramp onto a window that already holds samples from
-  before the step: 0.30 s at the full window. It averages measurement noise rather than lagging it:
+  before the step: 0.30 s at the full window. The onset window is what shortens that: the newest
+  MOONPILOT_LEAD_ACCEL_FAST samples are read beside the full window and believed only when they are
+  persistently deeper, which reaches -2.0 m/s^2 in 0.10 s on a step where the full window needs
+  0.20 s, and -3.0 in 0.10 s where it needs 0.25. It averages measurement noise rather than lagging it:
   0.19 m/s^2 of jitter over the window for 0.05 m/s of noise, against 1.41 m/s^2 for a one-frame
   difference. The lead's *speed* is left alone — `vLead` has no filter lag to remove, and this
   fit's endpoint value would add a transient bias exactly at the onset of braking.
@@ -106,6 +128,7 @@ class LeadAccelEstimator:
   def __init__(self, dt: float = DT_MDL, window: int = MOONPILOT_LEAD_ACCEL_WINDOW):
     self._samples: deque[float] = deque(maxlen=window)
     self._track: tuple[bool, bool, int] | None = None
+    self._fast_streak = 0
     self._tau = FirstOrderFilter(MOONPILOT_LEAD_ACCEL_TAU, MOONPILOT_LEAD_ACCEL_TAU_RC, dt)
     self.a_lead_tau = MOONPILOT_LEAD_ACCEL_TAU
     # slope = sum(w_i * v_i) for a uniform grid: w_i = 12 (i - (n-1)/2) / (dt n (n^2 - 1)).
@@ -116,6 +139,7 @@ class LeadAccelEstimator:
     v_lead = float(lead.vLead)
     if track != self._track or (self._samples and abs(v_lead - self._samples[-1]) > MOONPILOT_LEAD_SPEED_JUMP):
       self._samples.clear()
+      self._fast_streak = 0
       # A new lead's decay is new too: radard builds a fresh `Track` — and a fresh filter — for a new
       # `radarTrackId`, so carrying the old track's value over would tell the rollout that this lead's
       # accel holds for a length the previous lead earned.
@@ -130,7 +154,16 @@ class LeadAccelEstimator:
       return float(lead.aLeadK), float(lead.aLeadTau)
 
     n = len(self._samples)
-    a_lead = float(self._weights[n] @ np.fromiter(self._samples, float, n))
+    samples = np.fromiter(self._samples, float, n)
+    a_lead = float(self._weights[n] @ samples)
+    # The onset window, one-sided: it may only deepen the estimate, never lift it, because deeper is
+    # the direction the policy's preview and floor already treat as more braking. The streak is the
+    # noise gate — a real onset holds it for many frames, a noisy one cannot hold it at all.
+    if n >= MOONPILOT_LEAD_ACCEL_FAST:
+      a_fast = float(self._weights[MOONPILOT_LEAD_ACCEL_FAST] @ samples[-MOONPILOT_LEAD_ACCEL_FAST:])
+      self._fast_streak = self._fast_streak + 1 if a_fast < a_lead - MOONPILOT_LEAD_ACCEL_FAST_MARGIN else 0
+      if self._fast_streak >= MOONPILOT_LEAD_ACCEL_FAST_STREAK:
+        a_lead = min(a_lead, a_fast)
     if abs(a_lead) < MOONPILOT_LEAD_ACCEL_TAU_RESET:
       # `radard.py:77` re-arms the filter's own state here, not just the value it reports, and that
       # is what lets the *next* onset decay from the long tau. Assigning only `a_lead_tau` leaves

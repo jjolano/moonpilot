@@ -763,9 +763,12 @@ class TestPlanner(unittest.TestCase):
     """The observable statement of the estimator, closed-loop: the lead's speed history alone — every
     frame carries `a_lead=0.0` — has to bring the braking into the command.
 
-    Measured 0.30 s to -1.0 m/s^2 and 0.45 s to -2.0 m/s^2 on this loop's clock, against 0.60 s and
+    Measured 0.15 s to -1.0 m/s^2 and 0.30 s to -2.0 m/s^2 on this loop's clock, against 0.60 s and
     1.50 s for the same planner reading `aLeadK` directly (which is a revert's shape here, since
-    every `_lead` carries `a_lead=0.0`); the bounds sit between the two, not on the measurement.
+    every `_lead` carries `a_lead=0.0`); the bounds sit between the arms, not on the measurement.
+    The onset window in `moonpilot/lead.py` took a frame off the front of that: with it the command
+    reaches -0.5 m/s^2 at 0.10 s, -1.0 at 0.15 and -2.0 at 0.30, and without it 0.20 / 0.25 / 0.35 —
+    so the bounds below separate the two, and reverting the window fails them at -1.0.
 
     The numbers are the kinematic law's own, one frame later — and that is worth knowing, because the
     bare TTC approach term cost this test 0.45 s / 1.40 s: it keys off the closing rate, which only
@@ -785,16 +788,19 @@ class TestPlanner(unittest.TestCase):
         since_onset = DT_MDL if since_onset is None else since_onset + DT_MDL
       planner.update(_inputs(v_ego=v_ego, v_cruise_kph=108.0, lead=_lead(gap, v_lead, model_prob=0.95), standstill=v_ego < 0.1))
       if since_onset is not None:
-        for threshold in (-1.0, -2.0):
+        for threshold in (-0.5, -1.0, -2.0):
           if threshold not in reached and planner.output_a_target <= threshold:
             reached[threshold] = since_onset
       v_ego = max(0.0, v_ego + planner.output_a_target * DT_MDL)
       gap = max(0.0, gap - (v_ego - v_lead) * DT_MDL)
     self.assertTrue(-1.0 in reached)
     self.assertTrue(-2.0 in reached)
-    # between the arms with margin on both sides. The old 1.50 bound is exactly the revert arm's own
-    # value now that the floor restored the fast onset, so it had stopped separating them at all.
-    self.assertLessEqual(reached[-1.0], 0.40)
+    # Between the arms with margin on both sides, and the -2.0 bound is the coarse one: the old 1.50
+    # is exactly the revert arm's own value now that the floor restored the fast onset, so it had
+    # stopped separating anything at all.
+    self.assertLessEqual(reached[-0.5], 0.15)
+    self.assertLessEqual(reached[-1.0], 0.20)
+    self.assertLessEqual(reached[-2.0], 1.00)
     self.assertLessEqual(reached[-2.0], 1.00)
 
   def test_a_stale_lead_is_planned_as_if_it_were_fresh(self):

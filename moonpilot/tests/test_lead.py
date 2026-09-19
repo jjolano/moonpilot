@@ -1,3 +1,4 @@
+import contextlib
 import unittest
 from typing import cast
 from unittest import mock
@@ -19,6 +20,7 @@ from moonpilot.lead import (
   MOONPILOT_INPATH_GRID,
   MOONPILOT_INPATH_RC,
   MOONPILOT_LEAD_ACCEL_MIN_SAMPLES,
+  MOONPILOT_LEAD_ACCEL_FAST_STREAK,
   MOONPILOT_LEAD_ACCEL_TAU,
   MOONPILOT_LEAD_ACCEL_WINDOW,
   MOONPILOT_LEAD_SPEED_JUMP,
@@ -165,6 +167,72 @@ class TestLeadAccelEstimator(unittest.TestCase):
     is at -0.12 m/s^2 on that same frame and needs 1.2 s to reach 90 % of it."""
     self.assertAlmostEqual(self._accel(LeadAccelEstimator(), frames=MOONPILOT_LEAD_ACCEL_WINDOW), -3.0, delta=0.01)
     self.assertLess(self._accel(LeadAccelEstimator(), frames=MOONPILOT_LEAD_ACCEL_MIN_SAMPLES), -2.0)
+
+  @staticmethod
+  def _step_times(bare_window=False):
+    """Settled follow, then a step onto -3.5 m/s^2 at frame 0 of the second loop. Times are measured
+    from that frame; `bare_window` is the same estimator with the onset window made inert, which is
+    the arm this change is measured against."""
+    patch = mock.patch("moonpilot.lead.MOONPILOT_LEAD_ACCEL_FAST_STREAK", 10**9) if bare_window else contextlib.nullcontext()
+    hit = {}
+    with patch:
+      estimator = LeadAccelEstimator()
+      for _ in range(30):  # 1.5 s settled, so the full window is full of pre-onset samples
+        estimator.update(FusedLead(35.0, 0.0, v_lead=20.0, radar=True))
+      for k in range(15):
+        a_lead, _ = estimator.update(FusedLead(35.0, 0.0, v_lead=20.0 - 3.5 * k * DT_MDL, radar=True))
+        for threshold in (-2.0, -3.0):
+          if threshold not in hit and a_lead <= threshold:
+            hit[threshold] = k * DT_MDL
+    return hit
+
+  def test_the_onset_window_reads_a_brake_before_the_full_window_does(self):
+    """The bias the onset window exists for: after a step the seven-sample slope is still half
+    pre-onset samples, so it needs 0.20 s to pass -2.0 m/s^2 and 0.25 s to pass -3.0, where the
+    newest three samples have it in 0.10 s. Both arms are asserted, so a change that made the bare
+    window slower would fail here too — and the closed-loop consequence of this estimator difference
+    is pinned in test_longitudinal's braking-lead test."""
+    with_window = self._step_times()
+    bare = self._step_times(bare_window=True)
+
+    self.assertLessEqual(with_window[-2.0], 0.10)
+    self.assertLessEqual(with_window[-3.0], 0.10)
+    self.assertLessEqual(bare[-2.0], 0.20)
+    self.assertLessEqual(bare[-3.0], 0.25)
+    for threshold in (-2.0, -3.0):
+      self.assertLess(with_window[threshold], bare[threshold], f"the onset window did not beat the bare window at {threshold}")
+
+  def test_the_onset_window_can_only_deepen_the_estimate(self):
+    """The property the policy rests on. `moonpilot/longitudinal.py` only ever uses `a_lead` to add
+    braking (`min(a_lead, 0.0)` in the preview, and the floor/TTC terms key off the resulting closing
+    rate), so a deeper estimate is more braking and a shallower one is less — which makes "may only
+    deepen" the direction that cannot cost safety. It is also rare on a signal with no real onset:
+    11 of 600 frames of a 0.05 m/s random walk, the deepest of them 1.67 m/s^2.
+    """
+    rng = np.random.default_rng(0)
+    v = 20.0 + np.cumsum(rng.normal(0.0, 0.05, 600))
+    series = []
+    for streak in (MOONPILOT_LEAD_ACCEL_FAST_STREAK, 10**9):
+      estimator = LeadAccelEstimator()
+      with mock.patch("moonpilot.lead.MOONPILOT_LEAD_ACCEL_FAST_STREAK", streak):
+        series.append(np.array([estimator.update(FusedLead(35.0, 0.0, v_lead=float(x), radar=True))[0] for x in v]))
+
+    self.assertFalse(bool((series[0] > series[1] + 1e-12).any()), "the onset window lifted the estimate")
+    self.assertLess(float((series[0] < series[1] - 1e-12).mean()), 0.05)
+
+  def test_a_lone_deep_frame_is_not_an_onset(self):
+    """The shape the streak gate is for: one frame of radar noise — 0.5 m/s at 20 m/s, a -10 m/s^2
+    spike in the newest sample — must leave the estimate exactly where the bare window leaves it.
+    The next frame's short window reads the recovery, so the streak never reaches two."""
+    v = np.array([20.0] * 20 + [19.5] + [20.0] * 20)
+    series = []
+    for streak in (MOONPILOT_LEAD_ACCEL_FAST_STREAK, 10**9):
+      estimator = LeadAccelEstimator()
+      with mock.patch("moonpilot.lead.MOONPILOT_LEAD_ACCEL_FAST_STREAK", streak):
+        series.append(np.array([estimator.update(FusedLead(35.0, 0.0, v_lead=float(x), radar=True))[0] for x in v]))
+
+    np.testing.assert_array_equal(series[0], series[1])
+
 
   def test_noise_is_averaged_not_amplified(self):
     """0.05 m/s of measurement noise on a steady follower: bounded, and far below the jerk limits.
