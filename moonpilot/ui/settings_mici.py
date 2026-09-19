@@ -17,10 +17,22 @@ from openpilot.system.ui.widgets.scroller import NavScroller
 def _feature_button(feature: Feature):
   button = BigParamControl(feature.title, feature.key, description=feature.description)
   # Both gates, the same pair the tizi panel resolves per render: a missing dependency and the
-  # car itself. The value line only ever shows one of them (`_update_rows`).
-  button.set_enabled(lambda f=feature: available(f) and car_unavailable_reason(f, ui_state.CP) is None
-                     and (not f.offroad_only or ui_state.is_offroad()))
+  # car itself. The value line only ever shows one of them (`_unavailable_value`).
+  button.set_enabled(lambda f=feature: available(f) and car_unavailable_reason(f, ui_state.CP) is None and (not f.offroad_only or ui_state.is_offroad()))
   return button
+
+
+def _unavailable_value(feature: Feature) -> str:
+  """The value line for the row: the reason it cannot run, or empty while it can.
+
+  mici swallows a disabled widget's long press, so the description dialog carrying the reason
+  is unreachable and the reason has to ride the always-visible sub-label. The car's own reason
+  where there is one, the dependency placeholder otherwise, and nothing at all when the row is
+  live.
+  """
+  if reason := car_unavailable_reason(feature, ui_state.CP):
+    return reason
+  return "" if available(feature) else "unavailable"
 
 
 class MoonpilotLayoutMici(NavScroller):
@@ -28,6 +40,7 @@ class MoonpilotLayoutMici(NavScroller):
     super().__init__()
     self._params = ui_state.params
     self._rows = tuple((feature, _feature_button(feature)) for feature in FEATURES)
+    self._cp = ui_state.CP
 
     # The tailscale row carries its state in the value line rather than a second toggle: it is a
     # status readout whose only interaction is opening the sign-in dialog.
@@ -51,6 +64,12 @@ class MoonpilotLayoutMici(NavScroller):
     # mici's values are pushed, not callable-resolved, so the state needs re-reading every frame.
     self._tailscale.set_value(tailscale.status_text(self._params)[0])
     offroad_mode_mici.refresh(self._offroad, self._params)
+    # The car gate the value line carries is pushed too, and it can change under the panel: driven
+    # off a different object rather than re-reading nine params every frame, because `ui_state`
+    # re-parses CarParams on its own parameter thread and a new object is what that looks like.
+    if ui_state.CP is not self._cp:
+      self._cp = ui_state.CP
+      self._update_rows()
 
   def _show_tailscale(self):
     # A QR while there is something to scan; otherwise the state detail, which does not fit the
@@ -65,9 +84,7 @@ class MoonpilotLayoutMici(NavScroller):
   def _update_rows(self):
     # set_value is not callable-resolved, unlike set_enabled, so it needs pushing here.
     for feature, button in self._rows:
-      # An unavailable widget here cannot open its long-press dialog, so the reason has to ride the
-      # value line: the car's own reason where there is one, and the dependency placeholder otherwise.
-      button.set_value(car_unavailable_reason(feature, ui_state.CP) or "unavailable")
+      button.set_value(_unavailable_value(feature))
       # BigParamControl reads get_bool, which ignores the declared default, so set the pill
       # from the driver's preference the way the feature itself reads it.
       button.set_checked(wanted(feature, self._params))

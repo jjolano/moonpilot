@@ -13,9 +13,12 @@ What the module does at runtime:
     brand's safety-param flag (`LATERAL_ENGAGE_FLAGS`) that turns the panda rule on for this car.
     Only a car in scope reaches it (see `_available`), so every other car's `CarParams` is
     upstream's byte for byte.
-  - `car_unavailable_reason`, which is the panel's half of `_available`: why a driver cannot use
-    this feature on this car, or `None`. The settings rows are disabled with it, so a car that can
-    never be half-engaged says so instead of reading as on and doing nothing.
+  - `car_unavailable_reason`, what both settings panels ask: why a driver cannot use a feature on
+    this car, or `None`. For `LATERAL_ENGAGE` that is the panel's half of `_available` — the same
+    `_unsupported_reason` the gate itself reads — so a car that can never be half-engaged says so
+    instead of reading as on and doing nothing. `TORQUE_LATERAL` and `LONGITUDINAL` have one too,
+    panel-facing only: each names a car whose controlsd branch the fork's seam is not in, so the
+    feature is inert rather than gated, and nothing but the row's reason changes.
   - `moonpilot_actuator_gate`, built once by controlsd: the panda's two grants, read back by the
     client that produced them. A frame the safety layer rejects is silent to the sender, so a
     half-engaged car has to command nothing the panda will refuse — see `ActuatorGate`.
@@ -69,7 +72,7 @@ from openpilot.cereal import log
 from openpilot.common.params import Params
 from openpilot.selfdrive.selfdrived.events import ET
 
-from moonpilot.features import LATERAL_ENGAGE, Feature, enabled
+from moonpilot.features import LATERAL_ENGAGE, LONGITUDINAL, TORQUE_LATERAL, Feature, enabled
 
 ButtonType = car.CarState.ButtonEvent.Type
 EventName = log.OnroadEvent.EventName
@@ -121,8 +124,8 @@ def _unsupported_reason(CP) -> str | None:
   dashcam-mode car would still have the flag ORed into a config that never reads it.
   """
   if CP is None:
-    # The panel's boot case: CarParams is not loaded yet, so say nothing rather than claim the car
-    # cannot do it. `_available` is only ever reached with the real thing, from card and selfdrived.
+    # CarParams is not loaded yet, which is not a verdict on the car: no reason. The panel hoists
+    # this itself; `_available` only ever sees the real thing, from card and selfdrived.
     return None
   if CP.brand not in LATERAL_ENGAGE_FLAGS:
     return "Toyota, Lexus, Honda or Volkswagen only"
@@ -145,16 +148,39 @@ def _available(CP) -> bool:
   return _unsupported_reason(CP) is None
 
 
+def _torque_steered(CP) -> bool:
+  """Whether controlsd picks the branch the fork's torque controller seam sits in.
+
+  The whole dispatch, not `lateralTuning` alone: `steerControlType` is tested first, so an
+  angle- or curvature-steered car never reaches the torque branch however its tuning reads
+  (openpilot/selfdrive/controls/controlsd.py:64-71).
+  """
+  return (CP.steerControlType not in (car.CarParams.SteerControlType.angle, car.CarParams.SteerControlType.curvature)
+          and CP.lateralTuning.which() == 'torque')
+
+
 def car_unavailable_reason(feature: Feature, CP) -> str | None:
   """Why a driver cannot use this feature on this car, or `None`. What the settings panels ask.
 
   The dependency gate in `moonpilot/features.py` cannot see CarParams, so a feature with a car
   requirement needs a second gate; this is it, and it lives here with the requirement itself rather
   than as a per-feature branch inside both panel files. `ui_state.CP` is None until carParams
-  arrives offroad, which `_unsupported_reason` reads as "say nothing".
+  arrives offroad, which reads as "say nothing".
+
+  Three features have a reason, and only the first of them is a safety gate. `LATERAL_ENGAGE`'s is
+  the same `_unsupported_reason(CP)` `_available` reads, so the row and the behavior cannot
+  disagree. `TORQUE_LATERAL`'s and `LONGITUDINAL`'s are panel-facing only — nothing gates behavior
+  on them — because a car outside their seam's dispatch is a car the seam never runs on: the
+  feature is inert there, not gated.
   """
+  if CP is None:
+    return None
   if feature is LATERAL_ENGAGE:
     return _unsupported_reason(CP)
+  if feature is TORQUE_LATERAL and not _torque_steered(CP):
+    return "torque-steered cars only"
+  if feature is LONGITUDINAL and not CP.openpilotLongitudinalControl:
+    return "openpilot-longitudinal cars only"
   return None
 
 

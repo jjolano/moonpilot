@@ -18,7 +18,7 @@ from openpilot.common.realtime import DT_CTRL
 from openpilot.selfdrive.selfdrived.events import ET, EVENTS, Events
 from openpilot.selfdrive.selfdrived.state import SOFT_DISABLE_TIME, StateMachine
 
-from moonpilot.features import LATERAL_ENGAGE, SLAM
+from moonpilot.features import LATERAL_ENGAGE, LONGITUDINAL, SLAM, TORQUE_LATERAL
 from moonpilot.engage import (LateralEngage, car_unavailable_reason, moonpilot_actuator_gate,
                               moonpilot_engage, moonpilot_engage_safety_param)
 
@@ -41,13 +41,18 @@ def _params(on=True) -> Params:
   return cast(Params, FakeParams(on))
 
 
-def _cp(brand='toyota', pcm_cruise=True, flags=0, safety_param=73, safety_configs=1, passive=False):
+def _cp(brand='toyota', pcm_cruise=True, flags=0, safety_param=73, safety_configs=1, passive=False,
+        lateral_tuning='pid', steer_control_type=None, openpilot_longitudinal=False):
   """A real CarParams message, so the safety-param write is the one card actually does."""
   cp = car.CarParams.new_message()
   cp.brand = brand
   cp.pcmCruise = pcm_cruise
   cp.passive = passive
   cp.flags = int(flags)
+  cp.lateralTuning.init(lateral_tuning)
+  cp.steerControlType = (car.CarParams.SteerControlType.torque if steer_control_type is None
+                         else steer_control_type)
+  cp.openpilotLongitudinalControl = openpilot_longitudinal
   configs = cp.init('safetyConfigs', safety_configs)
   for c in configs:
     c.safetyParam = safety_param
@@ -495,12 +500,35 @@ class TestCarGate(unittest.TestCase):
       self.assertEqual(car_unavailable_reason(LATERAL_ENGAGE, cp) is None,
                        moonpilot_engage(cp, _params(on=True)).enabled)
 
+  def test_torque_steered_cars_have_no_reason(self):
+    # The branch, not the brand: `TORQUE_LATERAL`'s seam has no brand list, unlike `LATERAL_ENGAGE`'s.
+    for cp in (_cp(lateral_tuning='torque'), _cp(brand='hyundai', lateral_tuning='torque')):
+      self.assertIsNone(car_unavailable_reason(TORQUE_LATERAL, cp))
+
+  def test_cars_off_the_torque_branch_say_why(self):
+    self.assertEqual(car_unavailable_reason(TORQUE_LATERAL, _cp(lateral_tuning='pid')),
+                     "torque-steered cars only")
+    # The case a `lateralTuning`-only check gets wrong: controlsd tests `steerControlType` first
+    # (`controlsd.py:64-71`), so these never reach the torque branch however their tuning reads.
+    for steer_control_type in (car.CarParams.SteerControlType.angle, car.CarParams.SteerControlType.curvature):
+      with self.subTest(steer_control_type=steer_control_type):
+        self.assertEqual(car_unavailable_reason(TORQUE_LATERAL,
+                                                _cp(lateral_tuning='torque', steer_control_type=steer_control_type)),
+                         "torque-steered cars only")
+
+  def test_longitudinal_needs_openpilot_longitudinal_control(self):
+    self.assertIsNone(car_unavailable_reason(LONGITUDINAL, _cp(openpilot_longitudinal=True)))
+    self.assertEqual(car_unavailable_reason(LONGITUDINAL, _cp(openpilot_longitudinal=False)),
+                     "openpilot-longitudinal cars only")
+
   def test_features_without_a_car_requirement_are_unaffected(self):
     self.assertIsNone(car_unavailable_reason(SLAM, _cp(brand='hyundai')))
 
   def test_no_carparams_yet_is_not_a_reason(self):
     """The panel renders before carParams lands, and an unloaded CP is not a verdict on the car."""
-    self.assertIsNone(car_unavailable_reason(LATERAL_ENGAGE, None))
+    for feature in (LATERAL_ENGAGE, TORQUE_LATERAL, LONGITUDINAL):
+      with self.subTest(feature=feature.key):
+        self.assertIsNone(car_unavailable_reason(feature, None))
 
 
 class TestHalfEngagementBanner(unittest.TestCase):

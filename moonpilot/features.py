@@ -17,7 +17,7 @@ class Feature:
 LEAD_LATERAL = Feature(
   key="MoonpilotLeadLateral",
   title="lead lateral prediction",
-  description="Relax the lead following constraint for a lead predicted to leave your path. Takes effect after a restart.",
+  description="Relax the lead following constraint for a lead predicted to leave your path. Applies immediately.",
   offroad_only=True,
 )
 
