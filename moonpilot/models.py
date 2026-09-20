@@ -1009,16 +1009,18 @@ def restart_pending(params: Any, kind: str) -> bool:
 BUNDLED_LABEL = "stock"
 RESTART_NOTE = "(restart to apply)"
 TITLE_MODELS = "models"
+TITLE_CURRENT_MODEL = "current model"
+DESCRIPTION_CURRENT_MODEL = "Select the model used for driving. Driver monitoring uses a separate model."
 TITLE_BROWSE = "model marketplace"
 TITLE_INSTALLED = "downloaded models"
 TITLE_STORAGE = "storage"
 TITLE_DRIVING = "driving model"
 TITLE_MONITORING = "driver monitoring"
 TITLE_REFRESH = "refresh catalog"
-DESCRIPTION_MODELS = "Choose the model used for driving and the separate model used to watch the \
+DESCRIPTION_MODELS = "Choose the model used for driving and the separate model used to watch \
 driver. Driving models can change steering and slowing; monitoring models only watch attention."
-DESCRIPTION_BROWSE = "Models available to download. Install one, then select it from driving model or driver monitoring and restart to use it."
-DESCRIPTION_INSTALLED = "Downloaded models on this device. Select one from driving model or driver monitoring; remove or rebuild it here."
+DESCRIPTION_BROWSE = "Models available to install. Choose one from the model chooser after it is built."
+DESCRIPTION_INSTALLED = "Models installed on this device. Manage or remove packages here."
 DESCRIPTION_STORAGE = "Space the model store uses on the data partition. Installing needs room for \
 the package, the digest cache and the build."
 DESCRIPTION_REFRESH = "Fetch the catalog again. Needs a network; a failed refresh keeps the copy \
@@ -1058,7 +1060,7 @@ LABEL_OPEN = "OPEN"
 BROWSE_EMPTY = "no catalog yet"
 BROWSE_NONE = "nothing matches"
 BROWSE_STALE = "refresh the catalog first"
-INSTALL_TEXT = "Download and build this model. Then select it from driving model or driver monitoring and restart to use it."
+INSTALL_TEXT = "Download and build this model. Then choose it from the model chooser and restart to use it."
 # The protocol ids are precise and unreadable; these are what a driver picks between.
 PROTOCOL_LABELS = {
   "comma.supercombo.v1": "supercombo",
@@ -1270,6 +1272,33 @@ def browse() -> dict:
     "generated_at": str(document.get("generated_at", "")),
     "entries": [e for e in document["entries"] if isinstance(e, dict)],
   }
+
+
+def chooser_entries(params: Any, kind: str) -> list[dict | None]:
+  """Stock, built installed entries, then admitted catalog entries for one model kind."""
+  installed = status(params)["installed"]
+  installed_recipes = {selection_of(entry) for entry in installed}
+  entries: list[dict | None] = [None]
+  seen = set()
+  for entry in installed:
+    recipe = selection_of(entry)
+    if recipe in seen or entry.get("kind") != kind or entry.get("state") != "built":
+      continue
+    seen.add(recipe)
+    entries.append(entry)
+  for entry in browse().get("entries", []):
+    recipe = selection_of(entry)
+    if (
+      not recipe
+      or recipe in installed_recipes
+      or recipe in seen
+      or entry.get("kind") != kind
+      or not entry.get("admitted")
+    ):
+      continue
+    seen.add(recipe)
+    entries.append(entry)
+  return entries
 
 
 def entry_action(entry: dict, installed_selections: Collection[str]) -> str:

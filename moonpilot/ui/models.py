@@ -150,9 +150,9 @@ class ModelsLayout(Page):
     super().__init__(
       [
         submenu_item(
-          models.TITLE_DRIVING,
+          models.TITLE_CURRENT_MODEL,
           lambda: models.model_label(self._params, models.DRIVING),
-          lambda: models.model_description(self._params, models.DRIVING),
+          models.DESCRIPTION_CURRENT_MODEL,
           lambda: self._open_page(ChooserLayout(self._params, models.DRIVING, self._back)),
         ),
         submenu_item(
@@ -338,20 +338,23 @@ class InstalledLayout(Page):
 
 
 class ChooserLayout(Page):
-  """One kind-filtered chooser: stock plus built downloaded models."""
+  """One kind-filtered chooser: stock, built models and admitted catalog models."""
 
   def __init__(self, params: Params, kind: str, back: Callable):
     self._params = params
     self._kind = kind
+    self._back = back
+    self._choices_cache = models.chooser_entries(self._params, self._kind)
+    choices = self._choices_cache
     rows = [
       button_item(
         lambda index=index: self._name(index),
         lambda index=index: self._action(index),
         description=lambda index=index: self._detail(index),
         callback=lambda index=index: self._select(index),
-        enabled=_offroad,
+        enabled=lambda index=index: self._row_enabled(index),
       )
-      for index in range(INSTALLED_ROWS + 1)
+      for index in range(len(choices))
     ]
     self._rows = rows
     for index, row in enumerate(rows):
@@ -359,18 +362,21 @@ class ChooserLayout(Page):
     super().__init__(rows, models.TITLE_DRIVING if kind == models.DRIVING else models.TITLE_MONITORING, models.DESCRIPTION_MODELS, back)
 
   def _choices(self) -> list[dict | None]:
-    built = [entry for entry in models.status(self._params)["installed"] if entry.get("kind") == self._kind and entry.get("state") == "built"]
-    return [None, *built]
+    return self._choices_cache
 
   def _choice(self, index: int) -> dict | None | object:
-    choices = self._choices()
-    return choices[index] if index < len(choices) else _INVALID
+    return self._choices_cache[index] if index < len(self._choices_cache) else _INVALID
+
+  def _catalog_only(self, index: int) -> bool:
+    choice = self._choice(index)
+    return isinstance(choice, dict) and choice.get("state") != "built"
+
+  def _row_enabled(self, index: int) -> bool:
+    return _offroad() if not self._catalog_only(index) else True
 
   def _selection(self, index: int) -> str:
     choice = self._choice(index)
-    if choice is None or choice is _INVALID:
-      return ""
-    return models.selection_of(cast(dict, choice))
+    return "" if choice is None or choice is _INVALID else models.selection_of(cast(dict, choice))
 
   def _name(self, index: int) -> str:
     choice = self._choice(index)
@@ -382,18 +388,33 @@ class ChooserLayout(Page):
     choice = self._choice(index)
     if choice is _INVALID:
       return ""
-    return models.model_description(self._params, self._kind) if choice is None else models.installed_detail(cast(dict, choice))
+    if choice is None:
+      return models.model_description(self._params, self._kind)
+    return models.installed_detail(cast(dict, choice)) if choice.get("state") == "built" else models.entry_detail(cast(dict, choice))
 
   def _action(self, index: int) -> str:
+    if self._catalog_only(index):
+      return models.LABEL_INSTALL
     return models.REASON_SELECTED if self._selection(index) == models.desired(self._params, self._kind) else models.LABEL_SELECT
 
   def _select(self, index: int) -> None:
-    if not _offroad() or self._choice(index) is _INVALID:
+    choice = self._choice(index)
+    if choice is _INVALID:
+      return
+    if self._catalog_only(index):
+      selection = models.selection_of(cast(dict, choice))
+      _confirm(models.INSTALL_TEXT, models.LABEL_INSTALL, lambda: self._install(selection))
+      return
+    if not _offroad():
       return
     selection = self._selection(index)
     if selection == models.desired(self._params, self._kind):
       return
     _confirm(models.CONFIRM_SELECT, models.LABEL_SELECT, lambda: models.select(self._params, self._kind, selection))
+
+  def _install(self, selection: str) -> None:
+    models.request(self._params, "install", selection)
+    self._back()
 
 
 def row(params: Params, open_page: Callable, back: Callable) -> ListItem:

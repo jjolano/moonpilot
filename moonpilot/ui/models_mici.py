@@ -97,9 +97,9 @@ class ModelsPage(Page):
   def __init__(self, params: Params, open_page: Callable, back: Callable):
     self._params = params
     self._open_page = open_page
-    self._driving = submenu_button(models.TITLE_DRIVING, description=models.DESCRIPTION_MODELS)
-    self._driving.set_click_callback(lambda: open_page(ChooserPage(params, models.DRIVING, back)))
-    self._monitoring = submenu_button(models.TITLE_MONITORING, description=models.DESCRIPTION_MODELS)
+    self._current = submenu_button(models.TITLE_CURRENT_MODEL, description=models.DESCRIPTION_CURRENT_MODEL)
+    self._current.set_click_callback(lambda: open_page(ChooserPage(params, models.DRIVING, back)))
+    self._monitoring = submenu_button(models.TITLE_MONITORING, description=models.model_description(params, models.MONITORING))
     self._monitoring.set_click_callback(lambda: open_page(ChooserPage(params, models.MONITORING, back)))
     self._job = _JobCard(params)
     self._cancel = BigButton(models.LABEL_CANCEL, models.LABEL_CANCEL, description=models.DESCRIPTION_CANCEL)
@@ -114,7 +114,7 @@ class ModelsPage(Page):
     self._storage = BigButton(models.TITLE_STORAGE, description=models.DESCRIPTION_STORAGE)
     self._storage.set_click_callback(lambda: _describe(models.TITLE_STORAGE, models.DESCRIPTION_STORAGE))
     super().__init__(
-      [self._driving, self._monitoring, self._browse, self._installed, self._job, self._cancel, self._reboot, self._storage],
+      [self._current, self._monitoring, self._browse, self._installed, self._job, self._cancel, self._reboot, self._storage],
       models.TITLE_MODELS,
       models.DESCRIPTION_MODELS,
       back,
@@ -135,7 +135,7 @@ class ModelsPage(Page):
 
   def _update_rows(self):
     status = models.status(self._params)
-    self._driving.set_value(models.model_label(self._params, models.DRIVING))
+    self._current.set_value(models.model_label(self._params, models.DRIVING))
     self._monitoring.set_value(models.model_label(self._params, models.MONITORING))
     self._job.set_text(models.job_text(status["job"]) or "job")
     self._job.set_enabled(status["job"] is not None)
@@ -290,19 +290,22 @@ class InstalledPage(Page):
 
 
 class ChooserPage(Page):
-  """One kind-filtered chooser: stock plus built downloaded models."""
+  """One kind-filtered chooser: stock, built models, and admitted catalog models."""
 
   def __init__(self, params: Params, kind: str, back: Callable):
     self._params = params
     self._kind = kind
-    self._rows = [BigButton("") for _ in range(INSTALLED_ROWS + 1)]
-    for index, row in enumerate(self._rows):
-      row.set_click_callback(lambda index=index: self._select(index))
-    super().__init__(self._rows, models.TITLE_DRIVING if kind == models.DRIVING else models.TITLE_MONITORING, models.DESCRIPTION_MODELS, back)
+    self._back = back
+    self._choices_cache = models.chooser_entries(self._params, self._kind)
+    self._rows: list[BigButton] = []
+    super().__init__([], models.TITLE_DRIVING if kind == models.DRIVING else models.TITLE_MONITORING, models.DESCRIPTION_MODELS, back)
+    self._ensure_rows(max(1, len(self._choices_cache)))
     self._update_rows()
 
   def show_event(self):
     super().show_event()
+    self._choices_cache = models.chooser_entries(self._params, self._kind)
+    self._ensure_rows(max(1, len(self._choices_cache)))
     self._update_rows()
 
   def _update_state(self):
@@ -310,7 +313,15 @@ class ChooserPage(Page):
     self._update_rows()
 
   def _choices(self) -> list[dict | None]:
-    return [None, *[entry for entry in models.status(self._params)["installed"] if entry.get("kind") == self._kind and entry.get("state") == "built"]]
+    return self._choices_cache
+
+  def _ensure_rows(self, count: int) -> None:
+    while len(self._rows) < count:
+      index = len(self._rows)
+      row = BigButton("")
+      row.set_click_callback(lambda index=index: self._select(index))
+      self._rows.append(row)
+      self._scroller.add_widgets([row])
 
   def _choice(self, index: int) -> dict | None:
     choices = self._choices()
@@ -320,23 +331,40 @@ class ChooserPage(Page):
     choice = self._choice(index)
     return "" if choice is None else models.selection_of(choice)
 
+  def _install(self, selection: str) -> None:
+    _request(self._params, "install", selection)
+    self._back()
+
   def _select(self, index: int) -> None:
-    if not ui_state.is_offroad() or index >= len(self._choices()):
+    choices = self._choices()
+    if index >= len(choices):
       return
-    selection = self._selection(index)
-    if selection == models.desired(self._params, self._kind):
+    choice = choices[index]
+    selection = "" if choice is None else models.selection_of(choice)
+    if choice is not None and choice.get("state") != "built":
+      _confirm(models.INSTALL_TEXT, ICON_INSTALL, lambda: self._install(selection))
+      return
+    if not ui_state.is_offroad() or selection == models.desired(self._params, self._kind):
       return
     _confirm(models.CONFIRM_SELECT, ICON_INSTALL, lambda: models.select(self._params, self._kind, selection))
 
   def _update_rows(self):
     desired = models.desired(self._params, self._kind)
     choices = self._choices()
+    self._ensure_rows(max(1, len(choices)))
+    offroad = ui_state.is_offroad()
     for index, row in enumerate(self._rows):
       choice = choices[index] if index < len(choices) else None
       row.set_visible(index < len(choices))
-      row.set_enabled(ui_state.is_offroad())
+      row.set_enabled(offroad or choice is not None and choice.get("state") != "built")
       if index >= len(choices):
         continue
       selection = "" if choice is None else models.selection_of(choice)
       row.set_text("stock" if choice is None else str(choice.get("name") or selection[:12]))
-      row.set_value(models.REASON_SELECTED if selection == desired else models.LABEL_SELECT)
+      row.set_value(
+        models.LABEL_INSTALL
+        if choice is not None and choice.get("state") != "built"
+        else models.REASON_SELECTED
+        if selection == desired
+        else models.LABEL_SELECT
+      )

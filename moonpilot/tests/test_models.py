@@ -7,7 +7,6 @@ speak the request/status codecs, and the model processes read what `commit_boot_
 So a rule that moves here moves for all of them at once, which is the point of the module.
 """
 
-
 import json
 import os
 import tempfile
@@ -295,6 +294,44 @@ class TestCodecs(unittest.TestCase):
     installed = models.status(params)["installed"]
     self.assertEqual(len(installed), 1)
     self.assertEqual(models.selection_of(installed[0]), RECIPE)
+
+
+class TestChooserEntries(unittest.TestCase):
+  def test_stock_built_and_catalog_entries_are_ordered_and_deduplicated(self):
+    params = FakeParams()
+    built_recipe = "b" * 64
+    packaged_recipe = "c" * 64
+    monitoring_recipe = "d" * 64
+    catalog_recipe = "e" * 64
+    models.publish_status(
+      params,
+      installed=[
+        {"recipe": built_recipe, "name": "built", "kind": models.DRIVING, "state": "built"},
+        {"recipe": packaged_recipe, "name": "packaged", "kind": models.DRIVING, "state": "packaged"},
+        {"recipe": monitoring_recipe, "name": "monitoring", "kind": models.MONITORING, "state": "built"},
+      ],
+    )
+    catalog = [
+      {"recipe": built_recipe, "name": "built again", "kind": models.DRIVING, "admitted": True},
+      {"recipe": packaged_recipe, "name": "packaged again", "kind": models.DRIVING, "admitted": True},
+      {"recipe": "f" * 64, "name": "refused", "kind": models.DRIVING, "admitted": False},
+      {"recipe": monitoring_recipe, "name": "wrong kind", "kind": models.MONITORING, "admitted": True},
+      {"recipe": catalog_recipe, "name": "catalog", "kind": models.DRIVING, "admitted": True},
+      {"recipe": catalog_recipe, "name": "catalog duplicate", "kind": models.DRIVING, "admitted": True},
+    ]
+    with mock.patch.object(models, "browse", return_value={"entries": catalog}):
+      entries = models.chooser_entries(params, models.DRIVING)
+
+    self.assertEqual(
+      [None if entry is None else models.selection_of(entry) for entry in entries],
+      [None, built_recipe, catalog_recipe],
+    )
+    built = entries[1]
+    catalog_entry = entries[2]
+    assert built is not None
+    assert catalog_entry is not None
+    self.assertEqual(built["state"], "built")
+    self.assertTrue(catalog_entry["admitted"])
 
 
 class TestBootCommit(StoreCase):
