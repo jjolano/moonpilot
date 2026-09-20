@@ -162,7 +162,7 @@ The control law is upstream's family — feedforward in lateral acceleration, PI
 
 ### The longitudinal strategy
 
-`moonpilot/longitudinal.py` is the fork's own planner — what acceleration to ask for — and `moonpilot/longcontrol.py` its own acceleration controller, how that acceleration is tracked. Two seams pick them: `moonpilot_longitudinal_planner()` in plannerd, `moonpilot_longcontrol()` in controlsd, both factory calls returning `None` when the toggle is off, so upstream's acados MPC and upstream's PI loop stay on the line as the fallback. Seventeen things about them are not obvious:
+`moonpilot/longitudinal.py` is the fork's own planner — what acceleration to ask for — and `moonpilot/longcontrol.py` its own acceleration controller, how that acceleration is tracked. Two seams pick them: `moonpilot_longitudinal_planner()` in plannerd, `moonpilot_longcontrol()` in controlsd, both factory calls returning `None` when the toggle is off, so upstream's acados MPC and upstream's PI loop stay on the line as the fallback. Eighteen things about them are not obvious:
 
 - **The vehicle's positive comfort jerk can tighten onroad, but never loosen safety braking.** `moonpilot/jerk.py` pairs the existing lag-aligned `a_target` command slope with `carState.aEgo` only while the fork owns longitudinal control, then slowly filters a ratio after 100 valid positive ramps. `MoonpilotLongJerkScale` persists the applied scale, defaults to 1.0, and is clamped to 0.5…1.0; `jerk_limit` applies it only to the positive comfort/launch ramp. The stopping-tested down ramp and `MOONPILOT_JERK_EMERGENCY` are untouched, and no estimate is exactly the nominal planner.
 

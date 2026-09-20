@@ -533,6 +533,7 @@ def policy(
   a_cruise_base = cruise_accel(v_ego, v_cruise, e2e, steer_angle_deg, CP, accel_coast, allow_throttle) if coast_band > 0.0 else a_cruise_raw
   a_cruise = min(a_cruise_raw, a_curve)
   lead_asks = [(lead_accel(v_ego, gap, v_lead, a_lead, t_follow), source) for source, gap, v_lead, a_lead in leads]
+  # A negative speed error is intentional once closing; only a coast-band reduction blocks the lift.
   if lead_asks and a_curve >= 0.0 and a_cruise_raw >= a_cruise_base and v_cruise > 0.0:
     # `v_cruise > 0` is the force-decel gate: `forceDecel` zeroes the set speed, and the target below
     # is relative to it, so without this the lift would command motion at a car the planner is trying
