@@ -460,7 +460,6 @@ def build(
   out_dir: str | None = None,
   *,
   selection: str = "",
-  composition: str = "",
 ) -> str:
   """Compile one selection and write its build directory. Returns the directory.
 
@@ -516,7 +515,6 @@ def build(
       "state": "built",
       "error": None,
       "selection": selection,
-      "composition": composition,
       "protocol": proto.id,
       "roles": list(proto.roles),
       "members": {role: _member_record(members[role]) for role in members},
@@ -596,7 +594,7 @@ def smoke(onnx_path: str, protocol_id: str | None, camera: tuple[int, int], buil
   directory = build_dir or tempfile.mkdtemp(prefix="mp-smoke-")
   print(f"building {proto.id} into {directory} with {TG_FLAGS}")
   started = time.monotonic()
-  build(proto, members, configuration, models.CAMERA_RESOLUTIONS, directory, selection="smoke", composition="")
+  build(proto, members, configuration, models.CAMERA_RESOLUTIONS, directory, selection="smoke")
   print(f"built in {time.monotonic() - started:.0f}s, {os.path.getsize(os.path.join(directory, 'model.pkl')) / 1e6:.1f} MB")
   print("record:", models.load_build(os.path.basename(directory)))
 

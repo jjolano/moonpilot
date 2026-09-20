@@ -1,12 +1,12 @@
-"""moonpilot settings panel. Rows come from moonpilot/features.py, so a feature shows up
-here by existing in that table, and a feature whose dependencies are still missing reads
-as unavailable instead of silently doing nothing.
+"""Moonpilot settings panel with inline feature and model pages.
 
-The panel itself is the root: what this device is running (the models row), one row per *group* of
-features, and the two device actions that own their own live labels. A group pushes its own page,
-which is the same rows the flat panel used to carry -- the toggle, its description and its gates are
-unchanged, so a feature moved between groups is a table edit and nothing else.
+Only dialogs leave this panel through the application navigation stack. Feature groups and model
+pages stay in this panel's existing content rectangle and use their own leading Back row.
 """
+
+from collections.abc import Callable
+
+import pyray as rl
 
 from moonpilot import tailscale
 from moonpilot.engage import car_unavailable_reason
@@ -17,14 +17,14 @@ from moonpilot.ui.tailscale_qr import TailscaleSignInDialog
 from openpilot.common.params import Params
 from openpilot.selfdrive.ui.ui_state import ui_state
 from openpilot.system.ui.lib.application import gui_app
-from openpilot.system.ui.widgets import Widget
-from openpilot.system.ui.widgets.list_view import button_item, text_item, toggle_item
+from openpilot.system.ui.widgets import MousePos, Widget
+from openpilot.system.ui.widgets.list_view import ItemAction, ListItem, button_item, text_item, toggle_item
 from openpilot.system.ui.widgets.scroller_tici import Scroller
+
+CHEVRON = gui_app.texture("icons/chevron_right.png", 48, 48)
 
 
 def _unavailable_reason(feature: Feature) -> str | None:
-  """Why this feature cannot run, or None. Two gates, one message: the dependencies the device is
-  still missing, and the car itself."""
   modules = missing_modules(feature)
   if modules:
     return f"{feature.title} is currently unavailable until {', '.join(modules)} is installed, which happens automatically once the device is online."
@@ -34,16 +34,10 @@ def _unavailable_reason(feature: Feature) -> str | None:
 
 def _description(feature: Feature) -> str:
   reason = _unavailable_reason(feature)
-  if reason is None:
-    return feature.description
-  # Upstream's disabled-with-reason shape: bold reason, then the description (toggles.py).
-  return "<b>" + reason + "</b><br><br>" + feature.description
+  return feature.description if reason is None else "<b>" + reason + "</b><br><br>" + feature.description
 
 
 def _feature_toggle(feature: Feature, params: Params):
-  # title/description/enabled are re-resolved every render, so callables are all the refresh
-  # this panel needs. The pill follows wanted(), not enabled(): an unavailable feature the
-  # driver asked for still reads as on, like upstream's disabled-but-on toggles.
   return toggle_item(
     feature.title,
     description=lambda f=feature: _description(f),
@@ -54,11 +48,6 @@ def _feature_toggle(feature: Feature, params: Params):
 
 
 def _tailscale_row(params: Params):
-  # One row for tailscale's state and its sign-in: text, description and enabled are all
-  # re-resolved every render, so it reads SIGN IN and is tappable exactly while a login URL
-  # exists, and shows the state dimmed out otherwise. The description is where the URL and
-  # the explanatory line go — it wraps and expands on tap, which a right-aligned value
-  # would clip. Same shape as upstream's Pair Device row.
   return button_item(
     "tailscale",
     lambda: "SIGN IN" if tailscale.auth_url(params) else tailscale.status_text(params)[0].upper(),
@@ -66,6 +55,7 @@ def _tailscale_row(params: Params):
     callback=lambda: gui_app.push_widget(TailscaleSignInDialog()),
     enabled=lambda: bool(tailscale.auth_url(params)),
   )
+
 
 def _dependencies_row(params: Params):
   from moonpilot import deps
@@ -91,15 +81,77 @@ def _rollback_row(params: Params):
   return row
 
 
-class GroupLayout(Widget):
-  """One group's page: the group's own name and description, then its toggles. Pushed, so the way
-  back is the leading row, and the toggles are the same objects the flat panel used to carry."""
+class _ChevronAction(ItemAction):
+  WIDTH = 440
 
-  def __init__(self, group: Group, params: Params):
+  def __init__(self, enabled=True):
+    super().__init__(self.WIDTH, enabled)
+    self._clicked = False
+
+  def _render(self, rect):
+    rl.draw_texture_ex(
+      CHEVRON,
+      rl.Vector2(rect.x + rect.width - CHEVRON.width, rect.y + (rect.height - CHEVRON.height) / 2),
+      0.0,
+      1.0,
+      rl.WHITE if self.enabled else rl.Color(255, 255, 255, 100),
+    )
+    clicked, self._clicked = self._clicked, False
+    return clicked
+
+  def _handle_mouse_release(self, _mouse_pos: MousePos):
+    self._clicked = True
+
+
+def submenu_item(title, description: str, callback: Callable, enabled=True) -> ListItem:
+  return ListItem(title=title, description=description, action_item=_ChevronAction(enabled), callback=callback)
+
+
+class _PageStack(Widget):
+  """A small inline page stack; it never touches the application navigation stack."""
+
+  def __init__(self):
+    super().__init__()
+    self._pages: list[Widget] = []
+
+  def set_root(self, page: Widget) -> None:
+    self._pages = [page]
+
+  def open(self, page: Widget) -> None:
+    if self._pages:
+      self._pages[-1].hide_event()
+    self._pages.append(page)
+    page.show_event()
+
+  def back(self) -> None:
+    if len(self._pages) <= 1:
+      return
+    self._pages.pop().hide_event()
+    self._pages[-1].show_event()
+
+  def show_event(self):
+    super().show_event()
+    if self._pages:
+      self._pages[-1].show_event()
+
+  def hide_event(self):
+    if self._pages:
+      self._pages[-1].hide_event()
+    super().hide_event()
+
+  def _render(self, rect):
+    if self._pages:
+      self._pages[-1].render(rect)
+
+
+class GroupLayout(Widget):
+  """One feature group's inline page."""
+
+  def __init__(self, group: Group, params: Params, back: Callable):
     super().__init__()
     self._scroller = Scroller(
       [
-        button_item(group.title, "BACK", description=group.description, callback=lambda: gui_app.pop_widget()),
+        button_item(group.title, "BACK", description=group.description, callback=back),
         *(_feature_toggle(feature, params) for feature in group.features),
       ],
       line_separator=True,
@@ -109,24 +161,25 @@ class GroupLayout(Widget):
   def _render(self, rect):
     self._scroller.render(rect)
 
+  def show_event(self):
+    super().show_event()
+    self._scroller.show_event()
+
+  def hide_event(self):
+    self._scroller.hide_event()
+    super().hide_event()
+
 
 class MoonpilotLayout(Widget):
   def __init__(self):
     super().__init__()
     self._params = ui_state.params
-    self._scroller = Scroller(
+    self._stack = self._child(_PageStack())
+    self._root = Scroller(
       [
         text_item("version", version()),
-        models_ui.row(self._params),
-        *[
-          button_item(
-            group.title,
-            "OPEN",
-            description=group.description,
-            callback=lambda group=group, params=self._params: gui_app.push_widget(GroupLayout(group, params)),
-          )
-          for group in GROUPS
-        ],
+        models_ui.row(self._params, self._stack.open, self._stack.back),
+        *[submenu_item(group.title, group.description, lambda group=group: self._open_group(group)) for group in GROUPS],
         offroad_mode.row(self._params),
         _tailscale_row(self._params),
         _dependencies_row(self._params),
@@ -135,9 +188,11 @@ class MoonpilotLayout(Widget):
       line_separator=True,
       spacing=0,
     )
-    # Every feature row lives on a group page now; this is the one place that would notice a
-    # feature added to FEATURES but to no group (it cannot happen -- FEATURES is the flattening).
+    self._stack.set_root(self._root)
     assert FEATURES, GROUPS
 
+  def _open_group(self, group: Group):
+    self._stack.open(GroupLayout(group, self._params, self._stack.back))
+
   def _render(self, rect):
-    self._scroller.render(rect)
+    self._stack.render(rect)

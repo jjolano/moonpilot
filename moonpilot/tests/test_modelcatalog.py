@@ -1,23 +1,12 @@
-"""Admission and composition, against real recipes from the openmodels catalog.
+"""Catalog admission and interface verification against real openmodels recipes.
 
 The fixture (`fixtures/catalog.json`) is a trimmed snapshot at the catalog's own revision
-`2026-09-19T06:48:29Z`: the recipe and profile *documents* are copied byte for byte -- their digests
-are hashes of those bytes, so a fixture that edited them would fail to load at all -- with the
-profiles' prose fields dropped (nothing reads them and they are en-GB). Every digest here was read
-off the live catalog, and `test_fixture_is_a_valid_snapshot_twice_over` re-checks the copy against
+`2026-09-19T06:48:29Z`: recipe and profile documents are copied byte for byte, and their digests
+are hashes of those bytes. `test_fixture_is_a_valid_snapshot_twice_over` re-checks the copy against
 the vendored SDK, which is also what makes this file the vendored copy's test.
 
-What each case is for:
-
-- the pinned stock recipe and two archived supercombo generations, admitted;
-- a vision+policy and a vision+off+on+policy set, admitted, and a *second* vision+policy recipe with
-  a different `LAT_SMOOTH_SECONDS` so the composition rule's refusal is real;
-- a split with an action head from before the 2026-06-01 change, admitted under the family's pinned
-  decode, and one from after it, refused -- the one pair where a wrong answer is a wrong steering
-  request;
-- two driver-monitoring models, one with the sleep heads and one without;
-- two refusals that are not about the model at all: a split whose profile does not record the
-  feature port, and a driver-monitoring model missing the heads this tree reads.
+The cases cover admitted recipe families, action-head era refusals, driver-monitoring generations,
+and refusals for missing feature ports or required heads.
 """
 
 import hashlib
@@ -187,7 +176,6 @@ class TestBrowse(CatalogCase):
         set(entry),
         {
           "recipe",
-          "composition",
           "name",
           "kind",
           "family",
@@ -215,30 +203,6 @@ class TestBrowse(CatalogCase):
     # `models.browse()` is the panels' reader: the same entries, without the writer's `schema`/`total`.
     self.assertEqual(models.browse()["revision"], written["revision"])
     self.assertEqual(models.browse()["entries"], written["entries"])
-
-
-class TestCompose(CatalogCase):
-  def test_members_that_disagree_on_smoothing_cannot_be_one_model(self):
-    verdict = modelcatalog.compose(self.catalog, models.SPLIT_VISION_POLICY.id, {"vision": VISION_POLICY, "on_policy": VISION_POLICY_OTHER})
-    self.assertIsNone(verdict["record"])
-    self.assertEqual(verdict["reason"], models.MEMBERS_DISAGREE.format(key="LAT_SMOOTH_SECONDS"))
-
-  def test_picks_from_two_protocols_refuse(self):
-    verdict = modelcatalog.compose(self.catalog, models.SPLIT_VISION_POLICY.id, {"vision": VISION_POLICY, "on_policy": SPLIT_NEW_ACTION})
-    self.assertIsNotNone(verdict["reason"])
-    self.assertIsNone(verdict["record"])
-
-  def test_a_role_set_the_protocol_does_not_have_refuses(self):
-    verdict = modelcatalog.compose(self.catalog, models.SPLIT_VISION_POLICY.id, {"vision": VISION_POLICY})
-    self.assertTrue(models.UNKNOWN_ROLE in str(verdict["reason"]))
-
-  def test_one_recipe_under_every_role_is_not_a_composition(self):
-    # The reference run at the catalog's own revision: a set whose roles all come from one recipe is
-    # that recipe, and the digest is the selection -- a wrapper record would be a second name for one
-    # model with its own build directory to keep in step.
-    verdict = modelcatalog.compose(self.catalog, models.SUPERCOMBO.id, {"supercombo": STOCK})
-    self.assertEqual(verdict["reason"], models.SINGLE_RECIPE)
-    self.assertIsNone(verdict["record"])
 
 
 class TestInterfaceVerification(unittest.TestCase):

@@ -291,7 +291,6 @@ class Worker:
         models.CAMERA_RESOLUTIONS,
         directory,
         selection=selection,
-        composition=selection if models.is_composition(selection) else "",
       )
     except Exception as exc:
       self._failed_build(modelbuild, directory, str(exc))
@@ -315,37 +314,14 @@ class Worker:
       raise _Refused(models.UNKNOWN_SELECTION)
     # Anything in effect this boot, or wanted for the next one, is off limits: the driver switches
     # first, and the panel says so (models.SELECTED_HINT).
-    live = {models.boot(self.params)[kind]["id"] for kind in models.KINDS} | {models.desired(self.params, kind) for kind in models.KINDS}
-    compositions = models.list_compositions()
-    named = {
-      composition
-      for composition, record in compositions.items()
-      if selection in {str(member.get("recipe", "")) for member in (record.get("members") or {}).values()}
-    }
-    if selection in live or named & live:
+    live = {models.boot(self.params)[kind]["id"] for kind in models.KINDS}
+    live |= {models.desired(self.params, kind) for kind in models.KINDS}
+    if selection in live:
       raise _Refused(models.SELECTED_HINT)
-
-    if models.is_recipe(selection):
-      resolved = models.selection_record(selection)
-      if resolved is not None:
-        shutil.rmtree(models.build_dir(selection, resolved["protocol"].id), ignore_errors=True)
-      # Compositions that named it are dead rows: a record whose member is missing resolves to
-      # nothing, so they go with the package.
-      for composition in named:
-        try:
-          os.remove(models.composition_file(composition))
-        except OSError:
-          pass
-      shutil.rmtree(models.package_dir(selection), ignore_errors=True)
-    else:
-      record = compositions.get(selection)
-      if record is not None:
-        if (proto := models.protocol(str(record.get("protocol", "")))) is not None:
-          shutil.rmtree(models.build_dir(selection, proto.id), ignore_errors=True)
-        try:
-          os.remove(models.composition_file(selection))
-        except OSError:
-          pass
+    resolved = models.selection_record(selection)
+    if resolved is not None:
+      shutil.rmtree(models.build_dir(selection, resolved["protocol"].id), ignore_errors=True)
+    shutil.rmtree(models.package_dir(selection), ignore_errors=True)
     job.phase = "done"
 
 

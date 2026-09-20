@@ -60,11 +60,11 @@
     {"MoonpilotOffroad",
      {CLEAR_ON_MANAGER_START | CLEAR_ON_IGNITION_ON, BOOL, "0"}},
     // Model marketplace, moonpilot/models.py. The two desired strings are the
-    // driver's selection: "" is the bundled model, a 64-hex digest is one
-    // catalog recipe, "c-…" a composition of installed recipes. Persistent, and
-    // read by the UI only -- the model processes read the boot snapshot below,
-    // never these, so a selection change cannot swap a model under a running
-    // prediction (the panel says "restart to apply").
+    // driver's selection: "" is the bundled model, or one 64-hex digest for a
+    // catalog recipe. Persistent, and read by the UI only -- the model
+    // processes read the boot snapshot below, never these, so a selection
+    // change cannot swap a model under a running prediction (the panel says
+    // "restart to apply").
     {"MoonpilotModelsDriving", {PERSISTENT, STRING, ""}},
     {"MoonpilotModelsMonitoring", {PERSISTENT, STRING, ""}},
     // The committed per-boot decision: what each kind actually loads, with

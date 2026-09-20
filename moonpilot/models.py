@@ -8,12 +8,9 @@ actually run, and what every panel prints about them.
 
 Four things are worth knowing before reading the rest.
 
-**Selections are strings, and `""` is the bundled model.** A selection is either a 64-hex recipe
-digest (one recipe from the catalog, its members exactly as published) or a `c-…` composition id
-(one member per role, possibly from different recipes of one protocol — the fork's own record, in
-`compositions/`). Either way the string is the *whole* identity: it names the package directory,
-the build directory and the composition record, so a selection that is not installed is a selection
-whose directories do not exist.
+**Selections are strings, and `""` is the bundled model.** A non-empty selection is one 64-hex recipe
+digest from the catalog. The string is the whole identity: it names the package directory and build
+directory, so a selection that is not installed is a selection whose directories do not exist.
 
 **Nothing here is on a load path.** The modules the manager and the two UI trees import at boot —
 `moonpilot.procs`, `moonpilot.ui.settings*` — import this one, so it is stdlib plus
@@ -103,10 +100,6 @@ def builds_dir() -> str:
   return os.path.join(models_root(), "builds")
 
 
-def compositions_dir() -> str:
-  return os.path.join(models_root(), "compositions")
-
-
 def tmp_dir() -> str:
   """Scratch space for the worker. Inside the store on purpose: `dump_oob`'s and tinygrad's temp
   files must never land in the checkout, which is git state (AGENTS.md, Storage)."""
@@ -136,27 +129,12 @@ def build_record(key: str) -> str:
   return os.path.join(builds_dir(), key, "build.json")
 
 
-def composition_file(composition_id: str) -> str:
-  return os.path.join(compositions_dir(), f"{composition_id}.json")
-
-
-def composition_id(record: dict) -> str:
-  """`c-` plus the digest of the record's canonical JSON. Derived, so the same member set is one
-  id however it was picked, and so the id is checkable against the record."""
-  canonical = json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
-  return "c-" + hashlib.sha256(canonical.encode()).hexdigest()[:32]
-
-
-def is_composition(selection: str) -> bool:
-  return selection.startswith("c-")
-
-
 def is_recipe(selection: str) -> bool:
   return len(selection) == 64 and all(c in "0123456789abcdef" for c in selection)
 
 
 def valid_selection(selection: str) -> bool:
-  return is_recipe(selection) or (is_composition(selection) and len(selection) == 34)
+  return is_recipe(selection)
 
 
 # --- protocols: what may be selected -----------------------------------------
@@ -329,10 +307,9 @@ def features_role(proto: Protocol) -> str:
 
 
 # --- what a runnable member set looks like -----------------------------------
-# Admission (moonpilot/modelcatalog.py) checks a *catalog* recipe with these; the panels check a set
-# of *stored* packages with them (the compose page's inline verdict), and the composition record
-# writer uses them again. One rule, three callers, so a recipe the panel offers is a recipe the
-# worker will accept.
+# Admission (moonpilot/modelcatalog.py) checks a catalog recipe with these, and modelbuild checks
+# the stored members again before compiling. One rule, two callers, so a recipe the panel offers is
+# a recipe the worker will accept.
 #
 # Nothing here needs the catalog SDK: every input is a plain dict of what a document recorded --
 # `input_shapes`, `output_slices`, `targets`, `format` -- which is exactly what the catalog's
@@ -661,16 +638,15 @@ def _status_from(data: Any) -> dict:
 def _installed_from_dict(data: Any) -> dict | None:
   if not isinstance(data, dict):
     return None
-  selection = selection_of(data)
-  if not selection or not valid_selection(selection):
+  selection = data.get("recipe", "")
+  if not isinstance(selection, str) or not selection or not valid_selection(selection):
     return None
   state = data.get("state")
   if state not in ("packaged", "built", "failed"):
     state = "packaged"
   kind = data.get("kind")
   return {
-    "recipe": str(data.get("recipe", "")),
-    "composition": str(data.get("composition", "")),
+    "recipe": selection,
     "name": str(data.get("name", "")),
     "kind": kind if kind in KINDS else DRIVING,
     "protocol": str(data.get("protocol", "")),
@@ -683,10 +659,8 @@ def _installed_from_dict(data: Any) -> dict | None:
 
 
 def selection_of(entry: dict) -> str:
-  """The selection an entry names: the composition id for a composition, the recipe digest for a
-  recipe. The status shape carries both fields with one of them empty, so that a panel can tell the
-  two apart without parsing the id."""
-  return entry.get("composition") or entry.get("recipe") or ""
+  """The recipe digest an entry names."""
+  return entry.get("recipe") or ""
 
 
 def publish_status(
@@ -738,31 +712,6 @@ def build_state(key: str) -> tuple[str, str | None]:
   if not os.path.isfile(build_model(key)):
     return "failed", BUILD_INCOMPLETE
   return "built", None
-
-
-def load_composition(composition: str) -> dict | None:
-  record = read_json(composition_file(composition))
-  if not isinstance(record, dict) or record.get("schema") != SCHEMA:
-    return None
-  if composition_id({k: v for k, v in record.items() if k != "id"}) != composition:
-    return None
-  return record
-
-
-def list_compositions() -> dict[str, dict]:
-  """Every composition record that still checks against its own id."""
-  result = {}
-  try:
-    names = os.listdir(compositions_dir())
-  except OSError:
-    return result
-  for name in names:
-    if name.endswith(".json"):
-      composition = name[:-5]
-      record = load_composition(composition)
-      if record is not None:
-        result[composition] = record
-  return result
 
 
 def package_dir(recipe: str) -> str:
@@ -820,29 +769,8 @@ def verify_members(members: dict[str, dict]) -> str | None:
   return None
 
 
-# --- composition -------------------------------------------------------------
-# One model out of pieces: a vision member from one recipe and a policy member from another, of the
-# same protocol. The record names one recipe per role and the configuration they agreed on, and its
-# id is the digest of that record -- so the same picks are one id, and a record that has been edited
-# under its own name fails `load_composition`.
-#
-# The rule: every member admitted to the **same** protocol, the role set equal to the protocol's,
-# every `required_configuration` key equal across members, and every profile connection whose two
-# roles are both present checked port for port. A port missing on either side is `structure_unknown`
-# -- refused, not assumed. The driver's own rule is printed with it: cross-recipe mixing is allowed
-# only inside one protocol, and the pieces were not shipped together by comma.
-#
-# Admission's action-era check (`models.member_reason`) is not re-run here: a stored package has no
-# publication date, and it cannot matter, because every package in the store passed that check for
-# *this* protocol when it was installed and mixing across protocols is refused by role set.
-MEMBERS_DISAGREE = "members disagree on {key}"
-SINGLE_RECIPE = "one recipe, not a composition: select the recipe itself"
-STRUCTURE_UNKNOWN = "structure_unknown: {from_role}.{output} has no matching port on {to_role}"
-
-
 def member_view(member: Any) -> dict:
-  """A member document -- catalog or stored, they carry the same fields -- normalized to what
-  `member_reason` and `set_reason` read."""
+  """Normalize one catalog member document to the fields admission reads."""
   if not isinstance(member, dict):
     return {}
   metadata = member.get("metadata") if isinstance(member.get("metadata"), dict) else {}
@@ -853,8 +781,6 @@ def member_view(member: Any) -> dict:
     "format": artifact.get("format"),
     "size": int(artifact.get("size", 0) or 0),
     "targets": member.get("targets") if isinstance(member.get("targets"), list) else [],
-    "ports_in": member.get("inputs") if isinstance(member.get("inputs"), dict) else {},
-    "ports_out": member.get("outputs") if isinstance(member.get("outputs"), dict) else {},
     "configuration": member.get("configuration") if isinstance(member.get("configuration"), dict) else {},
   }
   if isinstance(member.get("published_at"), str):
@@ -862,180 +788,12 @@ def member_view(member: Any) -> dict:
   return view
 
 
-def stored_selection_members(selection: str) -> tuple[dict[str, dict], dict | None]:
-  """`{role: member_view}` for a stored package, plus that package's profile document. The recipe's
-  own role names are the roles; a member view carries `recipe` so a caller can report which recipe a
-  picture came from."""
-  package = load_package(selection)
-  if package is None:
-    return {}, None
-  members = (package["recipe"] or {}).get("members")
-  if not isinstance(members, dict):
-    return {}, None
-  views = {}
-  for role, member in members.items():
-    view = member_view(member)
-    view["recipe"] = selection
-    views[str(role)] = view
-  return views, package["profile"]
-
-
-def picks_are_one_recipe(picks: dict[str, str]) -> bool:
-  """Whether every role comes from the same recipe. Such a "composition" is the recipe, and the
-  recipe digest is the selection -- recording a wrapper around it would be a second way to name one
-  model, with its own build directory to keep in step."""
-  return len(set(picks.values())) == 1
-
-
-def composition_reason(protocol_id: str, picks: dict[str, str]) -> str | None:
-  """Why these picks cannot be one model, or `None`. `picks` is `{role: recipe digest}`.
-
-  Reads stored packages only, so a panel can show the verdict while the driver is still choosing.
-  """
-  proto = protocol(protocol_id)
-  if proto is None:
-    return NOT_INSTALLED
-  if frozenset(picks) != frozenset(proto.roles):
-    return f"{UNKNOWN_ROLE}: {', '.join(sorted(set(picks) ^ set(proto.roles)))}"
-  if picks and picks_are_one_recipe(picks):
-    return SINGLE_RECIPE
-  members: dict[str, dict] = {}
-  profiles: list[dict] = []
-  for role, recipe in picks.items():
-    views, profile = stored_selection_members(recipe)
-    if role not in views:
-      return f"{recipe[:12]} does not carry the {role} role"
-    members[role] = views[role]
-    if profile is not None:
-      profiles.append(profile)
-  return picks_reason(proto, members, profiles)
-
-
-def picks_reason(proto: Protocol, members: dict[str, dict], profiles: list[dict]) -> str | None:
-  """The composition rule over already-normalized members: `member_view` dicts and the profile
-  documents they came from. `composition_reason` and `moonpilot/modelcatalog.py`'s `compose` both
-  end here, so a pick a panel shows as compatible is a pick the worker accepts."""
-  if frozenset(members) != frozenset(proto.roles):
-    return f"{UNKNOWN_ROLE}: {', '.join(sorted(set(members) ^ set(proto.roles)))}"
-  configuration: dict[str, Any] = {}
-  for member in members.values():
-    for key in proto.required_configuration:
-      value = member.get("configuration", {}).get(key)
-      if value is None:
-        return MEMBERS_DISAGREE.format(key=key)
-      if key in configuration and configuration[key] != value:
-        return MEMBERS_DISAGREE.format(key=key)
-      configuration[key] = value
-  if (reason := set_reason(proto, members)) is not None:
-    return reason
-  return port_reason(proto, members, profiles)
-
-
-def port_reason(proto: Protocol, members: dict[str, dict], profiles: list[dict]) -> str | None:
-  """The profile connections whose two roles are both in the picks, checked port for port."""
-  seen: set[tuple[str, str, str, str]] = set()
-  for profile in profiles:
-    connections = profile.get("connections")
-    if not isinstance(connections, list):
-      continue
-    for edge in connections:
-      if not isinstance(edge, dict):
-        continue
-      source, target = str(edge.get("from", "")), str(edge.get("to", ""))
-      output, input_name = str(edge.get("output", "")), str(edge.get("input", ""))
-      if source not in members or target not in members or source == target:
-        continue
-      if (source, output, target, input_name) in seen:
-        continue
-      seen.add((source, output, target, input_name))
-      produced = members[source]["ports_out"].get(output)
-      consumed = members[target]["ports_in"].get(input_name)
-      if not produced or not consumed:
-        return STRUCTURE_UNKNOWN.format(from_role=source, output=output, to_role=target)
-      if produced.get("shape") != consumed.get("shape"):
-        return STRUCTURE_UNKNOWN.format(from_role=source, output=output, to_role=target)
-  return None
-
-
-def composition_record(protocol_id: str, picks: dict[str, str]) -> dict:
-  """The record for a pick set. `composition_id` is the digest of this, so it must be built the one
-  way -- the writer and the reader both go through here."""
-  configuration = {}
-  proto = protocol(protocol_id)
-  if proto is not None:
-    for role, recipe in picks.items():
-      views, _profile = stored_selection_members(recipe)
-      for key in proto.required_configuration:
-        value = (views.get(role) or {}).get("configuration", {}).get(key)
-        if value is not None:
-          configuration.setdefault(key, value)
-  return {
-    "schema": SCHEMA,
-    "protocol": protocol_id,
-    "members": {role: {"recipe": recipe} for role, recipe in sorted(picks.items())},
-    "configuration": configuration,
-  }
-
-
-def write_composition(protocol_id: str, picks: dict[str, str]) -> tuple[str | None, str | None]:
-  """Write the record for a pick set, or return why it may not exist. `(id, None)` or `(None, reason)`."""
-  if (reason := composition_reason(protocol_id, picks)) is not None:
-    return None, reason
-  record = composition_record(protocol_id, picks)
-  composition = composition_id(record)
-  record["id"] = composition
-  os.makedirs(compositions_dir(), exist_ok=True)
-  write_json(composition_file(composition), record)
-  return composition, None
-
-
-def compose_candidates(protocol_id: str) -> dict[str, list[dict]]:
-  """`{role: [{"recipe", "name", "size"}]}` -- the installed recipes that could fill each role of a
-  protocol, for the compose page. A candidate is a stored package that passes `member_reason` for
-  that role, so the page cannot offer a piece the rule would refuse."""
-  proto = protocol(protocol_id)
-  if proto is None:
-    return {}
-  candidates: dict[str, list[dict]] = {role: [] for role in proto.roles}
-  try:
-    recipes = sorted(d for d in os.listdir(packages_dir()) if not d.startswith(".") and os.path.isdir(package_dir(d)))
-  except OSError:
-    return candidates
-  for recipe in recipes:
-    views, _profile = stored_selection_members(recipe)
-    for role in proto.roles:
-      view = views.get(role)
-      if view is None or member_reason(role, proto, view) is not None:
-        continue
-      candidates[role].append({"recipe": recipe, "name": entry_name(recipe) or recipe[:12], "size": int(view.get("size", 0))})
-  return candidates
-
-
 def selection_record(selection: str) -> dict | None:
-  """Resolve a selection to `{"protocol", "configuration", "members", "composition"}`, or None when
-  it is not installed, its role set matches no protocol, or its own records do not check out. Pure
-  file I/O: no catalog, no network, no tinygrad, which is what lets the manager call it."""
+  """Resolve a recipe to its protocol, configuration and members, or None when it is not installed,
+  its role set matches no protocol, or its own records do not check out. Pure file I/O: no catalog,
+  network or tinygrad, which is what lets the manager call it."""
   if not valid_selection(selection):
     return None
-  if is_composition(selection):
-    composition = load_composition(selection)
-    if composition is None:
-      return None
-    proto = protocol(str(composition.get("protocol", "")))
-    if proto is None or frozenset(str(r) for r in (composition.get("members") or {})) != frozenset(proto.roles):
-      return None
-    members: dict[str, dict] = {}
-    for role, member in (composition.get("members") or {}).items():
-      recipe = str((member or {}).get("recipe", ""))
-      package = load_package(recipe)
-      if package is None:
-        return None
-      role_members = package_members(recipe, package["recipe"])
-      if role not in role_members:
-        return None
-      members[role] = role_members[role]
-    return {"protocol": proto, "configuration": composition.get("configuration") or {}, "members": members, "composition": composition}
-
   package = load_package(selection)
   if package is None:
     return None
@@ -1051,13 +809,11 @@ def selection_record(selection: str) -> dict | None:
   # lengths and smoothing, the boot snapshot's record -- should read.
   recipe_configuration = package["recipe"].get("configuration") or {}
   configuration = {key: recipe_configuration.get(key) for key in proto.required_configuration}
-  return {"protocol": proto, "configuration": configuration, "members": members, "composition": None}
+  return {"protocol": proto, "configuration": configuration, "members": members}
 
 
 def installed_entries() -> list[dict]:
-  """Every selection the store holds, as the status's `installed` list: packages first, then the
-  compositions that name them, each with its build state so the panel can say `packaged`,
-  `built` or `failed` without touching the build directory itself."""
+  """Every installed package, with its build state."""
   entries: list[dict] = []
   try:
     recipes = sorted(d for d in os.listdir(packages_dir()) if not d.startswith(".") and os.path.isdir(package_dir(d)))
@@ -1065,10 +821,6 @@ def installed_entries() -> list[dict]:
     recipes = []
   for recipe in recipes:
     entry = _entry_for(recipe)
-    if entry is not None:
-      entries.append(entry)
-  for composition in sorted(list_compositions()):
-    entry = _entry_for(composition)
     if entry is not None:
       entries.append(entry)
   return entries
@@ -1087,8 +839,7 @@ def _entry_for(selection: str) -> dict | None:
   if isinstance(record.get("provenance"), dict):
     provenance = str(record["provenance"].get("version", ""))
   return {
-    "recipe": selection if is_recipe(selection) else "",
-    "composition": selection if is_composition(selection) else "",
+    "recipe": selection,
     "name": entry_name(selection),
     "kind": proto.kind,
     "protocol": proto.id,
@@ -1258,27 +1009,20 @@ def restart_pending(params: Any, kind: str) -> bool:
 BUNDLED_LABEL = "stock"
 RESTART_NOTE = "(restart to apply)"
 TITLE_MODELS = "models"
-TITLE_BROWSE = "browse catalog"
-TITLE_INSTALLED = "installed"
+TITLE_BROWSE = "model marketplace"
+TITLE_INSTALLED = "downloaded models"
 TITLE_STORAGE = "storage"
 TITLE_DRIVING = "driving model"
 TITLE_MONITORING = "driver monitoring"
-TITLE_COMPOSE = "compose"
 TITLE_REFRESH = "refresh catalog"
-DESCRIPTION_MODELS = "The model this car drives with, and the driver-monitoring model it watches \
-with. Both come from the openmodels catalog; anything but stock is a model comma never tested, so \
-selecting one changes how the car steers and slows."
-DESCRIPTION_BROWSE = "Every model the catalog lists, with what this device would do with it. Only \
-models the fork can run are selectable."
-DESCRIPTION_INSTALLED = "What this device holds: installed packages, their builds, and which one \
-is in effect."
+DESCRIPTION_MODELS = "Choose the model used for driving and the separate model used to watch the \
+driver. Driving models can change steering and slowing; monitoring models only watch attention."
+DESCRIPTION_BROWSE = "Models available to download. Install one, then select it from driving model or driver monitoring and restart to use it."
+DESCRIPTION_INSTALLED = "Downloaded models on this device. Select one from driving model or driver monitoring; remove or rebuild it here."
 DESCRIPTION_STORAGE = "Space the model store uses on the data partition. Installing needs room for \
 the package, the digest cache and the build."
 DESCRIPTION_REFRESH = "Fetch the catalog again. Needs a network; a failed refresh keeps the copy \
 this device already has."
-DESCRIPTION_COMPOSE = "Build one model out of installed pieces: a vision member from one recipe \
-and a policy member from another of the same protocol. The pieces were not shipped together by \
-comma, and nothing here checks that they fit beyond their declared ports."
 LABEL_REFRESH = "REFRESH"
 LABEL_REBOOT = "REBOOT NOW"
 LABEL_INSTALL = "INSTALL"
@@ -1290,8 +1034,6 @@ LABEL_REMOVE = "REMOVE"
 LABEL_CANCEL = "CANCEL"
 LABEL_NEWER = "NEWER"
 LABEL_OLDER = "OLDER"
-LABEL_COMPOSE = "COMPOSE"
-LABEL_NONE = "NONE"
 FILTER_ALL = "all"
 FILTER_DRIVING = "driving"
 # Short on purpose: the filter row's buttons are 250 px wide, and "driver monitoring" overflows
@@ -1301,17 +1043,13 @@ FILTER_RUNNABLE = "runnable only"
 REBOOT_KEY = "DoReboot"  # upstream's own, read by the manager's power path (manager.py:199)
 CONFIRM_SELECT = "Use this model?"
 CONFIRM_REMOVE = "Remove this model?"
-CONFIRM_COMPOSE = "Compose this model?"
 CONFIRM_CANCEL = "Cancel the current model job?"
-SELECT_TEXT = "comma never tested this model, and neither has moonpilot. It changes how the car \
-steers and how it slows. It takes effect after a restart."
+SELECT_TEXT = "This model has not been tested by comma or moonpilot. Select it, then restart to use \
+it."
 REMOVE_TEXT = "This deletes the package and its build from the device. The model can be installed \
 again from the catalog."
-COMPOSE_TEXT = "These pieces were not shipped together by comma. Nothing here checks that they fit \
-beyond the ports their profiles declare."
 DESCRIPTION_CANCEL = "Canceling stops the current model job. You can start it again later."
-DESCRIPTION_REBOOT = "A selection takes effect when the device restarts, and the manager reads \
-DoReboot for that. Everything else in this panel is saved first."
+DESCRIPTION_REBOOT = "A selected model starts after restart. Restart after installing and selecting."
 REASON_SELECTED = "in effect"
 REASON_INSTALLED = "installed"
 DRIVING_ONLY = "PARKED ONLY"
@@ -1320,10 +1058,7 @@ LABEL_OPEN = "OPEN"
 BROWSE_EMPTY = "no catalog yet"
 BROWSE_NONE = "nothing matches"
 BROWSE_STALE = "refresh the catalog first"
-COMPATIBLE = "compatible"
-INSTALL_TEXT = "Installing downloads the model, checks its bytes against the catalog, and builds it \
-on this device. It does not change how the car drives: select it on the installed page afterwards, \
-and it takes effect after a restart."
+INSTALL_TEXT = "Download and build this model. Then select it from driving model or driver monitoring and restart to use it."
 # The protocol ids are precise and unreadable; these are what a driver picks between.
 PROTOCOL_LABELS = {
   "comma.supercombo.v1": "supercombo",
@@ -1331,8 +1066,8 @@ PROTOCOL_LABELS = {
   "comma.split-vision-off-on.v1": "vision + off + on",
   "comma.dmonitoring.v1": "driver monitoring",
 }
-OFFROAD_NOTE = "Installation runs while driving; selecting, composing and removing wait until the \
-car is parked and openpilot is off."
+OFFROAD_NOTE = "Installation runs while driving; selecting and removing wait until the car is parked \
+and openpilot is off."
 PHASE_TEXT = {
   "waiting-network": "waiting for network",
   "waiting-offroad": "waiting for offroad",
@@ -1463,8 +1198,7 @@ def catalog_description(catalog: dict) -> str:
 
 def installed_action(entry: dict, params: Any) -> tuple[str, str]:
   """What an installed model's first action row offers: the label, and which way it toggles.
-
-  `select` is per kind, and the desired value is the *selection*: a composition or a recipe digest.
+  `select` is per kind, and the desired value is the recipe digest.
   """
   selection = selection_of(entry)
   kind = entry.get("kind", DRIVING)
@@ -1474,8 +1208,7 @@ def installed_action(entry: dict, params: Any) -> tuple[str, str]:
 
 
 def installed_detail(entry: dict) -> str:
-  parts = [f"{entry.get('protocol', '')}", f"roles: {', '.join(entry.get('roles', []))}",
-           human_size(int(entry.get("size", 0))), str(entry.get("state", ""))]
+  parts = [f"{entry.get('protocol', '')}", f"roles: {', '.join(entry.get('roles', []))}", human_size(int(entry.get("size", 0))), str(entry.get("state", ""))]
   if entry.get("provenance"):
     parts.append(f"built by {entry['provenance']}")
   if entry.get("error"):
@@ -1513,14 +1246,13 @@ def model_description(params: Any, kind: str) -> str:
     return DESCRIPTION_MODELS
   active = params.get(ACTIVE_KEY[kind]) or ""
   if active.startswith("stock: "):
-    return f"{entry['id'][:12]} did not load: {active[len('stock: '):]}. {DESCRIPTION_MODELS}"
+    return f"{entry['id'][:12]} did not load: {active[len('stock: ') :]}. {DESCRIPTION_MODELS}"
   return f"in effect since this boot, built from {entry['id'][:12]}. {DESCRIPTION_MODELS}"
 
 
 def entry_name(selection: str) -> str:
-  """The catalog's display name for a selection, from the browse index the worker wrote, and `""`
-  when the index does not know it -- a composition never appears there, and neither does a recipe
-  whose catalog entry is gone."""
+  """The catalog's display name for a recipe, from the browse index the worker wrote, and `""`
+  when the index does not know it -- neither does a recipe whose catalog entry is gone."""
   for entry in browse().get("entries", []):
     if selection_of(entry) == selection:
       return str(entry.get("name", ""))

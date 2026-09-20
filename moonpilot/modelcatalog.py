@@ -16,10 +16,8 @@ browsable and not selectable, with the reason the panel prints.
 `slice` in the embedded pickle -- and `verify_downloaded` compares that with what the recipe
 recorded, so the artifact a build compiles is the artifact the admission decision was made about.
 
-**`admit` and `compose` are the worker's and the panels' shared answer.** Both panels compute a
-composition's verdict from stored packages (`models.picks_reason`); `compose` here is the same rule
-with catalog documents, which is what the worker would check before recording one. There is no
-second rule.
+`admit` is the worker's and the panels' shared answer: it decides whether a catalog recipe is
+runnable here and carries the reason and technical notes the panels show.
 """
 
 import os
@@ -185,7 +183,6 @@ def browse_index(catalog) -> dict:
       entries.append(
         {
           "recipe": recipe,
-          "composition": "",
           "name": str(model.get("name", "")),
           "kind": str(model.get("kind", "")),
           "family": str(model.get("family", "")),
@@ -274,46 +271,3 @@ def artifact_bytes(catalog, recipe: str) -> int:
   return sum(int(member["artifact"]["size"]) for member in recipe_object.data["members"].values())
 
 
-def compose(catalog, protocol_id: str, picks: dict[str, str]) -> dict:
-  """The composition rule over *catalog* recipes: one pick per role, all admitted to the same
-  protocol. `{"protocol", "record", "reason", "notes"}`.
-
-  The rule itself is `models.picks_reason` -- the same function the panels run over stored packages
-  and the worker checks a record against -- so this adds only the catalog's own findings to it.
-  """
-  proto = models.protocol(protocol_id)
-  result: dict[str, Any] = {"protocol": protocol_id, "record": None, "reason": None, "notes": []}
-  if proto is None:
-    result["reason"] = models.UNKNOWN_ROLE
-    return result
-  if frozenset(picks) != frozenset(proto.roles):
-    result["reason"] = f"{models.UNKNOWN_ROLE}: {', '.join(sorted(set(picks) ^ set(proto.roles)))}"
-    return result
-  if picks and models.picks_are_one_recipe(picks):
-    result["reason"] = models.SINGLE_RECIPE
-    return result
-
-  dates = _entry_dates(catalog)
-  members: dict[str, dict] = {}
-  profiles: list[dict] = []
-  for role, recipe in picks.items():
-    verdict = admit(catalog, recipe)
-    if not verdict["admitted"] or verdict["protocol"] != protocol_id:
-      result["reason"] = verdict["reason"] or f"{recipe[:12]} is not admitted to {protocol_id}"
-      return result
-    result["notes"].extend(verdict["notes"])
-    recipe_object = catalog.resolve(recipe)
-    view = _members_with_dates(catalog, recipe_object, dates).get(role)
-    if view is None:
-      result["reason"] = f"{recipe[:12]} does not carry the {role} role"
-      return result
-    view["configuration"] = recipe_object.data.get("configuration") or {}
-    members[role] = view
-    profiles.append(recipe_object.profile.data)
-
-  reason = models.picks_reason(proto, members, profiles)
-  if reason is not None:
-    result["reason"] = reason
-    return result
-  result["record"] = models.composition_record(protocol_id, picks)
-  return result

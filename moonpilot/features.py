@@ -38,7 +38,10 @@ PATH_PREVIEW = Feature(
 TURN_DESIRE = Feature(
   key="MoonpilotTurnDesire",
   title="turn desire",
-  description="Below 32 km/h, a turn signal feeds a turn desire into the model so it steers into the corner. The model's own turn prediction picks the direction. Restart to apply.",
+  description=(
+    "Below 32 km/h, a turn signal feeds a turn desire into the model so it steers into the corner. "
+    + "The model's own turn prediction picks the direction. Restart to apply."
+  ),
   offroad_only=True,
 )
 

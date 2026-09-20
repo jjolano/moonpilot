@@ -1,16 +1,12 @@
-"""The domain rules the model store is: protocols, the structural verdicts, the codecs, the boot
-commit and the composition rule.
+"""The domain rules the model store is: protocols, structural verdicts, codecs, boot commit and
+model jobs.
 
-Every test here is a *rule* the rest of the feature reads rather than a restatement of the code:
-`admit` (moonpilot/modelcatalog.py) is `member_reason`/`set_reason`, the compose page is
-`picks_reason`, the worker and both panels speak the request/status codecs, and the model processes
-read what `commit_boot_selection` wrote. So a rule that moves here moves for all of them at once,
-which is the point of the module.
-
-The tests use a duck-typed fake `Params`, the pattern `test_tailscale.py` and `test_offroad.py`
-use, and a fake store built under `moonpilot/models.models_root()` -- patched to a temp directory,
-because `models_root()` is what every path in the store hangs off.
+Every test here is a rule the rest of the feature reads rather than a restatement of the code:
+`admit` (moonpilot/modelcatalog.py) is `member_reason`/`set_reason`, the worker and both panels
+speak the request/status codecs, and the model processes read what `commit_boot_selection` wrote.
+So a rule that moves here moves for all of them at once, which is the point of the module.
 """
+
 
 import json
 import os
@@ -23,7 +19,6 @@ from unittest import mock
 from moonpilot import models
 
 RECIPE = "a" * 64
-OTHER_RECIPE = "b" * 64
 
 # A member `set_reason` accepts: the inputs the supercombo protocol feeds it, and a 512-wide
 # `hidden_state` against a 512-deep `features_buffer`, which is the one structural property the
@@ -37,9 +32,6 @@ SUPERCOMBO_INPUTS = {
   "action_t": [1, 2],
 }
 SUPERCOMBO_SLICES = {name: [0, 512] for name in models.DRIVING_SLICES}
-# A policy member: it consumes the feature the vision member produces, and needs no outputs of its
-# own beyond what the union already covers.
-POLICY_INPUTS = {"desire_pulse": [1, 25, 8], "features_buffer": [1, 24, 512], "traffic_convention": [1, 2], "action_t": [1, 2]}
 
 
 class FakeParams:
@@ -119,8 +111,7 @@ class StoreCase(unittest.TestCase):
         role: {
           "artifact": {"sha256": artifact_sha256, "size": size, "format": "onnx"},
           "source": {},
-          # Every member carries the agreed configuration as well as the recipe: that is what the
-          # real documents do, and what the composition rule reads.
+          # Every member carries the recorded configuration as well as the recipe.
           "configuration": dict(agreed),
           "missing": [],
           "inputs": {},
@@ -298,13 +289,12 @@ class TestCodecs(unittest.TestCase):
     params.put(models.STATUS_KEY, "not json")
     self.assertEqual(models.status(params), empty)
 
-  def test_an_installed_entry_carries_one_of_the_two_ids(self):
+  def test_status_ignores_legacy_selection_entries(self):
     params = FakeParams()
-    models.publish_status(params, installed=[{"recipe": RECIPE, "name": "a"}, {"composition": "c-" + "e" * 32, "name": "b"}])
+    models.publish_status(params, installed=[{"recipe": RECIPE, "name": "a"}, {"composition": "c-" + "e" * 32, "name": "legacy"}])
     installed = models.status(params)["installed"]
+    self.assertEqual(len(installed), 1)
     self.assertEqual(models.selection_of(installed[0]), RECIPE)
-    self.assertEqual(models.selection_of(installed[1]), "c-" + "e" * 32)
-    self.assertEqual(models.selection_of(installed[0]), installed[0]["recipe"])
 
 
 class TestBootCommit(StoreCase):
@@ -372,6 +362,15 @@ class TestBootCommit(StoreCase):
     self.assertEqual(models.desired(params, models.DRIVING), RECIPE)
     self.assertTrue(RECIPE[:12] in models.model_description(params, models.DRIVING))
 
+  def test_a_legacy_selection_falls_back_to_stock(self):
+    legacy = "c-" + "e" * 32
+    params = FakeParams({models.DRIVING_KEY: legacy})
+    entry = models.commit_boot_selection(params)[models.DRIVING]
+    self.assertEqual(entry["kind"], "bundled")
+    self.assertEqual(entry["requested"], legacy)
+    self.assertEqual(entry["fallback"], models.UNKNOWN_SELECTION)
+    self.assertEqual(models.desired(params, models.DRIVING), legacy)
+
   def test_a_built_selection_resolves_to_paths(self):
     digest = self.add_package("supercombo", input_shapes=SUPERCOMBO_INPUTS, slices=SUPERCOMBO_SLICES)
     self.add_build(digest, models.SUPERCOMBO.id)
@@ -437,77 +436,8 @@ class TestBootCommit(StoreCase):
     self.assertEqual(models.model_label(params, models.DRIVING), f"{models.BUNDLED_LABEL} {models.RESTART_NOTE}")
     with self.assertRaises(ValueError):
       models.select(params, models.DRIVING, "nonsense")
-
-
-class TestComposition(StoreCase):
-  def views(self, role: str, **overrides) -> dict:
-    base = {
-      "input_shapes": {"img": [1, 12, 128, 256], "big_img": [1, 12, 128, 256]},
-      # 512 wide, like the real feature, so `set_reason`'s width check passes and the *port* check
-      # below is the one under test.
-      "slices": {name: [0, 512] for name in models.DRIVING_SLICES},
-      "configuration": {"frame_skip": 4, "LAT_SMOOTH_SECONDS": 0.0, "LONG_SMOOTH_SECONDS": 0.3},
-      "ports_in": {},
-      "ports_out": {},
-      "format": "onnx",
-      "targets": ["QCOM"],
-    }
-    base.update(overrides)
-    return base
-
-  def test_members_that_disagree_on_smoothing_cannot_be_one_model(self):
-    members = {
-      "vision": self.views("vision"),
-      "on_policy": self.views(
-        "on_policy",
-        input_shapes={"desire_pulse": [1, 25, 8], "features_buffer": [1, 24, 512], "traffic_convention": [1, 2]},
-        configuration={"frame_skip": 4, "LAT_SMOOTH_SECONDS": 0.3, "LONG_SMOOTH_SECONDS": 0.3},
-      ),
-    }
-    self.assertEqual(models.picks_reason(models.SPLIT_VISION_POLICY, members, []), models.MEMBERS_DISAGREE.format(key="LAT_SMOOTH_SECONDS"))
-
-  def test_a_port_missing_on_either_side_is_structure_unknown(self):
-    members = {
-      "vision": self.views("vision", ports_out={}),
-      "on_policy": self.views(
-        "on_policy",
-        input_shapes={"desire_pulse": [1, 25, 8], "features_buffer": [1, 24, 512], "traffic_convention": [1, 2]},
-        ports_in={"features": {"shape": [512], "dtype": None, "semantics": None}},
-      ),
-    }
-    profile = {"connections": [{"from": "vision", "output": "features", "to": "on_policy", "input": "features"}]}
-    reason = models.picks_reason(models.SPLIT_VISION_POLICY, members, [profile])
-    self.assertIsNotNone(reason)
-    self.assertTrue(str(reason).startswith("structure_unknown"), reason)
-
-  def test_a_role_set_no_protocol_claims_is_refused(self):
-    reason = models.composition_reason(models.SPLIT_VISION_POLICY.id, {"vision": RECIPE})
-    self.assertIsNotNone(reason)
-    self.assertTrue(models.UNKNOWN_ROLE in str(reason))
-
-  def test_one_recipe_under_every_role_is_the_recipe_not_a_composition(self):
-    # A wrapper record around one model would be a second name for it, with its own build directory
-    # to keep in step; the recipe digest is the selection.
-    digest = self.add_package("supercombo", input_shapes=SUPERCOMBO_INPUTS, slices=SUPERCOMBO_SLICES)
-    composition, reason = models.write_composition(models.SUPERCOMBO.id, {"supercombo": digest})
-    self.assertIsNone(composition)
-    self.assertEqual(reason, models.SINGLE_RECIPE)
-
-  def test_writing_a_composition_round_trips_and_its_id_is_a_digest_of_the_record(self):
-    vision = self.add_package("vision", input_shapes={"img": [1, 12, 128, 256], "big_img": [1, 12, 128, 256]}, slices=SUPERCOMBO_SLICES)
-    policy = self.add_package("on_policy", input_shapes=POLICY_INPUTS, slices={})
-    picks = {"vision": vision, "on_policy": policy}
-    composition, reason = models.write_composition(models.SPLIT_VISION_POLICY.id, picks)
-    self.assertIsNone(reason)
-    assert composition is not None
-    self.assertTrue(models.is_composition(composition))
-    record = models.load_composition(composition)
-    assert record is not None
-    self.assertEqual(record["members"], {"on_policy": {"recipe": policy}, "vision": {"recipe": vision}})
-    # An edited record no longer matches its own name, which is what makes `load_composition` a check.
-    record["members"]["vision"]["recipe"] = OTHER_RECIPE
-    models.write_json(models.composition_file(composition), record)
-    self.assertIsNone(models.load_composition(composition))
+    with self.assertRaises(ValueError):
+      models.select(params, models.DRIVING, "c-" + "e" * 32)
 
 
 class TestCapacity(unittest.TestCase):
