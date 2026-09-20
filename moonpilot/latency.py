@@ -105,6 +105,7 @@ fakes. If it ever stops matching, the estimator goes quietly dead rather than wr
 """
 
 import math
+from typing import Any
 
 import numpy as np
 
@@ -142,6 +143,41 @@ MOONPILOT_LAG_BLOCK_COUNT = 50  # blocks in the ring, 250 s of history
 MOONPILOT_LAG_BLOCKS_NEEDED = 5  # blocks before the mean is trusted: 25 s of estimates
 MOONPILOT_LAG_ESTIMATE_EVERY = 5  # frames between estimates, 4 Hz at DT_MDL, as lagd's `sm.frame % 5`
 MOONPILOT_LAG_PERSIST_EVERY = 1200  # frames between param writes, 60 s at DT_MDL, as lagd's cache
+MOONPILOT_LAG_MODEL_REFRESH_FRAMES = 100  # frames between `modeld`'s re-reads of the persisted
+# estimate, 5 s at 20 Hz: the planner persists a trusted value every 60 s, so the model's ask horizon
+# follows within about a minute of the planner's projection without a message of its own.
+
+
+def persisted_seed(params: Any) -> tuple[float, int] | None:
+  """The persisted estimate as a seed: `(delay, evidence blocks)` when it is usable, else None.
+
+  One place decides what a usable persisted value is, because two processes act on it: the planner
+  seeds `LongLagEstimator` with it at construction, and `modeld` decodes the model's longitudinal ask
+  at the delay it implies (`applied_long_delay`). `isinstance` is load-bearing — the tests' FakeParams
+  answers every key with a bool, and the real param is a FLOAT whose "0.0" default is below the ROI
+  floor — and the evidence count rides with the value, so a drive that earns a block adds it to what
+  earlier drives left; a value written before the count existed was only ever written when trusted, so
+  a missing or malformed count reads as the needed one.
+  """
+  seeded = params.get(MOONPILOT_LAG_KEY, return_default=True)
+  if not (isinstance(seeded, float) and math.isfinite(seeded) and seeded >= MOONPILOT_LAG_MIN):
+    return None
+  seeded_blocks = params.get(MOONPILOT_LAG_BLOCKS_KEY, return_default=True)
+  blocks = seeded_blocks if isinstance(seeded_blocks, int) and not isinstance(seeded_blocks, bool) else 0
+  if blocks <= 0:
+    blocks = MOONPILOT_LAG_BLOCKS_NEEDED
+  return min(seeded, MOONPILOT_LAG_MAX), min(blocks, MOONPILOT_LAG_BLOCK_COUNT)
+
+
+def applied_long_delay(CP, params: Any, smoothing: float = 0.0) -> float:
+  """The delay the model's longitudinal ask is decoded at: what the planner projects through, plus the
+  model's own smoothing constant. `action_t` is this number plus one model period, so the ask and the
+  plan it is arbitrated against are computed for the same horizon; the car's own constant is the floor
+  and a value without enough evidence behind it is not applied at all, exactly as `seed` rules."""
+  seed = persisted_seed(params)
+  if seed is None or seed[1] < MOONPILOT_LAG_BLOCKS_NEEDED:
+    return float(CP.longitudinalActuatorDelay) + float(smoothing)
+  return float(max(CP.longitudinalActuatorDelay, min(MOONPILOT_LAG_MAX, max(MOONPILOT_LAG_MIN, seed[0])))) + float(smoothing)
 
 
 class LongLagEstimator:

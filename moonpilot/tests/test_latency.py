@@ -12,6 +12,7 @@ planner, so nothing may be learned from it — and `action_t` is the estimator's
 """
 
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import numpy as np
@@ -28,6 +29,8 @@ from moonpilot.latency import (
   MOONPILOT_LAG_MAX,
   MOONPILOT_LAG_WINDOW_SEC,
   LongLagEstimator,
+  applied_long_delay,
+  persisted_seed,
 )
 from moonpilot.longitudinal import MoonpilotLongitudinalPlanner
 from moonpilot.tests.test_longitudinal import _inputs, _lead, _planner
@@ -254,6 +257,35 @@ class _StoredParams:
     if key == MOONPILOT_LAG_BLOCKS_KEY:
       return self.blocks if self.blocks is not None else 0
     return self.value
+
+
+class TestAppliedLongDelay(unittest.TestCase):
+  """The horizon `modeld` decodes the longitudinal ask at is the number the planner projects through,
+  plus the model's smoothing: one validator (`persisted_seed`) decides what a persisted value is worth
+  for both consumers, so a boot cannot compute the ask and the plan for different horizons."""
+
+  def test_the_stock_constant_is_the_floor_and_the_fallback(self):
+    self.assertIsNone(persisted_seed(_StoredParams(0.0)))
+    self.assertAlmostEqual(applied_long_delay(CP, _StoredParams(0.0)), CP.longitudinalActuatorDelay, delta=1e-9)
+    self.assertAlmostEqual(applied_long_delay(CP, _StoredParams(0.0), 0.3), CP.longitudinalActuatorDelay + 0.3, delta=1e-9)
+
+  def test_a_trusted_value_is_applied_with_its_evidence(self):
+    trusted = _StoredParams(0.45, MOONPILOT_LAG_BLOCKS_NEEDED)
+    self.assertAlmostEqual(applied_long_delay(CP, trusted), 0.45, delta=1e-9)
+    # a value written before the count existed was only ever written when trusted
+    self.assertAlmostEqual(applied_long_delay(CP, _StoredParams(0.45)), 0.45, delta=1e-9)
+    # below the requirement the value is carried, not applied
+    self.assertAlmostEqual(applied_long_delay(CP, _StoredParams(0.45, 1)), CP.longitudinalActuatorDelay, delta=1e-9)
+
+  def test_the_roi_bounds_the_value(self):
+    self.assertAlmostEqual(applied_long_delay(CP, _StoredParams(1.5, MOONPILOT_LAG_BLOCKS_NEEDED)), MOONPILOT_LAG_MAX, delta=1e-9)
+    self.assertAlmostEqual(applied_long_delay(CP, _StoredParams(0.02, MOONPILOT_LAG_BLOCKS_NEEDED)), CP.longitudinalActuatorDelay, delta=1e-9)
+
+  def test_modeld_decodes_at_it(self):
+    """Both the horizon it starts with and the one it re-reads: a boot with a learned value and a
+    boot that learns one mid-drive must decode the ask at the plan's own horizon."""
+    text = (Path(__file__).resolve().parents[2] / "openpilot/selfdrive/modeld/modeld.py").read_text()
+    self.assertEqual(text.count("applied_long_delay(CP, params, long_smooth)"), 2)
 
 
 if __name__ == "__main__":

@@ -103,6 +103,19 @@ class TestCurveTargets(unittest.TestCase):
     self.assertIsNone(curve_targets(messaging.new_message("modelV2").modelV2, True))
     self.assertIsNone(curve_targets(_path(0.0), False))
 
+  def test_the_path_is_referenced_to_the_car_now(self):
+    """`position.x` is measured from the pose of the frame the model saw, so `ahead` is the travel the
+    caller can account for since then: the returned `x` is exactly that much closer, which is what
+    makes it meters ahead of the car now for the command and the published rollout alike."""
+    model = _path(0.004)
+    base = curve_targets(model, True)
+    shifted = curve_targets(model, True, ahead=2.0)
+    np.testing.assert_allclose(shifted.x, base.x - 2.0, atol=1e-12)
+    np.testing.assert_allclose(shifted.v, base.v, atol=1e-12)
+    for ahead in (0.0, -1.0, float("nan"), float("inf")):
+      with self.subTest(ahead=ahead):
+        np.testing.assert_allclose(curve_targets(model, True, ahead=ahead).x, base.x, atol=1e-12)
+
   def test_a_constant_radius_gives_the_budget_speed(self):
     curv = 0.004
     target = curve_targets(_path(curv), True)

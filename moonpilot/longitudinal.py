@@ -97,16 +97,13 @@ from moonpilot.curve import (
 )
 from moonpilot.features import COAST_GRADE, CURVE_SPEED, LEAD_LATERAL, LONGITUDINAL, MODEL_BRAKING, enabled
 from moonpilot.latency import (
-  MOONPILOT_LAG_BLOCKS_NEEDED,
   MOONPILOT_LAG_BLOCKS_KEY,
-  MOONPILOT_LAG_BLOCK_COUNT,
   MOONPILOT_LAG_KEY,
   MOONPILOT_LAG_LOG_DELTA,
-  MOONPILOT_LAG_MAX,
-  MOONPILOT_LAG_MIN,
   MOONPILOT_LAG_MIN_SPEED,
   MOONPILOT_LAG_PERSIST_EVERY,
   LongLagEstimator,
+  persisted_seed,
 )
 from moonpilot.jerk import (
   MOONPILOT_LONG_JERK_MIN_SAMPLES,
@@ -575,21 +572,11 @@ class MoonpilotLongitudinalPlanner:
     # constant are all exactly the planner this fork had before.
     self.long_lag = LongLagEstimator(CP, dt)
     self.long_lag_logged = self.long_lag.applied_delay()
-    # `isinstance` is load-bearing: the tests' FakeParams answers every key with a bool, and a bool is
-    # not a float, so no test is seeded. The real param is a FLOAT whose "0.0" default is below the
-    # ROI floor and so is not a seed either.
-    seeded = self.params.get(MOONPILOT_LAG_KEY, return_default=True)
-    if isinstance(seeded, float) and seeded >= MOONPILOT_LAG_MIN:
-      # The evidence count rides with the value, so a drive that earns a block adds it to what earlier
-      # drives left instead of the mean being re-trusted wholesale. Below the block requirement the
-      # carried mean is held back — `status` stays `unestimated` and the stock constant is applied —
-      # and a value written before the count existed was only ever written when trusted, so a missing
-      # or malformed count reads as the needed one.
-      seeded_blocks = self.params.get(MOONPILOT_LAG_BLOCKS_KEY, return_default=True)
-      blocks = seeded_blocks if isinstance(seeded_blocks, int) and not isinstance(seeded_blocks, bool) else 0
-      if blocks <= 0:
-        blocks = MOONPILOT_LAG_BLOCKS_NEEDED
-      self.long_lag.seed(min(seeded, MOONPILOT_LAG_MAX), min(blocks, MOONPILOT_LAG_BLOCK_COUNT))
+    # The persisted value and its evidence, validated in one place (`moonpilot.latency.persisted_seed`)
+    # because `modeld` acts on the same number to decode the model's longitudinal ask.
+    seed = persisted_seed(self.params)
+    if seed is not None:
+      self.long_lag.seed(*seed)
       self.long_lag_logged = self.long_lag.applied_delay()
     self.long_jerk = LongitudinalComfortJerkEstimator(dt)
     seeded_jerk = self.params.get(MOONPILOT_LONG_JERK_SCALE_KEY, return_default=True)
@@ -738,7 +725,6 @@ class MoonpilotLongitudinalPlanner:
     )
     self.lat_bias.update(predicted_lat_accel(sm['modelV2']), measured_curvature * CS.vEgo**2, bias_valid)
     scale = self.lat_bias.applied()
-    curve = curve_targets(sm['modelV2'], curve_allowed, vp.roll, scale)
     v_hold = math.inf
     if curve_allowed:
       budget = float(lat_accel_budget(math.copysign(1.0, measured_curvature), vp.roll, scale))
@@ -807,6 +793,9 @@ class MoonpilotLongitudinalPlanner:
         path_age = age if age <= MOONPILOT_CURVE_PATH_MAX_AGE else 0.0
         break
     x_path = v_ego * path_age
+    # The path is re-referenced here, once, rather than folded into each caller's `x_ego`: both the
+    # command and the published rollout then pass plain ego travel and share one target.
+    curve = curve_targets(sm['modelV2'], curve_allowed, vp.roll, scale, ahead=x_path)
 
     a_prev = float(self.output_a_target)
     v_pred = max(0.0, v_ego + a_prev * self.action_t)
@@ -825,7 +814,7 @@ class MoonpilotLongitudinalPlanner:
       self.allow_throttle,
       coast_band=coast_band,
       curve=curve,
-      x_ego=x_pred + x_path,
+      x_ego=x_pred,
       v_hold=v_hold,
     )
 
@@ -846,7 +835,6 @@ class MoonpilotLongitudinalPlanner:
       steer_angle,
       accel_coast,
       lead_age,
-      path_age,
       curve,
       v_hold,
       jerk_scale,
@@ -956,7 +944,6 @@ class MoonpilotLongitudinalPlanner:
     steer_angle,
     accel_coast,
     lead_age=0.0,
-    path_age=0.0,
     curve=None,
     v_hold=math.inf,
     comfort_scale=1.0,
@@ -968,11 +955,10 @@ class MoonpilotLongitudinalPlanner:
     a gap recomputed from the initial speed and the loop's current accel: on a closing lead at
     25 m/s, its speeds sat up to 0.42 m/s away from the consistent rollout's. `lead_age` carries the
     same staleness correction `update` applies, so the published plan is the same prediction the
-    command was taken from rather than a fresher one. `path_age` is the model path's own age, added
-    to the curve's `x_ego` exactly as `update` does it, for the same reason the plan and the command
-    have to agree. `curve` and `v_hold` ride along for the same reason: the rollout is the policy the
-    command came from, with the curve's own travel accumulated in `x` and the measured curvature held
-    across the horizon."""
+    command was taken from rather than a fresher one. `curve` and `v_hold` ride along for the same
+    reason: the rollout is the policy the command came from, with the curve's own travel accumulated
+    in `x` and the measured curvature held across the horizon — the curve target already carries the
+    path re-reference, so `x_ego` is plain ego travel here as it is in `update`."""
     speeds = np.zeros(CONTROL_N)
     accels = np.zeros(CONTROL_N)
     v, a, x, t_prev = v_ego, a_target, 0.0, 0.0
@@ -992,7 +978,7 @@ class MoonpilotLongitudinalPlanner:
         self.allow_throttle,
         coast_band=coast_band,
         curve=curve,
-        x_ego=x + v_ego * path_age,
+        x_ego=x,
         v_hold=v_hold,
       )
       a = float(np.clip(jerk_limit(a_cmd, a, t - t_prev, v, comfort_scale), ACCEL_MIN, ACCEL_MAX))

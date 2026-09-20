@@ -197,6 +197,15 @@ def main(demo=False):
     cloudlog.exception("moonpilot model runtime unavailable")
     runtime = None
 
+  try:  # moonpilot seam, see AGENTS.md: the learned horizon, with the stock formula when the module is absent
+    from moonpilot.latency import MOONPILOT_LAG_MODEL_REFRESH_FRAMES, applied_long_delay
+  except Exception:
+    cloudlog.exception("moonpilot long-lag horizon unavailable")
+    MOONPILOT_LAG_MODEL_REFRESH_FRAMES = 100
+
+    def applied_long_delay(CP, params, smoothing=0.0):
+      return CP.longitudinalActuatorDelay + smoothing
+
   CHESTNUT = runtime is None and chestnut_present() and chestnut_compiled()
   if CHESTNUT:
     os.environ['HCQDEV_WAIT_TIMEOUT_MS'] = '3000'
@@ -289,7 +298,7 @@ def main(demo=False):
   # TODO this needs more thought, use .2s extra for now to estimate other delays
   # TODO Move smooth seconds to action function
   lat_smooth, long_smooth = runtime.smoothness if runtime is not None else (LAT_SMOOTH_SECONDS, LONG_SMOOTH_SECONDS)  # moonpilot seam, see AGENTS.md
-  long_delay = CP.longitudinalActuatorDelay + long_smooth
+  long_delay = applied_long_delay(CP, params, long_smooth)  # moonpilot seam, see AGENTS.md
   prev_action = log.ModelDataV2.Action()
 
   DH = DesireHelper()
@@ -365,6 +374,10 @@ def main(demo=False):
     transforms = {name: model_transform_extra if 'big' in name else model_transform_main for name in model.vision_input_names}
     frame_delay = DT_MDL # compensate for time passed since the frame was captured: current_time - timestamp_eof is 50ms on average
     action_delay = DT_MDL / 2 # middle of the interval between model output (current state) and next frame (expected state)
+    if run_count % MOONPILOT_LAG_MODEL_REFRESH_FRAMES == 0:  # moonpilot seam, see AGENTS.md
+      # The planner persists a trusted estimate every 60 s; re-reading it keeps the ask's horizon on
+      # the number the plan is projected through instead of the one this boot started with.
+      long_delay = applied_long_delay(CP, params, long_smooth)
     lat_action_t = lat_delay + frame_delay + action_delay
     long_action_t = long_delay + frame_delay + action_delay
     inputs: dict[str, np.ndarray] = {

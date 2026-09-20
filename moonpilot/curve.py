@@ -71,8 +71,8 @@ MOONPILOT_CURVE_JERK_STEP = 2.0  # m; the length the jerk ceiling's |dk/ds| is m
 MOONPILOT_CURVE_PREVIEW_T = 4.0  # s of path admitted; past this the prediction is not worth braking on
 MOONPILOT_CURVE_PATH_MAX_AGE = 2 * DT_MDL  # s; how old the path may be before `moonpilot/longitudinal.py`
 # stops re-referencing it. The path's `position.x` is measured from the pose of the frame the model
-# saw, so the planner shifts the curve's `x_ego` by the car's travel since that frame — the age at the
-# planner tick that consumes the message, not its publish stamp: msgq buffers, so `recv_time` is set
+# saw, so the planner passes the car's travel since that frame as `curve_targets`' `ahead` — the age at
+# the planner tick that consumes the message, not its publish stamp: msgq buffers, so `recv_time` is set
 # when the planner actually reads it. Measured over 282,554 corpus plans, the publish lag is 31 ms
 # median and the interval from that publish to the plan's own send another 15.9 ms (21.4 p95) against
 # a 0.58 ms solve, so the tick anchor is worth up to ~0.48 m more at 30 m/s. Two model periods, the same
@@ -116,10 +116,9 @@ def lat_accel_budget(direction, roll, scale=1.0):
 
 
 class CurveTarget(NamedTuple):
-  """Where the path is worth slowing to: `x` in meters ahead of the pose this path was predicted from,
-  `v` in m/s there. Distance from where the command will act is the pair `(x, x_ego)`: the caller
-  re-references `x` to the car now by the travel since that pose, the age it will accept bounded by
-  `MOONPILOT_CURVE_PATH_MAX_AGE` (`moonpilot/longitudinal.py`'s `path_age`)."""
+  """Where the path is worth slowing to: `x` in meters ahead of the car now, `v` in m/s there.
+  `curve_targets` re-references the model's own `position.x` to the car by the travel the caller
+  passes as `ahead`, so every consumer compares it against plain ego travel."""
 
   x: np.ndarray
   v: np.ndarray
@@ -161,7 +160,7 @@ def jerk_ceiling_speed(curv, x) -> np.ndarray:
   return v_jerk
 
 
-def curve_targets(model, allowed, roll=0.0, scale=1.0) -> CurveTarget | None:
+def curve_targets(model, allowed, roll=0.0, scale=1.0, ahead=0.0) -> CurveTarget | None:
   """The speed the model's own path is worth taking, per sample, or None for no candidate.
 
   Curvature is `orientationRate.z / velocity.x` over the model's own time grid, which is the same
@@ -180,9 +179,19 @@ def curve_targets(model, allowed, roll=0.0, scale=1.0) -> CurveTarget | None:
   message with no path arrays takes that branch, which is why upstream's maneuver plant (it fills
   `position` and `velocity` but never `orientationRate`) and every existing fork test are unaffected
   whether the feature is on or off.
+
+  `ahead` is the distance the car has already covered since the frame this path was predicted from:
+  `position.x` is measured from that pose, so subtracting the travel the caller can account for is
+  what makes the returned `x` meters ahead of the car now — the reading every distance comparison
+  against it assumes, and the reason both the command and the published rollout pass plain ego travel
+  as `x_ego`. Zero is the no-correction case, which is what an absent, future-dated or stale stamp
+  has to give rather than an extrapolated one.
   """
   if not allowed:
     return None
+  ahead = float(ahead)
+  if not math.isfinite(ahead) or ahead <= 0.0:
+    ahead = 0.0
   x = np.asarray(model.position.x, dtype=float)
   psi_rate = np.asarray(model.orientationRate.z, dtype=float)
   v_path = np.asarray(model.velocity.x, dtype=float)
@@ -198,7 +207,7 @@ def curve_targets(model, allowed, roll=0.0, scale=1.0) -> CurveTarget | None:
   finite = np.isfinite(x) & np.isfinite(v_target)
   if not finite.any():
     return None
-  return CurveTarget(x[finite], v_target[finite])
+  return CurveTarget(x[finite] - ahead, v_target[finite])
 
 
 def curve_accel(v_ego, x_ego, curve) -> float:
