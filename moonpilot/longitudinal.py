@@ -780,8 +780,11 @@ class MoonpilotLongitudinalPlanner:
 
     # The model path is the third stale stream, and the only one nothing re-references: its
     # `position.x` is measured from the pose of the frame the model saw, whose exposure ended at
-    # `timestampEof`, while every candidate in the `min` is evaluated at the planner tick + `action_t`
-    # (`lead_age` is what puts the lead pair there). The car covers `v_ego * path_age` of that path
+    # `timestampEof`, while the path is re-referenced to the planner tick + `action_t`. That is
+    # deliberately a tick *later* than the lead pair's own instant: `lead_age` is a `logMonoTime`
+    # delta and both projection windows are `action_t + lead_age` long, so the pair lands at the
+    # model's *publish* + `action_t` — one publish-to-send interval (15.9 ms median, 0.48 m at
+    # 30 m/s) behind this anchor. The car covers `v_ego * path_age` of that path
     # before this command exists, and the age is the tick's rather than the publish stamp's: msgq
     # buffers, so `recv_time` is set when this process actually reads the message. Measured over
     # 282,554 corpus plans, the publish lag is 31 ms median and the interval from it to the plan's own
