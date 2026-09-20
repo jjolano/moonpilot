@@ -45,7 +45,10 @@ Two things are deliberately not upstream's:
     at 45 m/s^3 and instant ACCEL_MIN saturation in simulation. The delay itself is measured onroad
     by ``moonpilot.latency``: ``action_t`` is ``max(CP.longitudinalActuatorDelay, that estimate) +
     the planner's own period`` (DT_MDL in production), since upstream's constant is a cookie-cutter
-    default and a measured value may only lengthen the projection.
+    default and a measured value may only lengthen the projection. The model path is the third stale
+    stream that prediction has to re-reference: its ``position.x`` is measured from the frame the
+    model saw, so the curve candidate reads it ``v_ego * (logMonoTime - timestampEof)`` of the way in,
+    the same instant the lead pair is evaluated at.
 
   - the lead's acceleration is the fork's own estimate — the least-squares slope of ``vLead`` over
     ``moonpilot.lead.LeadAccelEstimator``'s window — because radard's ``aLeadK`` is a Kalman filter
