@@ -126,6 +126,7 @@ class TestInstall(unittest.TestCase):
         self.assertEqual(f.read(), b"#!/bin/sh\n")
       self.assertEqual(running.returncode, -signal.SIGKILL)
 
+
 class TestLatestRelease(unittest.TestCase):
   def test_track_json_and_sidecar_resolve_without_the_network(self):
     track = json.dumps({"TarballsVersion": _VERSION, "Tarballs": {"arm64": _ASSET}}).encode()
@@ -182,7 +183,12 @@ class TestArgv(unittest.TestCase):
     # Derivation from --state is conditional on the state file's directory being named `tailscale`
     # (cmd/tailscaled/tailscaled.go, ipnServerOpts). Left to that, a rename silently sends certs,
     # Taildrop and profile-data to HOME — the read-only rootfs on device.
-    with tempfile.TemporaryDirectory() as tmp, mock.patch.object(paths, "data_root", return_value=tmp), self._with_tun(True):
+    with (
+      tempfile.TemporaryDirectory() as tmp,
+      mock.patch.object(paths, "data_root", return_value=tmp),
+      mock.patch.object(tailscale, "PC", True),
+      self._with_tun(True),
+    ):
       _quick_install()
       args = tailscale.daemon_args()
       self.assertTrue("--statedir" in args)
@@ -275,21 +281,22 @@ class TestStateMigration(unittest.TestCase):
         self.assertEqual(tailscale.state_path(), str(legacy))
         self.assertTrue(legacy.exists())
 
-  def test_absent_persist_root_uses_legacy_state(self):
+  def test_device_keeps_state_under_data_root_without_persist_probe(self):
     with tempfile.TemporaryDirectory() as tmp:
-      data_root, _, persist_root = self._roots(tmp)
+      data_root, _, _ = self._roots(tmp)
       legacy = data_root / "tailscale" / "tailscaled.state"
-      legacy.write_bytes(b"legacy")
+      legacy.write_bytes(b"device state")
       legacy.chmod(0o600)
       with (
         mock.patch.object(paths, "data_root", return_value=str(data_root)),
-        mock.patch.object(paths, "persist_root", return_value=str(persist_root)),
+        mock.patch.object(paths, "persist_root", side_effect=AssertionError("device must not probe /persist")),
         mock.patch.object(tailscale, "PC", False),
         mock.patch.object(tailscale, "_state_fallback", None),
         mock.patch.object(tailscaled.subprocess, "run") as run,
       ):
-        self.assertEqual(tailscaled._migrate_state(), tailscaled.PERSIST_DIR_ERROR)
+        self.assertEqual(tailscaled._migrate_state(), "")
         self.assertEqual(tailscale.state_path(), str(legacy))
+        self.assertTrue(legacy.exists())
         run.assert_not_called()
 
 

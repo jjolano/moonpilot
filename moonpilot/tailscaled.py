@@ -10,7 +10,7 @@ Same shape and same reason as moonpilot/depsd.py.
 
 Installing, upgrading and supervising all live here rather than in a second process: the daemon is
 the thing that has to be restarted after an upgrade, and the status param is the thing the panels
-read.
+read. Device state stays under the data root; only PC startup migrates legacy state to persistence.
 """
 
 import os
@@ -23,7 +23,7 @@ from openpilot.cereal import log, messaging
 from openpilot.common.params import Params
 from openpilot.common.swaglog import cloudlog
 
-from moonpilot import tailscale
+from moonpilot import paths, tailscale
 
 POLL = 10.0  # status poll while the daemon is up
 WAIT = 30.0  # no network yet
@@ -79,8 +79,9 @@ def _copy_state(legacy: str, target: str) -> None:
     if os.path.exists(staged):
       os.unlink(staged)
 
+
 def _ensure_state_dir() -> bool:
-  """Create the reset-surviving state directory before tailscaled needs it."""
+  """Create the reset-surviving state directory on a PC before tailscaled needs it."""
   target_dir = os.path.dirname(tailscale.persistent_state_path())
   persist_root = os.path.dirname(target_dir)
   for directory in (persist_root, target_dir):
@@ -108,9 +109,13 @@ def _ensure_state_dir() -> bool:
 
   return True
 
+
 def _migrate_state() -> str:
-  """Move a legacy state file, or return the detail shown when persistence is unavailable."""
+  """Migrate PC state; on device, keep the canonical data-root state without probing `/persist`."""
   legacy = tailscale.legacy_state_path()
+  if not tailscale.PC:
+    paths.data_dir("tailscale")
+    return ""
   target = tailscale.persistent_state_path()
   if legacy == target:
     return ""
@@ -144,6 +149,7 @@ def _put_status(params: Params, state: str, detail: str = "", state_error: str =
     tailscale.put_status(params, tailscale.ERROR, state_error)
   else:
     tailscale.put_status(params, state, detail)
+
 
 BACKOFF_START = 30.0
 BACKOFF_MAX = 1800.0  # 30 min
