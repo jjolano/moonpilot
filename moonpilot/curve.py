@@ -50,10 +50,19 @@ from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.modeld.constants import ModelConstants
 from opendbc.car.interfaces import ACCEL_MAX
 
+from moonpilot.lead import resample  # the fork's one interpolation entry point, shared rather than re-derived
+
 MOONPILOT_CURVE_T_IDX = np.array(ModelConstants.T_IDXS)  # the model path's own time grid
 MOONPILOT_CURVE_A_LAT = 1.9  # m/s^2; lateral accel a curve is worth taking at
 MOONPILOT_CURVE_A_LAT_MIN = 1.0  # m/s^2; floor after the bank correction, so a large roll cannot zero the budget
 MOONPILOT_CURVE_J_LAT = 3.0  # m/s^3; lateral jerk the entry is shaped to, below upstream's 5.0 ISO command limit
+MOONPILOT_CURVE_JERK_STEP = 5.0  # m; the length the jerk ceiling's |dk/ds| is measured over, rather than
+# between the model's own samples. Those are 0.1-0.5 m apart near the car and a single one can carry a
+# curvature step the trend around it does not have (measured: a 4.3e-4 step across ~0.2 m, which the
+# sample-scale gradient reads as 2e-3 and this window as 8.6e-5). The derivative is a centered
+# +/-STEP/2 difference clamped to the path's own ends and divided by the span it actually used, so a
+# linear ramp reads its own slope exactly wherever the window fits inside it, and the cost is only
+# ramps shorter than the window, which read shallow — less braking, never more.
 MOONPILOT_CURVE_PREVIEW_T = 4.0  # s of path admitted; past this the prediction is not worth braking on
 MOONPILOT_CURVE_PATH_MAX_AGE = 2 * DT_MDL  # s; how old the path may be before `moonpilot/longitudinal.py`
 # stops re-referencing it. The path's `position.x` is measured from the pose of the frame the model
@@ -101,13 +110,49 @@ class CurveTarget(NamedTuple):
   v: np.ndarray
 
 
+def jerk_ceiling_speed(curv, x) -> np.ndarray:
+  """The speed each path sample is worth under `v^3 * |dk/ds| <= MOONPILOT_CURVE_J_LAT`.
+
+  `|dk/ds|` is a centered difference over `MOONPILOT_CURVE_JERK_STEP` meters rather than between the
+  model's own samples, because the pre-brake takes the *deepest* sample of the window and the
+  sample-scale gradient hands that choice to whichever sample is noisiest. Measured over 142,977
+  corpus frames: on the frames where only this ceiling asks for braking, the binding sample sits a
+  median 4.2 m ahead reading |dk/ds| 1.7e-3 — a 1.7 m ramp — and the curvature profiles behind that
+  are smooth except for one 4.3e-4 step across ~0.2 m, which the sample-scale gradient reads as 2e-3
+  and this window as 8.6e-5. A linear ramp — the shape a road's own transition curve has, and the
+  shape this ceiling exists for — reads its own slope exactly, so what the wider measurement costs is
+  only ramps shorter than the window, which are not roads.
+
+  Unconstrained (`inf`) wherever the derivative cannot speak: fewer than two usable samples, or a
+  degenerate span — a path is left alone rather than braked on a NaN. At the ends the window shrinks
+  to what the path has and the difference is divided by that shorter span, so the slope stays
+  unbiased rather than reading half of itself.
+  """
+  curv = np.asarray(curv, dtype=float)
+  x = np.asarray(x, dtype=float)
+  v_jerk = np.full(x.shape, np.inf)
+  finite = np.isfinite(x) & np.isfinite(curv)
+  if finite.sum() < 2:
+    return v_jerk
+  xs, cs = x[finite], curv[finite]
+  order = np.argsort(xs)
+  xs, cs = xs[order], cs[order]
+  half = 0.5 * MOONPILOT_CURVE_JERK_STEP
+  left = np.maximum(xs[0], xs - half)
+  right = np.minimum(xs[-1], xs + half)
+  dk_ds = np.abs(resample(xs, cs, right) - resample(xs, cs, left)) / np.maximum(right - left, 1e-9)
+  v_jerk[finite] = np.cbrt(MOONPILOT_CURVE_J_LAT / np.maximum(dk_ds, 1e-9))
+  return v_jerk
+
+
 def curve_targets(model, allowed, roll=0.0, scale=1.0) -> CurveTarget | None:
   """The speed the model's own path is worth taking, per sample, or None for no candidate.
 
   Curvature is `orientationRate.z / velocity.x` over the model's own time grid, which is the same
   pair upstream's `get_curvature_from_plan` reads. The budget is the bank-corrected lateral accel for
   the direction the path turns; the jerk ceiling is the same budget expressed as a speed, since
-  lateral jerk at constant speed is `v^3 * |dk/ds|`.
+  lateral jerk at constant speed is `v^3 * |dk/ds|` — and it is what makes a fast-tightening entry
+  slow *earlier* rather than harder, the one thing a measured lateral-accel limit cannot see.
 
   None means no candidate, which is the planner this fork had before any of this existed — a model
   message with no path arrays takes that branch, which is why upstream's maneuver plant (it fills
@@ -127,18 +172,7 @@ def curve_targets(model, allowed, roll=0.0, scale=1.0) -> CurveTarget | None:
   curv = psi_rate / np.maximum(v_path, MOONPILOT_CURVE_MIN_PATH_SPEED)
   budget = lat_accel_budget(np.sign(curv), roll, scale)
   v_accel = np.sqrt(budget / np.maximum(np.abs(curv), 1e-6))
-  # Lateral jerk at constant speed is v^3 * |dk/ds|, so a jerk ceiling is a speed ceiling. This is
-  # what makes a fast-tightening entry slow *earlier* rather than harder. A degenerate path — two
-  # samples at the same distance — leaves the derivative undefined, and that sample is left
-  # unconstrained rather than braking on a NaN.
-  if len(x) >= 2:
-    with np.errstate(divide='ignore', invalid='ignore'):
-      dk_ds = np.abs(np.gradient(curv, x))
-    v_jerk = np.cbrt(MOONPILOT_CURVE_J_LAT / np.maximum(dk_ds, 1e-9))
-    v_jerk = np.where(np.isfinite(v_jerk), v_jerk, np.inf)
-  else:
-    v_jerk = np.full(len(x), np.inf)
-  v_target = np.maximum(np.minimum(v_accel, v_jerk), MOONPILOT_CURVE_V_MIN)
+  v_target = np.maximum(np.minimum(v_accel, jerk_ceiling_speed(curv, x)), MOONPILOT_CURVE_V_MIN)
   finite = np.isfinite(x) & np.isfinite(v_target)
   if not finite.any():
     return None

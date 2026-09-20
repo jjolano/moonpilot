@@ -37,6 +37,7 @@ from moonpilot.curve import (
   MOONPILOT_CURVE_BIAS_PERSIST_EVERY,
   MOONPILOT_CURVE_HOLD_MARGIN,
   MOONPILOT_CURVE_K_HOLD,
+  MOONPILOT_CURVE_PATH_MAX_AGE,
   curve_targets,
   lat_accel_hold,
 )
@@ -185,6 +186,7 @@ def _inputs(
   model_should_stop=False,
   moonpilot_leads=None,
   radar_age_s=0.0,
+  model_age_s=0.0,
   path=None,
   lat_active=True,
   steering_pressed=False,
@@ -222,6 +224,7 @@ def _inputs(
   vehicle_parameters.vehicleParameters.roll = float(roll)
 
   model = messaging.new_message("modelV2")
+  model.modelV2.timestampEof = int(round(1e9 - model_age_s * 1e9))  # the publish lag, against SubMaster's modelV2 stamp
   model.modelV2.meta.disengagePredictions.gasPressProbs = [float(throttle_prob)] * 6
   model.modelV2.action.desiredAcceleration = float(model_accel)
   model.modelV2.action.shouldStop = bool(model_should_stop)
@@ -1684,6 +1687,60 @@ class TestCurveSpeed(unittest.TestCase):
         for _ in range(100):
           planner.update(_inputs(**inputs, **disengaged_kwargs))
         self.assertEqual(planner.lat_bias.samples, 0)
+
+  def test_the_path_is_referenced_from_the_frame_the_model_saw(self):
+    """`modelV2.position.x` is measured from the pose of the frame the model saw — `T_IDXS` is
+    published unshifted (`fill_model_msg.py:84`) — while every candidate in the `min` is evaluated at
+    model publish + `action_t`, which is where `lead_age` puts the lead pair. So the pre-brake has to
+    read the path `v_ego * (logMonoTime - timestampEof)` of the way in, or it brakes as if the car
+    were still where that frame was taken. Measured publish lag over seven corpus segments: 29 ms
+    median, 34 p95, 38 max — ~0.9 m at 30 m/s.
+
+    The geometry is chosen so the answer is the term's own arithmetic rather than its floor: a 40 m
+    ramp to a 250 m radius starting 20 m out, at 30 m/s, where one sample binds at ~66 m and the ask
+    is ~-0.25 m/s². A 3 m shift (the bound, 0.1 s) is then `|a| * 3 / 66` ≈ 0.013 deeper.
+    """
+    path = self._ramp_curve(30.0, 20.0, curvature=0.0022)
+
+    def settle(age):
+      planner = _planner()
+      for _ in range(40):
+        planner.update(_inputs(v_ego=30.0, path=path, model_age_s=age))
+      return planner
+
+    plain, shifted = settle(0.0), settle(0.1)
+    delta = plain.output_a_target - shifted.output_a_target
+    self.assertEqual(shifted.source, plain.source)
+    self.assertGreater(delta, 0.005, "the shift did not reach the command")
+    self.assertLess(delta, 0.05, "the shift moved the command by more than the term's own arithmetic")
+    self.assertLess(float(shifted.a_desired_trajectory.min()), float(plain.a_desired_trajectory.min()))
+
+  def test_the_path_age_is_bounded_and_absent_stamps_are_the_old_planner(self):
+    """Two model periods, the same bound `moonpilot/curvature.py` puts on the age of this same
+    message: past it the shift is dropped rather than extrapolated, and a missing, zero or impossible
+    stamp is the zero shift this planner had before it existed. That direction matters — a shift that
+    is too large empties the pre-brake's binding set, which stops it asking at all — so the guard is a
+    window rather than `max(0.0, ...)`."""
+    path = self._ramp_curve(30.0, 20.0, curvature=0.0022)
+
+    def command(sm):
+      planner = _planner()
+      for _ in range(40):
+        planner.update(sm)
+      return planner.output_a_target
+
+    plain = command(_inputs(v_ego=30.0, path=path))
+    for age in (MOONPILOT_CURVE_PATH_MAX_AGE + 1e-9, 0.5):
+      with self.subTest(model_age_s=age):
+        self.assertAlmostEqual(command(_inputs(v_ego=30.0, path=path, model_age_s=age)), plain, delta=1e-9)
+
+    unset = _inputs(v_ego=30.0, path=path, model_age_s=0.1)
+    unset['modelV2'].timestampEof = 0  # a message that never carried one
+    self.assertAlmostEqual(command(unset), plain, delta=1e-9)
+
+    no_stamp = _inputs(v_ego=30.0, path=path, model_age_s=0.1)
+    no_stamp.logMonoTime.pop('modelV2')  # a bare dict, as the maneuver plant hands the planner
+    self.assertAlmostEqual(command(no_stamp), plain, delta=1e-9)
 
   def test_the_rollout_carries_the_curve(self):
     """The published plan is the policy the command came from, so the rollout has to see the same

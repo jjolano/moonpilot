@@ -82,6 +82,7 @@ from moonpilot.curve import (
   MOONPILOT_CURVE_BIAS_MIN_SAMPLES,
   MOONPILOT_CURVE_BIAS_PERSIST_EVERY,
   MOONPILOT_CURVE_BIAS_TRACKING_TOLERANCE,
+  MOONPILOT_CURVE_PATH_MAX_AGE,
   LatAccelBiasEstimator,
   curve_accel,
   curve_targets,
@@ -773,6 +774,20 @@ class MoonpilotLongitudinalPlanner:
     # travel over `lead_age` rides on the extra time; the ego's rides on `x_stale`.
     x_stale = v_ego * lead_age
 
+    # The model path is the third stale stream, and the only one nothing re-references: its
+    # `position.x` is measured from the pose of the frame the model saw, whose exposure ended at
+    # `timestampEof`, while every candidate in the `min` is evaluated at model publish + `action_t`
+    # (`lead_age` is what puts the lead pair there). The car has already covered `v_ego *
+    # (logMonoTime - timestampEof)` of that path — measured 29 ms median, 34 p95, 38 max over seven
+    # corpus segments, ~0.9 m at 30 m/s — and the pre-brake's `slack = max(d, 1 m)` makes a meter of
+    # it worth real braking near an entry. Bounded the way `moonpilot/curvature.py` bounds the age of
+    # this same message, and a missing, zero or impossible stamp gives the zero shift this planner
+    # had before it existed — the safe direction, since a shift that is too large empties the binding
+    # set and stops the pre-brake asking at all.
+    path_age = (model_mono - sm['modelV2'].timestampEof) / 1e9 if model_mono else 0.0
+    path_age = path_age if 0.0 < path_age <= MOONPILOT_CURVE_PATH_MAX_AGE else 0.0
+    x_path = v_ego * path_age
+
     a_prev = float(self.output_a_target)
     v_pred = max(0.0, v_ego + a_prev * self.action_t)
     x_pred = 0.5 * (v_ego + v_pred) * self.action_t
@@ -790,7 +805,7 @@ class MoonpilotLongitudinalPlanner:
       self.allow_throttle,
       coast_band=coast_band,
       curve=curve,
-      x_ego=x_pred,
+      x_ego=x_pred + x_path,
       v_hold=v_hold,
     )
 
@@ -811,6 +826,7 @@ class MoonpilotLongitudinalPlanner:
       steer_angle,
       accel_coast,
       lead_age,
+      path_age,
       curve,
       v_hold,
       jerk_scale,
@@ -920,6 +936,7 @@ class MoonpilotLongitudinalPlanner:
     steer_angle,
     accel_coast,
     lead_age=0.0,
+    path_age=0.0,
     curve=None,
     v_hold=math.inf,
     comfort_scale=1.0,
@@ -931,9 +948,11 @@ class MoonpilotLongitudinalPlanner:
     a gap recomputed from the initial speed and the loop's current accel: on a closing lead at
     25 m/s, its speeds sat up to 0.42 m/s away from the consistent rollout's. `lead_age` carries the
     same staleness correction `update` applies, so the published plan is the same prediction the
-    command was taken from rather than a fresher one. `curve` and `v_hold` ride along for the same
-    reason: the rollout is the policy the command came from, with the curve's own travel accumulated
-    in `x` and the measured curvature held across the horizon."""
+    command was taken from rather than a fresher one. `path_age` is the model path's own age, added
+    to the curve's `x_ego` exactly as `update` does it, for the same reason the plan and the command
+    have to agree. `curve` and `v_hold` ride along for the same reason: the rollout is the policy the
+    command came from, with the curve's own travel accumulated in `x` and the measured curvature held
+    across the horizon."""
     speeds = np.zeros(CONTROL_N)
     accels = np.zeros(CONTROL_N)
     v, a, x, t_prev = v_ego, a_target, 0.0, 0.0
@@ -953,7 +972,7 @@ class MoonpilotLongitudinalPlanner:
         self.allow_throttle,
         coast_band=coast_band,
         curve=curve,
-        x_ego=x,
+        x_ego=x + v_ego * path_age,
         v_hold=v_hold,
       )
       a = float(np.clip(jerk_limit(a_cmd, a, t - t_prev, v, comfort_scale), ACCEL_MIN, ACCEL_MAX))

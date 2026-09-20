@@ -157,6 +157,45 @@ class TestCurveTargets(unittest.TestCase):
     target = curve_targets(_path(curv), True)
     self.assertAlmostEqual(float(target.v[-1]), math.sqrt(MOONPILOT_CURVE_A_LAT / curv), delta=1e-5)
 
+  def test_a_ten_metre_ramp_still_governs(self):
+    """The window does not lose the entry this ceiling exists for. A 10 m ramp to a 250 m radius is
+    `dk/ds = 4e-4`, i.e. `cbrt(3.0 / 4e-4)` = 19.6 m/s — and it is only two or three samples wide on
+    the model's own grid at 20 m/s, so the interpolated curvature under-reads its slope by ~10 %
+    (measured here: 20.7 m/s against the budget's 42 at that sample). It still governs, which is the
+    point: the entry is slowed before the budget would slow it."""
+    ramp = np.clip((X_IDXS - 20.0) / 10.0, 0.0, 1.0) * 0.004
+    target = curve_targets(_path(ramp), True)
+    keep = T_IDXS <= MOONPILOT_CURVE_PREVIEW_T
+    v_jerk = (MOONPILOT_CURVE_J_LAT / 4e-4) ** (1.0 / 3.0)
+    inside = (target.x >= 20.0) & (target.x <= 30.0) & (ramp[keep] < 0.004)
+    v_budget_here = np.sqrt(MOONPILOT_CURVE_A_LAT / np.maximum(ramp[keep][inside], 1e-6))
+    self.assertTrue(inside.any(), "the model grid has no sample inside the ramp")
+    self.assertTrue(np.all(target.v[inside] < v_budget_here))
+    self.assertLessEqual(float(target.v[inside].min()), v_jerk * 1.15)
+
+  def test_one_sample_of_curvature_noise_does_not_govern_the_ceiling(self):
+    """The ceiling is differenced on a `MOONPILOT_CURVE_JERK_STEP` grid rather than between the model's
+    own samples, because the pre-brake takes the *deepest* sample of the window: at the sample scale
+    one bad sample governs the whole term. Measured over 142,977 corpus frames, on the frames where
+    only this ceiling asks for braking the binding sample sits a median 4.2 m ahead reading
+    |dk/ds| 1.7e-3 — a 1.7 m ramp — and the profiles behind that are smooth except one 4.3e-4 step
+    across ~0.2 m, which the sample scale reads as 2e-3 and the grid as 8.6e-5.
+
+    Here the step is 4e-4 across the 0.94 m between two of the model grid's early samples: at the
+    sample scale that is `cbrt(3.0 / 4.3e-4)` = 19.1 m/s, well under the budget, so the ceiling would
+    govern; at 5 m the same step is 8e-5 and every sample keeps the speed the *budget* gives it. The
+    budget's own per-sample dip at that sample is untouched — it is a level rather than a derivative,
+    and a sample inside the projected ego position cannot bind anyway.
+    """
+    curv = np.full(len(X_IDXS), 0.002)
+    curv[3] += 4e-4  # X_IDXS[3] = 1.69 m, 0.94 m from its neighbor
+    target = curve_targets(_path(curv), True)
+    keep = T_IDXS <= MOONPILOT_CURVE_PREVIEW_T
+    v_budget = np.sqrt(MOONPILOT_CURVE_A_LAT / np.maximum(curv[keep], 1e-6))
+    self.assertEqual(len(target.v), int(keep.sum()))
+    self.assertTrue(np.allclose(target.v, v_budget, rtol=1e-4))
+    self.assertLess((MOONPILOT_CURVE_J_LAT / 4e-4) ** (1.0 / 3.0), float(np.max(v_budget)), "the step is too small to have governed at the sample scale")
+
   def test_a_nan_sample_is_dropped_rather_than_planned_on(self):
     curv = np.full(len(X_IDXS), 0.004)
     curv[3] = np.nan
@@ -331,6 +370,7 @@ class TestLatAccelBiasEstimator(unittest.TestCase):
     self.assertEqual(len(MOONPILOT_CURVE_T_IDX), len(T_IDXS))
     self.assertAlmostEqual(MOONPILOT_CURVE_MIN_PATH_SPEED, 1.0, delta=1e-12)
 
+
 class TestLatAccelBiasTrackingGate(unittest.TestCase):
   """The planner only learns from the fork's torque logger when that logger says it tracked."""
 
@@ -381,7 +421,6 @@ class TestLatAccelBiasTrackingGate(unittest.TestCase):
 
   def test_a_non_torque_union_member_keeps_learning(self):
     self.assertGreater(self._samples(), 0)
-
 
 
 if __name__ == "__main__":
