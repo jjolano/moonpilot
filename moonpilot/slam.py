@@ -129,7 +129,8 @@ class PriorChannel:
   """One channel of the car's motion prior, sampled in time and read by interpolation.
 
   A publisher pushes each sample with its own message time and reads it at the *odometry's* pose
-  time -- `logMonoTime - MOONPILOT_SLAM_POSE_DELAY` -- which is why this exists instead of reading
+  time -- `timestampEof - MOONPILOT_SLAM_POSE_DELAY`, the exposure-stamped pose time the module
+  header explains -- which is why this exists instead of reading
   the latest value off the subscription. `at` returns None rather than extrapolating: a pose time
   the samples do not span is a frame the prior cannot speak for, and the window would rather skip a
   sample than invent one.

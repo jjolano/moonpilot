@@ -86,6 +86,7 @@ from moonpilot.curve import (
   MOONPILOT_CURVE_BIAS_PERSIST_EVERY,
   MOONPILOT_CURVE_BIAS_TRACKING_TOLERANCE,
   MOONPILOT_CURVE_PATH_MAX_AGE,
+  MOONPILOT_CURVE_PATH_CLOCK_SANITY,
   LatAccelBiasEstimator,
   curve_accel,
   curve_targets,
@@ -779,16 +780,29 @@ class MoonpilotLongitudinalPlanner:
 
     # The model path is the third stale stream, and the only one nothing re-references: its
     # `position.x` is measured from the pose of the frame the model saw, whose exposure ended at
-    # `timestampEof`, while every candidate in the `min` is evaluated at model publish + `action_t`
-    # (`lead_age` is what puts the lead pair there). The car has already covered `v_ego *
-    # (logMonoTime - timestampEof)` of that path — measured 29 ms median, 34 p95, 38 max over seven
-    # corpus segments, ~0.9 m at 30 m/s — and the pre-brake's `slack = max(d, 1 m)` makes a meter of
-    # it worth real braking near an entry. Bounded the way `moonpilot/curvature.py` bounds the age of
-    # this same message, and a missing, zero or impossible stamp gives the zero shift this planner
-    # had before it existed — the safe direction, since a shift that is too large empties the binding
-    # set and stops the pre-brake asking at all.
-    path_age = (model_mono - sm['modelV2'].timestampEof) / 1e9 if model_mono else 0.0
-    path_age = path_age if 0.0 < path_age <= MOONPILOT_CURVE_PATH_MAX_AGE else 0.0
+    # `timestampEof`, while every candidate in the `min` is evaluated at the planner tick + `action_t`
+    # (`lead_age` is what puts the lead pair there). The car covers `v_ego * path_age` of that path
+    # before this command exists, and the age is the tick's rather than the publish stamp's: msgq
+    # buffers, so `recv_time` is set when this process actually reads the message. Measured over
+    # 282,554 corpus plans, the publish lag is 31 ms median and the interval from it to the plan's own
+    # send another 15.9 ms (21.4 p95) against a 0.58 ms solve — the loop, not the planner — so the
+    # tick anchor is worth up to ~0.48 m more at 30 m/s. A clock that does not line up with the stamps (a
+    # replay) falls back to the publish lag, which the stamps alone carry, and both candidates are
+    # bounded the way `moonpilot/curvature.py` bounds this message's age. Absent, zero or impossible
+    # stamps give the zero shift this planner had before it existed — the safe direction, since a
+    # shift too large empties the pre-brake's binding set and stops it asking at all.
+    path_age = 0.0
+    capture_time = sm['modelV2'].timestampEof * 1e-9
+    if math.isfinite(capture_time) and capture_time > 0.0:
+      recv_time = getattr(sm, 'recv_time', None) or {}
+      for stamp in (recv_time.get('modelV2'), (model_mono / 1e9) if model_mono else None):
+        if stamp is None or not math.isfinite(stamp):
+          continue
+        age = stamp - capture_time
+        if not 0.0 < age <= MOONPILOT_CURVE_PATH_CLOCK_SANITY:
+          continue  # not this source's clock: the stamp-only read is the fallback
+        path_age = age if age <= MOONPILOT_CURVE_PATH_MAX_AGE else 0.0
+        break
     x_path = v_ego * path_age
 
     a_prev = float(self.output_a_target)

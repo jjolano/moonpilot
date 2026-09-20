@@ -53,8 +53,10 @@ before any of this existed.
 (`/home/coder/route-corpus`, 199 rlog segments off the car, read through the frozen `custom` worktree
 whose cereal matches it) runs the estimator to `unestimated` everywhere — the intended outcome on a
 corpus that cannot support the measurement — and the reason is *not* the excitation floor. Over 42,980
-estimate attempts, **98.4 % were rejected on `num_okay`**: not enough valid samples inside one 60 s
-window, because the corpus holds only ~2.4 min of engaged longitudinal control in total. The
+estimate attempts, **98.4 % were rejected on `num_okay`**: not enough valid samples inside one
+window's worth of driving — the figure is from the run at the 60 s window the header's sizing sweep
+then widened to 90 s, which changes nothing — because the corpus holds only ~2.4 min of engaged
+longitudinal control in total. The
 excitation-range gate bound nothing, and only 24 estimates were ever accepted against the 100 a first
 trusted block needs. So the contingency to reach for is more engaged driving, never a lower
 `MOONPILOT_LAG_RANGE`.

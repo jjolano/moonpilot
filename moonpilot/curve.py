@@ -56,21 +56,33 @@ MOONPILOT_CURVE_T_IDX = np.array(ModelConstants.T_IDXS)  # the model path's own 
 MOONPILOT_CURVE_A_LAT = 1.9  # m/s^2; lateral accel a curve is worth taking at
 MOONPILOT_CURVE_A_LAT_MIN = 1.0  # m/s^2; floor after the bank correction, so a large roll cannot zero the budget
 MOONPILOT_CURVE_J_LAT = 3.0  # m/s^3; lateral jerk the entry is shaped to, below upstream's 5.0 ISO command limit
-MOONPILOT_CURVE_JERK_STEP = 5.0  # m; the length the jerk ceiling's |dk/ds| is measured over, rather than
-# between the model's own samples. Those are 0.1-0.5 m apart near the car and a single one can carry a
-# curvature step the trend around it does not have (measured: a 4.3e-4 step across ~0.2 m, which the
-# sample-scale gradient reads as 2e-3 and this window as 8.6e-5). The derivative is a centered
-# +/-STEP/2 difference clamped to the path's own ends and divided by the span it actually used, so a
-# linear ramp reads its own slope exactly wherever the window fits inside it, and the cost is only
-# ramps shorter than the window, which read shallow — less braking, never more.
+MOONPILOT_CURVE_JERK_STEP = 2.0  # m; the length the jerk ceiling's |dk/ds| is measured over, rather than
+# between the model's own samples. The model's spacing runs 0.1 m to 12 m along one path, so a
+# sample-scale gradient's value depends on where it happens to sit, and a single sample can carry a step
+# the trend around it does not have. Measured over 143,058 corpus frames, the frames where only this
+# ceiling asks for braking split by exactly that: the 33 % this window drops sit at a median 0.47 m
+# spacing with incoherent steps — net over summed |dk| 0.42, and |k| at 0.6x its own +/-5 m
+# neighbourhood — while the 67 % it keeps are coherent ramps at 1.7 m spacing with |k| at 1.7x its
+# neighbourhood, at full depth. 5 m dropped coherent ramps too (the dropped set's coherence median 1.0),
+# which is why this is sized to the sub-metre class rather than to the ramp the term exists for. The
+# derivative is a centered +/-STEP/2 difference clamped to the path's own ends and divided by the span
+# it actually used, so a linear ramp reads its own slope exactly wherever the window fits inside it,
+# and the cost is one-way: only structure narrower than the window reads shallow.
 MOONPILOT_CURVE_PREVIEW_T = 4.0  # s of path admitted; past this the prediction is not worth braking on
 MOONPILOT_CURVE_PATH_MAX_AGE = 2 * DT_MDL  # s; how old the path may be before `moonpilot/longitudinal.py`
 # stops re-referencing it. The path's `position.x` is measured from the pose of the frame the model
-# saw, so the planner shifts the curve's `x_ego` by the car's travel since that frame — `logMonoTime -
-# timestampEof`, measured 29 ms median and 38 ms max over seven corpus segments. Two model periods,
-# the same bound `moonpilot/curvature.py` puts on the age of this same message: past it the shift is
-# dropped rather than extrapolated, which leaves the planner this fork had before the correction —
-# the failure direction that only brakes less.
+# saw, so the planner shifts the curve's `x_ego` by the car's travel since that frame — the age at the
+# planner tick that consumes the message, not its publish stamp: msgq buffers, so `recv_time` is set
+# when the planner actually reads it. Measured over 282,554 corpus plans, the publish lag is 31 ms
+# median and the interval from that publish to the plan's own send another 15.9 ms (21.4 p95) against
+# a 0.58 ms solve, so the tick anchor is worth up to ~0.48 m more at 30 m/s. Two model periods, the same
+# bound `moonpilot/curvature.py` puts on the age of this same message: past it the shift is dropped
+# rather than extrapolated, which leaves the planner this fork had before the correction — the failure
+# direction that only brakes less.
+MOONPILOT_CURVE_PATH_CLOCK_SANITY = 10.0  # s; an age past this is a clock that does not line up with
+# the message's stamps — a replay reads wall time against a log — not a late planner, so the consumer
+# falls back to the publish lag, which the stamps alone carry, instead of the zero shift a mismatched
+# clock would otherwise give.
 MOONPILOT_CURVE_V_MIN = 5.0  # m/s; floor on any target speed, so a spurious curvature cannot ask for a stop
 MOONPILOT_CURVE_ACCEL_MIN = -1.5  # m/s^2; the terms' shared floor, well above ACCEL_MIN
 MOONPILOT_CURVE_MIN_SLACK = 1.0  # m; floor on the braking-distance denominator
@@ -104,7 +116,10 @@ def lat_accel_budget(direction, roll, scale=1.0):
 
 
 class CurveTarget(NamedTuple):
-  """Where the path is worth slowing to: `x` in meters ahead of the car now, `v` in m/s there."""
+  """Where the path is worth slowing to: `x` in meters ahead of the pose this path was predicted from,
+  `v` in m/s there. Distance from where the command will act is the pair `(x, x_ego)`: the caller
+  re-references `x` to the car now by the travel since that pose, the age it will accept bounded by
+  `MOONPILOT_CURVE_PATH_MAX_AGE` (`moonpilot/longitudinal.py`'s `path_age`)."""
 
   x: np.ndarray
   v: np.ndarray
@@ -115,13 +130,14 @@ def jerk_ceiling_speed(curv, x) -> np.ndarray:
 
   `|dk/ds|` is a centered difference over `MOONPILOT_CURVE_JERK_STEP` meters rather than between the
   model's own samples, because the pre-brake takes the *deepest* sample of the window and the
-  sample-scale gradient hands that choice to whichever sample is noisiest. Measured over 142,977
-  corpus frames: on the frames where only this ceiling asks for braking, the binding sample sits a
-  median 4.2 m ahead reading |dk/ds| 1.7e-3 — a 1.7 m ramp — and the curvature profiles behind that
-  are smooth except for one 4.3e-4 step across ~0.2 m, which the sample-scale gradient reads as 2e-3
-  and this window as 8.6e-5. A linear ramp — the shape a road's own transition curve has, and the
-  shape this ceiling exists for — reads its own slope exactly, so what the wider measurement costs is
-  only ramps shorter than the window, which are not roads.
+  sample-scale gradient hands that choice to whichever sample is noisiest. Measured over 143,058
+  corpus frames, the frames where only this ceiling asks for braking (741, 0.52 %) split by exactly
+  that: the 33 % the window drops sit at a median 0.47 m spacing with incoherent steps (net over
+  summed |dk| 0.42, |k| at 0.6x its +/-5 m neighbourhood) — a single sample's step, which no road has
+  and the model's own 0.1 s sampling cannot have resolved — while the 67 % it keeps are coherent
+  ramps at 1.7 m spacing with |k| at 1.7x its neighbourhood, at full depth. A linear ramp reads its
+  own slope exactly wherever the window fits inside it, so what the measurement costs is only
+  structure narrower than the window, which is one-way: shallower, never deeper.
 
   Unconstrained (`inf`) wherever the derivative cannot speak: fewer than two usable samples, or a
   degenerate span — a path is left alone rather than braked on a NaN. At the ends the window shrinks
@@ -153,6 +169,12 @@ def curve_targets(model, allowed, roll=0.0, scale=1.0) -> CurveTarget | None:
   the direction the path turns; the jerk ceiling is the same budget expressed as a speed, since
   lateral jerk at constant speed is `v^3 * |dk/ds|` — and it is what makes a fast-tightening entry
   slow *earlier* rather than harder, the one thing a measured lateral-accel limit cannot see.
+
+  Only the derivative is windowed. The budget stays per-sample on purpose, and that is measured
+  rather than assumed: over the corpus's 5,286 budget-binding frames the binding sample's |k| is
+  1.00x the median of its own +/-2 m neighbourhood (1.02x at +/-5 m, above 1.5x on 0.2 % of them),
+  because the deepest ask comes from the *nearest* binding sample of a sustained curve — which is
+  what the budget is for — rather than from a single sample's step.
 
   None means no candidate, which is the planner this fork had before any of this existed — a model
   message with no path arrays takes that branch, which is why upstream's maneuver plant (it fills

@@ -14,8 +14,11 @@ import time
 import unittest
 from types import SimpleNamespace
 from unittest import mock
+from pathlib import Path
 
 from moonpilot import models
+
+ROOT = Path(__file__).resolve().parents[2]
 
 RECIPE = "a" * 64
 
@@ -578,6 +581,28 @@ class TestWorkerPredicate(unittest.TestCase):
 
   def test_a_request_starts_it_again(self):
     self.assertTrue(self.wanted(**{models.STATUS_KEY: "{}", models.REQUEST_KEY: "{}"}))
+
+
+class TestDeclaredSmoothing(unittest.TestCase):
+  """One number for the model's timing: modeld decodes with the selection's declared smoothing, and
+  controlsd's curvature reference and torque controller must time against that same value rather than
+  modeld's module default (AGENTS.md, **The model marketplace**)."""
+
+  def test_the_boot_snapshot_carries_the_declared_value(self):
+    params = FakeParams()
+    self.assertEqual(models.boot_configuration(params, "LAT_SMOOTH_SECONDS", 0.0), 0.0)
+    snapshot = {"schema": models.SCHEMA, models.DRIVING: {"kind": "custom", "configuration": {"LAT_SMOOTH_SECONDS": 0.1}}}
+    params.put(models.BOOT_KEY, json.dumps(snapshot))
+    self.assertAlmostEqual(models.boot_configuration(params, "LAT_SMOOTH_SECONDS", 0.0), 0.1)
+    self.assertAlmostEqual(models.boot_configuration(params, "LONG_SMOOTH_SECONDS", 0.3), 0.3)
+    params.put(models.BOOT_KEY, json.dumps({"schema": models.SCHEMA, models.DRIVING: {"kind": "custom", "configuration": {"LAT_SMOOTH_SECONDS": "fast"}}}))
+    self.assertEqual(models.boot_configuration(params, "LAT_SMOOTH_SECONDS", 0.0), 0.0)
+
+  def test_controlsd_times_both_consumers_against_it(self):
+    text = (ROOT / "openpilot/selfdrive/controls/controlsd.py").read_text()
+    self.assertEqual(text.count('boot_configuration(self.params, "LAT_SMOOTH_SECONDS", LAT_SMOOTH_SECONDS)'), 1)
+    self.assertEqual(text.count("self.sm['lateralDelay'].lateralDelay + self.moonpilot_lat_smooth"), 1)
+    self.assertEqual(text.count('self.sm["lateralDelay"].lateralDelay + self.moonpilot_lat_smooth'), 1)
 
 
 if __name__ == "__main__":

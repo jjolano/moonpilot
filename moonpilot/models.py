@@ -892,6 +892,23 @@ def boot(params: Any) -> dict:
   return result
 
 
+def boot_configuration(params: Any, key: str, fallback: float) -> float:
+  """One declared configuration value from the committed driving selection, `fallback` when the
+  selection, the key or the value is absent.
+
+  The value is read out of the same boot snapshot `modeld` hands `DriverRuntime` (`smoothness`), so a
+  consumer that times its command against the model's decode cannot disagree with it -- `controlsd`'s
+  curvature reference and torque controller are the two that do. The one divergence is a build that
+  fails to load: modeld drops the runtime and uses its module constants, while this still reports what
+  the selection declared (the panel already says the model fell back).
+  """
+  configuration = boot(params)[DRIVING].get("configuration") or {}
+  try:
+    return float(configuration.get(key, fallback))
+  except (TypeError, ValueError):
+    return float(fallback)
+
+
 def _boot_entry(entry: dict) -> dict:
   kind = entry.get("kind")
   if kind not in ("bundled", "custom"):
@@ -1288,13 +1305,7 @@ def chooser_entries(params: Any, kind: str) -> list[dict | None]:
     entries.append(entry)
   for entry in browse().get("entries", []):
     recipe = selection_of(entry)
-    if (
-      not recipe
-      or recipe in installed_recipes
-      or recipe in seen
-      or entry.get("kind") != kind
-      or not entry.get("admitted")
-    ):
+    if not recipe or recipe in installed_recipes or recipe in seen or entry.get("kind") != kind or not entry.get("admitted"):
       continue
     seen.add(recipe)
     entries.append(entry)

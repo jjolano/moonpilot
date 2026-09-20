@@ -154,7 +154,7 @@ class SubMaster(dict):
   by default, which is the zero correction the planner made before that existed — a test that wants
   to exercise the staleness path shifts the radar stamp, as `_inputs(radar_age_s=...)` does."""
 
-  def __init__(self, data, moonpilot_leads=None, radar_age_s=0.0):
+  def __init__(self, data, moonpilot_leads=None, radar_age_s=0.0, recv_age_s=0.0):
     super().__init__(data)
     moonpilot = custom.MoonpilotState.new_message()
     if moonpilot_leads is not None:
@@ -163,6 +163,10 @@ class SubMaster(dict):
     self.valid = {"moonpilotState": moonpilot_leads is not None}
     self.alive = {"moonpilotState": moonpilot_leads is not None}
     self.logMonoTime = {"modelV2": 1e9, "radarState": 1e9 - radar_age_s * 1e9}
+    # The tick the planner consumes the message at, in seconds, as `messaging.SubMaster` stamps it.
+    # Equal to the model stamp by default, so `model_age_s` stays the age the planner reads; a test
+    # that wants the two anchors apart shifts this one with `recv_age_s`.
+    self.recv_time = {"modelV2": 1.0 + recv_age_s}
 
   def all_checks(self, *services):
     return True
@@ -187,6 +191,7 @@ def _inputs(
   moonpilot_leads=None,
   radar_age_s=0.0,
   model_age_s=0.0,
+  recv_age_s=0.0,
   path=None,
   lat_active=True,
   steering_pressed=False,
@@ -250,6 +255,7 @@ def _inputs(
     },
     moonpilot_leads=moonpilot_leads,
     radar_age_s=radar_age_s,
+    recv_age_s=recv_age_s,
   )
 
 
@@ -1562,6 +1568,41 @@ class TestCurveSpeed(unittest.TestCase):
     self.assertGreaterEqual(planner.output_a_target, MOONPILOT_CURVE_ACCEL_MIN - 1e-9)
     self.assertEqual(planner.source, Source.cruise)
 
+  def test_the_path_age_is_the_consuming_tick_not_the_publish_stamp(self):
+    """`recv_time` is stamped when the planner reads the message — msgq buffers, so it is the age the
+    shift must use — and the publish lag is only the fallback for a clock that does not line up with
+    the stamps. The two are not the same number: measured over the corpus, the interval from the
+    model publish to the plan's own send is ~16 ms median on top of the ~31 ms publish lag."""
+    path = self._ramp_curve(30.0, 20.0, curvature=0.0022)
+
+    def command(**ages):
+      planner = _planner()
+      for _ in range(40):
+        planner.update(_inputs(v_ego=30.0, path=path, **ages))
+      return planner.output_a_target
+
+    plain = command(model_age_s=0.05)
+    tick = command(model_age_s=0.05, recv_age_s=0.03)  # the tick sees 0.08 s
+    self.assertLess(tick, plain, "the tick anchor did not deepen the pre-brake")
+    self.assertAlmostEqual(tick, command(model_age_s=0.08), delta=1e-12)
+
+  def test_an_unusable_clock_falls_back_to_the_publish_lag(self):
+    """A replay reads wall time against a log's stamps, so its tick age is absurd; the publish lag is
+    computable from the stamps alone and is the fallback. A tick that is merely *late* — past
+    `MOONPILOT_CURVE_PATH_MAX_AGE` but inside the sanity bound — is a real staleness and drops the
+    shift instead, the same direction the bound always had."""
+    path = self._ramp_curve(30.0, 20.0, curvature=0.0022)
+
+    def command(**ages):
+      planner = _planner()
+      for _ in range(40):
+        planner.update(_inputs(v_ego=30.0, path=path, **ages))
+      return planner.output_a_target
+
+    plain = command(model_age_s=0.05)
+    self.assertAlmostEqual(command(model_age_s=0.05, recv_age_s=1e6), plain, delta=1e-12)
+    self.assertAlmostEqual(command(model_age_s=0.05, recv_age_s=0.5), command(model_age_s=0.0), delta=1e-12)
+
   def test_the_pre_brake_is_the_terms_own_floor_at_the_deepest_point(self):
     """At 30 m/s even a 60 m approach to a 21.79 m/s target needs more than the term's authority, so
     what bounds this is `MOONPILOT_CURVE_ACCEL_MIN` and not the geometry — the actuator's own
@@ -1740,6 +1781,7 @@ class TestCurveSpeed(unittest.TestCase):
 
     no_stamp = _inputs(v_ego=30.0, path=path, model_age_s=0.1)
     no_stamp.logMonoTime.pop('modelV2')  # a bare dict, as the maneuver plant hands the planner
+    no_stamp.recv_time.pop('modelV2')  # and no tick stamp: the tick anchor is the primary one now
     self.assertAlmostEqual(command(no_stamp), plain, delta=1e-9)
 
   def test_the_rollout_carries_the_curve(self):

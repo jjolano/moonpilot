@@ -174,27 +174,31 @@ class TestCurveTargets(unittest.TestCase):
     self.assertLessEqual(float(target.v[inside].min()), v_jerk * 1.15)
 
   def test_one_sample_of_curvature_noise_does_not_govern_the_ceiling(self):
-    """The ceiling is differenced on a `MOONPILOT_CURVE_JERK_STEP` grid rather than between the model's
-    own samples, because the pre-brake takes the *deepest* sample of the window: at the sample scale
-    one bad sample governs the whole term. Measured over 142,977 corpus frames, on the frames where
-    only this ceiling asks for braking the binding sample sits a median 4.2 m ahead reading
-    |dk/ds| 1.7e-3 — a 1.7 m ramp — and the profiles behind that are smooth except one 4.3e-4 step
-    across ~0.2 m, which the sample scale reads as 2e-3 and the grid as 8.6e-5.
+    """The ceiling is differenced over `MOONPILOT_CURVE_JERK_STEP` meters rather than between the
+    model's own samples, because the pre-brake takes the *deepest* sample of the window: at the sample
+    scale one bad sample governs the whole term. The corpus says which samples those are — of the 741
+    frames where only this ceiling asks for braking, the 33 % the window drops sit at a median 0.47 m
+    spacing with incoherent steps (net over summed |dκ| 0.42) and |κ| at 0.6x its own neighbourhood,
+    while the 67 % it keeps are coherent ramps at 1.7 m spacing with |κ| at 1.7x.
 
-    Here the step is 4e-4 across the 0.94 m between two of the model grid's early samples: at the
-    sample scale that is `cbrt(3.0 / 4.3e-4)` = 19.1 m/s, well under the budget, so the ceiling would
-    govern; at 5 m the same step is 8e-5 and every sample keeps the speed the *budget* gives it. The
-    budget's own per-sample dip at that sample is untouched — it is a level rather than a derivative,
-    and a sample inside the projected ego position cannot bind anyway.
+    Here the step is 4e-4 across the 0.19 m between two of the model grid's first samples — the
+    sub-metre class — so every sample keeps the speed the *budget* gives it, where the sample-scale
+    gradient reads that step as a ramp and caps three of them. The budget's own per-sample dip at the
+    spike is untouched: it is a level rather than a derivative.
     """
-    curv = np.full(len(X_IDXS), 0.002)
-    curv[3] += 4e-4  # X_IDXS[3] = 1.69 m, 0.94 m from its neighbor
+    curv = np.full(len(X_IDXS), 0.001)
+    curv[1] += 4e-4  # X_IDXS[1] = 0.19 m, 0.19 m from the sample before it and 0.56 m from the one after
     target = curve_targets(_path(curv), True)
     keep = T_IDXS <= MOONPILOT_CURVE_PREVIEW_T
     v_budget = np.sqrt(MOONPILOT_CURVE_A_LAT / np.maximum(curv[keep], 1e-6))
     self.assertEqual(len(target.v), int(keep.sum()))
     self.assertTrue(np.allclose(target.v, v_budget, rtol=1e-4))
-    self.assertLess((MOONPILOT_CURVE_J_LAT / 4e-4) ** (1.0 / 3.0), float(np.max(v_budget)), "the step is too small to have governed at the sample scale")
+
+    # what the sample-scale gradient made of the same step: a ramp, capped below the budget
+    with np.errstate(divide='ignore', invalid='ignore'):
+      dk_ds = np.abs(np.gradient(curv[keep], X_IDXS[keep]))
+    v_jerk_raw = np.cbrt(MOONPILOT_CURVE_J_LAT / np.maximum(dk_ds, 1e-9))
+    self.assertTrue(np.any(v_jerk_raw < v_budget), "the step was too small to have governed at the sample scale")
 
   def test_a_nan_sample_is_dropped_rather_than_planned_on(self):
     curv = np.full(len(X_IDXS), 0.004)
