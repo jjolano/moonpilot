@@ -56,6 +56,17 @@ CURVE_SPEED = Feature(
   offroad_only=True,
 )
 
+COAST_GRADE = Feature(
+  key="MoonpilotCoastGrade",
+  title="coast on grade",
+  description=(
+    "Within 1.5 m/s of the set speed the car coasts with the hill instead of holding it: allowed to "
+    + "run up on a descent and to sag on a climb. Following, curve and model braking are unchanged. "
+    + "Applies immediately."
+  ),
+  offroad_only=True,
+)
+
 # No requires: `requires` gates on importable Python modules, and tailscale here is a binary.
 # There is nothing to gate either way — the supervisor installs what is missing and the settings
 # row says so while it does.
@@ -75,7 +86,11 @@ SLAM = Feature(
 CATALOG_SIGNATURES = Feature(
   key="MoonpilotCatalogSignatures",
   title="catalog signatures",
-  description="Refuse a model catalog that fails its detached signature check against the key pinned in this build. Needs the cryptography package, installed automatically once the device is online. Off by default; an unsigned catalog is accepted until the fork pins a key.",
+  description=(
+    "Refuse a model catalog that fails its detached signature check against the key pinned in this build. "
+    + "Needs the cryptography package, installed automatically once the device is online. Off by default; "
+    + "an unsigned catalog is accepted until the fork pins a key."
+  ),
   requires=("cryptography",),
 )
 
@@ -85,6 +100,7 @@ LATERAL_ENGAGE = Feature(
   description="Steer from the main switch; brake, gas and cancel keep steering. Where panda cannot read the switch, the host's claim is trusted. Restart.",
   offroad_only=True,
 )
+
 
 @dataclass(frozen=True)
 class Group:
@@ -113,7 +129,7 @@ SPEED = Group(
   description="What the car does with the pedals: whose planner sets the speed, and how it reads the road ahead.",
   # The lead's lateral prediction sits here rather than with the steering because the fork reaches
   # it through the planner's time gap, not through a steering request.
-  features=(LONGITUDINAL, MODEL_BRAKING, CURVE_SPEED, LEAD_LATERAL, SLAM),
+  features=(LONGITUDINAL, MODEL_BRAKING, CURVE_SPEED, COAST_GRADE, LEAD_LATERAL, SLAM),
 )
 
 DEVICE = Group(

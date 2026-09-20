@@ -40,6 +40,7 @@ def _unavailable_value(feature: Feature) -> str:
     return reason
   return "" if available(feature) else "unavailable"
 
+
 def _dependencies_row(params: Params):
   from moonpilot import deps
 
@@ -149,7 +150,9 @@ class MoonpilotLayoutMici(NavScroller):
     self._dependencies = _dependencies_row(self._params)
     self._rollback = _rollback_row(self._params)
 
-    self._scroller.add_widgets([self._models_button, *[button for _group, button in self._group_buttons], self._offroad, self._tailscale, self._dependencies, self._rollback])
+    self._scroller.add_widgets(
+      [self._models_button, *[button for _group, button in self._group_buttons], self._offroad, self._tailscale, self._dependencies, self._rollback]
+    )
     self._update_rows()
     ui_state.add_offroad_transition_callback(self._update_rows)
 
@@ -166,6 +169,7 @@ class MoonpilotLayoutMici(NavScroller):
     self._models_button.set_value(models.model_label(self._params, models.DRIVING))
     self._tailscale.set_value(tailscale.status_text(self._params)[0])
     from moonpilot import boot, deps
+
     self._dependencies.set_value(deps.status_text(self._params)[0])
     self._rollback.set_value(boot.rollback_text(self._params))
     offroad_mode_mici.refresh(self._offroad, self._params)

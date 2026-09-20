@@ -13,7 +13,7 @@ from unittest import mock
 
 from openpilot.common.params import Params
 
-from moonpilot import fetch, paths, procs, tailscale
+from moonpilot import fetch, paths, procs, tailscale, tailscaled
 from moonpilot.features import FEATURES
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -187,7 +187,7 @@ class TestArgv(unittest.TestCase):
       args = tailscale.daemon_args()
       self.assertTrue("--statedir" in args)
       self.assertEqual(args[args.index("--statedir") + 1], tailscale.root())
-      self.assertEqual(os.path.dirname(tailscale.state_path()), tailscale.root())
+      self.assertEqual(os.path.dirname(tailscale.state_path()), paths.persist_root())
 
   def test_tun_mode_is_probed_not_assumed(self):
     # comma 3X's kernel has CONFIG_TUN=y; the comma four kernel is a different tree.
@@ -214,6 +214,83 @@ class TestArgv(unittest.TestCase):
       self.assertTrue("--netfilter-mode=off" in args)
       self.assertTrue(f"--hostname={tailscale.HOSTNAME}" in args)
       self.assertEqual(args[-5:], ["up", "--accept-dns=false", "--accept-routes=false", "--netfilter-mode=off", f"--hostname={tailscale.HOSTNAME}"])
+
+
+class TestStateMigration(unittest.TestCase):
+  def _roots(self, tmp: str) -> tuple[Path, Path, Path]:
+    data_root = Path(tmp) / "data"
+    legacy_root = data_root / "tailscale"
+    legacy_root.mkdir(parents=True)
+    persist_parent = Path(tmp) / "persist"
+    persist_root = persist_parent / "moonpilot"
+    return data_root, persist_parent, persist_root
+
+  def test_legacy_state_is_copied_before_it_is_removed(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      data_root, persist_parent, persist_root = self._roots(tmp)
+      legacy = data_root / "tailscale" / "tailscaled.state"
+      payload = b"node identity and login session"
+      legacy.write_bytes(payload)
+      legacy.chmod(0o600)
+      with (
+        mock.patch.object(paths, "data_root", return_value=str(data_root)),
+        mock.patch.object(paths, "persist_root", return_value=str(persist_root)),
+        mock.patch.object(tailscale, "PC", True),
+        mock.patch.object(tailscale, "_state_fallback", None),
+      ):
+        self.assertEqual(tailscaled._migrate_state(), "")
+        target = persist_root / "tailscaled.state"
+        self.assertEqual(target.read_bytes(), payload)
+        self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+        self.assertFalse(legacy.exists())
+
+  def test_missing_persist_directory_is_created_for_new_state(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      data_root, _, persist_root = self._roots(tmp)
+      with (
+        mock.patch.object(paths, "data_root", return_value=str(data_root)),
+        mock.patch.object(paths, "persist_root", return_value=str(persist_root)),
+        mock.patch.object(tailscale, "PC", True),
+        mock.patch.object(tailscale, "_state_fallback", None),
+      ):
+        self.assertEqual(tailscaled._migrate_state(), "")
+        self.assertTrue(persist_root.is_dir())
+
+  def test_read_only_persist_directory_uses_legacy_state(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      data_root, persist_parent, persist_root = self._roots(tmp)
+      persist_parent.mkdir()
+      persist_root.mkdir()
+      persist_root.chmod(0o555)
+      legacy = data_root / "tailscale" / "tailscaled.state"
+      legacy.write_bytes(b"legacy")
+      legacy.chmod(0o600)
+      with (
+        mock.patch.object(paths, "data_root", return_value=str(data_root)),
+        mock.patch.object(paths, "persist_root", return_value=str(persist_root)),
+        mock.patch.object(tailscale, "PC", True),
+        mock.patch.object(tailscale, "_state_fallback", None),
+      ):
+        self.assertEqual(tailscaled._migrate_state(), tailscaled.PERSIST_DIR_ERROR)
+        self.assertEqual(tailscale.state_path(), str(legacy))
+        self.assertTrue(legacy.exists())
+
+  def test_absent_persist_root_uses_legacy_state(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      data_root, _, persist_root = self._roots(tmp)
+      legacy = data_root / "tailscale" / "tailscaled.state"
+      legacy.write_bytes(b"legacy")
+      legacy.chmod(0o600)
+      with (
+        mock.patch.object(paths, "data_root", return_value=str(data_root)),
+        mock.patch.object(paths, "persist_root", return_value=str(persist_root)),
+        mock.patch.object(tailscale, "PC", False),
+        mock.patch.object(tailscale, "_state_fallback", None),
+        mock.patch.object(tailscaled.subprocess, "run") as run,
+      ):
+        self.assertEqual(tailscaled._migrate_state(), tailscaled.PERSIST_DIR_ERROR)
+        self.assertEqual(tailscale.state_path(), str(legacy))
+        run.assert_not_called()
 
 
 class TestParseStatus(unittest.TestCase):

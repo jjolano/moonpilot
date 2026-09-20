@@ -27,6 +27,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
+
 try:
   import cryptography  # noqa: F401
 except ImportError:
@@ -258,13 +259,24 @@ class TestInterfaceVerification(unittest.TestCase):
     """
     source = ROOT / "openpilot/selfdrive/modeld/models/dmonitoring_model.onnx"
     interface = metadata.parse(str(source))
-    document = {"schema": 1, "type": "recipe", "profile": "c" * 64,
-                "members": {"dmonitoring": {"artifact": {"sha256": "e" * 64, "size": source.stat().st_size, "format": "onnx"},
-                                            "source": {}, "configuration": {}, "missing": [], "inputs": {}, "outputs": {},
-                                            "targets": ["QCOM"],
-                                            "metadata": {"input_shapes": interface["input_shapes"],
-                                                         "output_slices": interface["output_slices"]}}},
-                "configuration": {}}
+    document = {
+      "schema": 1,
+      "type": "recipe",
+      "profile": "c" * 64,
+      "members": {
+        "dmonitoring": {
+          "artifact": {"sha256": "e" * 64, "size": source.stat().st_size, "format": "onnx"},
+          "source": {},
+          "configuration": {},
+          "missing": [],
+          "inputs": {},
+          "outputs": {},
+          "targets": ["QCOM"],
+          "metadata": {"input_shapes": interface["input_shapes"], "output_slices": interface["output_slices"]},
+        }
+      },
+      "configuration": {},
+    }
     slices = document["members"]["dmonitoring"]["metadata"]["output_slices"]
     if tamper:
       # A package that is internally consistent -- written under its own digest, like a real install
@@ -286,16 +298,13 @@ class TestInterfaceVerification(unittest.TestCase):
     self.assertIsNone(modelcatalog.verify_downloaded(None, self.package_from_onnx()))
 
   def test_a_package_whose_bytes_disagree_is_a_mismatch(self):
-    self.assertEqual(modelcatalog.verify_downloaded(None, self.package_from_onnx(tamper=True)),
-                     modelcatalog.INTERFACE_MISMATCH)
+    self.assertEqual(modelcatalog.verify_downloaded(None, self.package_from_onnx(tamper=True)), modelcatalog.INTERFACE_MISMATCH)
 
   def test_a_shifted_existing_slice_bound_is_a_mismatch(self):
-    self.assertEqual(modelcatalog.verify_downloaded(None, self.package_from_onnx(slice_mutation="bound")),
-                     modelcatalog.INTERFACE_MISMATCH)
+    self.assertEqual(modelcatalog.verify_downloaded(None, self.package_from_onnx(slice_mutation="bound")), modelcatalog.INTERFACE_MISMATCH)
 
   def test_a_changed_existing_slice_step_is_a_mismatch(self):
-    self.assertEqual(modelcatalog.verify_downloaded(None, self.package_from_onnx(slice_mutation="step")),
-                     modelcatalog.INTERFACE_MISMATCH)
+    self.assertEqual(modelcatalog.verify_downloaded(None, self.package_from_onnx(slice_mutation="step")), modelcatalog.INTERFACE_MISMATCH)
 
   def test_verify_onnx_never_executes_the_file(self):
     # The only reader of a downloaded artifact: a hostile `output_slices` pickle cannot resolve
@@ -318,7 +327,7 @@ class TestCatalogSignature(unittest.TestCase):
     self.addCleanup(patcher.stop)
     self.raw = FIXTURE.read_bytes()
 
-  def keypair(self):
+  def key_pair(self):
     from cryptography.hazmat.primitives import serialization
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
@@ -327,7 +336,7 @@ class TestCatalogSignature(unittest.TestCase):
     return private, public.decode("ascii")
 
   def test_refresh_accepts_a_valid_catalog_signature(self):
-    private, public = self.keypair()
+    private, public = self.key_pair()
     url = "https://catalog.invalid/catalog.json"
     calls = []
 
@@ -343,7 +352,7 @@ class TestCatalogSignature(unittest.TestCase):
     self.assertEqual(Path(models.catalog_file()).read_bytes(), self.raw)
 
   def test_a_bad_signature_leaves_the_previous_snapshot_untouched(self):
-    private, public = self.keypair()
+    private, public = self.key_pair()
     path = Path(models.catalog_file())
     path.parent.mkdir(parents=True)
     path.write_bytes(self.raw)
@@ -358,7 +367,7 @@ class TestCatalogSignature(unittest.TestCase):
     self.assertEqual(path.read_bytes(), self.raw)
 
   def test_an_absent_signature_sidecar_is_refused(self):
-    _, public = self.keypair()
+    _, public = self.key_pair()
     url = "https://catalog.invalid/catalog.json"
 
     def read_url(request_url, _limit, timeout=30):

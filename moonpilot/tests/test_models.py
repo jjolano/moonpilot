@@ -28,13 +28,18 @@ OTHER_RECIPE = "b" * 64
 # A member `set_reason` accepts: the inputs the supercombo protocol feeds it, and a 512-wide
 # `hidden_state` against a 512-deep `features_buffer`, which is the one structural property the
 # recurrence needs.
-SUPERCOMBO_INPUTS = {"img": [1, 12, 128, 256], "big_img": [1, 12, 128, 256], "features_buffer": [1, 24, 512],
-                     "desire_pulse": [1, 25, 8], "traffic_convention": [1, 2], "action_t": [1, 2]}
+SUPERCOMBO_INPUTS = {
+  "img": [1, 12, 128, 256],
+  "big_img": [1, 12, 128, 256],
+  "features_buffer": [1, 24, 512],
+  "desire_pulse": [1, 25, 8],
+  "traffic_convention": [1, 2],
+  "action_t": [1, 2],
+}
 SUPERCOMBO_SLICES = {name: [0, 512] for name in models.DRIVING_SLICES}
 # A policy member: it consumes the feature the vision member produces, and needs no outputs of its
 # own beyond what the union already covers.
-POLICY_INPUTS = {"desire_pulse": [1, 25, 8], "features_buffer": [1, 24, 512],
-                 "traffic_convention": [1, 2], "action_t": [1, 2]}
+POLICY_INPUTS = {"desire_pulse": [1, 25, 8], "features_buffer": [1, 24, 512], "traffic_convention": [1, 2], "action_t": [1, 2]}
 
 
 class FakeParams:
@@ -96,9 +101,7 @@ class StoreCase(unittest.TestCase):
   def _write_json(self, path: str, value: dict) -> None:
     models.write_json(path, value)
 
-  def add_package(
-    self, role: str, *, input_shapes: dict | None, slices: dict | None, configuration: dict | None = None, size: int = 4
-  ) -> str:
+  def add_package(self, role: str, *, input_shapes: dict | None, slices: dict | None, configuration: dict | None = None, size: int = 4) -> str:
     """A stored package: `recipe.json` with one member, `profile.json`, and an artifact whose bytes
     are `size` long. Returns the *digest of the bytes it wrote*, which is the selection id the rest
     of the store is keyed on -- writing them through the canonical serialization `Manifest.create`
@@ -339,8 +342,7 @@ class TestBootCommit(StoreCase):
         is_dirty=False,
       ),
     )
-    hardware = mock.Mock(get_serial=mock.Mock(return_value="test-serial"),
-                         get_device_type=mock.Mock(return_value="test-device"))
+    hardware = mock.Mock(get_serial=mock.Mock(return_value="test-serial"), get_device_type=mock.Mock(return_value="test-device"))
 
     with (
       mock.patch.object(manager, "save_bootlog"),
@@ -359,7 +361,6 @@ class TestBootCommit(StoreCase):
 
     params.put.assert_any_call("Version", "test-version", block=True)
     exception.assert_called_once_with("failed to commit moonpilot model boot selection")
-
 
   def test_a_selection_with_no_build_falls_back_and_keeps_the_reason(self):
     params = FakeParams({models.DRIVING_KEY: RECIPE})
@@ -383,6 +384,7 @@ class TestBootCommit(StoreCase):
     self.assertTrue(os.path.isdir(entry["build"]))
     self.assertIsNone(entry["fallback"])
     self.assertFalse(models.restart_pending(params, models.DRIVING))
+
   def test_a_custom_active_model_keeps_the_selection_label(self):
     params, digest = self.custom_params()
     params.put(models.ACTIVE_DRIVING_KEY, "custom (supercombo)")
@@ -395,8 +397,7 @@ class TestBootCommit(StoreCase):
     params, digest = self.custom_params()
     params.put(models.ACTIVE_DRIVING_KEY, "stock: RuntimeError: broken model")
     self.assertEqual(models.model_label(params, models.DRIVING), f"stock, {digest[:12]} did not load")
-    self.assertIn("RuntimeError: broken model", models.model_description(params, models.DRIVING))
-
+    self.assertTrue("RuntimeError: broken model" in models.model_description(params, models.DRIVING))
 
   def test_a_failed_build_falls_back_with_the_compilers_message(self):
     digest = self.add_package("supercombo", input_shapes=SUPERCOMBO_INPUTS, slices=SUPERCOMBO_SLICES)
@@ -493,8 +494,7 @@ class TestComposition(StoreCase):
     self.assertEqual(reason, models.SINGLE_RECIPE)
 
   def test_writing_a_composition_round_trips_and_its_id_is_a_digest_of_the_record(self):
-    vision = self.add_package("vision", input_shapes={"img": [1, 12, 128, 256], "big_img": [1, 12, 128, 256]},
-                              slices=SUPERCOMBO_SLICES)
+    vision = self.add_package("vision", input_shapes={"img": [1, 12, 128, 256], "big_img": [1, 12, 128, 256]}, slices=SUPERCOMBO_SLICES)
     policy = self.add_package("on_policy", input_shapes=POLICY_INPUTS, slices={})
     picks = {"vision": vision, "on_policy": policy}
     composition, reason = models.write_composition(models.SPLIT_VISION_POLICY.id, picks)
@@ -518,6 +518,7 @@ class TestCapacity(unittest.TestCase):
     with mock.patch.object(models, "free_bytes", lambda: models.MAX_STORE_BYTES), mock.patch.object(models, "store_usage", lambda: models.MAX_STORE_BYTES):
       self.assertEqual(models.capacity_reason(1), models.STORE_FULL)
 
+
 class TestJobReporting(unittest.TestCase):
   """What the panels render for a running job: the phase line, the bar's fraction, its label.
 
@@ -526,12 +527,12 @@ class TestJobReporting(unittest.TestCase):
   published while a job runs (`Job.started_at`), so an older worker's snapshot has no `elapsed` and
   the line must read as it did before -- a panel that required it would show `None` to the driver.
   """
+
   def test_job_active_matches_the_live_phases(self):
     for phase in models.PHASES:
       with self.subTest(phase=phase):
         self.assertEqual(models.job_active({"phase": phase}), phase not in ("done", "error", "canceled"))
     self.assertFalse(models.job_active(None))
-
 
   def test_the_patient_phases_carry_a_clock(self):
     for phase in models.PATIENT_PHASES:
@@ -610,7 +611,6 @@ class TestWorkerPredicate(unittest.TestCase):
 
   def test_a_request_starts_it_again(self):
     self.assertTrue(self.wanted(**{models.STATUS_KEY: "{}", models.REQUEST_KEY: "{}"}))
-
 
 
 if __name__ == "__main__":

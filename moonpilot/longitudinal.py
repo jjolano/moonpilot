@@ -2,7 +2,9 @@
 
 Upstream solves an acados MPC every frame. This is closed-form — no solver, no generated C — and
 every number in it is fork-owned, so tuning happens here instead of inside a generated optimization
-problem. The policy is three candidates, and the smallest wins:
+problem. Braking candidates use `min` arbitration; when a lead is above its time-gap target and no
+other term is braking, the fork may raise only the cruise slot toward a bounded closing target so an
+over-braked gap can recover. The policy is:
 
   - a spacing regulator that holds ``gap == max(STOP_DISTANCE, t_follow * v_ego)`` against the nearest
     lead, gaining rigidity as the gap closes (all the slack is in the time gap, none in the gains);
@@ -26,6 +28,13 @@ problem. The policy is three candidates, and the smallest wins:
 path's own curvature, and a proportional regulator on the lateral accel the car is actually pulling.
 ``moonpilot/curve.py`` is where the math and its constants live; both are inert without the model's
 path arrays and, for the in-curve term, ``vehicleParameters.valid``.
+``MoonpilotCoastGrade`` adds a grade-aware coast band inside the cruise slot: when the road pushes the
+car away from its set speed, the cruise candidate tapers toward upstream's fitted coast acceleration as
+the drift approaches 1.5 m/s, allowing a descent to run up and a climb to sag. It can only replace the
+cruise candidate; lead, TTC, stopping-floor, curve and model-braking candidates are still ``min``'d
+against it upstream of the actuator clip, so no safety term is weakened. The flag is read every frame,
+and missing pose or experimental mode leaves this feature inert.
+
 
 Two things are deliberately not upstream's:
 
@@ -52,14 +61,13 @@ import math
 import time
 
 import numpy as np
-
 import openpilot.cereal.messaging as messaging
 from opendbc.car.interfaces import ACCEL_MIN, ACCEL_MAX
 from opendbc.car.structs import car
 from opendbc.car.vehicle_model import VehicleModel
 from openpilot.cereal import log
 from openpilot.common.constants import CV
-from openpilot.common.params import Params
+from openpilot.common.params import Params, UnknownKeyName
 from openpilot.common.realtime import DT_MDL
 from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.car.cruise import V_CRUISE_MAX, V_CRUISE_UNSET
@@ -81,7 +89,7 @@ from moonpilot.curve import (
   lat_accel_hold,
   predicted_lat_accel,
 )
-from moonpilot.features import CURVE_SPEED, LEAD_LATERAL, LONGITUDINAL, MODEL_BRAKING, enabled
+from moonpilot.features import COAST_GRADE, CURVE_SPEED, LEAD_LATERAL, LONGITUDINAL, MODEL_BRAKING, enabled
 from moonpilot.latency import (
   MOONPILOT_LAG_BLOCKS_NEEDED,
   MOONPILOT_LAG_KEY,
@@ -167,6 +175,15 @@ MOONPILOT_LEAD_PREVIEW_T_ACCEL = 0.5  # s of the lead's own acceleration credite
 # is a live term on its own against a slow lead — a 0.5 m/s^2 launch draws 0.292 m/s^2 at 0.25 s against
 # 0.165, and 0.15 m of gap by 2 s — while against a hard one (2 m/s^2) the comfort ramp is what binds
 # and this term moves 0.005 m until `MOONPILOT_JERK_LAUNCH` unlocks it.
+MOONPILOT_CLOSE_OVERSPEED = 3.0  # m/s; how far over the set speed the follow distance may be restored
+MOONPILOT_CLOSE_DISTANCE = 10.0  # m; the spacing error at which that overspeed is applied in full, so
+# the target tapers to the set speed as the gap closes and the setpoint is the equilibrium rather than
+# a limit cycle around it. Closing a 1.45 s headway means being *faster than the lead*, so a gate on
+# the sign of the speed error cannot do this job: it switches off the instant the car exceeds its set
+# speed, which is one frame after the maneuver starts (measured: the command sat at the budget with
+# the excess stuck at 19.9 m). The bound is a speed instead, and it is the fork's own — upstream never
+# closes a gap above the set speed at all, since its `min` over `(mpc, cruise)` caps it at
+# `clip(v_cruise - v_ego, ...)` exactly as this fork's did before the lift.
 MOONPILOT_A_LEAD_MIN = -10.0  # m/s^2; bounds on a lead's accel estimate, upstream's (long_mpc.process_lead)
 MOONPILOT_A_LEAD_MAX = 5.0
 MOONPILOT_OUT_OF_PATH_T_FOLLOW = 0.7  # time-gap scale for a lead predicted to leave the path
@@ -176,6 +193,12 @@ MOONPILOT_A_CRUISE_MAX_BP = [0.0, 10.0, 25.0, 40.0]  # m/s
 MOONPILOT_A_CRUISE_MAX_V = [1.6, 1.2, 0.8, 0.6]  # m/s^2
 MOONPILOT_A_TOTAL_MAX_BP = [20.0, 40.0]  # m/s
 MOONPILOT_A_TOTAL_MAX_V = [1.7, 3.2]  # m/s^2 combined accel budget
+MOONPILOT_COAST_BAND = 1.5  # m/s; allowed set-speed drift on a grade, above on a descent and below on a climb
+# 3.4 mph / 5.4 km/h is large enough to let a hill spend itself without making the set speed meaningless.
+MOONPILOT_COAST_GRADE_MIN = 0.2  # m/s^2; minimum road term (`accel_coast - coast_accel(0.0)`) before this applies
+# Below this is effectively level road, about a 3.5 % grade, so the speed target stays exact.
+MOONPILOT_COAST_ACCEL_MAX = 1.0  # m/s^2; bound on the coast command for garbage pitch and the ACCEL_MAX sentinel
+# Both bad pose input and the missing-pose sentinel must not turn into an unbounded coast command.
 MOONPILOT_JERK_UP = 1.5  # m/s^3
 MOONPILOT_JERK_LAUNCH = 4.0  # m/s^3; the up-limit at and below MOONPILOT_JERK_LAUNCH_SPEED, tapering
 # back to `MOONPILOT_JERK_UP` at twice it, and only from the second frame of a ramp — `jerk_limit`
@@ -222,9 +245,15 @@ def coast_accel(pitch: float) -> float:
   return float(np.sin(pitch) * -5.65 - 0.3)
 
 
-def cruise_accel(v_ego, v_cruise, e2e, steer_angle_deg, CP, accel_coast, allow_throttle) -> float:
-  """Speed-error term. In experimental mode the cap is ACCEL_MAX and neither the cornering budget
-  nor the coast limit applies, because the model's own accel is the candidate that governs there."""
+MOONPILOT_COAST_FLAT_ACCEL = coast_accel(0.0)  # the fit's level-road loss term, kept derived so the
+# road's own contribution is computed from the fit rather than duplicating its -0.3 literal.
+
+
+def cruise_cap(v_ego, e2e, steer_angle_deg, CP, accel_coast, allow_throttle) -> float:
+  """The ceiling on a *positive* accel ask, and the budget the closing ask below is bounded by: the
+  comfort curve `MOONPILOT_A_CRUISE_MAX_V`, the combined accel budget less the cornering demand, and
+  the coast limit when the model expects the driver on the gas. `ACCEL_MAX` in experimental mode,
+  where neither the cornering budget nor the coast limit applies."""
   cap = ACCEL_MAX if e2e else float(np.interp(v_ego, MOONPILOT_A_CRUISE_MAX_BP, MOONPILOT_A_CRUISE_MAX_V))
   if not e2e:
     a_total_max = float(np.interp(v_ego, MOONPILOT_A_TOTAL_MAX_BP, MOONPILOT_A_TOTAL_MAX_V))
@@ -233,7 +262,37 @@ def cruise_accel(v_ego, v_cruise, e2e, steer_angle_deg, CP, accel_coast, allow_t
     if not allow_throttle:
       coast_limit = float(np.interp(v_ego, [MOONPILOT_MIN_ALLOW_THROTTLE_SPEED, 2 * MOONPILOT_MIN_ALLOW_THROTTLE_SPEED], [cap, max(accel_coast, ACCEL_MIN)]))
       cap = min(cap, coast_limit)
-  return float(np.clip(MOONPILOT_K_CRUISE * (v_cruise - v_ego), MOONPILOT_A_CRUISE_MIN, cap))
+  return cap
+
+
+def cruise_accel(v_ego, v_cruise, e2e, steer_angle_deg, CP, accel_coast, allow_throttle, coast_band: float = 0.0) -> float:
+  """Return the speed-error cruise candidate, clipped to its normal cap.
+
+  With ``coast_band`` enabled, only inside the band and only when the grade pushes the car away from
+  the set speed, the command is upstream's fitted coast acceleration for that grade, tapered linearly
+  to zero at the band edge. A descent may therefore run up to ``v_cruise + coast_band`` and a climb
+  may sag to ``v_cruise - coast_band``, settling at the edge where proportional authority resumes; the
+  caller's jerk limit makes entry gradual. Below the band on a descent, above it on a climb, on level
+  road (below ``MOONPILOT_COAST_GRADE_MIN``), with ``coast_band == 0.0`` (feature off or pose missing),
+  or in ``e2e`` mode, the plain speed-error law is unchanged.
+
+  The taper's sign follows the grade, so it cannot command toward the set speed against gravity. This
+  only changes the cruise candidate: lead, TTC, stopping-floor, curve and model-braking candidates are
+  ``min``'d against it upstream of the actuator clip, so no safety term is weakened.
+  """
+  cap = cruise_cap(v_ego, e2e, steer_angle_deg, CP, accel_coast, allow_throttle)
+  a = float(np.clip(MOONPILOT_K_CRUISE * (v_cruise - v_ego), MOONPILOT_A_CRUISE_MIN, cap))
+  if coast_band > 0.0 and not e2e:
+    coast = float(np.clip(accel_coast, -MOONPILOT_COAST_ACCEL_MAX, MOONPILOT_COAST_ACCEL_MAX))
+    grade = coast - MOONPILOT_COAST_FLAT_ACCEL
+    error = v_cruise - v_ego
+    # Only where the hill is the thing moving the car — it pushes away from the set speed — and only
+    # inside the band. A descent needs this even when the model disallows throttle: the existing cap
+    # limits positive acceleration but never relaxes braking above the set speed. On a climb with
+    # throttle already disallowed, that existing cap is the requested coast behavior and stays intact.
+    if abs(grade) > MOONPILOT_COAST_GRADE_MIN and abs(error) < coast_band and error * grade < 0.0 and (allow_throttle or grade > 0.0):
+      a = coast * (coast_band - abs(error)) / coast_band
+  return float(a)
 
 
 def lead_accel(v_ego, gap, v_lead, a_lead, t_follow) -> float:
@@ -418,7 +477,22 @@ def model_candidate(model, e2e, allowed) -> float | None:
   return a
 
 
-def policy(v_ego, leads, v_cruise, t_follow, e2e, model_accel, steer_angle_deg, CP, accel_coast, allow_throttle, curve=None, x_ego=0.0, v_hold=math.inf):
+def policy(
+  v_ego,
+  leads,
+  v_cruise,
+  t_follow,
+  e2e,
+  model_accel,
+  steer_angle_deg,
+  CP,
+  accel_coast,
+  allow_throttle,
+  curve=None,
+  x_ego=0.0,
+  v_hold=math.inf,
+  coast_band: float = 0.0,
+):
   """The smallest of the candidates, and which one it was.
 
   `leads` is a sequence of (source, gap, v_lead, a_lead) for the leads that are present, in
@@ -431,11 +505,47 @@ def policy(v_ego, leads, v_cruise, t_follow, e2e, model_accel, steer_angle_deg, 
   live in experimental mode too. That is the point of putting them there rather than beside the model
   candidate: `min` means they can only ever add braking to whatever the model asked for, never
   substitute for it.
+
+  **The `min` is a ceiling on braking and on the set speed, not on the follow distance.** Left as a
+  pure minimum, the cruise term's speed-error output — which is exactly 0 once the car is at its set
+  speed — also caps the spacing regulator's ask to *close* a gap, and the regulator's ask is a large
+  positive number there (0.3 per meter of spacing error plus 0.6 per m/s of closing, i.e. +8.6 m/s^2
+  for a 20 m excess). So a car that over-brakes for anything transient — a lead's brake tap, the
+  model's ask, a curve pre-brake — ends up behind its follow distance and then holds the new, larger
+  gap: measured from the settled setpoint at 30 m/s with the set speed equal to the lead's, a lead
+  tapping -5 m/s^2 for half a second left the gap at 63.1 m against a 43.5 m setpoint 25 s later.
+  Upstream's arbitration has the same ceiling (`min` over `(mpc, cruise)`, and its cruise term is
+  `clip(v_cruise - v_ego, ...)`), so the standoff is inherited rather than fork-owned; what the fork
+  owns is how much headway its own anticipation buys.
+
+  Hence the one lift: while no curve or coast term is already braking (the ordinary set-speed error
+  may be negative because this lift intentionally allows a bounded overspeed), a lead's spacing error
+  that is oversized raises the cruise slot to the *closing target* — a speed `MOONPILOT_CLOSE_OVERSPEED`
+  above the set speed, tapered over `MOONPILOT_CLOSE_DISTANCE` of error, so the maneuver is planned
+  rather than a limit cycle at the set speed — bounded by the regulator's own ask and by the identical
+  budget the set-speed term is clipped by (comfort curve, cornering budget, coast limit). Every braking
+  candidate still arbitrates through the `min` below and the model's own ask still caps the result, so
+  this can only turn coasting into closing: it cannot add braking, cannot exceed the model, and is inert
+  at the setpoint, which is what makes the setpoint the equilibrium instead of a one-sided wall.
   """
   a_curve = min(curve_accel(v_ego, x_ego, curve), lat_accel_hold(v_ego, v_hold))
-  a_cruise = min(cruise_accel(v_ego, v_cruise, e2e, steer_angle_deg, CP, accel_coast, allow_throttle), a_curve)
+  a_cruise_raw = cruise_accel(v_ego, v_cruise, e2e, steer_angle_deg, CP, accel_coast, allow_throttle, coast_band)
+  a_cruise_base = cruise_accel(v_ego, v_cruise, e2e, steer_angle_deg, CP, accel_coast, allow_throttle) if coast_band > 0.0 else a_cruise_raw
+  a_cruise = min(a_cruise_raw, a_curve)
+  lead_asks = [(lead_accel(v_ego, gap, v_lead, a_lead, t_follow), source) for source, gap, v_lead, a_lead in leads]
+  if lead_asks and a_curve >= 0.0 and a_cruise_raw >= a_cruise_base and v_cruise > 0.0:
+    # `v_cruise > 0` is the force-decel gate: `forceDecel` zeroes the set speed, and the target below
+    # is relative to it, so without this the lift would command motion at a car the planner is trying
+    # to stop — measured, it broke 9 of the 60 upstream maneuver combinations, all of them the
+    # `force_decel` half of a maneuver that ends stopped behind a lead.
+    excess = min(gap - max(MOONPILOT_STOP_DISTANCE, t_follow * v_ego) for _, gap, _, _ in leads)
+    if excess > 0.0:
+      v_close = v_cruise + MOONPILOT_CLOSE_OVERSPEED * min(1.0, excess / MOONPILOT_CLOSE_DISTANCE)
+      closing = min(min(ask for ask, _ in lead_asks), MOONPILOT_K_V * (v_close - v_ego))
+      if closing > 0.0:
+        a_cruise = max(a_cruise, min(closing, cruise_cap(v_ego, e2e, steer_angle_deg, CP, accel_coast, allow_throttle)))
   candidates = [(a_cruise, LongitudinalPlanSource.cruise)]
-  candidates += [(lead_accel(v_ego, gap, v_lead, a_lead, t_follow), source) for source, gap, v_lead, a_lead in leads]
+  candidates += lead_asks
   if model_accel is not None:
     candidates.append((float(model_accel), LongitudinalPlanSource.e2e))
   accel, source = min(candidates, key=lambda c: c[0])
@@ -544,7 +654,18 @@ class MoonpilotLongitudinalPlanner:
 
     self.action_t = self.long_lag.applied_delay() + self.dt
 
-    accel_coast = coast_accel(sm['carControl'].orientationNED[1]) if len(sm['carControl'].orientationNED) == 3 else ACCEL_MAX
+    pose_valid = len(sm['carControl'].orientationNED) == 3
+    accel_coast = coast_accel(sm['carControl'].orientationNED[1]) if pose_valid else ACCEL_MAX
+    # Zero when the pose is missing (accel_coast is the ACCEL_MAX sentinel) or the driver turned the
+    # row off — the band is the feature's whole surface, so both collapse to the planner this fork
+    # had before it. The normal path reads the toggle on every frame, so a row change applies immediately.
+    # An older local params database can predate this row; its shipped default is on, so retain the
+    # same behavior until the row is present.
+    try:
+      coast_enabled = enabled(COAST_GRADE, self.params)
+    except UnknownKeyName:
+      coast_enabled = True
+    coast_band = MOONPILOT_COAST_BAND if pose_valid and coast_enabled else 0.0
     throttle_probs = sm['modelV2'].meta.disengagePredictions.gasPressProbs
     throttle_prob = throttle_probs[1] if len(throttle_probs) > 1 else 1.0
     self.allow_throttle = throttle_prob > MOONPILOT_ALLOW_THROTTLE_THRESHOLD or v_ego <= MOONPILOT_MIN_ALLOW_THROTTLE_SPEED
@@ -642,6 +763,7 @@ class MoonpilotLongitudinalPlanner:
       self.CP,
       accel_coast,
       self.allow_throttle,
+      coast_band=coast_band,
       curve=curve,
       x_ego=x_pred,
       v_hold=v_hold,
@@ -667,6 +789,7 @@ class MoonpilotLongitudinalPlanner:
       curve,
       v_hold,
       jerk_scale,
+      coast_band=coast_band,
     )
 
     self.j_desired_trajectory = np.gradient(self.a_desired_trajectory, MOONPILOT_CONTROL_T_IDX)
@@ -764,6 +887,7 @@ class MoonpilotLongitudinalPlanner:
     curve=None,
     v_hold=math.inf,
     comfort_scale=1.0,
+    coast_band: float = 0.0,
   ):
     """The same policy rolled forward over the published horizon, from (v_ego, a_target). The ego's
     own travel is carried in x, so the gap the leads are rolled against is the gap this plan
@@ -781,7 +905,20 @@ class MoonpilotLongitudinalPlanner:
       t = float(t_idx)
       states = [(source, *lead_state_at(lead, t + lead_age, x + v_ego * lead_age, a_lead, a_lead_tau)) for source, lead, a_lead, a_lead_tau in leads]
       a_cmd, _ = policy(
-        v, states, v_cruise, t_follow, e2e, model_accel, steer_angle, self.CP, accel_coast, self.allow_throttle, curve=curve, x_ego=x, v_hold=v_hold
+        v,
+        states,
+        v_cruise,
+        t_follow,
+        e2e,
+        model_accel,
+        steer_angle,
+        self.CP,
+        accel_coast,
+        self.allow_throttle,
+        coast_band=coast_band,
+        curve=curve,
+        x_ego=x,
+        v_hold=v_hold,
       )
       a = float(np.clip(jerk_limit(a_cmd, a, t - t_prev, v, comfort_scale), ACCEL_MIN, ACCEL_MAX))
       speeds[i] = v

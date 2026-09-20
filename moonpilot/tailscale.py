@@ -3,7 +3,7 @@
 The device has no tailscale and no package manager (AGENTS.md, How a dependency reaches the
 device), so `install()` fetches the stable-track static tarball into `<data_root>/tailscale`
 and `moonpilot/tailscaled.py` supervises it. Binaries, the control socket and tailscaled's var
-root stay there; its node identity, login session and prefs live at `<persist_root>/tailscale`
+root stay there; its node identity, login session and prefs live at `<persist_root>/tailscaled.state`
 so a factory reset does not log the device out. This module is the shared vocabulary for both,
 plus the encode/decode of the one string param the supervisor and the settings panels talk
 through.
@@ -13,7 +13,7 @@ only, and nothing here creates a directory or runs a process — the path helper
 the same rule and the same reason as deps.site_dir().
 
 """
- 
+
 
 import json
 import os
@@ -95,7 +95,7 @@ def state_path() -> str:
   """tailscaled's persistent state, or the legacy path when migration cannot use `/persist`."""
   persistent = persistent_state_path()
   legacy = legacy_state_path()
-  if os.path.isfile(legacy) and (_state_fallback == (persistent, legacy) or not _persist_writable()):
+  if _state_fallback == (persistent, legacy) or (os.path.isfile(legacy) and not _persist_writable()):
     return legacy
   return persistent
 
@@ -104,6 +104,12 @@ def use_legacy_state() -> None:
   """Keep the daemon on its old state file after a failed persistent migration."""
   global _state_fallback
   _state_fallback = (persistent_state_path(), legacy_state_path())
+
+
+def use_persistent_state() -> None:
+  """Clear a previous migration fallback after persistence is available again."""
+  global _state_fallback
+  _state_fallback = None
 
 
 def binaries() -> tuple[str, str] | None:

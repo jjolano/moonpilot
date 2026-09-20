@@ -21,7 +21,6 @@ import os
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
 from dataclasses import dataclass
 
@@ -56,9 +55,7 @@ class Requirement:
 
 # Every package a fork feature may need. A row here and its line in deps.lock land together, or
 # `--require-hashes` fails the install.
-REQUIREMENTS: tuple[Requirement, ...] = (
-  Requirement("cryptography", "cryptography==50.0.1"),
-)
+REQUIREMENTS: tuple[Requirement, ...] = (Requirement("cryptography", "cryptography==50.0.1"),)
 
 
 def site_dir() -> str:
@@ -189,11 +186,14 @@ def install() -> None:
   with open(lock_path(), "rb") as lock:
     fingerprint = hashlib.sha256(lock.read()).hexdigest()[:16]
   release = os.path.join(releases_dir, fingerprint)
-  if os.path.lexists(release):
-    # Never mutate a release that another process may still be using.
-    staging = tempfile.mkdtemp(prefix=f".{fingerprint}-", dir=releases_dir)
-    target = staging
-  else:
+  if os.path.lexists(release) and not os.path.isdir(release):
+    raise OSError(f"dependency release path is not a directory: {release}")
+  staging: str | None = None
+  target: str | None = None
+  if not os.path.isdir(release):
+    # A release is immutable once its install succeeds. A failed install removes its staging
+    # directory in `finally`, so an existing directory is safe to reuse without touching the
+    # current release that another process may still import.
     os.makedirs(release, mode=0o775)
     staging = release
     target = release
@@ -203,17 +203,15 @@ def install() -> None:
   # uv's cache and /data are different filesystems, which is exactly the hardlink warning uv emits.
   env["UV_LINK_MODE"] = "copy"
   try:
-    subprocess.run(
-      [uv(), "pip", "install", "--target", target, "--require-hashes", "-r", lock_path()],
-      env=env,
-      check=True,
-      capture_output=True,
-      text=True,
-    )
-
-    if target != release:
-      shutil.rmtree(target)
-    staging = None
+    if target is not None:
+      subprocess.run(
+        [uv(), "pip", "install", "--target", target, "--require-hashes", "-r", lock_path()],
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+      )
+      staging = None
 
     current = site_dir()
     current_tmp = f"{current}.tmp-{os.getpid()}-{time.monotonic_ns()}"

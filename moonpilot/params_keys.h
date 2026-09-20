@@ -24,6 +24,9 @@
     // predicted path, and the curve target is not validated until someone
     // drives it.
     {"MoonpilotCurveSpeed", {PERSISTENT, BOOL, "0"}},
+    // On by default: it lets a grade spend its own acceleration inside a bounded speed band; the
+    // feature is read every frame and safety candidates still win through the planner's minimum.
+    {"MoonpilotCoastGrade", {PERSISTENT, BOOL, "1"}},
     // Off by default: it changes the steering request, and the preview gain is
     // not validated until someone drives it.
     {"MoonpilotPathPreview", {PERSISTENT, BOOL, "0"}},

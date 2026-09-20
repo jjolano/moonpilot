@@ -86,6 +86,7 @@ class TestTiziDescription(unittest.TestCase):
 if __name__ == "__main__":
   unittest.main()
 
+
 class TestGrouping(unittest.TestCase):
   """The panel's pages are the feature table's groups, so these two properties are what keeps a
   regroup from losing a row: every feature is on exactly one page, and the flat `FEATURES` the old
@@ -115,7 +116,7 @@ class TestGrouping(unittest.TestCase):
     self.assertEqual(set(grouped), set(FEATURES))
 
     text = (Path(__file__).resolve().parents[2] / "moonpilot" / "params_keys.h").read_text()
-    self.assertIn(f'{{"{CATALOG_SIGNATURES.key}", {{PERSISTENT, BOOL, "0"}}}}', text)
+    self.assertTrue(f'{{"{CATALOG_SIGNATURES.key}", {{PERSISTENT, BOOL, "0"}}}}' in text)
 
 
 class TestModelsStrings(unittest.TestCase):

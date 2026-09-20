@@ -28,7 +28,6 @@ class FakeParams:
     return self._on
 
 
-
 class ParamStore:
   def __init__(self):
     self.values: dict[str, str] = {}
@@ -153,8 +152,6 @@ class TestActivation(unittest.TestCase):
         self._cleanup(system, deps.site_dir())
 
 
-
-
 class TestStatusAndRetry(unittest.TestCase):
   def test_status_writes_only_when_changed(self):
     params = ParamStore()
@@ -228,6 +225,25 @@ class TestInstall(unittest.TestCase):
       self.assertEqual(os.listdir(os.path.join(tmp, "deps", "releases")), [self._fingerprint()])
       self.assertFalse(os.path.exists(os.path.join(tmp, "deps", "site-packages")))
       self.assertTrue(deps.available("moonpilot_install_probe"))
+
+  def test_existing_release_is_reused_without_reinstall(self):
+    # The fingerprint names an immutable successful install. Re-running depsd must promote it,
+    # not install into a throwaway directory and then point `current` at the old contents.
+    with tempfile.TemporaryDirectory() as tmp, mock.patch.object(paths, "data_root", return_value=tmp):
+      release = os.path.join(tmp, "deps", "releases", self._fingerprint())
+      os.makedirs(release)
+      with open(os.path.join(release, "marker"), "w") as marker:
+        marker.write("complete")
+      with (
+        mock.patch.object(deps, "uv", return_value="/usr/bin/uv"),
+        mock.patch.object(deps.subprocess, "run") as run,
+        mock.patch.object(deps, "activate"),
+      ):
+        deps.install()
+      run.assert_not_called()
+      self.assertEqual(os.path.realpath(deps.site_dir()), release)
+      with open(os.path.join(release, "marker")) as marker:
+        self.assertEqual(marker.read(), "complete")
 
 
 def _normalize(name: str) -> str:

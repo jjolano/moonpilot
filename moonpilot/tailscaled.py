@@ -30,6 +30,7 @@ WAIT = 30.0  # no network yet
 CHECK_INTERVAL = 6 * 3600  # stable-track version-check cadence
 
 LEGACY_STATE_ERROR = "persistent tailscale state unavailable; using legacy state"
+PERSIST_DIR_ERROR = "persistent tailscale directory unavailable; using legacy state"
 
 _MIGRATE_STATE = """\
 import os
@@ -38,7 +39,11 @@ import sys
 import tempfile
 
 legacy, target = sys.argv[1:3]
-fd, staged = tempfile.mkstemp(prefix=".tailscaled.state.", dir=os.path.dirname(target))
+target_dir = os.path.dirname(target)
+if not os.path.isdir(os.path.dirname(target_dir)):
+  raise OSError("persistent root is unavailable")
+os.makedirs(target_dir, mode=0o700, exist_ok=True)
+fd, staged = tempfile.mkstemp(prefix=".tailscaled.state.", dir=target_dir)
 try:
   with os.fdopen(fd, "wb") as destination:
     with open(legacy, "rb") as source:
@@ -74,12 +79,48 @@ def _copy_state(legacy: str, target: str) -> None:
     if os.path.exists(staged):
       os.unlink(staged)
 
+def _ensure_state_dir() -> bool:
+  """Create the reset-surviving state directory before tailscaled needs it."""
+  target_dir = os.path.dirname(tailscale.persistent_state_path())
+  persist_root = os.path.dirname(target_dir)
+  for directory in (persist_root, target_dir):
+    if os.path.isdir(directory):
+      try:
+        if not (os.stat(directory).st_mode & 0o222):
+          return False
+      except OSError:
+        return False
+
+  if tailscale.sudo():
+    if not os.path.isdir(persist_root):
+      return False
+    try:
+      subprocess.run([*tailscale.sudo(), "mkdir", "-p", "-m", "700", target_dir], check=True)
+    except (OSError, subprocess.CalledProcessError):
+      return False
+    return os.path.isdir(target_dir)
+
+  try:
+    os.makedirs(target_dir, mode=0o700, exist_ok=True)
+    os.chmod(target_dir, 0o700)
+  except OSError:
+    return False
+
+  return True
 
 def _migrate_state() -> str:
   """Move a legacy state file, or return the detail shown when persistence is unavailable."""
   legacy = tailscale.legacy_state_path()
   target = tailscale.persistent_state_path()
-  if legacy == target or not os.path.isfile(legacy):
+  if legacy == target:
+    return ""
+
+  if not _ensure_state_dir():
+    tailscale.use_legacy_state()
+    return PERSIST_DIR_ERROR
+
+  if not os.path.isfile(legacy):
+    tailscale.use_persistent_state()
     return ""
 
   try:
@@ -94,6 +135,7 @@ def _migrate_state() -> str:
     tailscale.use_legacy_state()
     cloudlog.exception("moonpilot tailscale state migration failed")
     return LEGACY_STATE_ERROR
+  tailscale.use_persistent_state()
   return ""
 
 
@@ -102,6 +144,7 @@ def _put_status(params: Params, state: str, detail: str = "", state_error: str =
     tailscale.put_status(params, tailscale.ERROR, state_error)
   else:
     tailscale.put_status(params, state, detail)
+
 BACKOFF_START = 30.0
 BACKOFF_MAX = 1800.0  # 30 min
 UP_RETRY = 30.0  # do not respawn `tailscale up` faster than this
