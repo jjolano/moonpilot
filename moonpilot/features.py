@@ -35,6 +35,13 @@ PATH_PREVIEW = Feature(
   offroad_only=True,
 )
 
+TURN_DESIRE = Feature(
+  key="MoonpilotTurnDesire",
+  title="turn desire",
+  description="Below 32 km/h, a turn signal feeds a turn desire into the model so it steers into the corner. The model's own turn prediction picks the direction. Restart to apply.",
+  offroad_only=True,
+)
+
 LONGITUDINAL = Feature(
   key="MoonpilotLongitudinal",
   title="moonpilot longitudinal",
@@ -121,7 +128,7 @@ class Group:
 STEERING = Group(
   title="steering",
   description="How openpilot moves the wheel: whose controller, when a curve is entered, and whether openpilot can steer at all.",
-  features=(LATERAL_ENGAGE, TORQUE_LATERAL, PATH_PREVIEW),
+  features=(LATERAL_ENGAGE, TORQUE_LATERAL, PATH_PREVIEW, TURN_DESIRE),
 )
 
 SPEED = Group(

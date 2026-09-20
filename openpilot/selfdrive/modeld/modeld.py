@@ -293,6 +293,7 @@ def main(demo=False):
   prev_action = log.ModelDataV2.Action()
 
   DH = DesireHelper()
+  from moonpilot.turn_desire import turn_desire  # moonpilot seam, see AGENTS.md
 
   while True:
     # Keep receiving frames until we are at least 1 frame ahead of previous extra frame
@@ -409,6 +410,10 @@ def main(demo=False):
       r_lane_change_prob = desire_state[log.Desire.laneChangeRight]
       lane_change_prob = l_lane_change_prob + r_lane_change_prob
       DH.update(sm['carState'], sm['carControl'].latActive, lane_change_prob)
+      # moonpilot seam, see AGENTS.md: low-speed turn desire from the blinker
+      turn = turn_desire(sm, params)
+      if turn is not None:
+        DH.desire = turn
       modelv2_send.modelV2.meta.laneChangeState = DH.lane_change_state
       modelv2_send.modelV2.meta.laneChangeDirection = DH.lane_change_direction
 

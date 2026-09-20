@@ -31,6 +31,10 @@
     // Off by default: it aligns the model path to its capture age plus steering
     // delay; the response gain still needs on-device validation.
     {"MoonpilotPathPreview", {PERSISTENT, BOOL, "0"}},
+    // On by default: below the lane-change speed threshold a turn signal
+    // feeds a turn desire into the model so it steers into the corner. The
+    // model's own turn prediction picks the direction.
+    {"MoonpilotTurnDesire", {PERSISTENT, BOOL, "1"}},
     // Tailscaled -> panels, one line: "<state>" or "<state> <detail>", decoded
     // in moonpilot/tailscale.py. CLEAR_ON_MANAGER_START so a reboot cannot
     // leave a stale "running 100.x" on screen.
