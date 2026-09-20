@@ -17,6 +17,7 @@ from openpilot.cereal import log
 from openpilot.common.params import Params
 from openpilot.common.realtime import DT_CTRL
 from openpilot.selfdrive.selfdrived.events import ET, EVENTS, Events
+from openpilot.selfdrive.selfdrived.alertmanager import AlertManager
 from openpilot.selfdrive.selfdrived.state import SOFT_DISABLE_TIME, StateMachine
 
 from moonpilot.features import LATERAL_ENGAGE, LONGITUDINAL, SLAM, TORQUE_LATERAL
@@ -30,6 +31,7 @@ from moonpilot.engage import (
 )
 
 ButtonType = car.CarState.ButtonEvent.Type
+GearShifter = car.CarState.GearShifter
 EventName = log.OnroadEvent.EventName
 State = log.SelfdriveState.OpenpilotState
 
@@ -122,10 +124,11 @@ def _cp(
   return cp
 
 
-def _cs(available=False, enabled=False, buttons=()):
+def _cs(available=False, enabled=False, buttons=(), gear=GearShifter.drive):
   cs = car.CarState.new_message()
   cs.cruiseState.available = available
   cs.cruiseState.enabled = enabled
+  cs.gearShifter = gear
   cs.buttonEvents = [{'type': t, 'pressed': p} for t, p in buttons]
   return cs
 
@@ -211,6 +214,10 @@ class TestEngageScope(unittest.TestCase):
       events.add(EventName.pedalPressed)
       engage.update(_cs(available=True), events, enabled=False)
       self.assertEqual(events.events, [EventName.pedalPressed, EventName.pcmDisable])
+      reverse_events = Events()
+      reverse_events.add(EventName.reverseGear)
+      engage.update(_cs(available=True, gear=GearShifter.reverse), reverse_events, enabled=False)
+      self.assertEqual(reverse_events.events, [EventName.reverseGear])
       self.assertFalse(engage.controls_allowed(_ps(controls_allowed_lateral=True)))
 
   def test_enabled_for_a_stock_acc_car(self):
@@ -295,6 +302,94 @@ class TestEngagePolicy(unittest.TestCase):
     # Gas keeps its softer path: an override is not a disable, and steering continues through it
     self.assertTrue(EventName.gasPressedOverride in events.events)
     self.assertFalse(events.contains(ET.USER_DISABLE))
+
+  def test_reverse_disengages_quietly_and_does_not_latch(self):
+    """Upstream's loud pair for the gear is gone; the disengage itself is not."""
+    events = self._run(_cs(available=True, gear=GearShifter.reverse), enabled=True, extra_events=(EventName.reverseGear, EventName.wrongGear))
+    # No full-screen "Reverse Gear" banner and no "TAKE CONTROL IMMEDIATELY"
+    self.assertNotIn(EventName.reverseGear, events.events)
+    self.assertFalse(events.contains(ET.IMMEDIATE_DISABLE))
+    # The car still stops steering on this frame, through the plain disengage chime
+    self.assertTrue(EventName.buttonCancel in events.events)
+    self.assertTrue(events.contains(ET.USER_DISABLE))
+    # A pause, not the latch: no re-arm gesture is needed to get the state back
+    self.assertFalse(self.engage._blocked)
+    # And the alert a driver still gets is upstream's own, on an engage attempt in the wrong gear
+    self.assertTrue(EventName.wrongGear in events.events)
+
+  def test_reverse_shows_one_refusal_on_the_first_engage_attempt(self):
+    """Wrong gear blocks the attempt, but does not retry the alert on every reversing frame."""
+    first = self._run(_cs(available=True, gear=GearShifter.reverse), extra_events=(EventName.reverseGear,))
+    self.assertNotIn(EventName.reverseGear, first.events)
+    self.assertTrue(EventName.wrongGear in first.events)
+    self.assertTrue(EventName.buttonEnable in first.events)
+    self.assertTrue(first.contains(ET.ENABLE))
+    self.assertTrue(first.contains(ET.NO_ENTRY))
+    state_machine = StateMachine()
+    self.assertEqual(state_machine.update(first), (False, False))
+    self.assertTrue(ET.NO_ENTRY in state_machine.current_alert_types)
+
+    second = self._run(_cs(available=True, gear=GearShifter.reverse), extra_events=(EventName.reverseGear,))
+    self.assertNotIn(EventName.reverseGear, second.events)
+    self.assertTrue(EventName.wrongGear in second.events)
+    self.assertNotIn(EventName.buttonEnable, second.events)
+
+  def test_reverse_alert_is_filtered_with_the_main_switch_off(self):
+    events = self._run(_cs(gear=GearShifter.reverse), extra_events=(EventName.reverseGear,))
+    self.assertNotIn(EventName.reverseGear, events.events)
+
+  def test_reverse_alerts_follow_the_state_machine(self):
+    """The user-visible contract: quiet disengage, stale soft-alert removal, then one refusal."""
+    alert_manager = AlertManager()
+    state_machine = StateMachine()
+    cp = _cp()
+
+    def cycle(frame, gear, enabled):
+      events = Events()
+      if gear != GearShifter.drive:
+        events.add(EventName.wrongGear)
+      if gear == GearShifter.reverse:
+        events.add(EventName.reverseGear)
+      cs = _cs(available=True, gear=gear)
+      self.engage.update(cs, events, enabled)
+      state_enabled, _ = state_machine.update(events)
+      alerts = events.create_alerts(
+        state_machine.current_alert_types,
+        [cp, cs, None, False, state_machine.soft_disable_timer, 0],
+      )
+      alert_manager.add_many(frame, alerts)
+      self.engage.clear_reverse_alerts(alert_manager)
+      alert_manager.process_alerts(frame, set())
+      return state_enabled, alerts
+
+    cycle(0, GearShifter.drive, False)
+    cycle(1, GearShifter.neutral, True)
+    enabled, alerts = cycle(2, GearShifter.reverse, True)
+    self.assertFalse(enabled)
+    self.assertEqual([alert.alert_type for alert in alerts], ["buttonCancel/userDisable"])
+    self.assertEqual(alert_manager.current_alert.alert_text_1, "")
+
+    # The neutral frame's cached "Gear not D" soft alert must not reappear after the chime expires.
+    cycle(25, GearShifter.reverse, False)
+    self.assertEqual(alert_manager.current_alert.alert_text_2, "")
+
+    # Starting in reverse gives one real refusal alert, not the passive reverse banner.
+    engage = LateralEngage(True)
+    state_machine = StateMachine()
+    alert_manager = AlertManager()
+    events = Events()
+    events.add(EventName.reverseGear)
+    cs = _cs(available=True, gear=GearShifter.reverse)
+    engage.update(cs, events, False)
+    self.assertEqual(state_machine.update(events), (False, False))
+    alerts = events.create_alerts(
+      state_machine.current_alert_types,
+      [cp, cs, None, False, state_machine.soft_disable_timer, 0],
+    )
+    alert_manager.add_many(0, alerts)
+    engage.clear_reverse_alerts(alert_manager)
+    alert_manager.process_alerts(0, set())
+    self.assertEqual(alert_manager.current_alert.alert_text_2, "Gear not D")
 
   def test_an_authoritative_disable_latches_until_rearmed(self):
     # The main switch dropping, which a stock-ACC car raises as `wrongCarMode` -- a USER_DISABLE.
@@ -456,6 +551,11 @@ class TestScriptedDrive(unittest.TestCase):
       self.events.add(EventName.pedalPressed)
     if fault is not None:
       self.events.add(fault)  # a level-triggered condition, e.g. an EPS temp fault
+    if cs.gearShifter == GearShifter.reverse:
+      # Both of upstream's gear events, as car_events raises them: reverse is in no brand's
+      # DRIVABLE_GEARS, so `wrongGear` rides along with `reverseGear` on every reversing frame.
+      self.events.add(EventName.reverseGear)
+      self.events.add(EventName.wrongGear)
     if acc_set and not self.acc_set:
       self.events.add(EventName.pcmEnable)
     elif self.acc_set and not acc_set:
@@ -509,6 +609,17 @@ class TestScriptedDrive(unittest.TestCase):
     self.assertEqual(self._step(_cs(available=False), main_switch=False), (State.disabled, False, False))
 
     # And the main switch back on re-engages, which is the arming gesture
+    self.assertEqual(self._step(_cs(available=True)), (State.enabled, True, True))
+
+  def test_reverse_pauses_the_drive_and_d_resumes_it(self):
+    """Backing out of a parking space costs the gear, not the drive."""
+    self.assertEqual(self._step(_cs(available=True)), (State.enabled, True, True))
+
+    # The gear lands: disengaged on that frame, and held there while it is in reverse
+    self.assertEqual(self._step(_cs(available=True, gear=GearShifter.reverse)), (State.disabled, False, False))
+    self.assertEqual(self._step(_cs(available=True, gear=GearShifter.reverse)), (State.disabled, False, False))
+
+    # Back in D: half-engaged again, with no LKAS press and no main-switch cycle
     self.assertEqual(self._step(_cs(available=True)), (State.enabled, True, True))
 
   def test_a_soft_disable_recovers_by_itself(self):
