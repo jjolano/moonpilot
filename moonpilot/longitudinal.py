@@ -265,6 +265,20 @@ def cruise_cap(v_ego, e2e, steer_angle_deg, CP, accel_coast, allow_throttle) -> 
   return cap
 
 
+def _coast_applies(v_ego, v_cruise, e2e, accel_coast, allow_throttle, coast_band) -> bool:
+  coast = float(np.clip(accel_coast, -MOONPILOT_COAST_ACCEL_MAX, MOONPILOT_COAST_ACCEL_MAX))
+  grade = coast - MOONPILOT_COAST_FLAT_ACCEL
+  error = v_cruise - v_ego
+  return (
+    coast_band > 0.0
+    and not e2e
+    and abs(grade) > MOONPILOT_COAST_GRADE_MIN
+    and abs(error) < coast_band
+    and error * grade < 0.0
+    and (allow_throttle or grade > 0.0)
+  )
+
+
 def cruise_accel(v_ego, v_cruise, e2e, steer_angle_deg, CP, accel_coast, allow_throttle, coast_band: float = 0.0) -> float:
   """Return the speed-error cruise candidate, clipped to its normal cap.
 
@@ -282,16 +296,13 @@ def cruise_accel(v_ego, v_cruise, e2e, steer_angle_deg, CP, accel_coast, allow_t
   """
   cap = cruise_cap(v_ego, e2e, steer_angle_deg, CP, accel_coast, allow_throttle)
   a = float(np.clip(MOONPILOT_K_CRUISE * (v_cruise - v_ego), MOONPILOT_A_CRUISE_MIN, cap))
-  if coast_band > 0.0 and not e2e:
+  if _coast_applies(v_ego, v_cruise, e2e, accel_coast, allow_throttle, coast_band):
     coast = float(np.clip(accel_coast, -MOONPILOT_COAST_ACCEL_MAX, MOONPILOT_COAST_ACCEL_MAX))
-    grade = coast - MOONPILOT_COAST_FLAT_ACCEL
-    error = v_cruise - v_ego
-    # Only where the hill is the thing moving the car — it pushes away from the set speed — and only
-    # inside the band. A descent needs this even when the model disallows throttle: the existing cap
-    # limits positive acceleration but never relaxes braking above the set speed. On a climb with
-    # throttle already disallowed, that existing cap is the requested coast behavior and stays intact.
-    if abs(grade) > MOONPILOT_COAST_GRADE_MIN and abs(error) < coast_band and error * grade < 0.0 and (allow_throttle or grade > 0.0):
-      a = coast * (coast_band - abs(error)) / coast_band
+    # Only where the hill is the thing moving the car — it pushes the car away from the set speed —
+    # and only inside the band. A descent needs this even when the model disallows throttle: the
+    # existing cap limits positive acceleration but never relaxes braking above the set speed. On a
+    # climb with throttle already disallowed, that existing cap is the requested coast behavior.
+    a = coast * (coast_band - abs(v_cruise - v_ego)) / coast_band
   return float(a)
 
 
@@ -533,8 +544,9 @@ def policy(
   a_cruise_base = cruise_accel(v_ego, v_cruise, e2e, steer_angle_deg, CP, accel_coast, allow_throttle) if coast_band > 0.0 else a_cruise_raw
   a_cruise = min(a_cruise_raw, a_curve)
   lead_asks = [(lead_accel(v_ego, gap, v_lead, a_lead, t_follow), source) for source, gap, v_lead, a_lead in leads]
-  # A negative speed error is intentional once closing; only a coast-band reduction blocks the lift.
-  if lead_asks and a_curve >= 0.0 and a_cruise_raw >= a_cruise_base and v_cruise > 0.0:
+  coast_braking = _coast_applies(v_ego, v_cruise, e2e, accel_coast, allow_throttle, coast_band) and accel_coast < 0.0
+  # A negative speed error is intentional once closing; only an active coast-band braking ask blocks the lift.
+  if lead_asks and a_curve >= 0.0 and not coast_braking and a_cruise_raw >= a_cruise_base and v_cruise > 0.0:
     # `v_cruise > 0` is the force-decel gate: `forceDecel` zeroes the set speed, and the target below
     # is relative to it, so without this the lift would command motion at a car the planner is trying
     # to stop — measured, it broke 9 of the 60 upstream maneuver combinations, all of them the

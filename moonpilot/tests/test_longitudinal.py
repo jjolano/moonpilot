@@ -562,6 +562,24 @@ class TestPolicyFunctions(unittest.TestCase):
       cruise_accel(29.0, 30.0, False, 0.0, CP, -0.75, True, coast_band=1.5),
       places=9,
     )
+    downhill_coast = policy(
+      30.0,
+      [(Source.lead0, max(MOONPILOT_STOP_DISTANCE, t_follow * 30.0) + 20.0, 30.0, 0.0)],
+      29.0,
+      t_follow,
+      False,
+      None,
+      0.0,
+      CP,
+      -0.05,
+      True,
+      coast_band=1.5,
+    )[0]
+    self.assertAlmostEqual(
+      downhill_coast,
+      cruise_accel(30.0, 29.0, False, 0.0, CP, -0.05, True, coast_band=1.5),
+      places=9,
+    )
     # `forceDecel` zeroes the set speed, and the target is relative to it: no lift at a car being stopped
     self.assertAlmostEqual(out(setpoint + 20.0, v_cruise=0.0), MOONPILOT_A_CRUISE_MIN, places=9)
     # the model still caps it in experimental mode, and the nearest lead governs
