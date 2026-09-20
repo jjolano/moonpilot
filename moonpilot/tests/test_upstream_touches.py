@@ -64,7 +64,7 @@ ALLOWED = {
   "openpilot/selfdrive/ui/mici/layouts/settings/settings.py": "moonpilot panel",
   "openpilot/system/hardware/hardwared.py": "offroad mode member in onroad_conditions",
   "openpilot/system/manager/manager.py": "the model store's boot selection commit",
-  "openpilot/selfdrive/modeld/modeld.py": "the fork's driving model runtime",
+  "openpilot/selfdrive/modeld/modeld.py": "the fork's driving model runtime; low-speed turn-desire hook after DesireHelper.update()",
   "openpilot/selfdrive/modeld/dmonitoringmodeld.py": "the fork's monitoring model runtime",
   "openpilot/system/manager/process_config.py": "MOONPILOT_PROCS",
   # The fork's own opendbc/panda: recorded as submodule pointer moves, so the paths of the

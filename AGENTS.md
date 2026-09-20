@@ -24,7 +24,7 @@ New fork behavior: write it under `moonpilot/`, hook it at the seam that already
 | `openpilot/system/manager/process_config.py` | `procs += MOONPILOT_PROCS` from `moonpilot/procs.py` |
 | `openpilot/system/manager/manager.py` | `commit_boot_selection(params)` right after the default seeding — the one boot snapshot every model process reads; `moonpilot.boot`'s boot-health token and rollback report after the first `ensure_running` |
 | `launch_chffrplus.sh` | `moonpilot/boot.sh recover` before anything else in `launch()`, and the boot token written into the swap record — the boot-success rollback, see **Boot rollback** |
-| `openpilot/selfdrive/modeld/modeld.py` | `moonpilot_model_runtime()`, and the runtime's model, smoothing constants and action decode |
+| `openpilot/selfdrive/modeld/modeld.py` | `moonpilot_model_runtime()`, and the runtime's model, smoothing constants and action decode; low-speed turn-desire hook after `DesireHelper.update()` |
 | `openpilot/selfdrive/modeld/dmonitoringmodeld.py` | `moonpilot_dm_runtime()`, and the runtime's model and output parse |
 | `openpilot/cereal/custom.capnp` | `MoonpilotState` (upstream's reserved struct; never change the `@0x…` id) |
 | `openpilot/cereal/log.capnp` | `moonpilotState @107` event field; `PandaState.controlsAllowedLateral @38` and `controlsAllowedLongitudinal @39` — upstream's two slots reserved for forks, the first carrying this fork's lateral grant and the second named for the longitudinal half of the split, which this fork never populates |

@@ -411,7 +411,7 @@ def main(demo=False):
       lane_change_prob = l_lane_change_prob + r_lane_change_prob
       DH.update(sm['carState'], sm['carControl'].latActive, lane_change_prob)
       # moonpilot seam, see AGENTS.md: low-speed turn desire from the blinker
-      turn = turn_desire(sm, params)
+      turn = turn_desire(sm, desire_state, params)
       if turn is not None:
         DH.desire = turn
       modelv2_send.modelV2.meta.laneChangeState = DH.lane_change_state
