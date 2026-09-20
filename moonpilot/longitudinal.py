@@ -108,6 +108,13 @@ from moonpilot.jerk import (
 )
 
 from moonpilot.lead import LeadAccelEstimator, nearest_lead_in_path
+from moonpilot.pitch import (
+  MOONPILOT_PITCH_MIN_SAMPLES,
+  MOONPILOT_PITCH_MIN_SPEED,
+  MOONPILOT_PITCH_OFFSET_KEY,
+  MOONPILOT_PITCH_PERSIST_EVERY,
+  PitchOffsetEstimator,
+)
 from moonpilot.slam import ego_speed_correction
 
 LongCtrlState = car.CarControl.Actuators.LongControlState
@@ -602,6 +609,12 @@ class MoonpilotLongitudinalPlanner:
     seeded_scale = self.params.get(MOONPILOT_CURVE_BIAS_KEY, return_default=True)
     if isinstance(seeded_scale, float) and seeded_scale > 1.0:
       self.lat_bias.seed(min(seeded_scale, MOONPILOT_CURVE_BIAS_MAX), MOONPILOT_CURVE_BIAS_MIN_SAMPLES)
+    # The standing offset in the reported pitch (`moonpilot/pitch.py`), subtracted before any grade
+    # term reads it. Seeded from the last drive because the window is longer than most of them.
+    self.pitch_offset = PitchOffsetEstimator(dt)
+    seeded_pitch = self.params.get(MOONPILOT_PITCH_OFFSET_KEY, return_default=True)
+    if isinstance(seeded_pitch, float) and seeded_pitch != 0.0:
+      self.pitch_offset.seed(seeded_pitch, MOONPILOT_PITCH_MIN_SAMPLES)
     self.frames = 0
     # One per radarState slot, ticked every frame so an absent or replaced lead resets its window.
     self.lead_accel = (LeadAccelEstimator(dt), LeadAccelEstimator(dt))
@@ -668,7 +681,12 @@ class MoonpilotLongitudinalPlanner:
     self.action_t = self.long_lag.applied_delay() + self.dt
 
     pose_valid = len(sm['carControl'].orientationNED) == 3
-    accel_coast = coast_accel(sm['carControl'].orientationNED[1]) if pose_valid else ACCEL_MAX
+    pitch = float(sm['carControl'].orientationNED[1]) if pose_valid else 0.0
+    # Learn from the raw signal whenever the car is driving — the bias belongs to the device and the
+    # car, not to who is steering — and correct every grade term with what is trusted so far. Nothing
+    # learned is exactly zero, which is the grade input this planner had before.
+    self.pitch_offset.update(pitch, pose_valid and CS.vEgo > MOONPILOT_PITCH_MIN_SPEED and not CS.standstill)
+    accel_coast = coast_accel(pitch - self.pitch_offset.applied()) if pose_valid else ACCEL_MAX
     # Zero when the pose is missing (accel_coast is the ACCEL_MAX sentinel) or the driver turned the
     # row off — the band is the feature's whole surface, so both collapse to the planner this fork
     # had before it. The normal path reads the toggle on every frame, so a row change applies immediately.
@@ -861,6 +879,8 @@ class MoonpilotLongitudinalPlanner:
       self._persist_lag()
     if self.frames % MOONPILOT_LONG_JERK_PERSIST_EVERY == 0 and self.long_jerk.status == 'estimated':
       self._persist_long_jerk()
+    if self.pitch_offset.samples % MOONPILOT_PITCH_PERSIST_EVERY == 0 and self.pitch_offset.status == 'estimated':
+      self._persist_pitch_offset()
 
     if self.lat_bias.frames % MOONPILOT_CURVE_BIAS_PERSIST_EVERY == 0 and self.lat_bias.status == 'estimated':
       self._persist_lat_scale()
@@ -877,6 +897,13 @@ class MoonpilotLongitudinalPlanner:
     value = round(self.long_jerk.applied(), 3)
     self.params.put(MOONPILOT_LONG_JERK_SCALE_KEY, value)
     cloudlog.info(f"moonpilot longitudinal comfort jerk scale {value:.3f} over {self.long_jerk.samples} paired ramps")
+
+  def _persist_pitch_offset(self):
+    """Persist the learned offset: the window is longer than most drives, so without this it would
+    restart from zero every boot and never finish converging."""
+    value = round(self.pitch_offset.applied(), 4)
+    self.params.put(MOONPILOT_PITCH_OFFSET_KEY, value)
+    cloudlog.info(f"moonpilot pitch offset {math.degrees(value):.2f} deg over {self.pitch_offset.samples} frames")
 
   def _persist_lat_scale(self):
     """Persist the learned value so the next boot plans with it from the first frame. Gated on a

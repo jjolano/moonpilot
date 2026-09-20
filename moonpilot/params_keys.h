@@ -52,6 +52,12 @@
     // what the model's path predicted. 1.0 is neutral, and the applied value is
     // clamped at or above it, so a learned bias only ever plans for less speed.
     {"MoonpilotCurveLatScale", {PERSISTENT, FLOAT, "1.0"}},
+    // Learned onroad by moonpilot/pitch.py: the standing offset in
+    // carControl.orientationNED[1], in radians, subtracted before any grade
+    // term reads the pitch. 0.0 means nothing measured yet and corrects
+    // nothing; the applied value is clamped so a wrong offset alone cannot
+    // take level road past MOONPILOT_COAST_GRADE_MIN.
+    {"MoonpilotPitchOffset", {PERSISTENT, FLOAT, "0.0"}},
     // Offroad mode, entered from the moonpilot panel's row or a hold on the
     // driving view: while it is set the device stays offroad with the ignition
     // on. CLEAR_ON_IGNITION_ON so a new drive always comes up onroad,
