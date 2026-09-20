@@ -57,6 +57,7 @@ from moonpilot.longitudinal import (
   MOONPILOT_COAST_GRADE_MIN,
   MOONPILOT_CONTROL_T_IDX,
   MOONPILOT_FCW_DECEL,
+  MOONPILOT_FOLLOW_CUSHION,
   MOONPILOT_JERK_EMERGENCY,
   MOONPILOT_JERK_DOWN,
   MOONPILOT_JERK_LAUNCH,
@@ -302,6 +303,27 @@ class TestPolicyFunctions(unittest.TestCase):
         self.assertAlmostEqual(_gap_target(v, t_follow), t_follow * v, delta=1e-9)
         self.assertGreater(lead_accel(v, MOONPILOT_STOP_DISTANCE + t_follow * v, v, 0.0, t_follow), 0.0)
 
+  def test_the_follow_target_is_a_cushion_not_a_wall(self):
+    """A low closing speed may cross the nominal target, then the same regulator holds a small
+    opening speed until the exact target is recovered. The target remains the only equilibrium."""
+    t_follow = MOONPILOT_T_FOLLOW[int(Personality.standard)]
+    v_lead = 20.0
+    v_ego = v_lead + MOONPILOT_FOLLOW_CUSHION * MOONPILOT_K_GAP / (2 * MOONPILOT_K_V)
+    gap = _gap_target(v_ego, t_follow)
+    accel = 0.0
+    gap_errors = []
+
+    for _ in range(round(30.0 / DT_MDL)):
+      accel = jerk_limit(lead_accel(v_ego, gap, v_lead, 0.0, t_follow), accel, DT_MDL, v_ego)
+      v_ego = max(0.0, v_ego + accel * DT_MDL)
+      gap += (v_lead - v_ego) * DT_MDL
+      gap_errors.append(gap - _gap_target(v_ego, t_follow))
+
+    self.assertLess(min(gap_errors), -0.1 * MOONPILOT_FOLLOW_CUSHION)
+    self.assertGreater(min(gap_errors), -MOONPILOT_FOLLOW_CUSHION)
+    self.assertAlmostEqual(v_ego, v_lead, delta=1e-3)
+    self.assertAlmostEqual(gap_errors[-1], 0.0, delta=1e-3)
+
   def test_the_approach_handover_has_the_stopping_geometry(self):
     """The regulator hands over to the approach term at gap == STOP_DISTANCE + (v^2 - v_lead^2) / 2,
     which is the point where stopping needs more than the approach decel — the crossing the old
@@ -312,7 +334,11 @@ class TestPolicyFunctions(unittest.TestCase):
     t_follow = MOONPILOT_T_FOLLOW[int(Personality.standard)]
     for v_ego, v_lead in ((25.0, 0.0), (30.0, 0.0), (20.0, 0.0), (25.0, 20.0), (10.0, 0.0)):
       gap_star = MOONPILOT_STOP_DISTANCE + (v_ego**2 - v_lead**2) / 2
-      a_track = max(MOONPILOT_K_GAP * (gap_star - _gap_target(v_ego, t_follow)) + MOONPILOT_K_V * (v_lead - v_ego), -MOONPILOT_APPROACH_DECEL)
+      cushion = min(MOONPILOT_FOLLOW_CUSHION, (v_ego - v_lead) * MOONPILOT_K_V / MOONPILOT_K_GAP)
+      a_track = max(
+        MOONPILOT_K_GAP * (gap_star - _gap_target(v_ego, t_follow) + cushion) + MOONPILOT_K_V * (v_lead - v_ego),
+        -MOONPILOT_APPROACH_DECEL,
+      )
       self.assertAlmostEqual(lead_accel(v_ego, gap_star - 1e-3, v_lead, 0.0, t_follow), -MOONPILOT_APPROACH_DECEL, delta=1e-3)
       self.assertAlmostEqual(lead_accel(v_ego, gap_star + 1e-3, v_lead, 0.0, t_follow), a_track, delta=1e-3)
 

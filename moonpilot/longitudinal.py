@@ -6,8 +6,9 @@ problem. Braking candidates use `min` arbitration; when a lead is above its time
 other term is braking, the fork may raise only the cruise slot toward a bounded closing target so an
 over-braked gap can recover. The policy is:
 
-  - a spacing regulator that holds ``gap == max(STOP_DISTANCE, t_follow * v_ego)`` against the nearest
-    lead, gaining rigidity as the gap closes (all the slack is in the time gap, none in the gains);
+  - a spacing regulator whose exact equilibrium is
+    ``gap == max(STOP_DISTANCE, t_follow * v_ego)``, with a one-meter inward cushion while closing
+    and relative-speed recovery after the cushion is spent;
     the standstill distance is a floor under the headway rather than an offset on top of it;
   - the time gap itself, biased by ``MoonpilotLeadLateral`` when the lead is predicted to leave the
     path — the fork's lateral prediction reaches the longitudinal policy here, since there is no
@@ -136,6 +137,12 @@ MOONPILOT_T_FOLLOW = {
 }
 MOONPILOT_K_GAP = 0.3  # 1/s^2 on the spacing error
 MOONPILOT_K_V = 0.6  # 1/s on the relative speed
+MOONPILOT_FOLLOW_CUSHION = 1.0  # m; a closing approach may spend this much of the nominal gap before
+# the spacing regulator adds its full speed-matching brake. The moving cushion is closing speed times
+# K_V / K_GAP, capped here: below the cap it exactly cancels the relative-speed term at the nominal
+# gap, then vanishes as ego becomes slower so the same regulator smoothly reopens the exact time gap.
+# It also tapers out before the time-gap target reaches the standstill floor. TTC and stopping-floor
+# terms never read it.
 MOONPILOT_APPROACH_DECEL = 1.0  # m/s^2; the spacing regulator's braking authority, and the
 # decel the approach term binds past — one number, so the
 # two terms meet at the same output
@@ -324,6 +331,15 @@ def lead_accel(v_ego, gap, v_lead, a_lead, t_follow) -> float:
   further the slower it went. It only governs below ``STOP_DISTANCE / t_follow`` (4.1 m/s at the
   standard personality), which is the region where there is no time gap left to hold.
 
+  The nominal follow gap is a soft boundary while closing. The regulator moves its working target
+  inward by at most `MOONPILOT_FOLLOW_CUSHION`, with the uncapped distance equal to closing speed
+  times `K_V / K_GAP`. Below the cap that exactly cancels speed-matching brake at the nominal gap:
+  relative motion may spend the cushion instead of treating the target as a wall. Once ego is slower
+  the cushion is zero, and the unmodified relative-speed term lets the gap reopen before adding
+  acceleration. Exact speed-match equilibrium stays at the nominal gap, and the cushion tapers out
+  with the time-gap headroom so it can never move the target inside `STOP_DISTANCE`. This changes
+  only the spacing regulator; the TTC and stopping-floor terms below still read the physical gap.
+
   The approach is two terms, and the deeper one wins against the regulator's capped output.
 
   The first is time-to-collision: it holds the closing rate inside what the slack affords at
@@ -366,7 +382,16 @@ def lead_accel(v_ego, gap, v_lead, a_lead, t_follow) -> float:
   v_lead_eff = max(0.0, v_lead + min(float(a_lead), 0.0) * MOONPILOT_LEAD_PREVIEW_T)
   v_lead_match = v_lead + max(float(a_lead), 0.0) * MOONPILOT_LEAD_PREVIEW_T_ACCEL
   gap_target = max(MOONPILOT_STOP_DISTANCE, t_follow * v_ego)
-  a_track = max(MOONPILOT_K_GAP * (gap - gap_target) + MOONPILOT_K_V * (v_lead_match - v_ego), -MOONPILOT_APPROACH_DECEL)
+  closing_match = max(v_ego - v_lead_match, 0.0)
+  gap_cushion = min(
+    MOONPILOT_FOLLOW_CUSHION,
+    closing_match * MOONPILOT_K_V / MOONPILOT_K_GAP,
+    max(t_follow * v_ego - MOONPILOT_STOP_DISTANCE, 0.0),
+  )
+  a_track = max(
+    MOONPILOT_K_GAP * (gap - gap_target + gap_cushion) + MOONPILOT_K_V * (v_lead_match - v_ego),
+    -MOONPILOT_APPROACH_DECEL,
+  )
   closing = v_ego - v_lead_eff
   if closing <= 0.0:
     return a_track  # not closing: nothing to brake for
