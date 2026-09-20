@@ -55,6 +55,13 @@ MOONPILOT_CURVE_A_LAT = 1.9  # m/s^2; lateral accel a curve is worth taking at
 MOONPILOT_CURVE_A_LAT_MIN = 1.0  # m/s^2; floor after the bank correction, so a large roll cannot zero the budget
 MOONPILOT_CURVE_J_LAT = 3.0  # m/s^3; lateral jerk the entry is shaped to, below upstream's 5.0 ISO command limit
 MOONPILOT_CURVE_PREVIEW_T = 4.0  # s of path admitted; past this the prediction is not worth braking on
+MOONPILOT_CURVE_PATH_MAX_AGE = 2 * DT_MDL  # s; how old the path may be before `moonpilot/longitudinal.py`
+# stops re-referencing it. The path's `position.x` is measured from the pose of the frame the model
+# saw, so the planner shifts the curve's `x_ego` by the car's travel since that frame — `logMonoTime -
+# timestampEof`, measured 29 ms median and 38 ms max over seven corpus segments. Two model periods,
+# the same bound `moonpilot/curvature.py` puts on the age of this same message: past it the shift is
+# dropped rather than extrapolated, which leaves the planner this fork had before the correction —
+# the failure direction that only brakes less.
 MOONPILOT_CURVE_V_MIN = 5.0  # m/s; floor on any target speed, so a spurious curvature cannot ask for a stop
 MOONPILOT_CURVE_ACCEL_MIN = -1.5  # m/s^2; the terms' shared floor, well above ACCEL_MIN
 MOONPILOT_CURVE_MIN_SLACK = 1.0  # m; floor on the braking-distance denominator

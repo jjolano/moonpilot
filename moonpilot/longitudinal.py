@@ -93,6 +93,8 @@ from moonpilot.curve import (
 from moonpilot.features import COAST_GRADE, CURVE_SPEED, LEAD_LATERAL, LONGITUDINAL, MODEL_BRAKING, enabled
 from moonpilot.latency import (
   MOONPILOT_LAG_BLOCKS_NEEDED,
+  MOONPILOT_LAG_BLOCKS_KEY,
+  MOONPILOT_LAG_BLOCK_COUNT,
   MOONPILOT_LAG_KEY,
   MOONPILOT_LAG_LOG_DELTA,
   MOONPILOT_LAG_MAX,
@@ -573,7 +575,16 @@ class MoonpilotLongitudinalPlanner:
     # ROI floor and so is not a seed either.
     seeded = self.params.get(MOONPILOT_LAG_KEY, return_default=True)
     if isinstance(seeded, float) and seeded >= MOONPILOT_LAG_MIN:
-      self.long_lag.seed(min(seeded, MOONPILOT_LAG_MAX), MOONPILOT_LAG_BLOCKS_NEEDED)
+      # The evidence count rides with the value, so a drive that earns a block adds it to what earlier
+      # drives left instead of the mean being re-trusted wholesale. Below the block requirement the
+      # carried mean is held back — `status` stays `unestimated` and the stock constant is applied —
+      # and a value written before the count existed was only ever written when trusted, so a missing
+      # or malformed count reads as the needed one.
+      seeded_blocks = self.params.get(MOONPILOT_LAG_BLOCKS_KEY, return_default=True)
+      blocks = seeded_blocks if isinstance(seeded_blocks, int) and not isinstance(seeded_blocks, bool) else 0
+      if blocks <= 0:
+        blocks = MOONPILOT_LAG_BLOCKS_NEEDED
+      self.long_lag.seed(min(seeded, MOONPILOT_LAG_MAX), min(blocks, MOONPILOT_LAG_BLOCK_COUNT))
       self.long_lag_logged = self.long_lag.applied_delay()
     self.long_jerk = LongitudinalComfortJerkEstimator(dt)
     seeded_jerk = self.params.get(MOONPILOT_LONG_JERK_SCALE_KEY, return_default=True)
@@ -855,10 +866,11 @@ class MoonpilotLongitudinalPlanner:
     self.output_should_stop = (should_stop(v_ego, a_target) and not trailing) or (e2e and sm['modelV2'].action.shouldStop)
     self.output_a_target = a_target
     self.source = source
-    # Persist the learned value so the next boot projects through it from the first frame. Gated on a
-    # trusted estimate, so an unestimated or invalid one never becomes the next drive's constant.
+    # Persist the learned value *and its evidence* so the next boot continues from where this drive
+    # got to: the count decides whether the value is applied (see the seeding above), so a drive that
+    # only earned a block or two hands them on rather than restarting.
     self.frames += 1
-    if self.frames % MOONPILOT_LAG_PERSIST_EVERY == 0 and self.long_lag.status == 'estimated':
+    if self.frames % MOONPILOT_LAG_PERSIST_EVERY == 0 and self.long_lag.valid_blocks > 0:
       self._persist_lag()
     if self.frames % MOONPILOT_LONG_JERK_PERSIST_EVERY == 0 and self.long_jerk.status == 'estimated':
       self._persist_long_jerk()
@@ -872,6 +884,7 @@ class MoonpilotLongitudinalPlanner:
   def _persist_lag(self):
     value = round(self.long_lag.estimate, 3)
     self.params.put(MOONPILOT_LAG_KEY, value)
+    self.params.put(MOONPILOT_LAG_BLOCKS_KEY, self.long_lag.valid_blocks)
     if abs(value - self.long_lag_logged) > MOONPILOT_LAG_LOG_DELTA:
       cloudlog.info(f"moonpilot longitudinal lag {value:.3f} s over {self.long_lag.valid_blocks} blocks, action_t {self.action_t:.3f} s")
       self.long_lag_logged = value

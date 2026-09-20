@@ -23,6 +23,7 @@ from openpilot.common.realtime import DT_MDL
 
 from moonpilot.latency import (
   MOONPILOT_LAG_BLOCKS_NEEDED,
+  MOONPILOT_LAG_BLOCKS_KEY,
   MOONPILOT_LAG_BLOCK_SIZE,
   MOONPILOT_LAG_MAX,
   MOONPILOT_LAG_WINDOW_SEC,
@@ -35,9 +36,10 @@ CP = CarInterface.get_non_essential_params(CAR.HONDA_CIVIC)
 
 # The window has to fill before anything can be estimated — `Points` prefills with zeros and a
 # correlation over the unfilled region is NaN — and then `MOONPILOT_LAG_BLOCKS_NEEDED` blocks of
-# `MOONPILOT_LAG_BLOCK_SIZE` estimates have to clear the gates: 60 s + 25 s at 20 Hz. 90 s is that
-# with room to spare, so the exact recovery timing below is the only thing measured against a clock.
-SETTLED_FRAMES = int(90.0 / DT_MDL)
+# `MOONPILOT_LAG_BLOCK_SIZE` estimates have to clear the gates: the window plus 25 s at 20 Hz. Derived
+# from the window constant so a change there cannot silently starve these tests, and 40 s of margin
+# over it means the exact recovery timing below is the only thing measured against a clock.
+SETTLED_FRAMES = int((MOONPILOT_LAG_WINDOW_SEC + 40.0) / DT_MDL)
 
 
 def _square(hz: float, amplitude: float):
@@ -208,14 +210,49 @@ class TestPlannerWiring(unittest.TestCase):
     self.assertEqual(unmeasured.long_lag.status, "unestimated")
     self.assertAlmostEqual(unmeasured.action_t, CP.longitudinalActuatorDelay + DT_MDL, delta=1e-9)
 
+  def test_a_partial_evidence_count_is_carried_not_trusted(self):
+    """The count that rides with the value decides whether it is applied, which is what lets a drive
+    with too little engaged long control hand its block on instead of having it thrown away — and
+    what keeps a mean from one block out of `action_t`. A value written before the count existed was
+    only ever written when trusted, so a store that answers 0 for it still seeds as trusted."""
+    with mock.patch.object(longitudinal_mod, "Params", lambda: _StoredParams(0.45, 1)):
+      carried = MoonpilotLongitudinalPlanner(CP)
+    self.assertEqual(carried.long_lag.valid_blocks, 1)
+    self.assertEqual(carried.long_lag.status, "unestimated")
+    self.assertAlmostEqual(carried.action_t, CP.longitudinalActuatorDelay + DT_MDL, delta=1e-9)
+
+    with mock.patch.object(longitudinal_mod, "Params", lambda: _StoredParams(0.45, MOONPILOT_LAG_BLOCKS_NEEDED)):
+      trusted = MoonpilotLongitudinalPlanner(CP)
+    self.assertEqual(trusted.long_lag.status, "estimated")
+    self.assertAlmostEqual(trusted.action_t, 0.45 + DT_MDL, delta=1e-9)
+
+  def test_evidence_accumulates_across_seeds(self):
+    """Blocks carried from earlier drives plus the one this drive earns is a trusted mean: the count
+    is the evidence, and the ring keeps filling from where the last drive left off rather than
+    restarting. The value stays inside the same gates — it is the *amount* of evidence that is being
+    accumulated, not its quality."""
+    est = LongLagEstimator(CP, DT_MDL)
+    est.seed(0.30, MOONPILOT_LAG_BLOCKS_NEEDED - 1)
+    self.assertEqual(est.status, "unestimated")
+    self.assertAlmostEqual(est.applied_delay(), CP.longitudinalActuatorDelay, delta=1e-9)
+
+    _plant(est, _square(0.25, 1.5), lag=6, frames=SETTLED_FRAMES)
+    self.assertEqual(est.status, "estimated")
+    self.assertAlmostEqual(est.estimate, 0.30, delta=DT_MDL)
+    self.assertAlmostEqual(est.applied_delay(), 0.30, delta=DT_MDL)
+
 
 class _StoredParams:
-  """A param store holding one value, for the seeding path `FakeParams`'s bool cannot reach."""
+  """A param store holding the persisted lag pair, for the seeding path `FakeParams`'s bool cannot
+  reach. `blocks` answers the evidence key and nothing else, so the value still reads as the value."""
 
-  def __init__(self, value):
+  def __init__(self, value, blocks=None):
     self.value = value
+    self.blocks = blocks
 
   def get(self, key, block=False, return_default=False):
+    if key == MOONPILOT_LAG_BLOCKS_KEY:
+      return self.blocks if self.blocks is not None else 0
     return self.value
 
 

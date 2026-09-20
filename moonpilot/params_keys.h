@@ -44,6 +44,13 @@
     // measured yet, which is below the estimator's own ROI floor and so is
     // never applied.
     {"MoonpilotLongLag", {PERSISTENT, FLOAT, "0.0"}},
+    // The evidence behind MoonpilotLongLag, in blocks of accepted estimates.
+    // It rides with the value so fragmented engagement accumulates across
+    // drives instead of being re-trusted wholesale: below the estimator's own
+    // block requirement the carried mean is held back and the stock constant
+    // stands. 0 is "no evidence", which is what a value written before this
+    // key existed reads as.
+    {"MoonpilotLongLagBlocks", {PERSISTENT, INT, "0"}},
     // Learned onroad from positive command ramps versus `carState.aEgo`.
     // Tightens only the longitudinal comfort-side jerk; the braking and
     // emergency ramps stay validated constants.

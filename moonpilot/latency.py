@@ -59,6 +59,20 @@ excitation-range gate bound nothing, and only 24 estimates were ever accepted ag
 trusted block needs. So the contingency to reach for is more engaged driving, never a lower
 `MOONPILOT_LAG_RANGE`.
 
+**Which is why the evidence count is persisted with the value, and not the value alone.** Replayed
+per *drive* — the estimator spans log segments, and feeding it segment by segment would restart it
+every minute — the two routes that carry engaged long control give the split above a shape: 3,688
+attempts, of which **82 % lack valid samples**, 14 % fail the confidence gate and 4 % the NCC gate;
+the attempts that clear both quality gates read 0.245 s (sd 0.016) and 0.350 s (sd 0.043), i.e. the
+estimator is right where it can speak. What it cannot do is speak often enough: those drives reach
+**1 block of the 5** a trusted mean needs, and a sweep of the sizing constants changes nothing —
+window 40/90/120/180 s × valid gate 5/15/25 s × speed gate 1/2/5 m/s all end at 0 trusted blocks,
+best case 1. The gate is not mis-tuned, the evidence is thin. Carrying the count across drives is
+therefore the one lever the data supports: a drive that earns a block adds it to what earlier drives
+left, the mean is applied only once the blocks are there, and `MAX_LAG_STD` is what checks that the
+blocks agree. `MoonpilotLongLagBlocks` is that count; a value written before the key existed was only
+ever written when trusted, so a missing count reads as the needed one.
+
 Two more numbers from the same run, both worth knowing before reading a device result. Where the
 estimator did get to run it reported 0.33–0.40 s with NCC 0.965–0.986, and an independent high-pass
 lag scan of the same data — which shares no machinery with `lagd` — peaks at 0.34 s (r 0.576 against
@@ -106,13 +120,19 @@ from openpilot.selfdrive.locationd.lagd import (
 )
 
 MOONPILOT_LAG_KEY = "MoonpilotLongLag"  # the param the learned value persists in, as FLOAT
+MOONPILOT_LAG_BLOCKS_KEY = "MoonpilotLongLagBlocks"  # its evidence, in blocks, as INT
 MOONPILOT_LAG_LOG_DELTA = 0.05  # s of movement worth a log line, so the qlog can be read per drive
 MOONPILOT_LAG_MIN = 0.05  # s; ROI floor, one frame of the 20 Hz command
 MOONPILOT_LAG_MAX = 0.60  # s; ROI ceiling, mirrors lagd's MAX_LAG
 MOONPILOT_LAG_MIN_SPEED = 5.0  # m/s; below this the stopping ramp owns the command, not the policy
 MOONPILOT_LAG_MAX_ABS_AEGO = 4.0  # m/s^2; sanity gate on the measurement itself
 MOONPILOT_LAG_RANGE = 0.5  # m/s^2; excitation floor, mirrors lagd's MIN_LAT_ACCEL_RANGE
-MOONPILOT_LAG_WINDOW_SEC = 60.0  # s of samples per correlation, lagd's MOVING_WINDOW_SEC
+MOONPILOT_LAG_WINDOW_SEC = 90.0  # s of samples per correlation: lagd's 60 s, extended because the
+# gate that decides whether an estimate is possible is the *valid-sample* count inside the window, and
+# this car's engaged long control comes in ~60 s stretches (measured: at 60 s the best engaged route
+# earns 0 blocks, at 90 s it earns 1). A longer window is how sparse engagement accumulates into one
+# correlation; the quality gates (NCC, confidence, block spread) are untouched, and the estimates the
+# two windows produce agree to 0.06 s.
 MOONPILOT_LAG_MIN_OKAY_SEC = 25.0  # s of valid samples in the window before an estimate is used
 MOONPILOT_LAG_RECOVERY_SEC = 2.0  # s of hold-off after an invalid frame, lagd's own buffer
 MOONPILOT_LAG_BLOCK_SIZE = 20  # estimates per block: 5 s at the 4 Hz estimate cadence below
