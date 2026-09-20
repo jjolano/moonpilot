@@ -69,6 +69,23 @@ class TestMoonpilotLatControlTorque(unittest.TestCase):
     self.assertAlmostEqual(lac_log.desiredLateralAccel, 1e-4 * (199 - 22.5) * 625, delta=1e-3)
     self.assertAlmostEqual(lac_log.desiredLateralAccel, (sample_22 + sample_23) / 2, delta=1e-3)
 
+  def test_feedback_setpoint_holds_delay_on_tightening_and_looks_ahead_on_unwind(self):
+    lac, VM, _ = _controller()
+    CS, params = _state(), log.VehicleParameters.new_message()
+    lat_delay = 0.2
+
+    _run(lac, VM, CS, params, 100, desired_curvature=1.0 / 625, lat_delay=lat_delay)
+    lac_log = _run(lac, VM, CS, params, 10, desired_curvature=2.0 / 625, lat_delay=lat_delay)
+    self.assertAlmostEqual(lac_log.desiredLateralAccel, 1.0, delta=1e-3)  # tightening remains delay-matched
+
+    _run(lac, VM, CS, params, 100, desired_curvature=2.0 / 625, lat_delay=lat_delay)
+    lac_log = _run(lac, VM, CS, params, 2, desired_curvature=1.0 / 625, lat_delay=lat_delay)
+    self.assertAlmostEqual(lac_log.desiredLateralAccel, 1.0, delta=1e-3)  # same-sign unwind starts early
+
+    _run(lac, VM, CS, params, 100, desired_curvature=1.0 / 625, lat_delay=lat_delay)
+    lac_log = _run(lac, VM, CS, params, 2, desired_curvature=-2.0 / 625, lat_delay=lat_delay)
+    self.assertAlmostEqual(lac_log.desiredLateralAccel, 0.0, delta=1e-3)  # reversal releases but is not anticipated
+
   def test_jerk_tracks_a_constant_rate_request(self):
     lac, VM, _ = _controller()
     CS, params = _state(), log.VehicleParameters.new_message()

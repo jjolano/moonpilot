@@ -37,7 +37,6 @@ from moonpilot.curve import (
   MOONPILOT_CURVE_BIAS_PERSIST_EVERY,
   MOONPILOT_CURVE_HOLD_MARGIN,
   MOONPILOT_CURVE_K_HOLD,
-  CurveTarget,
   curve_targets,
   lat_accel_hold,
 )
@@ -50,7 +49,6 @@ from moonpilot.jerk import (
 from moonpilot.features import FEATURES
 from moonpilot.lead import MOONPILOT_LEAD_ACCEL_TAU, LeadAccelEstimator
 from moonpilot.longitudinal import (
-  MOONPILOT_A_CRUISE_MIN,
   MOONPILOT_APPROACH_DECEL,
   MOONPILOT_COAST_BAND,
   MOONPILOT_COAST_FLAT_ACCEL,
@@ -76,7 +74,6 @@ from moonpilot.longitudinal import (
   MoonpilotLongitudinalPlanner,
   coast_accel,
   cruise_accel,
-  cruise_cap,
   jerk_limit,
   lead_accel,
   lead_state_at,
@@ -92,7 +89,7 @@ ROOT = Path(__file__).resolve().parents[2]
 COAST_DESCENT_PITCH = -0.1
 COAST_CLIMB_PITCH = 0.1
 COAST_SET_SPEED = 30.0
-COAST_SUBTHRESHOLD_PITCH = 0.02
+COAST_SUBTHRESHOLD_PITCH = 0.06  # ~6 %: the latest route's moderate grade, below the high-grade gate
 
 
 class FakeParams:
@@ -367,6 +364,18 @@ class TestPolicyFunctions(unittest.TestCase):
     for v_ego, gap, v_lead in ((25.0, 120.0, 0.0), (25.0, 8.0, 0.0), (25.0, 40.0, 20.0)):
       self.assertAlmostEqual(lead_accel(v_ego, gap, v_lead, 0.0, 1.45), a_stop(v_ego, gap, v_lead), delta=1e-6)
 
+  def test_the_last_meter_is_a_soft_stop_target(self):
+    """At the latest route's crawl stop, the TTC term—not the exact-distance floor—sets strength."""
+    v_ego, gap, v_lead, a_lead = 1.37, 6.58, 0.32, -0.8
+    v_lead_eff = max(0.0, v_lead + a_lead * MOONPILOT_LEAD_PREVIEW_T)
+    a_ttc = -MOONPILOT_K_TTC * (v_ego - v_lead_eff - (gap - MOONPILOT_STOP_DISTANCE) / MOONPILOT_TTC_TARGET)
+    exact_floor = -(v_ego**2 - v_lead_eff**2) / (2 * (gap - MOONPILOT_STOP_DISTANCE))
+
+    actual = lead_accel(v_ego, gap, v_lead, a_lead, MOONPILOT_T_FOLLOW[int(Personality.standard)])
+    self.assertLess(a_ttc, -MOONPILOT_APPROACH_DECEL)
+    self.assertAlmostEqual(actual, a_ttc, places=9)
+    self.assertGreater(actual, exact_floor)
+
   def test_the_lead_accel_credit_splits_by_direction_and_by_term(self):
     """The lead's own accel is credited forward into two different speeds, one direction each, and
     where each one lands is the whole contract. Braking goes into the speed the safety terms are
@@ -510,11 +519,9 @@ class TestPolicyFunctions(unittest.TestCase):
     stopped lead that is 318.5 m, where the regulator still wants +69.7 m/s^2 — a 70.7 m/s^2 step in
     the lead candidate, and a case upstream's maneuver suite has no maneuver for. It cannot reach the
     output: while the lead asks for more than the cruise candidate, `min` picks cruise, so what the
-    output steps by is the cruise slot minus the approach decel. Two invariants, and nothing else pins
-    them: arbitration never amplifies a candidate step, and the step the output does take is bounded
-    by the cruise *cap* plus the approach decel — the cap and not the speed-error value, because the
-    closing lift in `policy` may raise that slot to the cap while the gap is oversized, which is
-    exactly the case here (456 m against a stopped lead at 30 m/s).
+    output steps by is the active cruise slot minus the approach decel. Two invariants pin it:
+    arbitration never amplifies a candidate step, and the output step is bounded by that cruise
+    slot plus the approach decel. At the set speed the slot is zero even when the gap is oversized.
     """
     CP = _cp()
     t_follow = MOONPILOT_T_FOLLOW[int(Personality.standard)]
@@ -530,87 +537,35 @@ class TestPolicyFunctions(unittest.TestCase):
       output_step = abs(run(gap_star + 1e-3) - run(gap_star - 1e-3))
       self.assertLessEqual(output_step, candidate_step + 1e-9)  # arbitration never amplifies
       # the slack is the probe offset: inside the crossing the approach term is a hair past the approach decel
-      self.assertLessEqual(output_step, cruise_cap(v_ego, False, 0.0, CP, -0.3, True) + MOONPILOT_APPROACH_DECEL + 1e-3)
+      self.assertLessEqual(output_step, cruise_accel(v_ego, v_cruise, False, 0.0, CP, -0.3, True) + MOONPILOT_APPROACH_DECEL + 1e-3)
       worst_shrink = min(worst_shrink, output_step / candidate_step)
 
     # the 25/0 case is the one where the candidate step is large and the output's is not
     self.assertLess(worst_shrink, 0.2)
 
-  def test_the_closing_lift_is_bounded_and_gated(self):
-    """`policy`'s `min` is a ceiling on braking and on the set speed, not on the follow distance: an
-    oversized gap lifts the cruise slot to the closing target, and every gate that must stop it does.
-
-    Pinned by arithmetic, at states where each gate is the one that matters. The lift's ceiling is the
-    *cap* rather than the speed-error value — 0.733 at 30 m/s against the 0.0 the unlifted law
-    commands — and it is inert at the setpoint, which is what makes the setpoint the equilibrium
-    rather than a one-sided wall.
-    """
+  def test_an_oversized_gap_never_accelerates_at_or_above_set_speed(self):
+    """A larger gap may remain; recovering it never buys acceleration beyond the set speed."""
     CP = _cp()
     t_follow = MOONPILOT_T_FOLLOW[int(Personality.standard)]
-    v_ego, v_cruise = 30.0, 30.0
-    setpoint = max(MOONPILOT_STOP_DISTANCE, t_follow * v_ego)
-    cap = cruise_cap(v_ego, False, 0.0, CP, -0.3, True)
+    v_cruise = 30.0
 
-    def out(gap, v_lead=30.0, a_lead=0.0, v_cruise=v_cruise, curve=None, e2e=False, model=None, leads=None):
-      return policy(
-        v_ego, leads if leads is not None else [(Source.lead0, gap, v_lead, a_lead)], v_cruise, t_follow, e2e, model, 0.0, CP, -0.3, True, curve=curve
+    for v_ego in (v_cruise, v_cruise + 1.0):
+      setpoint = max(MOONPILOT_STOP_DISTANCE, t_follow * v_ego)
+      actual = policy(
+        v_ego,
+        [(Source.lead0, setpoint + 20.0, v_cruise, 0.0)],
+        v_cruise,
+        t_follow,
+        False,
+        None,
+        0.0,
+        CP,
+        -0.3,
+        True,
       )[0]
-
-    # an oversized gap closes at the cap, not beyond it, and the unlifted law would have commanded 0
-    self.assertGreater(cap, 0.0)
-    self.assertAlmostEqual(out(setpoint + 20.0), cap, places=9)
-    self.assertAlmostEqual(cruise_accel(v_ego, v_cruise, False, 0.0, CP, -0.3, True), 0.0, places=9)
-    # inert at the setpoint, and an undersized gap still brakes through the regulator
-    self.assertAlmostEqual(out(setpoint), 0.0, places=9)
-    self.assertLess(out(setpoint - 1.0), 0.0)
-    # a lead that is braking is untouched: the lift needs every lead ask to be positive
-    self.assertLess(out(setpoint + 20.0, a_lead=-5.0), -MOONPILOT_APPROACH_DECEL)
-    # a set speed below the current speed is a slow-down, and a curve is being slowed for
-    self.assertLess(out(setpoint + 20.0, v_cruise=20.0), 0.0)
-    self.assertLess(out(setpoint + 20.0, curve=CurveTarget(np.array([10.0, 20.0, 30.0]), np.full(3, 10.0))), 0.0)
-    # A negative grade-aware cruise slot is already braking; the lift must not override it just because
-    # the lead gap is oversized.
-    coast_only = policy(
-      29.0,
-      [(Source.lead0, max(MOONPILOT_STOP_DISTANCE, t_follow * 29.0) + 20.0, 29.0, 0.0)],
-      30.0,
-      t_follow,
-      False,
-      None,
-      0.0,
-      CP,
-      -0.75,
-      True,
-      coast_band=1.5,
-    )[0]
-    self.assertAlmostEqual(
-      coast_only,
-      cruise_accel(29.0, 30.0, False, 0.0, CP, -0.75, True, coast_band=1.5),
-      places=9,
-    )
-    downhill_coast = policy(
-      30.0,
-      [(Source.lead0, max(MOONPILOT_STOP_DISTANCE, t_follow * 30.0) + 20.0, 30.0, 0.0)],
-      29.0,
-      t_follow,
-      False,
-      None,
-      0.0,
-      CP,
-      -0.05,
-      True,
-      coast_band=1.5,
-    )[0]
-    self.assertAlmostEqual(
-      downhill_coast,
-      cruise_accel(30.0, 29.0, False, 0.0, CP, -0.05, True, coast_band=1.5),
-      places=9,
-    )
-    # `forceDecel` zeroes the set speed, and the target is relative to it: no lift at a car being stopped
-    self.assertAlmostEqual(out(setpoint + 20.0, v_cruise=0.0), MOONPILOT_A_CRUISE_MIN, places=9)
-    # the model still caps it in experimental mode, and the nearest lead governs
-    self.assertAlmostEqual(out(setpoint + 20.0, e2e=True, model=0.2), 0.2, places=9)
-    self.assertAlmostEqual(out(setpoint, leads=[(Source.lead0, setpoint, 30.0, 0.0), (Source.lead1, setpoint + 20.0, 30.0, 0.0)]), 0.0, places=9)
+      expected = cruise_accel(v_ego, v_cruise, False, 0.0, CP, -0.3, True)
+      self.assertLessEqual(actual, 0.0)
+      self.assertAlmostEqual(actual, expected, places=9)
 
   def test_a_lead_that_stops_inside_the_horizon_keeps_its_stopping_distance(self):
     """The predicted travel is the integral of the lead's clamped speed: monotone in t, and exactly
@@ -1207,41 +1162,6 @@ class TestPlanner(unittest.TestCase):
     self.assertLessEqual(reached[-0.5], 0.25)
     self.assertLessEqual(reached[-1.0], 0.40)
     self.assertLessEqual(reached[-2.0], 0.80)
-
-  def test_an_oversized_gap_returns_to_the_setpoint(self):
-    """The observable statement of the closing lift: over-braking for a transient no longer re-seats
-    the follow distance.
-
-    From the settled setpoint at 30 m/s with the set speed *equal* to the lead's — the case where the
-    unlifted law held the gap at 63.1 m against a 43.5 m setpoint for as long as the trace ran — a
-    lead's half-second brake tap is closed back inside 2 m of the setpoint, and the car does not dive
-    through it. The maneuver is a *speed*, `MOONPILOT_CLOSE_OVERSPEED` over the set speed tapered
-    over `MOONPILOT_CLOSE_DISTANCE`, because closing a 1.45 s headway means being faster than the
-    lead: a gate on the sign of the speed error stalls one frame in (measured, the excess stuck at
-    19.9 m with the command already on the budget).
-    """
-    planner = _planner()
-    t_follow = MOONPILOT_T_FOLLOW[int(Personality.standard)]
-    v_ego, v_lead, gap = 30.0, 30.0, _gap_target(30.0, t_follow)
-    recovered, undershoot = None, 0.0
-    for frame in range(int(40.0 / DT_MDL)):
-      t = frame * DT_MDL
-      a_lead = -5.0 if t < 0.5 else (2.0 if v_lead < 30.0 else 0.0)
-      v_lead = max(0.0, v_lead + a_lead * DT_MDL)
-      planner.update(_inputs(v_ego=v_ego, v_cruise_kph=108.0, lead=_lead(gap, v_lead, model_prob=0.95)))
-      a = planner.output_a_target
-      excess = gap - _gap_target(v_ego, t_follow)
-      if t > 1.0:
-        undershoot = min(undershoot, excess)
-        if excess <= 2.0 and recovered is None:
-          recovered = t
-      v_ego = max(0.0, v_ego + a * DT_MDL)
-      gap += (v_lead - v_ego) * DT_MDL
-    self.assertIsNotNone(recovered)
-    assert recovered is not None
-    self.assertLess(recovered, 30.0)  # 21.75 s measured; the unlifted law never recovers at all
-    self.assertAlmostEqual(gap - _gap_target(v_ego, t_follow), 0.0, delta=1.0)
-    self.assertGreater(undershoot, -1.0)  # it lands on the setpoint rather than diving through it
 
   def test_a_stale_lead_is_planned_as_if_it_were_fresh(self):
     """radarState lands a full cycle behind the modelV2 tick that polls it, and both inputs get

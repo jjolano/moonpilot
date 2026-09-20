@@ -60,9 +60,14 @@ def _slam_node(sm, priors) -> Node | None:
   if min(len(odometry.trans), len(odometry.rot), len(odometry.transStd), len(odometry.rotStd)) < 3:
     return None
 
-  # The pose the odometry describes is one MOONPILOT_SLAM_POSE_DELAY old, so the prior is read
-  # there and the node is stamped there: both sides of the interval then cover the same span.
-  mono_time = sm.logMonoTime['cameraOdometry'] * 1e-9 - MOONPILOT_SLAM_POSE_DELAY
+  # The pose the odometry describes is one MOONPILOT_SLAM_POSE_DELAY before the frame's *end of
+  # exposure*, so the prior is read there and the node is stamped there: both sides of the interval
+  # then cover the same span. `timestampEof`, not `logMonoTime`, for the same reason locationd uses
+  # it (`locationd.py:162`): the publish time trails the exposure by modeld's own inference and send
+  # latency -- a measured 30.5 ms median (p95 33.5, max 200) over 13k corpus frames -- and pairing
+  # the prior with that instead leaves 30 % of the very `a * dt` error this read exists to remove,
+  # correlated -0.85 with `aEgo` and worth +0.019 m/s of under-correction while braking.
+  mono_time = odometry.timestampEof * 1e-9 - MOONPILOT_SLAM_POSE_DELAY
   v_ego = priors['carState'].at(mono_time)
   yaw_rate = priors['deviceMotion'].at(mono_time)
   if v_ego is None or yaw_rate is None:
@@ -92,7 +97,6 @@ def _slam_node(sm, priors) -> Node | None:
     trans_std_x=float(trans_std[0]),
     rot_std_z=float(rot_std[2]),
   )
-
 
 
 def main() -> None:

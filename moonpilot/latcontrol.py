@@ -107,10 +107,19 @@ class MoonpilotLatControlTorque(LatControl):
     measured_curvature = -VM.calc_curvature(math.radians(CS.steeringAngleDeg - params.angleOffsetDeg), CS.vEgo, params.roll)
     measured_lat_accel = measured_curvature * CS.vEgo**2
     desired_lat_accel = desired_curvature * CS.vEgo**2
-
     # Fed whether or not lateral is active, so the delay line is warm on engage.
     self.requests.append(desired_lat_accel)
-    setpoint = self._setpoint(lat_delay)
+
+    # Feedback follows the delayed request while tightening. Unwind can start at the jerk-lookahead
+    # sample, but a sign change only releases the old turn: opposite feedback still waits for the plant.
+    delayed_setpoint = self._setpoint(lat_delay)
+    lookahead_setpoint = self._setpoint(max(lat_delay - MOONPILOT_JERK_LOOKAHEAD_T, 0.0))
+    if delayed_setpoint * lookahead_setpoint < 0:
+      setpoint = 0.0
+    elif abs(lookahead_setpoint) < abs(delayed_setpoint):
+      setpoint = lookahead_setpoint
+    else:
+      setpoint = delayed_setpoint
     error = setpoint - measured_lat_accel
     desired_jerk = self._desired_jerk(lat_delay)
 

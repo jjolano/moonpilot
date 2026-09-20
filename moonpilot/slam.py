@@ -29,13 +29,15 @@ Four things about it are not obvious.
   signal that exists; it is device-frame, so its `z` is down-positive and the ingest negates it into
   the car's left-positive yaw.
 - **The prior is read at the odometry's pose time, not at the frame's own.** `cameraOdometry`'s
-  `trans`/`rot` describe the pose as of `logMonoTime - MOONPILOT_SLAM_POSE_DELAY` (locationd's own
+  `trans`/`rot` describe the pose as of `timestampEof - MOONPILOT_SLAM_POSE_DELAY` (locationd's own
   `CAM_ODO_POSE_DELAY`, and the reason it computes its observation time that way). Pairing "latest
   odometry" with "latest carState" instead puts an `a * 0.1 s` error on every interval -- 0.15-0.35
   m/s while braking, the same order as the signal this file measures and correlated with exactly the
   approach regime the planner's gap terms live in. So `PriorChannel` samples the two channels with
   their own message times and interpolates both onto that third time, and a frame whose pose time
-  the prior cannot span is skipped rather than extrapolated.
+  the prior cannot span is skipped rather than extrapolated. The exposure stamp is what the message
+  carries the pose for; the publish time is 30.5 ms later on the device and reading the prior there
+  gives back 30 % of the error, so `moonpilot/leadd.py` stamps the node from `timestampEof`.
 
 Two approximations are stage-1 on purpose. **The device frame is still treated as the car frame**:
 for each newly ingested pose, trusted `extrinsicsCalibration.rpyCalib` rotates `trans`/`rot` from
@@ -90,6 +92,18 @@ MOONPILOT_SLAM_MAX_AGE = 0.30  # s; the transport budget, on top of MOONPILOT_SL
 MOONPILOT_SLAM_VEL_WINDOW_S = 1.0  # s of the window dVel speaks for; the whole window lags a change
 MOONPILOT_SLAM_CORR_STD_MIN = 0.02  # m; 1/(1 + corrStd) is the trust a consumer scales in, so the
 MOONPILOT_SLAM_CORR_STD_MAX = 2.0  # floor is nearly full trust and the ceiling is a third of it
+MOONPILOT_SLAM_MAX_SCALE_ERR = 0.1  # fraction of the speed being corrected, and the low-speed bound
+# A wheel-speed scale error is proportional to the speed it is measured on -- 2 % of 20 m/s is
+# 0.4 m/s, 2 % of 0 is 0 -- so the correction is bounded by a fraction of that speed rather than by
+# an absolute number alone. At a standstill the prior is exactly 0 and the weights hand ~90 % of the
+# answer to posenet, whose translation is least trustworthy there (locationd stops checking its
+# health below 5 m/s at all, `locationd.py:242`), and the result lands on the same `v_ego` both
+# standstill guards measure: MOONPILOT_SHOULD_STOP_SPEED in the planner's trailing gate and
+# upstream's 0.3 in `should_stop`. Replaying 988 s of genuinely parked corpus through the window
+# put a positive correction past 0.1 m/s on 0.05 % of frames, worst +0.578, which is enough to
+# clear should-stop and take the delivered command off `CP.stopAccel`. This bound is 0 there by
+# construction and inert where the feature earns its keep: 2 m/s of headroom at 20 m/s, against a
+# measured moving p99 of 0.19.
 
 
 class Node(NamedTuple):
@@ -278,7 +292,7 @@ def fill_ego_correction(message, corr: dict) -> None:
   field.corrStd = corr["corrStd"]
 
 
-def ego_speed_correction(sm) -> float:
+def ego_speed_correction(sm, v_ego: float) -> float:
   """The published ego-speed correction in m/s, 0.0 when there is nothing to trust.
 
   The planner's single entry point into the correction: a correction that is absent, invalid, stale,
@@ -287,6 +301,11 @@ def ego_speed_correction(sm) -> float:
   smoother's own 1-sigma, so a confident window is applied nearly whole and a doubtful one a third of
   the way (see MOONPILOT_SLAM_CORR_STD_*). The staleness budget is MOONPILOT_SLAM_MAX_AGE plus
   MOONPILOT_SLAM_POSE_DELAY, because every correction carries the pose delay by construction.
+
+  `v_ego` is the raw wheel speed this correction is measured against, and the bound is a fraction of
+  it (MOONPILOT_SLAM_MAX_SCALE_ERR): the error being corrected is a scale error, so it is zero at a
+  standstill however confident the window is. Passed in rather than read off `carState` here so the
+  bound is visible at the one call site that applies it.
 
   getattr, not `sm.valid`: the longitudinal maneuver harness passes a plain dict as `sm`, the same
   reason moonpilot/lead.py reads the leads that way. `alive` is what covers a daemon that died with
@@ -299,8 +318,10 @@ def ego_speed_correction(sm) -> float:
   corr = sm["moonpilotState"].egoCorrection
   if not corr.valid or corr.age > MOONPILOT_SLAM_MAX_AGE + MOONPILOT_SLAM_POSE_DELAY:
     return 0.0
-  if not all(math.isfinite(v) for v in (corr.dVel, corr.corrStd)):
+  if not all(math.isfinite(v) for v in (corr.dVel, corr.corrStd, v_ego)):
     return 0.0
 
   trust = 1.0 / (1.0 + float(np.clip(corr.corrStd, MOONPILOT_SLAM_CORR_STD_MIN, MOONPILOT_SLAM_CORR_STD_MAX)))
-  return float(np.clip(corr.dVel, -MOONPILOT_SLAM_MAX_CORR_VEL, MOONPILOT_SLAM_MAX_CORR_VEL)) * trust
+  applied = float(np.clip(corr.dVel, -MOONPILOT_SLAM_MAX_CORR_VEL, MOONPILOT_SLAM_MAX_CORR_VEL)) * trust
+  bound = MOONPILOT_SLAM_MAX_SCALE_ERR * max(float(v_ego), 0.0)
+  return float(np.clip(applied, -bound, bound))

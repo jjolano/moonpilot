@@ -2,9 +2,9 @@
 
 Upstream solves an acados MPC every frame. This is closed-form — no solver, no generated C — and
 every number in it is fork-owned, so tuning happens here instead of inside a generated optimization
-problem. Braking candidates use `min` arbitration; when a lead is above its time-gap target and no
-other term is braking, the fork may raise only the cruise slot toward a bounded closing target so an
-over-braked gap can recover. The policy is:
+problem. Braking candidates use `min` arbitration, and the cruise slot remains the set-speed
+authority: an oversized lead gap never raises it above the ordinary speed-error request. The policy
+is:
 
   - a spacing regulator whose exact equilibrium is
     ``gap == max(STOP_DISTANCE, t_follow * v_ego)``, with a one-meter inward cushion while closing
@@ -159,7 +159,8 @@ MOONPILOT_TTC_TARGET = 3.0  # s; headway the approach term holds the closing rat
 # governing term on 14 % of the lead-term calls at T=3 and 17 % at T=5 —
 # a minority either way, which is what the dial is choosing between)
 MOONPILOT_K_TTC = 1.0  # 1/s on the excess closing rate
-MOONPILOT_MIN_SLACK = 0.5  # m; floor on the stopping term's braking-distance denominator
+MOONPILOT_MIN_SLACK = 1.0  # m; the standstill target is soft inside this final meter: the exact
+# kinematic floor gives way to the TTC/regulator profile there, while higher-speed stops still bind
 MOONPILOT_LEAD_PREVIEW_T = 0.5  # s of the lead's own braking credited to the safety terms' lead speed
 # It is one-sided, and the only *prediction* in this function: a lead that is braking is matched as if
 # it had already shed this much speed, which is what makes the onset early — measured on a settled
@@ -189,15 +190,6 @@ MOONPILOT_LEAD_PREVIEW_T_ACCEL = 0.5  # s of the lead's own acceleration credite
 # is a live term on its own against a slow lead — a 0.5 m/s^2 launch draws 0.292 m/s^2 at 0.25 s against
 # 0.165, and 0.15 m of gap by 2 s — while against a hard one (2 m/s^2) the comfort ramp is what binds
 # and this term moves 0.005 m until `MOONPILOT_JERK_LAUNCH` unlocks it.
-MOONPILOT_CLOSE_OVERSPEED = 3.0  # m/s; how far over the set speed the follow distance may be restored
-MOONPILOT_CLOSE_DISTANCE = 10.0  # m; the spacing error at which that overspeed is applied in full, so
-# the target tapers to the set speed as the gap closes and the setpoint is the equilibrium rather than
-# a limit cycle around it. Closing a 1.45 s headway means being *faster than the lead*, so a gate on
-# the sign of the speed error cannot do this job: it switches off the instant the car exceeds its set
-# speed, which is one frame after the maneuver starts (measured: the command sat at the budget with
-# the excess stuck at 19.9 m). The bound is a speed instead, and it is the fork's own — upstream never
-# closes a gap above the set speed at all, since its `min` over `(mpc, cruise)` caps it at
-# `clip(v_cruise - v_ego, ...)` exactly as this fork's did before the lift.
 MOONPILOT_A_LEAD_MIN = -10.0  # m/s^2; bounds on a lead's accel estimate, upstream's (long_mpc.process_lead)
 MOONPILOT_A_LEAD_MAX = 5.0
 MOONPILOT_OUT_OF_PATH_T_FOLLOW = 0.7  # time-gap scale for a lead predicted to leave the path
@@ -209,8 +201,8 @@ MOONPILOT_A_TOTAL_MAX_BP = [20.0, 40.0]  # m/s
 MOONPILOT_A_TOTAL_MAX_V = [1.7, 3.2]  # m/s^2 combined accel budget
 MOONPILOT_COAST_BAND = 1.5  # m/s; allowed set-speed drift on a grade, above on a descent and below on a climb
 # 3.4 mph / 5.4 km/h is large enough to let a hill spend itself without making the set speed meaningless.
-MOONPILOT_COAST_GRADE_MIN = 0.2  # m/s^2; minimum road term (`accel_coast - coast_accel(0.0)`) before this applies
-# Below this is effectively level road, about a 3.5 % grade, so the speed target stays exact.
+MOONPILOT_COAST_GRADE_MIN = 0.4  # m/s^2; minimum road term (`accel_coast - coast_accel(0.0)`) before this applies
+# Below this is a moderate road, about a 7 % grade; only high-grade hills get the coast band.
 MOONPILOT_COAST_ACCEL_MAX = 1.0  # m/s^2; bound on the coast command for garbage pitch and the ACCEL_MAX sentinel
 # Both bad pose input and the missing-pose sentinel must not turn into an unbounded coast command.
 MOONPILOT_JERK_UP = 1.5  # m/s^3
@@ -353,17 +345,15 @@ def lead_accel(v_ego, gap, v_lead, a_lead, t_follow) -> float:
   closing rate, which the lead's own speed history drives.
 
   The second is the stopping floor, the old kinematic term kept as a bound rather than as the
-  approach: the exact decel that arrives at STOP_DISTANCE with the lead's *braking-credited* speed —
-  the credit is `MOONPILOT_LEAD_PREVIEW_T`'s, above, and the acceleration credit is the regulator's —
-  which binds from
-  ``slack == v_ego^2 / 2``. It is not redundant. A TTC term is proportional on the
-  closing rate, so it ramps — and ramping is not stopping: TTC_TARGET = 5 binds at a slack of
-  ``5 * (v - 1)``, which above ~34 m/s is *inside* the ``v^2 / 7`` that stopping at ACCEL_MIN needs,
-  and on the TTC term alone this car reaches a stopped lead at 14 m/s from 36 m/s. The floor binds
-  earlier than the stopping distance and `min` cannot out-vote it, so it holds where the TTC term
-  asks for less; where the TTC term asks for more, the TTC term wins, which is how the fork's
-  response reaches the plan. Below 1 m/s of closing rate neither binds and the regulator alone owns
-  the creep.
+  approach. Outside `MOONPILOT_MIN_SLACK` it is the exact decel that arrives at STOP_DISTANCE with
+  the lead's *braking-credited* speed. Inside that final meter its denominator stops shrinking: the
+  standstill distance becomes a soft target and the TTC/regulator profile can shape the crawl stop
+  instead of the exact-distance term deepening without bound. It is not redundant outside that
+  comfort region. A TTC term is proportional on the closing rate, so it ramps — and ramping is not
+  stopping: TTC_TARGET = 5 binds at a slack of ``5 * (v - 1)``, which above ~34 m/s is *inside* the
+  ``v^2 / 7`` that stopping at ACCEL_MIN needs, and on the TTC term alone this car reaches a stopped
+  lead at 14 m/s from 36 m/s. The floor binds earlier and `min` cannot out-vote it, so it holds where
+  the TTC term asks for less; where the TTC term asks for more, the TTC term wins.
 
   The handover in either case is a step, not a crossover: at the crossing the regulator's output is
   whatever the spacing error says, positive while the gap is still wide — +69.7 m/s^2 at 25 m/s and
@@ -398,16 +388,11 @@ def lead_accel(v_ego, gap, v_lead, a_lead, t_follow) -> float:
   slack = max(gap - MOONPILOT_STOP_DISTANCE, 0.0)
   a_ttc = -MOONPILOT_K_TTC * (closing - slack / MOONPILOT_TTC_TARGET)
   a = min(a_track, a_ttc) if a_ttc < -MOONPILOT_APPROACH_DECEL else a_track
-  # The stopping floor, and it is what makes this law safe rather than merely responsive. The TTC term
-  # is proportional on the closing rate, so against a lead the ego is gaining on fast it ramps — and
-  # ramping is not stopping: at 36 m/s with TTC_TARGET = 5 it binds 175 m out, where coming to rest
-  # behind a stopped lead needs 185 m, and the car reaches the lead at 14 m/s. Nothing upstream of
-  # this reaches that regime — the maneuver suite's fastest stopped-lead approach is 25 m/s — so the
-  # floor is what covers it. It is the old kinematic term kept as a bound rather than as the approach:
-  # the exact decel that arrives at STOP_DISTANCE with the lead's speed, binding from a slack of
-  # v_ego^2 / 2, which is always inside the stopping distance. `min` cannot out-vote it, so it holds
-  # where the TTC term asks for less — and where the TTC term asks for more, the TTC term wins, which
-  # is the fork's own response and the reason both are here.
+  # The stopping floor makes this law safe outside the final soft meter rather than merely responsive.
+  # A TTC term ramps on closing rate, and ramping is not stopping: at 36 m/s with TTC_TARGET = 5 it
+  # binds 175 m out, where coming to rest behind a stopped lead needs 185 m. The old kinematic term
+  # remains the bound throughout that regime. Only inside MOONPILOT_MIN_SLACK does its denominator
+  # stop shrinking, so the exact standstill point is not chased with increasing crawl-speed braking.
   a_stop = -(v_ego**2 - v_lead_eff**2) / (2 * max(gap - MOONPILOT_STOP_DISTANCE, MOONPILOT_MIN_SLACK))
   return min(a, a_stop) if a_stop < -MOONPILOT_APPROACH_DECEL else a
 
@@ -549,46 +534,16 @@ def policy(
   candidate: `min` means they can only ever add braking to whatever the model asked for, never
   substitute for it.
 
-  **The `min` is a ceiling on braking and on the set speed, not on the follow distance.** Left as a
-  pure minimum, the cruise term's speed-error output — which is exactly 0 once the car is at its set
-  speed — also caps the spacing regulator's ask to *close* a gap, and the regulator's ask is a large
-  positive number there (0.3 per meter of spacing error plus 0.6 per m/s of closing, i.e. +8.6 m/s^2
-  for a 20 m excess). So a car that over-brakes for anything transient — a lead's brake tap, the
-  model's ask, a curve pre-brake — ends up behind its follow distance and then holds the new, larger
-  gap: measured from the settled setpoint at 30 m/s with the set speed equal to the lead's, a lead
-  tapping -5 m/s^2 for half a second left the gap at 63.1 m against a 43.5 m setpoint 25 s later.
-  Upstream's arbitration has the same ceiling (`min` over `(mpc, cruise)`, and its cruise term is
-  `clip(v_cruise - v_ego, ...)`), so the standoff is inherited rather than fork-owned; what the fork
-  owns is how much headway its own anticipation buys.
-
-  Hence the one lift: while no curve or coast term is already braking (the ordinary set-speed error
-  may be negative because this lift intentionally allows a bounded overspeed), a lead's spacing error
-  that is oversized raises the cruise slot to the *closing target* — a speed `MOONPILOT_CLOSE_OVERSPEED`
-  above the set speed, tapered over `MOONPILOT_CLOSE_DISTANCE` of error, so the maneuver is planned
-  rather than a limit cycle at the set speed — bounded by the regulator's own ask and by the identical
-  budget the set-speed term is clipped by (comfort curve, cornering budget, coast limit). Every braking
-  candidate still arbitrates through the `min` below and the model's own ask still caps the result, so
-  this can only turn coasting into closing: it cannot add braking, cannot exceed the model, and is inert
-  at the setpoint, which is what makes the setpoint the equilibrium instead of a one-sided wall.
+  The cruise slot remains the set-speed authority. At or above `v_cruise` its ordinary speed-error
+  output is non-positive even when a lead gap is oversized, so `min` cannot select positive
+  acceleration merely to recover follow distance. A transient brake can therefore leave a larger
+  gap behind a lead holding the set speed; closing it waits for the lead to pull away or the ego to
+  fall below set speed. That is deliberate: follow-distance recovery never buys overspeed.
   """
   a_curve = min(curve_accel(v_ego, x_ego, curve), lat_accel_hold(v_ego, v_hold))
   a_cruise_raw = cruise_accel(v_ego, v_cruise, e2e, steer_angle_deg, CP, accel_coast, allow_throttle, coast_band)
-  a_cruise_base = cruise_accel(v_ego, v_cruise, e2e, steer_angle_deg, CP, accel_coast, allow_throttle) if coast_band > 0.0 else a_cruise_raw
   a_cruise = min(a_cruise_raw, a_curve)
   lead_asks = [(lead_accel(v_ego, gap, v_lead, a_lead, t_follow), source) for source, gap, v_lead, a_lead in leads]
-  coast_braking = _coast_applies(v_ego, v_cruise, e2e, accel_coast, allow_throttle, coast_band) and accel_coast < 0.0
-  # A negative speed error is intentional once closing; only an active coast-band braking ask blocks the lift.
-  if lead_asks and a_curve >= 0.0 and not coast_braking and a_cruise_raw >= a_cruise_base and v_cruise > 0.0:
-    # `v_cruise > 0` is the force-decel gate: `forceDecel` zeroes the set speed, and the target below
-    # is relative to it, so without this the lift would command motion at a car the planner is trying
-    # to stop — measured, it broke 9 of the 60 upstream maneuver combinations, all of them the
-    # `force_decel` half of a maneuver that ends stopped behind a lead.
-    excess = min(gap - max(MOONPILOT_STOP_DISTANCE, t_follow * v_ego) for _, gap, _, _ in leads)
-    if excess > 0.0:
-      v_close = v_cruise + MOONPILOT_CLOSE_OVERSPEED * min(1.0, excess / MOONPILOT_CLOSE_DISTANCE)
-      closing = min(min(ask for ask, _ in lead_asks), MOONPILOT_K_V * (v_close - v_ego))
-      if closing > 0.0:
-        a_cruise = max(a_cruise, min(closing, cruise_cap(v_ego, e2e, steer_angle_deg, CP, accel_coast, allow_throttle)))
   candidates = [(a_cruise, LongitudinalPlanSource.cruise)]
   candidates += lead_asks
   if model_accel is not None:
@@ -664,10 +619,13 @@ class MoonpilotLongitudinalPlanner:
     v_ego = max(CS.vEgo, 0.0)
     # The rolling-window ego correction, when there is a fresh one to apply: the wheel speed is a
     # scale error away from the truth -- ~5 % on a worn tyre set -- and every term below plans from
-    # it, so the correction goes in at the source rather than into one of the candidates. Zero when
-    # the feature is off, nothing is published, the correction is stale or its publisher is dead,
-    # which makes this exactly the plan this planner had before the correction existed.
-    v_ego = max(0.0, v_ego + ego_speed_correction(sm))
+    # it, so the correction goes in at the source rather than into one of the candidates. Bounded by
+    # a fraction of the raw speed it corrects, which is what makes it exactly zero at a standstill:
+    # a scale error is proportional to speed, and the guards that declare rest read this same
+    # `v_ego`. Zero when the feature is off, nothing is published, the correction is stale or its
+    # publisher is dead, which makes this exactly the plan this planner had before the correction
+    # existed.
+    v_ego = max(0.0, v_ego + ego_speed_correction(sm, v_ego))
     a_ego = float(np.clip(CS.aEgo, ACCEL_MIN, ACCEL_MAX))
 
     v_cruise = min(CS.vCruise, V_CRUISE_MAX) * CV.KPH_TO_MS
