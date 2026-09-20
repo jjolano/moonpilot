@@ -58,7 +58,7 @@ class Controls:
 
     self.LoC = moonpilot_longcontrol(self.CP) or LongControl(self.CP)  # moonpilot seam, see AGENTS.md
     self.moonpilot_gate = moonpilot_actuator_gate(self.CP)  # moonpilot seam, see AGENTS.md
-    self.curvature_preview = moonpilot_curvature()  # moonpilot seam, see AGENTS.md
+    self.curvature_reference = moonpilot_curvature()  # moonpilot seam, see AGENTS.md
     self.VM = VehicleModel(self.CP)
     self.LaC: LatControl
     if self.CP.steerControlType == car.CarParams.SteerControlType.angle:
@@ -134,9 +134,11 @@ class Controls:
       new_desired_curvature = self.sm['lateralManeuverPlan'].desiredCurvature if CC.latActive else self.curvature
     else:
       new_desired_curvature = model_v2.action.desiredCurvature if CC.latActive else self.curvature
-    if self.curvature_preview is not None:  # moonpilot seam, see AGENTS.md
-      new_desired_curvature = self.curvature_preview.update(model_v2, CS.vEgo, self.sm['lateralDelay'].lateralDelay + LAT_SMOOTH_SECONDS,
-                                                            CC.latActive, new_desired_curvature)
+    if self.curvature_reference is not None and CC.latActive and not self.sm.valid['lateralManeuverPlan']:  # moonpilot seam, see AGENTS.md
+      new_desired_curvature = self.curvature_reference.update(
+        model_v2, new_desired_curvature, v_ego=CS.vEgo, lat_delay=self.sm['lateralDelay'].lateralDelay + LAT_SMOOTH_SECONDS,
+        model_recv_time=self.sm.recv_time['modelV2'], now=self.sm.recv_time['selfdriveState'],
+        model_valid=self.sm.valid['modelV2'] and self.sm.alive['modelV2'])
     self.desired_curvature, curvature_limited = clip_curvature(CS.vEgo, self.desired_curvature, new_desired_curvature, lp.roll)
     lat_delay = self.sm["lateralDelay"].lateralDelay + LAT_SMOOTH_SECONDS
 

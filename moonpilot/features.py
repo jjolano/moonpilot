@@ -30,8 +30,8 @@ TORQUE_LATERAL = Feature(
 
 PATH_PREVIEW = Feature(
   key="MoonpilotPathPreview",
-  title="path preview steering",
-  description="Add a bounded share of the path's upcoming curvature to the model's steering request, so a curve is entered earlier. Restart to apply.",
+  title="response-aligned steering",
+  description="Align the model path with when steering is expected to respond, using live model age and steering delay. Restart to apply.",
   offroad_only=True,
 )
 

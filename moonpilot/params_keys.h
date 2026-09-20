@@ -24,11 +24,12 @@
     // predicted path, and the curve target is not validated until someone
     // drives it.
     {"MoonpilotCurveSpeed", {PERSISTENT, BOOL, "0"}},
-    // On by default: it lets a grade spend its own acceleration inside a bounded speed band; the
-    // feature is read every frame and safety candidates still win through the planner's minimum.
+    // On by default: it lets a grade spend its own acceleration inside a
+    // bounded speed band; the feature is read every frame and safety candidates
+    // still win through the planner's minimum.
     {"MoonpilotCoastGrade", {PERSISTENT, BOOL, "1"}},
-    // Off by default: it changes the steering request, and the preview gain is
-    // not validated until someone drives it.
+    // Off by default: it aligns the model path to its capture age plus steering
+    // delay; the response gain still needs on-device validation.
     {"MoonpilotPathPreview", {PERSISTENT, BOOL, "0"}},
     // Tailscaled -> panels, one line: "<state>" or "<state> <detail>", decoded
     // in moonpilot/tailscale.py. CLEAR_ON_MANAGER_START so a reboot cannot
@@ -81,9 +82,11 @@
     {"MoonpilotModelsActiveMonitoring", {CLEAR_ON_MANAGER_START, STRING}},
     // depsd writes this boot's state; the manager clears it at manager start.
     {"MoonpilotDepsStatus", {CLEAR_ON_MANAGER_START, STRING}},
-    // The settings panel writes retry requests; depsd consumes and clears them this boot.
+    // The settings panel writes retry requests; depsd consumes and clears them
+    // this boot.
     {"MoonpilotDepsRequest", {CLEAR_ON_MANAGER_START, STRING}},
-    // The settings panel writes this toggle; a user change or params reset clears it.
+    // The settings panel writes this toggle; a user change or params reset
+    // clears it.
     {"MoonpilotCatalogSignatures", {PERSISTENT, BOOL, "0"}},
     // manager writes the boot rollback report; it clears it at manager start.
     {"MoonpilotRollback", {CLEAR_ON_MANAGER_START, STRING}},
