@@ -152,9 +152,9 @@ class TestLongLagEstimator(unittest.TestCase):
 
 class TestPlannerWiring(unittest.TestCase):
   # The stopping floor's onset at 15 m/s against a 9 m/s lead, where the projection's extra meters
-  # decide whether the floor asks for anything at all: 0.45 s of lag is 0.30 s past the stock
-  # constant, which at this 6 m/s closing rate is 1.8 m of the approach.
-  ONSET = {"v_ego": 15.0, "v_cruise_kph": 54.0, "d_rel": 79.5, "v_lead": 9.0}
+  # decide whether the new 1.15 m/s^2 floor-admission threshold binds: 0.45 s of lag is 0.30 s
+  # past the stock constant, which at this 6 m/s closing rate is 1.8 m of the approach.
+  ONSET = {"v_ego": 15.0, "v_cruise_kph": 54.0, "d_rel": 70.5, "v_lead": 9.0}
 
   @classmethod
   def _commands(cls, seed, frames=80):
@@ -174,9 +174,9 @@ class TestPlannerWiring(unittest.TestCase):
     """The seeded lag reaches the command through the projection and nothing else.
 
     A single frame cannot show it: from the planner's zero baseline the jerk limit allows 0.1 m/s^2,
-    so two first-frame commands are the same clamped value whatever the delay. Held at one state for
-    80 frames the two planners separate qualitatively — on the stock constant the lead is still 1.8 m
-    further out and the floor asks for nothing, while through 0.45 s it has crossed its onset.
+    so two first-frame commands are the same clamped value whatever the delay. Held at d_rel=70.5 m
+    with 15/9 m/s ego/lead, the unseeded planner remains just outside the new 1.15 m/s^2 floor
+    boundary while the extra 1.8 m from 0.45 s crosses it; the two planners therefore separate.
     """
     unseeded_planner, unseeded = self._commands(None)
     seeded_planner, seeded = self._commands(0.45)
