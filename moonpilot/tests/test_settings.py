@@ -9,6 +9,7 @@ of them labels a working feature "unavailable" on every row, which no import or 
 notice.
 """
 
+import importlib
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,7 +19,7 @@ from opendbc.car.structs import car
 
 from moonpilot import models
 from moonpilot.features import CATALOG_SIGNATURES, FEATURES, GROUPS, LATERAL_ENGAGE, Feature
-from moonpilot.ui import settings, settings_mici
+from moonpilot.ui import models as models_ui, models_mici, settings, settings_mici
 
 # A name no distribution can provide, so `available()` is False without depending on the
 # environment (see test_deps.py, which pins the same contract from the other side).
@@ -37,6 +38,14 @@ def _cp(brand="toyota", pcm_cruise=True, flags=0, passive=False):
   cp.passive = passive
   cp.flags = int(flags)
   return cp
+
+
+class TestChevronImportOrder(unittest.TestCase):
+  def test_submenu_modules_do_not_load_textures_at_import(self):
+    for module in (settings, models_ui, models_mici):
+      with self.subTest(module=module.__name__):
+        with mock.patch.object(module.gui_app, "texture", side_effect=AssertionError("texture loaded during import")):
+          importlib.reload(module)
 
 
 class TestMiciValue(unittest.TestCase):

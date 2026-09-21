@@ -21,7 +21,7 @@ KIND_FILTERS = (models.FILTER_ALL, models.FILTER_DRIVING, models.FILTER_MONITORI
 ICON_INSTALL = "icons_mici/settings/software.png"
 ICON_REMOVE = "icons_mici/settings/device/uninstall.png"
 ICON_REBUILD = "icons_mici/settings/device/update.png"
-CHEVRON = gui_app.texture("icons/chevron_right.png", 48, 48)
+_CHEVRON_PATH = "icons/chevron_right.png"
 BAR_TRACK = rl.Color(57, 57, 57, 255)
 BAR_FILL = rl.Color(51, 171, 76, 255)
 BAR_HEIGHT = 10
@@ -42,7 +42,8 @@ def _confirm(title: str, icon: str, action, *, red: bool = False) -> None:
 class _SubmenuButton(BigButton):
   def __init__(self, text: str, value: str = "", *, description: str = ""):
     super().__init__(text, value, description=description)
-    self._chevron = CHEVRON
+    # Load after init_window so the texture is valid; per-instance, not module scope.
+    self._chevron = gui_app.texture(_CHEVRON_PATH, 48, 48)
 
   def _title_width_hint(self) -> int:
     return super()._title_width_hint() - self._chevron.width - 20

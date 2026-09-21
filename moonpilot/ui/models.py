@@ -16,6 +16,7 @@ from openpilot.system.ui.lib.application import FontWeight, TextAlignment, TextA
 from openpilot.system.ui.widgets.confirm_dialog import ConfirmDialog
 from openpilot.system.ui.widgets.label import gui_label
 from openpilot.system.ui.widgets.list_view import (
+  ITEM_PADDING,
   ITEM_TEXT_VALUE_COLOR,
   ItemAction,
   ListItem,
@@ -32,7 +33,7 @@ BAR_WIDTH = 620
 PAGE_ROWS = 8
 INSTALLED_ROWS = 8
 KIND_FILTERS = (models.FILTER_ALL, models.FILTER_DRIVING, models.FILTER_MONITORING)
-CHEVRON = gui_app.texture("icons/chevron_right.png", 48, 48)
+_CHEVRON_PATH = "icons/chevron_right.png"
 _INVALID = object()
 
 
@@ -43,17 +44,18 @@ def _offroad() -> bool:
 class _ChevronAction(ItemAction):
   """A non-dialog row action that draws the standard right chevron."""
 
-  WIDTH = 520
-
   def __init__(self, value: str | Callable[[], str] = "", enabled: bool | Callable[[], bool] = True):
-    super().__init__(self.WIDTH, enabled)
+    # Width 0 means full-row hitbox; value and chevron still draw at the rect's right edge.
+    super().__init__(0, enabled)
     self._value = value
     self._clicked = False
+    # Load after init_window so the texture is valid; per-instance, not module scope.
+    self._chevron = gui_app.texture(_CHEVRON_PATH, 48, 48)
     self._font = gui_app.font(FontWeight.NORMAL)
 
   def _render(self, rect):
     value = self._value() if callable(self._value) else self._value
-    value_rect = rl.Rectangle(rect.x, rect.y, rect.width - CHEVRON.width - 24, rect.height)
+    value_rect = rl.Rectangle(rect.x, rect.y, rect.width - self._chevron.width - 24, rect.height)
     if value:
       gui_label(
         value_rect,
@@ -65,8 +67,8 @@ class _ChevronAction(ItemAction):
         alignment_vertical=TextAlignmentVertical.MIDDLE,
       )
     rl.draw_texture_ex(
-      CHEVRON,
-      rl.Vector2(rect.x + rect.width - CHEVRON.width, rect.y + (rect.height - CHEVRON.height) / 2),
+      self._chevron,
+      rl.Vector2(rect.x + rect.width - self._chevron.width, rect.y + (rect.height - self._chevron.height) / 2),
       0.0,
       1.0,
       rl.WHITE if self.enabled else rl.Color(255, 255, 255, 100),
@@ -78,8 +80,44 @@ class _ChevronAction(ItemAction):
     self._clicked = True
 
 
+class _SubmenuItem(ListItem):
+  """Submenu row whose description stays open across show_event resets."""
+
+  def show_event(self):
+    super().show_event()
+    # Refresh dynamic descriptions before sizing so the open height fits current text.
+    self._update_state()
+    self._set_description_visible(True)
+
+  def _update_state(self):
+    previous_description = self._prev_description
+    super()._update_state()
+    if self.description_visible and self._prev_description != previous_description:
+      self._rect.height = self.get_item_height(self._font, int(self._rect.width - ITEM_PADDING * 2))
+
+  def set_parent_rect(self, parent_rect):
+    old_width = self._rect.width
+    super().set_parent_rect(parent_rect)
+    # Construction opens at the 600px base width; re-size once the panel width lands.
+    if self.description_visible and self._rect.width != old_width:
+      self._update_state()
+      self._rect.height = self.get_item_height(self._font, int(self._rect.width - ITEM_PADDING * 2))
+
+  def _handle_mouse_release(self, mouse_pos: MousePos):
+    if not self.is_visible:
+      return
+    if self.action_item:
+      action_rect = self.get_right_item_rect(self._rect)
+      if rl.check_collision_point_rec(mouse_pos, action_rect):
+        return
+    if self.callback:
+      self.callback()
+
+
 def submenu_item(title, value, description: str | Callable[[], str] | None, callback, enabled=True) -> ListItem:
-  return ListItem(title=title, description=description, action_item=_ChevronAction(value, enabled), callback=callback)
+  row = _SubmenuItem(title=title, description=description, action_item=_ChevronAction(value, enabled), callback=callback)
+  row.show_event()
+  return row
 
 
 class Page(Scroller):

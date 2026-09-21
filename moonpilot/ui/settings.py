@@ -18,10 +18,10 @@ from openpilot.common.params import Params
 from openpilot.selfdrive.ui.ui_state import ui_state
 from openpilot.system.ui.lib.application import gui_app
 from openpilot.system.ui.widgets import MousePos, Widget
-from openpilot.system.ui.widgets.list_view import ItemAction, ListItem, button_item, text_item, toggle_item
+from openpilot.system.ui.widgets.list_view import ITEM_PADDING, ItemAction, ListItem, button_item, text_item, toggle_item
 from openpilot.system.ui.widgets.scroller_tici import Scroller
 
-CHEVRON = gui_app.texture("icons/chevron_right.png", 48, 48)
+_CHEVRON_PATH = "icons/chevron_right.png"
 
 
 def _unavailable_reason(feature: Feature) -> str | None:
@@ -82,16 +82,17 @@ def _rollback_row(params: Params):
 
 
 class _ChevronAction(ItemAction):
-  WIDTH = 440
-
   def __init__(self, enabled=True):
-    super().__init__(self.WIDTH, enabled)
+    # Width 0 means full-row hitbox; the chevron still draws at the rect's right edge.
+    super().__init__(0, enabled)
+    # Load after init_window so the texture is valid; per-instance, not module scope.
+    self._chevron = gui_app.texture(_CHEVRON_PATH, 48, 48)
     self._clicked = False
 
   def _render(self, rect):
     rl.draw_texture_ex(
-      CHEVRON,
-      rl.Vector2(rect.x + rect.width - CHEVRON.width, rect.y + (rect.height - CHEVRON.height) / 2),
+      self._chevron,
+      rl.Vector2(rect.x + rect.width - self._chevron.width, rect.y + (rect.height - self._chevron.height) / 2),
       0.0,
       1.0,
       rl.WHITE if self.enabled else rl.Color(255, 255, 255, 100),
@@ -103,8 +104,44 @@ class _ChevronAction(ItemAction):
     self._clicked = True
 
 
+class _SubmenuItem(ListItem):
+  """Submenu row whose description stays open across show_event resets."""
+
+  def show_event(self):
+    super().show_event()
+    # Refresh dynamic descriptions before sizing so the open height fits current text.
+    self._update_state()
+    self._set_description_visible(True)
+
+  def _update_state(self):
+    previous_description = self._prev_description
+    super()._update_state()
+    if self.description_visible and self._prev_description != previous_description:
+      self._rect.height = self.get_item_height(self._font, int(self._rect.width - ITEM_PADDING * 2))
+
+  def set_parent_rect(self, parent_rect):
+    old_width = self._rect.width
+    super().set_parent_rect(parent_rect)
+    # Construction opens at the 600px base width; re-size once the panel width lands.
+    if self.description_visible and self._rect.width != old_width:
+      self._update_state()
+      self._rect.height = self.get_item_height(self._font, int(self._rect.width - ITEM_PADDING * 2))
+
+  def _handle_mouse_release(self, mouse_pos: MousePos):
+    if not self.is_visible:
+      return
+    if self.action_item:
+      action_rect = self.get_right_item_rect(self._rect)
+      if rl.check_collision_point_rec(mouse_pos, action_rect):
+        return
+    if self.callback:
+      self.callback()
+
+
 def submenu_item(title, description: str, callback: Callable, enabled=True) -> ListItem:
-  return ListItem(title=title, description=description, action_item=_ChevronAction(enabled), callback=callback)
+  row = _SubmenuItem(title=title, description=description, action_item=_ChevronAction(enabled), callback=callback)
+  row.show_event()
+  return row
 
 
 class _PageStack(Widget):
