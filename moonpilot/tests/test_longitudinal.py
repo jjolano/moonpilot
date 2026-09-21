@@ -51,9 +51,6 @@ from moonpilot.features import FEATURES
 from moonpilot.lead import MOONPILOT_LEAD_ACCEL_TAU, LeadAccelEstimator
 from moonpilot.longitudinal import (
   MOONPILOT_APPROACH_DECEL,
-  MOONPILOT_FLOOR_ADMISSION_DECEL,
-  MOONPILOT_FLOOR_ADMISSION_SPEED_BP,
-  MOONPILOT_FLOOR_ADMISSION_SPEED_V,
   MOONPILOT_COAST_BAND,
   MOONPILOT_COAST_FLAT_ACCEL,
   MOONPILOT_COAST_GRADE_MIN,
@@ -334,31 +331,22 @@ class TestPolicyFunctions(unittest.TestCase):
     self.assertAlmostEqual(gap_errors[-1], 0.0, delta=1e-3)
 
   def test_the_approach_handover_has_the_stopping_geometry(self):
-    """The regulator hands over to the stopping floor where its exact decel passes the separately
-    measured floor-admission threshold. The regulator itself remains capped at 1.0 m/s^2; at
-    17 m/s the 1.15 m/s^2 floor threshold moves the crossing 16 m toward the measured driver onset.
+    """The regulator hands over to the approach term at gap == STOP_DISTANCE + (v^2 - v_lead^2) / 2,
+    which is the point where stopping needs more than the approach decel — the crossing the old
+    kinematic term had. It is now the *stopping floor* that binds there (the TTC term is still
+    dormant: +37.5 m/s^2 at 25 m/s), and 0.15 m/s^2 of probe either side of the crossing reads -1.0
+    or the regulator, exactly as it did before the approach term changed.
     """
     t_follow = MOONPILOT_T_FOLLOW[int(Personality.standard)]
     for v_ego, v_lead in ((25.0, 0.0), (30.0, 0.0), (20.0, 0.0), (25.0, 20.0), (10.0, 0.0)):
-      floor = float(np.interp(v_ego, MOONPILOT_FLOOR_ADMISSION_SPEED_BP, MOONPILOT_FLOOR_ADMISSION_SPEED_V))
-      gap_star = MOONPILOT_STOP_DISTANCE + (v_ego**2 - v_lead**2) / (2 * floor)
+      gap_star = MOONPILOT_STOP_DISTANCE + (v_ego**2 - v_lead**2) / 2
       cushion = min(MOONPILOT_FOLLOW_CUSHION, (v_ego - v_lead) * MOONPILOT_K_V / MOONPILOT_K_GAP)
       a_track = max(
         MOONPILOT_K_GAP * (gap_star - _gap_target(v_ego, t_follow) + cushion) + MOONPILOT_K_V * (v_lead - v_ego),
         -MOONPILOT_APPROACH_DECEL,
       )
-      self.assertAlmostEqual(lead_accel(v_ego, gap_star - 1e-3, v_lead, 0.0, t_follow), -floor, delta=1e-3)
+      self.assertAlmostEqual(lead_accel(v_ego, gap_star - 1e-3, v_lead, 0.0, t_follow), -MOONPILOT_APPROACH_DECEL, delta=1e-3)
       self.assertAlmostEqual(lead_accel(v_ego, gap_star + 1e-3, v_lead, 0.0, t_follow), a_track, delta=1e-3)
-
-  def test_floor_admission_is_continuous_and_high_speed_invariant(self):
-    """The 1.15 -> 1.0 floor threshold blends over 20–25 m/s: a car crossing 25 m/s never
-    changes law at a hard boundary, and the pinned 33/36/40 m/s floor uses the old 1.0 gate."""
-    self.assertAlmostEqual(float(np.interp(17.0, MOONPILOT_FLOOR_ADMISSION_SPEED_BP, MOONPILOT_FLOOR_ADMISSION_SPEED_V)), MOONPILOT_FLOOR_ADMISSION_DECEL)
-    values = [lead_accel(v, 200.0, 0.0, 0.0, 1.45) for v in (24.9, 25.0, 25.1)]
-    self.assertLess(max(values) - min(values), 0.03)
-    for v, gap in ((33.0, 550.0), (36.0, 600.0), (40.0, 700.0)):
-      expected = -(v**2) / (2 * (gap - MOONPILOT_STOP_DISTANCE))
-      self.assertAlmostEqual(lead_accel(v, gap, 0.0, 0.0, 1.45), expected, delta=1e-9)
 
   def test_the_ttc_term_governs_where_it_asks_for_more_than_stopping(self):
     """Past the crossing the two approach terms are live together, and the TTC term wins wherever it
@@ -507,8 +495,7 @@ class TestPolicyFunctions(unittest.TestCase):
           if closing > 0.0:
             a_ttc = -MOONPILOT_K_TTC * (closing - (gap - MOONPILOT_STOP_DISTANCE) / MOONPILOT_TTC_TARGET)
             a_stop = -(v_ego**2 - v_lead**2) / (2 * max(gap - MOONPILOT_STOP_DISTANCE, 0.5))
-          floor = float(np.interp(v_ego, MOONPILOT_FLOOR_ADMISSION_SPEED_BP, MOONPILOT_FLOOR_ADMISSION_SPEED_V))
-          binds = (a_ttc < -MOONPILOT_APPROACH_DECEL) or (a_stop < -floor)
+          binds = min(a_ttc, a_stop) < -MOONPILOT_APPROACH_DECEL
           for t_follow in MOONPILOT_T_FOLLOW.values():
             a = lead_accel(v_ego, gap, v_lead, 0.0, t_follow)
             if binds:
@@ -848,10 +835,11 @@ class TestPlanner(unittest.TestCase):
         gap = max(0.0, gap + (v_lead - v_ego) * DT_MDL)
       self.assertGreaterEqual(min(errors), -0.35)
 
-  def test_mid_approach_lead_brake_stays_safe_with_the_new_floor_gate(self):
-    """A lead braking at -3.5 m/s^2 mid-approach while TTC is 4–7 s exercises the raised urban
-    floor admission with the regulator still capped at -1.0. The 17 m/s ego stays clear: minimum
-    gap is 30.40 m and the peak command is -1.88 m/s^2 in this measured case."""
+  def test_mid_approach_lead_brake_stays_safe(self):
+    """A lead braking at -3.5 m/s^2 mid-approach while TTC is 4–7 s exercises the floor admission
+    with the regulator capped at -1.0. The 17 m/s ego stays clear: minimum gap is 32.55 m and the
+    peak command is -1.79 m/s^2 in this measured case (rest 32.39 m at 12 s; carried to rest over
+    25 s the minima are 10.54 m against the old 1.15 gate's 9.33 m — no contact either way)."""
     planner = _planner()
     v_ego, v_lead, gap = 17.0, 17.0, 90.0
     active_ttc = []
@@ -870,7 +858,8 @@ class TestPlanner(unittest.TestCase):
       v_lead = max(0.0, v_lead + a_lead * DT_MDL)
       gap = max(0.0, gap + (v_lead - v_ego) * DT_MDL)
     self.assertTrue(active_ttc)
-    self.assertGreater(minimum_gap, 10.0)
+    self.assertAlmostEqual(minimum_gap, 32.55, delta=0.05)
+    self.assertAlmostEqual(peak, -1.79, delta=0.05)
     self.assertGreater(peak, ACCEL_MIN)
 
   def test_a_radar_dropout_releases_the_lead_candidate(self):
@@ -1164,6 +1153,34 @@ class TestPlanner(unittest.TestCase):
     self.assertLess(peak, 3.0)
     self.assertLess(v_ego, 0.5)  # it stopped
     self.assertGreater(gap, 5.0)  # and it did not run into the lead
+
+  def test_the_reference_approach_holds_its_average_decel(self):
+    """The developer's stated objective as an observable property: on the 10 m/s reference approach
+    (stopped lead appearing at the 114 m first-present maximum, cruise at entry speed), average decel
+    from the -0.5 crossing to rest is 0.979 m/s^2 with peak -1.20 and rest 5.18 m. A raised admission
+    threshold shortens the distance used and raises the average (1.15 measured 1.137 with peak -1.41),
+    so this fails if anyone re-raises the gate without measuring. Pinned on the command, not the
+    constant — the law, not the dial.
+    """
+    planner = _planner()
+    v_ego, gap = 10.0, 114.0
+    commands, speeds, gaps = [], [], []
+    for _ in range(round(80.0 / DT_MDL)):
+      planner.update(_inputs(v_ego=v_ego, v_cruise_kph=10.0 * 3.6, lead=_lead(gap, 0.0), standstill=False))
+      commands.append(float(planner.output_a_target))
+      speeds.append(v_ego)
+      gaps.append(gap)
+      v_ego = max(0.0, v_ego + commands[-1] * DT_MDL)
+      gap = max(0.0, gap - v_ego * DT_MDL)
+      if v_ego < 0.05 and abs(commands[-1]) < 0.05:
+        break
+    onset = next(i for i, c in enumerate(commands) if c < -0.5)
+    rest = next((i for i in range(onset, len(speeds)) if speeds[i] < 0.05), len(speeds) - 1)
+    distance = gaps[onset] - gaps[rest]
+    self.assertGreater(distance, 0.0, "the approach never reached the -0.5 command")
+    self.assertLessEqual(speeds[onset] ** 2 / (2 * distance), 0.979 + 0.02)
+    self.assertGreaterEqual(min(commands[onset:]), -1.20 - 0.05)
+    self.assertAlmostEqual(gaps[-1], 5.18, delta=0.05)
 
   def test_a_fresh_matched_speed_radar_lead_stays_within_approach_decel(self):
     """A new radar slot with no reported lead acceleration must not turn matched-speed following into

@@ -147,15 +147,9 @@ MOONPILOT_FOLLOW_CUSHION = 1.0  # m; a closing approach may spend this much of t
 # gap, then vanishes as ego becomes slower so the same regulator smoothly reopens the exact time gap.
 # It also tapers out before the time-gap target reaches the standstill floor. TTC and stopping-floor
 # terms never read it.
-MOONPILOT_APPROACH_DECEL = 1.0  # m/s^2; the spacing regulator's braking authority. It stays at 1.0
-# so a stopped-lead onset can move without making the follow regulator itself deeper.
-MOONPILOT_FLOOR_ADMISSION_DECEL = 1.15  # m/s^2; the threshold is live where acquisition is not
-# binding — closed-loop -0.5 crossing 37.6 -> 33.2 m at 8 m/s, 55.5 -> 48.5 m at 10 m/s
-# (analytic 56.0 -> 49.5 m), 90.0 -> 78.9 m at 13 m/s — and moves ~nothing at 17 m/s, where both
-# arms admit on the first acquirable frame at the 131.9 m lead horizon.
-MOONPILOT_FLOOR_ADMISSION_SPEED_BP = [20.0, 25.0]  # m/s; blending back to 1.0 here leaves the
-# 33/36/40 m/s stopped-lead safety runs byte-identical while the complaint's 5–17 m/s regime gets X.
-MOONPILOT_FLOOR_ADMISSION_SPEED_V = [MOONPILOT_FLOOR_ADMISSION_DECEL, MOONPILOT_APPROACH_DECEL]
+MOONPILOT_APPROACH_DECEL = 1.0  # m/s^2; the spacing regulator's braking authority, and the
+# decel the approach term binds past — one number, so the
+# two terms meet at the same output
 MOONPILOT_TTC_TARGET = 3.0  # s; headway the approach term holds the closing rate inside. Lower is
 # shallower — a_ttc = -K*(closing - slack/T) deepens with T, so this
 # is the dial between the floor's plateau (T below ~2 the term never
@@ -365,19 +359,6 @@ def lead_accel(v_ego, gap, v_lead, a_lead, t_follow) -> float:
   lead at 14 m/s from 36 m/s. The floor binds earlier and `min` cannot out-vote it, so it holds where
   the TTC term asks for less; where the TTC term asks for more, the TTC term wins.
 
-  What *admits* that floor is a separate dial from the regulator's own authority, and it is the
-  stopped-lead onset. The regulator stays capped at `MOONPILOT_APPROACH_DECEL = 1.0` while the floor
-  is admitted past `MOONPILOT_FLOOR_ADMISSION_DECEL = 1.15` through 20 m/s, blended continuously back
-  to 1.0 by 25 m/s. It moves the closed-loop -0.5 crossing only where the lead is visible early
-  enough for it to bind: 37.6 -> 33.2 m at 8 m/s, 55.5 -> 48.5 at 10, 90.0 -> 78.9 at 13, and
-  *nothing* at 17 m/s, where both thresholds cross at 127.7 m because publication is capped at the
-  ~131.9 m model-matched lead horizon and every X at or below 1.15 admits on the first acquirable
-  frame. 1.15 is sized against the driver's own 1.14 brake-phase average decel, and the 33/36/40 m/s
-  stopped-lead runs stay byte-identical. It is not free: on the pinned 17 m/s / 90 m setup with the
-  lead braking -3.5 m/s^2 over t in [2,5) s, the minimum gap is 30.4 m against the base law's 32.6
-  at 12 s, and 9.3 against 10.5 carried to rest over 25 s, with no contact in any arm. Raising the
-  dial further spends that margin.
-
   The handover in either case is a step, not a crossover: at the crossing the regulator's output is
   whatever the spacing error says, positive while the gap is still wide — +69.7 m/s^2 at 25 m/s and
   the 318.5 m stopping crossing — and the approach terms replace it from there. That step is only
@@ -411,12 +392,13 @@ def lead_accel(v_ego, gap, v_lead, a_lead, t_follow) -> float:
   slack = max(gap - MOONPILOT_STOP_DISTANCE, 0.0)
   a_ttc = -MOONPILOT_K_TTC * (closing - slack / MOONPILOT_TTC_TARGET)
   a = min(a_track, a_ttc) if a_ttc < -MOONPILOT_APPROACH_DECEL else a_track
-  # The floor's admission threshold is the separate comfort/safety dial: 1.15 at 20 m/s moves the
-  # 17 m/s -0.5 crossing 16 m toward the measured driver onset, while a linear return to 1.0 by
-  # 25 m/s keeps the 33/36/40 m/s safety cases unchanged and avoids a speed discontinuity.
+  # The stopping floor makes this law safe outside the final soft meter rather than merely responsive.
+  # A TTC term ramps on closing rate, and ramping is not stopping: at 36 m/s with TTC_TARGET = 5 it
+  # binds 175 m out, where coming to rest behind a stopped lead needs 185 m. The old kinematic term
+  # remains the bound throughout that regime. Only inside MOONPILOT_MIN_SLACK does its denominator
+  # stop shrinking, so the exact standstill point is not chased with increasing crawl-speed braking.
   a_stop = -(v_ego**2 - v_lead_eff**2) / (2 * max(gap - MOONPILOT_STOP_DISTANCE, MOONPILOT_MIN_SLACK))
-  floor_admission = float(np.interp(v_ego, MOONPILOT_FLOOR_ADMISSION_SPEED_BP, MOONPILOT_FLOOR_ADMISSION_SPEED_V))
-  return min(a, a_stop) if a_stop < -floor_admission else a
+  return min(a, a_stop) if a_stop < -MOONPILOT_APPROACH_DECEL else a
 
 
 def jerk_limit(a_cmd, a_prev, dt, v_ego, comfort_scale=1.0) -> float:
