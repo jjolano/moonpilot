@@ -117,7 +117,7 @@ struct OnroadEvent @0xc4fa6047f024e718 {
     selfdrivedLagging @81;
     resumeBlocked @82;
     carNotReady @103;
-    lateralEngageOff @104;  # moonpilot seam, see AGENTS.md: the fork's half-engagement is armed but not steering
+    lateralEngageOff @105;  # moonpilot seam, see AGENTS.md: the fork's half-engagement is armed but not steering
     steerTimeLimit @83;
     vehicleSensorsInvalid @84;
     locationdTemporaryError @85;
@@ -129,6 +129,7 @@ struct OnroadEvent @0xc4fa6047f024e718 {
     personalityChanged @91;
     aeb @92;
     userBookmark @95;
+    userBookmarkNotPaired @104;
     excessiveActuation @96;
     bigModelLoading @100;
     bigModelFailed @102;
@@ -2238,6 +2239,7 @@ struct DriverMonitoringState {
       pose @0: Bool;
       eye @1: Bool;
       phone @2: Bool;
+      sleep @3: Bool;
     }
 
     struct Pose {
