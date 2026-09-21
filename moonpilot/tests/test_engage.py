@@ -303,43 +303,104 @@ class TestEngagePolicy(unittest.TestCase):
     self.assertTrue(EventName.gasPressedOverride in events.events)
     self.assertFalse(events.contains(ET.USER_DISABLE))
 
-  def test_reverse_disengages_quietly_and_does_not_latch(self):
+  def test_park_and_reverse_disengage_quietly_and_do_not_latch(self):
     """Upstream's loud pair for the gear is gone; the disengage itself is not."""
-    events = self._run(_cs(available=True, gear=GearShifter.reverse), enabled=True, extra_events=(EventName.reverseGear, EventName.wrongGear))
-    # No full-screen "Reverse Gear" banner and no "TAKE CONTROL IMMEDIATELY"
-    self.assertNotIn(EventName.reverseGear, events.events)
-    self.assertFalse(events.contains(ET.IMMEDIATE_DISABLE))
-    # The car still stops steering on this frame, through the plain disengage chime
+    for gear, extra in ((GearShifter.park, ()), (GearShifter.reverse, (EventName.reverseGear,))):
+      with self.subTest(gear=gear):
+        events = self._run(_cs(available=True, gear=gear), enabled=True, extra_events=(*extra, EventName.wrongGear))
+        # No full-screen "Reverse Gear" banner and no "TAKE CONTROL IMMEDIATELY"
+        self.assertNotIn(EventName.reverseGear, events.events)
+        self.assertFalse(events.contains(ET.IMMEDIATE_DISABLE))
+        # The car still stops steering on this frame, through the plain disengage chime
+        self.assertTrue(EventName.buttonCancel in events.events)
+        self.assertTrue(events.contains(ET.USER_DISABLE))
+        # A pause, not the latch: no re-arm gesture is needed to get the state back
+        self.assertFalse(self.engage._blocked)
+        # And the alert a driver still gets is upstream's own, on an engage attempt in the wrong gear
+        self.assertTrue(EventName.wrongGear in events.events)
+
+  def test_park_and_reverse_show_one_refusal_on_the_first_engage_attempt(self):
+    """Wrong gear blocks the attempt, but does not retry the alert on every frame it is held."""
+    for gear, extra in ((GearShifter.park, ()), (GearShifter.reverse, (EventName.reverseGear,))):
+      with self.subTest(gear=gear):
+        # A fresh module per gear: the one-shot is per entry into that gear, not per instance
+        engage = moonpilot_engage(_cp(), _params(on=True))
+
+        attempts = []
+        for _ in range(2):
+          events = Events()
+          for name in (*extra, EventName.wrongGear):
+            events.add(name)
+          engage.update(_cs(available=True, gear=gear), events, False)
+          attempts.append(events)
+        first, second = attempts
+        self.assertNotIn(EventName.reverseGear, first.events)
+        self.assertTrue(EventName.wrongGear in first.events)
+        self.assertTrue(EventName.buttonEnable in first.events)
+        self.assertTrue(first.contains(ET.ENABLE))
+        self.assertTrue(first.contains(ET.NO_ENTRY))
+        state_machine = StateMachine()
+        self.assertEqual(state_machine.update(first), (False, False))
+        self.assertTrue(ET.NO_ENTRY in state_machine.current_alert_types)
+
+        second = attempts[1]
+        self.assertNotIn(EventName.reverseGear, second.events)
+        self.assertTrue(EventName.wrongGear in second.events)
+        self.assertNotIn(EventName.buttonEnable, second.events)
+
+  def test_the_refusal_comes_back_after_the_main_switch_is_cycled(self):
+    """The one-shot is per arming, not per drive: the switch coming on is the attempt."""
+    engage = moonpilot_engage(_cp(), _params(on=True))
+
+    def run(available):
+      events = Events()
+      events.add(EventName.wrongGear)
+      engage.update(_cs(available=available, gear=GearShifter.park), events, False)
+      return events
+
+    self.assertTrue(EventName.buttonEnable in run(True).events)
+    self.assertNotIn(EventName.buttonEnable, run(True).events)
+    run(False)
+    self.assertTrue(EventName.buttonEnable in run(True).events)
+
+  def test_neutral_allows_the_half_engagement(self):
+    """Steering without speed authority is meaningful with the drivetrain disconnected."""
+    events = self._run(_cs(available=True, gear=GearShifter.neutral), extra_events=(EventName.wrongGear,))
+    # The gear's own block is gone, so the request goes out as it would in drive
+    self.assertNotIn(EventName.wrongGear, events.events)
+    self.assertFalse(events.contains(ET.NO_ENTRY))
+    self.assertTrue(EventName.buttonEnable in events.events)
+    state_machine = StateMachine()
+    self.assertEqual(state_machine.update(events), (True, True))
+
+  def test_neutral_keeps_the_half_engagement_but_not_the_full_one(self):
+    """The half-engaged state survives a shift into neutral; the full stack ends it."""
+    engage = moonpilot_engage(_cp(), _params(on=True))
+
+    # The gear lands with the car's own ACC off: nothing to disengage on
+    events = Events()
+    events.add(EventName.wrongGear)
+    engage.update(_cs(available=True, gear=GearShifter.neutral), events, True)
+    self.assertNotIn(EventName.buttonCancel, events.events)
+    self.assertFalse(events.contains(ET.USER_DISABLE))
+    self.assertFalse(events.contains(ET.SOFT_DISABLE))
+
+    # ACC is the full stack, which neutral does not allow: the same quiet disengage
+    events = Events()
+    events.add(EventName.wrongGear)
+    engage.update(_cs(available=True, gear=GearShifter.neutral, enabled=True), events, True)
     self.assertTrue(EventName.buttonCancel in events.events)
     self.assertTrue(events.contains(ET.USER_DISABLE))
-    # A pause, not the latch: no re-arm gesture is needed to get the state back
-    self.assertFalse(self.engage._blocked)
-    # And the alert a driver still gets is upstream's own, on an engage attempt in the wrong gear
-    self.assertTrue(EventName.wrongGear in events.events)
-
-  def test_reverse_shows_one_refusal_on_the_first_engage_attempt(self):
-    """Wrong gear blocks the attempt, but does not retry the alert on every reversing frame."""
-    first = self._run(_cs(available=True, gear=GearShifter.reverse), extra_events=(EventName.reverseGear,))
-    self.assertNotIn(EventName.reverseGear, first.events)
-    self.assertTrue(EventName.wrongGear in first.events)
-    self.assertTrue(EventName.buttonEnable in first.events)
-    self.assertTrue(first.contains(ET.ENABLE))
-    self.assertTrue(first.contains(ET.NO_ENTRY))
-    state_machine = StateMachine()
-    self.assertEqual(state_machine.update(first), (False, False))
-    self.assertTrue(ET.NO_ENTRY in state_machine.current_alert_types)
-
-    second = self._run(_cs(available=True, gear=GearShifter.reverse), extra_events=(EventName.reverseGear,))
-    self.assertNotIn(EventName.reverseGear, second.events)
-    self.assertTrue(EventName.wrongGear in second.events)
-    self.assertNotIn(EventName.buttonEnable, second.events)
+    self.assertFalse(events.contains(ET.IMMEDIATE_DISABLE))
+    self.assertFalse(engage._blocked)
 
   def test_reverse_alert_is_filtered_with_the_main_switch_off(self):
     events = self._run(_cs(gear=GearShifter.reverse), extra_events=(EventName.reverseGear,))
     self.assertNotIn(EventName.reverseGear, events.events)
 
-  def test_reverse_alerts_follow_the_state_machine(self):
-    """The user-visible contract: quiet disengage, stale soft-alert removal, then one refusal."""
+  def test_gear_alerts_follow_the_state_machine(self):
+    """The user-visible contract: neutral keeps steering, the blocked gears disengage quietly, and
+    an engage attempt in one of them gets upstream's own refusal."""
     alert_manager = AlertManager()
     state_machine = StateMachine()
     cp = _cp()
@@ -358,38 +419,45 @@ class TestEngagePolicy(unittest.TestCase):
         [cp, cs, None, False, state_machine.soft_disable_timer, 0],
       )
       alert_manager.add_many(frame, alerts)
-      self.engage.clear_reverse_alerts(alert_manager)
       alert_manager.process_alerts(frame, set())
       return state_enabled, alerts
 
     cycle(0, GearShifter.drive, False)
-    cycle(1, GearShifter.neutral, True)
+    # Neutral is the gear the half-engaged state is allowed in: no alert, and no disengage
+    enabled, alerts = cycle(1, GearShifter.neutral, True)
+    self.assertTrue(enabled)
+    self.assertEqual(alerts, [])
+
+    # Reverse in the same state disengages on the frame the gear lands, through the plain chime
     enabled, alerts = cycle(2, GearShifter.reverse, True)
     self.assertFalse(enabled)
     self.assertEqual([alert.alert_type for alert in alerts], ["buttonCancel/userDisable"])
     self.assertEqual(alert_manager.current_alert.alert_text_1, "")
 
-    # The neutral frame's cached "Gear not D" soft alert must not reappear after the chime expires.
+    # Nothing gear-related is left on the screen once the chime expires
     cycle(25, GearShifter.reverse, False)
     self.assertEqual(alert_manager.current_alert.alert_text_2, "")
 
-    # Starting in reverse gives one real refusal alert, not the passive reverse banner.
-    engage = LateralEngage(True)
-    state_machine = StateMachine()
-    alert_manager = AlertManager()
-    events = Events()
-    events.add(EventName.reverseGear)
-    cs = _cs(available=True, gear=GearShifter.reverse)
-    engage.update(cs, events, False)
-    self.assertEqual(state_machine.update(events), (False, False))
-    alerts = events.create_alerts(
-      state_machine.current_alert_types,
-      [cp, cs, None, False, state_machine.soft_disable_timer, 0],
-    )
-    alert_manager.add_many(0, alerts)
-    engage.clear_reverse_alerts(alert_manager)
-    alert_manager.process_alerts(0, set())
-    self.assertEqual(alert_manager.current_alert.alert_text_2, "Gear not D")
+    # Starting in park or reverse gives one real refusal alert, not the passive reverse banner
+    for gear in (GearShifter.park, GearShifter.reverse):
+      with self.subTest(gear=gear):
+        engage = LateralEngage(True)
+        state_machine = StateMachine()
+        alert_manager = AlertManager()
+        events = Events()
+        events.add(EventName.wrongGear)
+        if gear == GearShifter.reverse:
+          events.add(EventName.reverseGear)
+        cs = _cs(available=True, gear=gear)
+        engage.update(cs, events, False)
+        self.assertEqual(state_machine.update(events), (False, False))
+        alerts = events.create_alerts(
+          state_machine.current_alert_types,
+          [cp, cs, None, False, state_machine.soft_disable_timer, 0],
+        )
+        alert_manager.add_many(0, alerts)
+        alert_manager.process_alerts(0, set())
+        self.assertEqual(alert_manager.current_alert.alert_text_2, "Gear not D")
 
   def test_an_authoritative_disable_latches_until_rearmed(self):
     # The main switch dropping, which a stock-ACC car raises as `wrongCarMode` -- a USER_DISABLE.
@@ -551,11 +619,12 @@ class TestScriptedDrive(unittest.TestCase):
       self.events.add(EventName.pedalPressed)
     if fault is not None:
       self.events.add(fault)  # a level-triggered condition, e.g. an EPS temp fault
-    if cs.gearShifter == GearShifter.reverse:
-      # Both of upstream's gear events, as car_events raises them: reverse is in no brand's
-      # DRIVABLE_GEARS, so `wrongGear` rides along with `reverseGear` on every reversing frame.
-      self.events.add(EventName.reverseGear)
+    if cs.gearShifter != GearShifter.drive:
+      # Upstream's gear event, as car_events raises it: park, neutral and reverse are in no brand's
+      # DRIVABLE_GEARS, so `wrongGear` rides along on every frame in one of them.
       self.events.add(EventName.wrongGear)
+    if cs.gearShifter == GearShifter.reverse:
+      self.events.add(EventName.reverseGear)
     if acc_set and not self.acc_set:
       self.events.add(EventName.pcmEnable)
     elif self.acc_set and not acc_set:
@@ -621,6 +690,34 @@ class TestScriptedDrive(unittest.TestCase):
 
     # Back in D: half-engaged again, with no LKAS press and no main-switch cycle
     self.assertEqual(self._step(_cs(available=True)), (State.enabled, True, True))
+
+  def test_park_pauses_the_drive_and_d_resumes_it(self):
+    """Parking costs the gear, not the drive -- the same pause reverse gets."""
+    self.assertEqual(self._step(_cs(available=True)), (State.enabled, True, True))
+
+    # The gear lands: disengaged on that frame, and held there while it is in park
+    self.assertEqual(self._step(_cs(available=True, gear=GearShifter.park)), (State.disabled, False, False))
+    self.assertEqual(self._step(_cs(available=True, gear=GearShifter.park)), (State.disabled, False, False))
+
+    # Back in D: half-engaged again, with no LKAS press and no main-switch cycle
+    self.assertEqual(self._step(_cs(available=True)), (State.enabled, True, True))
+
+  def test_neutral_keeps_steering_and_the_full_stack_ends_it(self):
+    """Coasting in neutral is a half-engaged state; ACC in neutral is not a state at all."""
+    self.assertEqual(self._step(_cs(available=True)), (State.enabled, True, True))
+
+    # The gear lands with the car's own ACC off: the half-engagement is allowed to continue
+    self.assertEqual(self._step(_cs(available=True, gear=GearShifter.neutral)), (State.enabled, True, True))
+    self.assertEqual(self._step(_cs(available=True, gear=GearShifter.neutral)), (State.enabled, True, True))
+
+    # ACC is the full stack, which neutral does not allow: disengaged on the frame it is set
+    self.assertEqual(self._step(_cs(available=True, gear=GearShifter.neutral), acc_set=True), (State.disabled, False, False))
+
+    # ACC canceled again in neutral: the half-engagement comes back with no driver gesture
+    self.assertEqual(self._step(_cs(available=True, gear=GearShifter.neutral)), (State.enabled, True, True))
+
+    # And D with ACC set is upstream's own full engagement
+    self.assertEqual(self._step(_cs(available=True), acc_set=True), (State.enabled, True, True))
 
   def test_a_soft_disable_recovers_by_itself(self):
     """A transient fault costs the state while it lasts, not the rest of the drive.

@@ -34,12 +34,16 @@ What the module does at runtime:
     cycling the main switch; a soft disable is left to upstream's own state machine, which returns
     to enabled by itself once the condition clears.
 
-    Reverse is the one upstream disengage the module respells rather than suppresses or keeps.
-    `reverseGear`'s full-screen banner and its "TAKE CONTROL IMMEDIATELY" disable are filtered,
-    and the gear disengages through `buttonCancel`'s plain disengage chime instead — below the
-    latch, so backing out of a parking space pauses the half-engaged state rather than ending the
-    drive's. `wrongGear` is untouched, so "Gear not D" is still what a driver sees if they ask to
-    engage in reverse, and D re-arms by itself.
+    Park and reverse are the upstream disengages the module respells rather than suppresses or
+    keeps: `wrongGear`'s soft disable would leave the model's path being steered for
+    SOFT_DISABLE_TIME, and `reverseGear`'s full-screen banner with its "TAKE CONTROL IMMEDIATELY"
+    disable would latch the state off for the drive. So the gear disengages through
+    `buttonCancel`'s plain disengage chime instead — below the latch, so a parking maneuver pauses
+    the half-engaged state rather than ending the drive's — and D re-arms by itself. Neutral is the
+    one gear that state is allowed in, because steering without speed authority is meaningful with
+    the drivetrain disconnected: its gear event is dropped while the car's own ACC is off and comes
+    back with the full stack, where the same quiet disengage applies. "Gear not D" is still what a
+    driver sees if they ask to engage in park or reverse.
 
     It also raises `lateralEngageOff` while the latch is set — a permanent banner, because the
     suppressors above are exactly what make a latched car silent: the events upstream would have
@@ -99,7 +103,7 @@ from opendbc.car.toyota.values import ToyotaFlags, ToyotaSafetyFlags
 from opendbc.car.volkswagen.values import VolkswagenSafetyFlags
 from openpilot.cereal import log
 from openpilot.common.params import Params
-from openpilot.selfdrive.selfdrived.events import EVENT_NAME, ET
+from openpilot.selfdrive.selfdrived.events import ET
 
 from moonpilot.features import LATERAL_ENGAGE, LONGITUDINAL, TORQUE_LATERAL, Feature, enabled
 
@@ -299,10 +303,10 @@ class LateralEngage:
     # ACC's previous state, so re-arming is its *rising edge*. Clearing on the level instead would
     # undo the LKAS toggle one frame later for a driver who pressed it while cruising with ACC set.
     self._acc_set_prev = False
-    # Reverse's one-shot NO_ENTRY request is an engagement attempt, not a retry while the gear is
-    # held. Reset when the gear leaves reverse or the cruise main switch goes off.
-    self._reverse_seen = False
-    self._clear_reverse_alerts = False
+    # A gear openpilot cannot drive in raises `wrongGear` on every frame it is held, so the refusal
+    # request is one-shot per entry: an engagement attempt, not a retry. Reset when the gear becomes
+    # drivable again or the cruise main switch goes off.
+    self._wrong_gear_seen = False
 
   def controls_allowed(self, ps) -> bool:
     """Whether this pandaState is one openpilot can be enabled on.
@@ -312,20 +316,6 @@ class LateralEngage:
     cross-check stays sharp instead of being switched off.
     """
     return bool(ps.controlsAllowed) or (self.enabled and bool(ps.controlsAllowedLateral))
-
-  def clear_reverse_alerts(self, alert_manager) -> None:
-    """Expire only the cached wrong-gear soft alert on the quiet reverse transition.
-
-    AlertManager clears warning and no-entry types when StateMachine leaves them, but a soft-disable
-    alert created in a preceding neutral frame has its own duration. Reverse must not resurrect that
-    stale alert, and unrelated soft faults must remain visible.
-    """
-    if not self._clear_reverse_alerts:
-      return
-    alert_type = f"{EVENT_NAME[EventName.wrongGear]}/{ET.SOFT_DISABLE}"
-    entry = alert_manager.alerts.get(alert_type)
-    if entry is not None:
-      entry.end_frame = -1
 
   def update(self, CS, events, enabled: bool) -> None:
     """Adjust the cycle's engagement events in place. Runs after every other event source.
@@ -338,8 +328,6 @@ class LateralEngage:
       return
 
     reverse = CS.gearShifter == GearShifter.reverse
-    self._clear_reverse_alerts = reverse
-    first_reverse = reverse and not self._reverse_seen
     # `reverseGear` is the passive full-screen alert this feature replaces. Keep `wrongGear`, whose
     # NO_ENTRY is the alert for an actual engagement attempt, and filter the passive event even when
     # the cruise main switch is off.
@@ -349,12 +337,24 @@ class LateralEngage:
       # a future interface declares reverse drivable.
       events.add(EventName.wrongGear)
 
+    # Neutral is the one gear the half-engaged state is allowed in: steering without speed authority
+    # is meaningful with the drivetrain disconnected, which is why the gear's event is dropped while
+    # the car's own ACC is off. ACC is the full stack — the same signal the re-arm above reads that
+    # way — and full engagement in neutral is not allowed, so the event comes back with it and the
+    # quiet disengage below applies. The event is the whole "not a gear openpilot drives in" test:
+    # DRIVABLE_GEARS is the car's own list and car_events is where it is applied, so the fork never
+    # restates it.
+    if CS.gearShifter == GearShifter.neutral and not CS.cruiseState.enabled:
+      events.events = [e for e in events.events if e != EventName.wrongGear]
+    wrong_gear = EventName.wrongGear in events.events
+    first_wrong_gear = wrong_gear and not self._wrong_gear_seen
+
     if not CS.cruiseState.available:
       # The cruise main switch is off, which is upstream's own disengage: the car events raise
       # wrongCarMode, and the panda rule drops its permission on acc_main's falling edge.
       self._blocked = False
       self._acc_set_prev = False
-      self._reverse_seen = False
+      self._wrong_gear_seen = False
       return
 
     if CS.cruiseState.enabled and not self._acc_set_prev:
@@ -379,8 +379,9 @@ class LateralEngage:
     lkas_rearm = lkas_pressed and was_blocked and not self._blocked
 
     # The point of the feature: a brake or gas tap must not take the steering with it, and neither
-    # must ACC's cancel button. `reverseGear` was filtered above; `wrongGear` remains the source of
-    # the one-shot "Gear not D" refusal on an engagement attempt.
+    # must ACC's cancel button. `reverseGear` was filtered above; `wrongGear` is still the source of
+    # the one-shot "Gear not D" refusal on an engagement attempt, wherever the gear is one the car
+    # cannot drive in.
     events.events = [e for e in events.events if e not in SUPPRESSED_EVENTS]
 
     if lkas_pressed and self._blocked:
@@ -396,31 +397,33 @@ class LateralEngage:
       self._blocked = True
     elif not enabled and not self._blocked and not events.contains(ET.ENABLE):
       # The driver's arming gesture is the cruise main switch coming on, which upstream has no
-      # event for on a stock-ACC car. buttonEnable carries the normal engage chime. In reverse,
-      # emit it once on entry (or on an LKAS re-arm) even though wrongGear is present: StateMachine
-      # needs ENABLE plus NO_ENTRY to show the refusal alert, and `_reverse_seen` prevents a
-      # refusal retry on every reversing frame. ET.ENABLE skips it when upstream already asked.
-      reverse_attempt = reverse and (first_reverse or lkas_rearm)
-      ordinary_attempt = not reverse and not events.contains(ET.NO_ENTRY) and not events.contains(ET.SOFT_DISABLE)
-      if reverse_attempt or ordinary_attempt:
+      # event for on a stock-ACC car. buttonEnable carries the normal engage chime. In park or
+      # reverse, emit it once on entry (or on an LKAS re-arm) even though wrongGear is present:
+      # StateMachine needs ENABLE plus NO_ENTRY to show the refusal alert, and `_wrong_gear_seen`
+      # prevents a refusal retry on every frame the gear is held. ET.ENABLE skips it when upstream
+      # already asked.
+      wrong_gear_attempt = wrong_gear and (first_wrong_gear or lkas_rearm)
+      ordinary_attempt = not wrong_gear and not events.contains(ET.NO_ENTRY) and not events.contains(ET.SOFT_DISABLE)
+      if wrong_gear_attempt or ordinary_attempt:
         events.add(EventName.buttonEnable)
 
-    self._reverse_seen = reverse
+    self._wrong_gear_seen = wrong_gear
 
-    if reverse and enabled:
-      # Reverse with the state machine still enabled: stop steering now, quietly, and without the
-      # latch. Upstream raises two events for the gear — `wrongGear`, a soft disable whose NO_ENTRY
-      # reads "Gear not D", and `reverseGear`, whose own types are a full-screen banner for as long
-      # as the gear is held and an ImmediateDisableAlert, "TAKE CONTROL IMMEDIATELY". A stock car
-      # sees those once per drive; a half-engaged one is engaged whenever the main switch is on, so
-      # it pays them on every three-point turn and the USER_DISABLE latches the state off for the
-      # rest of the drive. So `reverseGear` is filtered above and the disengage is respelled as the
-      # quiet one: `buttonCancel`'s USER_DISABLE is upstream's plain disengage chime with nothing on
-      # screen. Added below the latch check on purpose, so the gear pauses the state instead of
-      # latching it. The one-shot refusal request above cannot fight this disengage while the state
-      # machine catches up. Steering still stops on the frame the gear lands — `wrongGear`'s soft
-      # disable would take SOFT_DISABLE_TIME to, and the model's path is not something to steer on
-      # for three seconds of reversing. The alert the driver does still get is upstream's own
+    if wrong_gear and enabled:
+      # Park or reverse with the state machine still enabled, or neutral with the car's own ACC set:
+      # stop steering now, quietly, and without the latch. Upstream raises two events for the gear —
+      # `wrongGear`, a soft disable whose NO_ENTRY reads "Gear not D", and, in reverse only,
+      # `reverseGear`, whose own types are a full-screen banner for as long as the gear is held and
+      # an ImmediateDisableAlert, "TAKE CONTROL IMMEDIATELY". A stock car sees those once per drive;
+      # a half-engaged one is engaged whenever the main switch is on, so it pays them on every
+      # parking maneuver and the USER_DISABLE latches the state off for the rest of the drive. So
+      # `reverseGear` is filtered above and the disengage is respelled as the quiet one:
+      # `buttonCancel`'s USER_DISABLE is upstream's plain disengage chime with nothing on screen.
+      # Added below the latch check on purpose, so the gear pauses the state instead of latching it.
+      # The one-shot refusal request above cannot fight this disengage while the state machine
+      # catches up. Steering still stops on the frame the gear lands — `wrongGear`'s soft disable
+      # would take SOFT_DISABLE_TIME to, and the model's path is not something to steer on for three
+      # seconds of parking or reversing. The alert the driver does still get is upstream's own
       # "Gear not D" NO_ENTRY, on an engage attempt in the wrong gear, which `wrongGear` supplies.
       # Shifting back to D drops the gear events and the gate, and the ordinary engage request
       # re-arms on the next frame with no driver gesture.
