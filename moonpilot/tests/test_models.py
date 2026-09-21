@@ -275,6 +275,7 @@ class TestCodecs(unittest.TestCase):
       params.put(models.REQUEST_KEY, bad)
       self.assertIsNone(models.read_request(params), bad)
 
+  @mock.patch.object(models, "free_bytes", lambda: 0)
   def test_the_status_shape_is_fixed(self):
     params = FakeParams()
     empty = models.status(params)
@@ -291,6 +292,7 @@ class TestCodecs(unittest.TestCase):
     params.put(models.STATUS_KEY, "not json")
     self.assertEqual(models.status(params), empty)
 
+  @mock.patch.object(models, "free_bytes", lambda: 0)
   def test_status_ignores_legacy_selection_entries(self):
     params = FakeParams()
     models.publish_status(params, installed=[{"recipe": RECIPE, "name": "a"}, {"composition": "c-" + "e" * 32, "name": "legacy"}])
@@ -300,6 +302,7 @@ class TestCodecs(unittest.TestCase):
 
 
 class TestChooserEntries(unittest.TestCase):
+  @mock.patch.object(models, "free_bytes", lambda: 0)
   def test_stock_built_and_catalog_entries_are_ordered_and_deduplicated(self):
     params = FakeParams()
     built_recipe = "b" * 64
@@ -545,6 +548,7 @@ class TestJobReporting(unittest.TestCase):
     # With nothing to measure the label is the phase line, so the two renderers can use one call.
     self.assertEqual(models.job_progress_text({"phase": "building", "elapsed": 83}), "building 1:23")
 
+  @mock.patch.object(models, "free_bytes", lambda: 0)
   def test_a_live_job_publishes_its_elapsed_but_one_that_never_started_does_not(self):
     params = FakeParams()
     models.publish_status(params, job=models.Job(id="1", op="install", phase="downloading", received=5, total=10))

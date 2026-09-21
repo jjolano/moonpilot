@@ -78,8 +78,8 @@
     // processes read the boot snapshot below, never these, so a selection
     // change cannot swap a model under a running prediction (the panel says
     // "restart to apply").
-    {"MoonpilotModelsDriving", {PERSISTENT, STRING, ""}},
-    {"MoonpilotModelsMonitoring", {PERSISTENT, STRING, ""}},
+    {"MoonpilotModelsDriving", {PERSISTENT, STRING}},
+    {"MoonpilotModelsMonitoring", {PERSISTENT, STRING}},
     // The committed per-boot decision: what each kind actually loads, with
     // every check the boot made recorded beside it. Written once by
     // commit_boot_selection() from openpilot/system/manager/manager.py, after

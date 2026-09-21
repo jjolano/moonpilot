@@ -853,8 +853,8 @@ def _entry_for(selection: str) -> dict | None:
 
 # --- boot commit -------------------------------------------------------------
 def desired(params: Any, kind: str) -> str:
-  """The driver's selection for one kind, `""` for the bundled model. A default is declared on both
-  rows, so this is the read that works with and without the manager (AGENTS.md, Features)."""
+  """The driver's selection for one kind; unset means the bundled model. `return_default=True`
+  keeps this read safe in a bare script as well as after manager initialization."""
   value = params.get(DESIRED_KEY[kind], return_default=True)
   return str(value) if value else ""
 
