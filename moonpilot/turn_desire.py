@@ -50,3 +50,30 @@ def turn_desire(sm, desire_state=None, params=None) -> int | None:
     return log.Desire.turnRight
 
   return None
+
+
+def turn_desire_alert(sm, params=None) -> int | None:
+  """The banner for an active turn desire: `log.OnroadEvent.EventName.turnLeft` / `turnRight`, or None.
+
+  The same predicate modeld feeds the model, plus the one thing the model side does not need:
+  openpilot must be the thing steering. `carControl.latActive` is the flag modeld hands
+  `DesireHelper.update`, and without it a driver waiting at a light with a blinker on -- disengaged,
+  or with the fork's half-engagement latched off -- gets a banner for a turn nobody is taking.
+
+  The desire state is read from the model message rather than required: a `SubMaster` that has
+  never received `modelV2` hands back a default-constructed message whose `desireState` list is
+  empty, and indexing it would raise. An empty or short list reads as "no prediction", which is
+  exactly what `turn_desire` falls back to the blinker for.
+  """
+  if not sm["carControl"].latActive:
+    return None
+  model = sm["modelV2"]
+  desire_state = model.meta.desireState
+  if len(desire_state) <= log.Desire.turnRight:
+    desire_state = None
+  desire = turn_desire(sm, desire_state, params)
+  if desire == log.Desire.turnLeft:
+    return log.OnroadEvent.EventName.turnLeft
+  if desire == log.Desire.turnRight:
+    return log.OnroadEvent.EventName.turnRight
+  return None

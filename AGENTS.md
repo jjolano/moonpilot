@@ -27,7 +27,7 @@ New fork behavior: write it under `moonpilot/`, hook it at the seam that already
 | `openpilot/selfdrive/modeld/modeld.py` | `moonpilot_model_runtime()`, and the runtime's model, smoothing constants and action decode; the learned long-lag horizon (`applied_long_delay`, re-read in the loop); low-speed turn-desire hook after `DesireHelper.update()` |
 | `openpilot/selfdrive/modeld/dmonitoringmodeld.py` | `moonpilot_dm_runtime()`, and the runtime's model and output parse |
 | `openpilot/cereal/custom.capnp` | `MoonpilotState` (upstream's reserved struct; never change the `@0x…` id) |
-| `openpilot/cereal/log.capnp` | `moonpilotState @107` event field; `PandaState.controlsAllowedLateral @38` and `controlsAllowedLongitudinal @39` — upstream's two slots reserved for forks, the first carrying this fork's lateral grant and the second named for the longitudinal half of the split, which this fork never populates |
+| `openpilot/cereal/log.capnp` | `moonpilotState @107` event field; `PandaState.controlsAllowedLateral @38` and `controlsAllowedLongitudinal @39` — upstream's two slots reserved for forks, the first carrying this fork's lateral grant and the second named for the longitudinal half of the split, which this fork never populates; the fork's own `OnroadEvent.EventName` rows — `lateralEngageOff @105`, `turnLeft @106` and `turnRight @107`, above upstream's highest @104, so the next fork event is @108 |
 | `openpilot/cereal/services.py` | `moonpilotState` service row |
 | `openpilot/common/version.h` | `COMMA_VERSION "<upstream>-moonpilot.<fork revision>"` |
 | `openpilot/selfdrive/controls/plannerd.py` | `moonpilotState` subscription; `moonpilot_longitudinal_planner()` picks the longitudinal planner |
@@ -36,14 +36,15 @@ New fork behavior: write it under `moonpilot/`, hook it at the seam that already
 | `openpilot/selfdrive/controls/controlsd.py` | `moonpilot_latcontrol()` picks the torque lateral controller, `moonpilot_longcontrol()` the acceleration controller, `moonpilot_curvature()` applies response-aligned curvature, `moonpilot_actuator_gate()` both actuator permissions; `pandaStates` in the subscription |
 | `openpilot/selfdrive/car/card.py` | `moonpilot_engage_safety_param()` before `CarParams` is written |
 | `openpilot/selfdrive/pandad/pandad.cc` | `PandaState.controlsAllowedLateral` from the panda health flag |
-| `openpilot/selfdrive/selfdrived/selfdrived.py` | `moonpilot_engage()`; `LateralEngage.update()` after every event source; the panda cross-check; `is_fork_build()` picks the startup banner |
-| `openpilot/selfdrive/selfdrived/events.py` | `EventName.lateralEngageOff` — the half-engagement banner |
+| `openpilot/selfdrive/selfdrived/selfdrived.py` | `moonpilot_engage()`; `LateralEngage.update()` after every event source; the panda cross-check; `is_fork_build()` picks the startup banner; the turn-desire banner, raised from `moonpilot/turn_desire.py`'s `turn_desire_alert` — the fed desire is never published, so the banner recomputes the same predicate modeld feeds the model, and requires `carControl.latActive` so it appears only while openpilot is the thing steering |
+| `openpilot/selfdrive/selfdrived/events.py` | `EventName.lateralEngageOff` — the half-engagement banner; the turn-desire banner |
 | `openpilot/selfdrive/test/process_replay/process_replay.py` | `moonpilotState` in plannerd's `pubs` |
 | `openpilot/selfdrive/ui/ui_state.py` | `moonpilotState` subscription |
 | `openpilot/selfdrive/ui/onroad/augmented_road_view.py` | half-engaged border color from `moonpilot/ui/onroad.py`; the disengaged border color moves off blue; the offroad-mode hold gesture |
 | `openpilot/selfdrive/ui/onroad/model_renderer.py` | lead path draw (tizi) |
 | `openpilot/selfdrive/ui/mici/onroad/augmented_road_view.py` | the offroad-mode hold gesture (mici) |
 | `openpilot/selfdrive/ui/mici/onroad/model_renderer.py` | lead path draw (mici); half-engaged lane-line color |
+| `openpilot/selfdrive/ui/mici/onroad/alert_renderer.py` | turn-desire banner icon and height (mici) |
 | `openpilot/selfdrive/ui/layouts/home.py` | brand string (tizi) |
 | `openpilot/selfdrive/ui/mici/layouts/home.py` | brand label (mici) |
 | `openpilot/selfdrive/ui/layouts/settings/settings.py` | `PanelType.MOONPILOT` + panel from `moonpilot/ui/settings.py` |

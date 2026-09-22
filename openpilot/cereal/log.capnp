@@ -118,6 +118,8 @@ struct OnroadEvent @0xc4fa6047f024e718 {
     resumeBlocked @82;
     carNotReady @103;
     lateralEngageOff @105;  # moonpilot seam, see AGENTS.md: the fork's half-engagement is armed but not steering
+    turnLeft @106;  # moonpilot seam, see AGENTS.md: the fork's low-speed turn-desire banner
+    turnRight @107;  # moonpilot seam, see AGENTS.md
     steerTimeLimit @83;
     vehicleSensorsInvalid @84;
     locationdTemporaryError @85;

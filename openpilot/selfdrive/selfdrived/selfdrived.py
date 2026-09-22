@@ -27,6 +27,7 @@ from openpilot.common.version import get_build_metadata
 from openpilot.common.hardware import HARDWARE
 from moonpilot.engage import moonpilot_engage  # moonpilot seam, see AGENTS.md
 from moonpilot.features import is_fork_build  # moonpilot seam, see AGENTS.md
+from moonpilot.turn_desire import turn_desire_alert  # moonpilot seam, see AGENTS.md
 
 REPLAY = "REPLAY" in os.environ
 SIMULATION = "SIMULATION" in os.environ
@@ -330,6 +331,13 @@ class SelfdriveD:
     elif self.sm['modelV2'].meta.laneChangeState in (LaneChangeState.laneChangeStarting,
                                                     LaneChangeState.laneChangeFinishing):
       self.events.add(EventName.laneChange)
+    # moonpilot seam, see AGENTS.md: the turn-desire banner, beside upstream's lane-change one. The
+    # applied turn desire is never published, so this recomputes modeld's own predicate -- plus the
+    # one thing modeld does not check, `carControl.latActive`: the pulse is fed to the model while
+    # disengaged too, and a banner there would claim a turn nobody is taking.
+    turn_alert = turn_desire_alert(self.sm, self.params)
+    if turn_alert is not None:
+      self.events.add(turn_alert)
 
     for i, pandaState in enumerate(self.sm['pandaStates']):
       # All pandas must match the list of safetyConfigs, and if outside this list, must be silent or noOutput

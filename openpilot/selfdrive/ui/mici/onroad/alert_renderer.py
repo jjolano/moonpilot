@@ -179,6 +179,12 @@ class AlertRenderer(Widget):
       txt_icon = self._txt_turn_signal_left if self._last_icon_side == 'left' else self._txt_turn_signal_right
       icon_margin_x = 2
       icon_margin_y = 5
+    elif event_name in ('turnLeft', 'turnRight'):  # moonpilot seam, see AGENTS.md: the fork's
+      # turn-desire banner wears the same turn signal the lane-change banner does.
+      icon_side = IconSide.left if event_name == 'turnLeft' else IconSide.right
+      txt_icon = self._txt_turn_signal_left if event_name == 'turnLeft' else self._txt_turn_signal_right
+      icon_margin_x = 2
+      icon_margin_y = 5
 
     elif event_name == 'laneChangeBlocked':
       CS = ui_state.sm['carState']
@@ -279,6 +285,8 @@ class AlertRenderer(Widget):
     elif event_name == 'preLaneChangeRight':
       bg_height = small_alert_height
     elif event_name == 'laneChange':
+      bg_height = small_alert_height
+    elif event_name in ('turnLeft', 'turnRight'):  # moonpilot seam, see AGENTS.md
       bg_height = small_alert_height
     elif event_name == 'laneChangeBlocked':
       bg_height = medium_alert_height

@@ -623,6 +623,23 @@ EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
       Priority.LOW, VisualAlert.none, AudibleAlert.none, .1),
   },
 
+  EventName.turnLeft: {  # moonpilot seam, see AGENTS.md: the fork's turn-desire banner, beside upstream's
+    # lane-change banner and shaped like it -- small, quiet, and no sound.
+    ET.WARNING: Alert(
+      "Turning Left",
+      "",
+      AlertStatus.normal, AlertSize.small,
+      Priority.LOW, VisualAlert.none, AudibleAlert.none, .1),
+  },
+
+  EventName.turnRight: {  # moonpilot seam, see AGENTS.md
+    ET.WARNING: Alert(
+      "Turning Right",
+      "",
+      AlertStatus.normal, AlertSize.small,
+      Priority.LOW, VisualAlert.none, AudibleAlert.none, .1),
+  },
+
   EventName.steerSaturated: {
     ET.WARNING: Alert(
       "Take Control",
