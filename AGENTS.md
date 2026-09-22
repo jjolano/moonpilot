@@ -518,12 +518,16 @@ that drifts fails the suite rather than compiling.
 
 Three ways to check this feature without a car: `.venv/bin/python3 -m unittest` runs of
 `moonpilot/tests/test_models.py`, `test_modelcatalog.py` and `test_modelruntime.py`;
-`DEV=CPU:LLVM python3 -m moonpilot.modelbuild smoke --onnx openpilot/selfdrive/modeld/models/<model>.onnx`,
+`DEV=CPU:LLVM python3 -m moonpilot.modelbuild smoke --onnx openpilot/selfdrive/modeld/models/dmonitoring_model.onnx`,
 which compiles, pickles, loads through `moonpilot/modelruntime.py` and runs one frame of zeros; and, for
 the whole chain against the real catalog, a scratch script that patches `models.paths.data_dir` to a temp
 root, calls `modelsd.Worker` through `models.request`/`serve`, then `commit_boot_selection` and the
 runtime. All three were run at the catalog revision above: the pinned stock recipe reaches one frame with
-`plan`, `lane_lines`, `lead`, `meta` and `pose` finite, and its build takes ~20 s on the dev PC.
+`plan`, `lane_lines`, `lead`, `meta` and `pose` finite, and its build takes ~20 s on the dev PC. The
+bundled `driving_supercombo.onnx` is deliberately not a smoke input anymore: upstream's current file
+declares the stateful `new_img`/`state_*_q` contract, which `comma.supercombo.v1` refuses rather than
+half-feeds, so driving smoke needs a catalog or retained supercombo artifact whose inputs match the fork
+protocol.
 
 ### Forked opendbc and panda
 
