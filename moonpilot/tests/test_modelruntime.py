@@ -13,7 +13,7 @@ therefore asserted to *differ* in the way the conventions differ.
 
 Two tests reach into `moonpilot/modelbuild.py` because the pair has to agree and nothing else checks
 it: the tinygrad flags string against the SConscript the device actually builds with, and the fork's
-`dump_oob` output against upstream's `load_oob`.
+`dump_oob` output against `modelruntime._load_fork_oob`.
 """
 
 import json
@@ -346,30 +346,27 @@ class TestBuildAgreement(unittest.TestCase):
   checks: the compile flags, and the pickle format the runtime loads."""
 
   def test_tg_flags_match_the_sconscript(self):
-    # The device's string is an f-string over the backend name the SConscript picks, so this
-    # reconstructs it from both literals rather than from a copy that could drift silently.
+    # The device's string is a plain QCOM literal, so compare it directly rather than from
+    # a copy that could drift silently.
     from moonpilot import modelbuild
 
     scons = (ROOT / "openpilot/selfdrive/modeld/SConscript").read_text()
-    backend = re.search(r"tg_backend = '(QCOM)'", scons)
-    device = re.search(r"tg_flags = f'(DEV=\{tg_backend\}[^']*)'", scons)
+    device = re.search(r"tg_flags = '(DEV=QCOM[^']*)'", scons)
     cpu = re.search(r"else '(DEV=CPU:LLVM)'", scons)
-    self.assertIsNotNone(backend, "the SConscript's QCOM backend moved")
     self.assertIsNotNone(device, "the SConscript's QCOM flag string moved")
     self.assertIsNotNone(cpu, "the SConscript's CPU flag string moved")
-    self.assertEqual(device.group(1).replace("{tg_backend}", backend.group(1)), modelbuild.TG_FLAGS_QCOM)
+    self.assertEqual(device.group(1), modelbuild.TG_FLAGS_QCOM)
     self.assertEqual(cpu.group(1), modelbuild.TG_FLAGS_CPU)
 
-  def test_dump_oob_round_trips_through_upstream(self):
-    from openpilot.selfdrive.modeld.helpers import load_oob
-
+  def test_dump_oob_round_trips_through_fork_loader(self):
     from moonpilot import modelbuild
+    from moonpilot import modelruntime
 
     payload = {"metadata": {"input_shapes": {"img": [1, 12, 128, 256]}}, "values": np.arange(16, dtype=np.float32).reshape(4, 4)}
     with tempfile.TemporaryFile() as handle:
       modelbuild.dump_oob(payload, handle)
       handle.seek(0)
-      loaded = load_oob(handle)
+      loaded = modelruntime._load_fork_oob(handle)
     self.assertEqual(sorted(loaded), sorted(payload))
     values = loaded["values"]
     assert isinstance(values, np.ndarray)

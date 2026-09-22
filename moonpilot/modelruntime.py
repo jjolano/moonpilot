@@ -31,20 +31,20 @@ not certain of, and `None` means "run upstream's model", which is the whole cont
   pins it at admission and the build record carries it forward.
 """
 
+import io
 import os
 import pickle
+import struct
 import time
 
 import numpy as np
 from tinygrad.tensor import Tensor
 
 from openpilot.cereal import log
-from openpilot.common.file_chunker import open_file_chunked
 from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.controls.lib.drive_helpers import smooth_value
-from openpilot.selfdrive.modeld.compile_modeld import nv12_copy_size
 from openpilot.selfdrive.modeld.constants import ModelConstants
-from openpilot.selfdrive.modeld.helpers import MODELS_DIR, get_tg_input_devices, load_oob
+from openpilot.selfdrive.modeld.helpers import MODELS_DIR
 from openpilot.selfdrive.modeld.parse_model_outputs import Parser, safe_exp, sigmoid
 from openpilot.system.camerad.cameras.nv12_info import get_nv12_info
 
@@ -52,9 +52,8 @@ from moonpilot import models
 from typing import Any
 
 SEND_RAW_PRED = os.getenv("SEND_RAW_PRED")
-
 MIN_LAT_CONTROL_SPEED = 0.3
-DM_PROCESS_NAME = "openpilot.selfdrive.modeld.dmonitoringmodeld"
+
 # The DM warp is model-independent -- it maps the camera's NV12 frame to the model's input size,
 # which the build refuses to change (`models.DM_INPUT_SIZE`) -- so it is read from the checkout
 # rather than copied into every build.
@@ -72,6 +71,20 @@ def _active(kind: str, text: str, params: Any) -> None:
 def _fallback(kind: str, reason: str, params: Any) -> None:
   cloudlog.warning(f"moonpilot models: running the bundled model, {reason}")
   _active(kind, f"stock: {reason}", params)
+
+
+def _load_fork_oob(handle):
+  """The fork `model.pkl` loader: pre-#38933 upstream `helpers.load_oob`, verbatim."""
+  opcodes = handle.read(struct.unpack("<q", handle.read(8))[0])
+
+  def buffers():
+    while chunk := handle.read(8):
+      buf = pickle.PickleBuffer(bytearray(struct.unpack("<q", chunk)[0]))
+      if handle.readinto(buf) != buf.raw().nbytes:
+        raise EOFError("incomplete model buffer")
+      yield buf
+
+  return pickle.load(io.BytesIO(opcodes), buffers=buffers())
 
 
 def _field_key(names: set[str], role: str, field: str) -> str:
@@ -123,7 +136,8 @@ class DriverModel:
   """
 
   def __init__(self, entry: dict, cam_w: int, cam_h: int):
-    payload = load_oob(open_file_chunked(os.path.join(entry["build"], "model.pkl")))
+    with open(os.path.join(entry["build"], "model.pkl"), "rb") as handle:
+      payload = _load_fork_oob(handle)
 
     self.metadata = payload["metadata"]
     self.model_device = payload["input_devices"]["model"]
@@ -146,7 +160,8 @@ class DriverModel:
       for role in self.policy_roles
     }
 
-    self.frame_copy_size = nv12_copy_size(*get_nv12_info(cam_w, cam_h)[:3])
+    stride, y_height, uv_height, _ = get_nv12_info(cam_w, cam_h)
+    self.frame_copy_size = models.nv12_copy_size(stride, y_height, uv_height)
     self.run_model = payload["run_model"][(cam_w, cam_h)]
     self.input_queues, self.npy, self.frame_views = _make_queues(self.metadata, self.model_device, self.frame_copy_size)
     self.parser = Parser()
@@ -267,7 +282,7 @@ class MonitoringModel:
     self.input_shapes = metadata["input_shapes"]
     self.output_slices = {name: slice(*bounds) for name, bounds in metadata["slices"].items()}
 
-    self.DEV = get_tg_input_devices(DM_PROCESS_NAME, chestnut=False)["DEV"]
+    self.DEV = payload["input_devices"]["model"]
     self.numpy_inputs = {"calib": np.zeros(self.input_shapes["calib"], dtype=np.float32)}
     self.warp_inputs_np = {"transform": np.zeros((3, 3), dtype=np.float32)}
     self.warp_inputs = {key: Tensor(value, device="NPY") for key, value in self.warp_inputs_np.items()}
@@ -275,7 +290,7 @@ class MonitoringModel:
     self.tensor_inputs = {key: Tensor(value, device="NPY").realize() for key, value in self.numpy_inputs.items()}
     self._blob_cache: dict[int, Tensor] = {}
     with open(os.path.join(MODELS_DIR, DM_WARP.format(w=cam_w, h=cam_h)), "rb") as handle:
-      self.image_warp = pickle.load(handle)
+      self.image_warp = pickle.load(handle)["run"]
 
   def run(self, buf, calib: np.ndarray, transform: np.ndarray) -> tuple[np.ndarray, float]:
     self.numpy_inputs["calib"][0, :] = calib
@@ -288,7 +303,7 @@ class MonitoringModel:
       self._blob_cache[ptr] = Tensor.from_blob(ptr, (self.frame_buf_params[3],), dtype="uint8", device=self.DEV)
 
     self.warp_inputs_np["transform"][:] = transform[:]
-    self.tensor_inputs["input_img"] = self.image_warp(self._blob_cache[ptr], self.warp_inputs["transform"])
+    self.tensor_inputs["input_img"] = self.image_warp(input_frame=self._blob_cache[ptr], M_inv=self.warp_inputs["transform"])
 
     output = self.model_run(**self.tensor_inputs).numpy().flatten()
 

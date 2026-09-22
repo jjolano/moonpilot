@@ -68,6 +68,12 @@ CAMERA_RESOLUTIONS = ((1928, 1208), (1344, 760))
 # The DM warp compiles to the model's own input size (openpilot/common/transformations/model.py).
 DM_INPUT_SIZE = (1440, 960)
 
+
+# The compiler and the runtime must share this one definition.
+def nv12_copy_size(stride: int, y_height: int, uv_height: int) -> int:
+  return stride * (y_height + uv_height)
+
+
 SCHEMA = 1
 
 

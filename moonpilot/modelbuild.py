@@ -10,21 +10,21 @@ device build pins the compiler to CPU 7 (`isolcpus` on AGNOS); this module does 
 `moonpilot/tests/test_modelruntime.py` fails if the two strings drift. The import order is why the
 flags are set at module import rather than in a function: `DEV=` is read when a device is opened.
 
-**The families are compiled by different code, and only the single-role one is upstream's own.**
-`comma.supercombo.v1` reuses `compile_modeld.py`'s helpers verbatim, because the fork's runtime has
-to reproduce exactly the buffers and the recurrence that model was trained against.
+**The families are compiled by different code, all of it fork-owned.** `comma.supercombo.v1` follows
+the deleted `openpilot/selfdrive/modeld/compile_modeld.py`, moved here verbatim, because the fork's
+runtime has to reproduce exactly the buffers and the recurrence that model was trained against.
 `comma.split-vision-policy.v1` and `comma.split-vision-off-on.v1` need the historical split glue,
 which no longer exists upstream: the vision member runs once, its `hidden_state` slice feeds each
 policy member's feature queue, and the JIT returns one flat tensor per role -- which is why the
 runtime merges per-role slices instead of slicing one buffer. `comma.dmonitoring.v1` is a single
-`TinyJit` over the model, pickled plainly, mirroring `tinygrad/examples/openpilot/compile3.py`.
+`TinyJit` over the model, pickled plainly.
 
 **Every queue and view is recorded, not re-derived.** The metadata written into `model.pkl` carries
 the exact shapes the JIT was captured against (`queue_shapes`, `npy_shapes`, `packed_npy_size`,
 `input_keys`), and `moonpilot/modelruntime.py` rebuilds the buffers from that record. One thing is
 deliberately *not* recorded: the packed buffer's size includes the camera's NV12 frame copy size,
 which differs per resolution, so the runtime computes it from the camera it was handed -- the same
-function the compiler uses (`nv12_copy_size(get_nv12_info(w, h))`).
+function the compiler uses (`models.nv12_copy_size`).
 
 **A half-finished build is never valid.** `build.json` is written last, from a temp directory inside
 the store, and `models.build_state` treats a build without it -- or without `model.pkl` -- as not
@@ -40,6 +40,7 @@ but `slice` in the embedded metadata pickle. The only `pickle.load` in this file
 import argparse
 import datetime
 import io
+import math
 import os
 import pickle
 import platform
@@ -48,7 +49,7 @@ import struct
 import tempfile
 import time
 from functools import partial
-from typing import Any
+from typing import Any, NamedTuple
 
 import numpy as np
 
@@ -82,19 +83,266 @@ os.environ.setdefault("GMMU", "0")  # for chestnut fast loading, noop for qcom
 
 from tinygrad.device import Device
 from tinygrad.engine.jit import TinyJit
+from tinygrad.helpers import Context
 from tinygrad.tensor import Tensor
 
-from openpilot.selfdrive.modeld.compile_modeld import (
-  MODELD_INPUTS,
-  NV12Frame,
-  compile_jit,
-  make_input_queues,
-  make_run_model,
-  make_run_policy,
-  make_warp,
-  nv12_copy_size,
-  read_file_chunked_to_disk,
-)
+
+class NV12Frame(NamedTuple):
+  """Camera frame geometry: the resolution plus what `get_nv12_info` reports. Moved from deleted
+  `openpilot/selfdrive/modeld/compile_modeld.py`; current upstream `compile_warp.py` defines the
+  same shape but lives behind `examples.openpilot.helpers`, which is not importable from the
+  project root without a path hack."""
+  width: int
+  height: int
+  stride: int
+  y_height: int
+  uv_height: int
+  size: int
+
+
+MODELD_INPUTS = ["img_q", "big_img_q", "feat_q", "desire_q", "packed_npy_inputs"]
+
+
+def read_file_chunked_to_disk(path: str) -> str:
+  """The selected ONNX as a path `OnnxRunner` can open. Deleted `file_chunker` only existed for
+  upstream's chunked checkouts; the fork's members are single files, so an unchunked path is used
+  directly and never copied to a `.unchunked` staging file."""
+  return path
+
+
+def warp_perspective_tinygrad(src_flat, M_inv, dst_shape, src_shape, stride_pad, border_fill_val=None):
+  w_dst, h_dst = dst_shape
+  h_src, w_src = src_shape
+
+  x = Tensor.arange(w_dst).reshape(1, w_dst).expand(h_dst, w_dst).reshape(-1)
+  y = Tensor.arange(h_dst).reshape(h_dst, 1).expand(h_dst, w_dst).reshape(-1)
+
+  # inline 3x3 matmul as elementwise to avoid reduce op (enables fusion with gather)
+  src_x = M_inv[0, 0] * x + M_inv[0, 1] * y + M_inv[0, 2]
+  src_y = M_inv[1, 0] * x + M_inv[1, 1] * y + M_inv[1, 2]
+  src_w = M_inv[2, 0] * x + M_inv[2, 1] * y + M_inv[2, 2]
+
+  src_x = src_x / src_w
+  src_y = src_y / src_w
+
+  x_round = Tensor.round(src_x)
+  y_round = Tensor.round(src_y)
+  x_nn_clipped = x_round.clip(0, w_src - 1).cast("int")
+  y_nn_clipped = y_round.clip(0, h_src - 1).cast("int")
+  idx = y_nn_clipped * (w_src + stride_pad) + x_nn_clipped
+  sampled = src_flat[idx]
+
+  if border_fill_val is None:
+    return sampled
+
+  in_bounds = ((x_round >= 0) & (x_round <= w_src - 1) &
+               (y_round >= 0) & (y_round <= h_src - 1)).cast(sampled.dtype)
+  return sampled * in_bounds + Tensor(border_fill_val, dtype=sampled.dtype) * (1 - in_bounds)
+
+
+def frames_to_tensor(frames):
+  H = (frames.shape[0] * 2) // 3
+  W = frames.shape[1]
+  in_img1 = Tensor.cat(frames[0:H:2, 0::2],
+                       frames[1:H:2, 0::2],
+                       frames[0:H:2, 1::2],
+                       frames[1:H:2, 1::2],
+                       frames[H:H+H//4].reshape((H//2, W//2)),
+                       frames[H+H//4:H+H//2].reshape((H//2, W//2)), dim=0).reshape((6, H//2, W//2))
+  return in_img1
+
+
+def make_frame_prepare(nv12: NV12Frame, model_w, model_h):
+  cam_w, cam_h, stride, y_height, uv_height, _ = nv12
+  uv_offset = stride * y_height
+  stride_pad = stride - cam_w
+
+  def frame_prepare_tinygrad(input_frame, M_inv):
+    M_inv = M_inv.to(Device.DEFAULT).realize()
+    # UV_SCALE @ M_inv @ UV_SCALE_INV simplifies to elementwise scaling
+    M_inv_uv = M_inv * Tensor([[1.0, 1.0, 0.5], [1.0, 1.0, 0.5], [2.0, 2.0, 1.0]], device=Device.DEFAULT)
+    # deinterleave NV12 UV plane (UVUV... -> separate U, V)
+    uv = input_frame[uv_offset:uv_offset + uv_height * stride].reshape(uv_height, stride)
+    with Context(SPLIT_REDUCEOP=0):
+      y = warp_perspective_tinygrad(input_frame[:cam_h*stride],
+                                    M_inv, (model_w, model_h),
+                                    (cam_h, cam_w), stride_pad).realize()
+      u = warp_perspective_tinygrad(uv[:cam_h//2, :cam_w:2].flatten(),
+                                    M_inv_uv, (model_w//2, model_h//2),
+                                    (cam_h//2, cam_w//2), 0).realize()
+      v = warp_perspective_tinygrad(uv[:cam_h//2, 1:cam_w:2].flatten(),
+                                    M_inv_uv, (model_w//2, model_h//2),
+                                    (cam_h//2, cam_w//2), 0).realize()
+    yuv = y.cat(u).cat(v).reshape((model_h * 3 // 2, model_w))
+    tensor = frames_to_tensor(yuv)
+    return tensor
+  return frame_prepare_tinygrad
+
+
+def get_policy_npy_shapes(input_shapes):
+  dp = input_shapes["desire_pulse"]  # (1, 25, 8)
+  tc = input_shapes["traffic_convention"]  # (1, 2)
+  at = input_shapes["action_t"]  # (1, 2)
+  fb = input_shapes["features_buffer"]  # (1, T-1, ...) e.g. (1, 24, 32, 512) with spatial features
+  feat_dim = math.prod(fb[2:])
+  # TODO prev_feat shouldn't exist and be handled inside the JIT, but corrupt on QCOM for now
+  shapes = {"desire": (dp[2],), "traffic_convention": tuple(tc), "action_t": tuple(at), "prev_feat": (fb[0], feat_dim)}
+  return shapes, [math.prod(s) for s in shapes.values()]
+
+
+def make_input_queues(input_shapes, frame_skip, device, frame_copy_size):
+  img = input_shapes["img"]  # (1, 12, 128, 256)
+  fb = input_shapes["features_buffer"]  # (1, T-1, ...), past features only; the model appends the current frame's feature
+  feat_dim = math.prod(fb[2:])
+  dp = input_shapes["desire_pulse"]  # (1, 25, 8)
+  n_frames = img[1] // 6
+  img_buf_shape = (frame_skip * (n_frames - 1) + 1, 6, img[2], img[3])
+
+  policy_shapes, _ = get_policy_npy_shapes(input_shapes)
+  shapes = {"tfm": (3, 3), "big_tfm": (3, 3)} | policy_shapes
+  sizes = [math.prod(s) for s in shapes.values()]
+  packed_npy_size = sum(sizes) * np.dtype(np.float32).itemsize
+  packed_input = np.zeros(packed_npy_size + 2 * frame_copy_size, dtype=np.uint8)
+  packed_npy_inputs = packed_input[:packed_npy_size].view(np.float32)
+  frames = packed_input[packed_npy_size:]
+  frame_views = {"img": frames[:frame_copy_size], "big_img": frames[frame_copy_size:]}
+  # views into the packed inputs, to be refilled at runtime
+  npy = {k: v.reshape(s) for (k, s), v in zip(shapes.items(), np.split(packed_npy_inputs, np.cumsum(sizes[:-1])), strict=True)}
+  input_queues = {
+    "img_q": Tensor(np.zeros(img_buf_shape, dtype=np.uint8), device=device).contiguous().realize(),
+    "big_img_q": Tensor(np.zeros(img_buf_shape, dtype=np.uint8), device=device).contiguous().realize(),
+    "feat_q": Tensor(np.zeros((frame_skip * fb[1], fb[0], feat_dim), dtype=np.float32), device=device).contiguous().realize(),
+    "desire_q": Tensor(np.zeros((frame_skip * dp[1], dp[0], dp[2]), dtype=np.float32), device=device).contiguous().realize(),
+    "packed_npy_inputs": Tensor(packed_input, device="NPY").realize(),
+  }
+  return input_queues, npy, frame_views
+
+
+def shift_and_sample(buf, new_val, sample_fn):
+  buf.assign(buf[1:].cat(new_val, dim=0).contiguous())
+  return sample_fn(buf)
+
+
+def sample_skip(buf, frame_skip):
+  return buf[::frame_skip].contiguous().flatten(0, 1).unsqueeze(0)
+
+
+def sample_desire(buf, frame_skip):
+  return buf.reshape(-1, frame_skip, *buf.shape[1:]).max(1).flatten(0, 1).unsqueeze(0)
+
+
+def make_warp(nv12, model_w, model_h):
+  frame_prepare = make_frame_prepare(nv12, model_w, model_h)
+
+  def warp(tfm, big_tfm, frame, big_frame):
+    tfm = tfm.to(Device.DEFAULT)
+    big_tfm = big_tfm.to(Device.DEFAULT)
+    frame = frame.to(Device.DEFAULT)
+    big_frame = big_frame.to(Device.DEFAULT)
+    Tensor.realize(tfm, big_tfm, frame, big_frame)
+
+    warped_frame = frame_prepare(frame, tfm).unsqueeze(0)
+    warped_big_frame = frame_prepare(big_frame, big_tfm).unsqueeze(0)
+    return Tensor.cat(warped_frame, warped_big_frame)
+
+  return warp
+
+
+def make_run_policy(model_runner, model_metadata, frame_skip):
+  sample_desire_fn = partial(sample_desire, frame_skip=frame_skip)
+  sample_skip_fn = partial(sample_skip, frame_skip=frame_skip)
+  npy_shapes, npy_sizes = get_policy_npy_shapes(model_metadata["input_shapes"])
+  model_input_dtypes = {name: spec.dtype for name, spec in model_runner.graph_inputs.items()}
+
+  def run_policy(warped, img_q, big_img_q, feat_q, desire_q, packed_npy_inputs):
+    packed_npy_inputs = packed_npy_inputs.to(Device.DEFAULT)
+    Tensor.realize(packed_npy_inputs, warped)
+
+    img = shift_and_sample(img_q, warped[0:1], sample_skip_fn)
+    big_img = shift_and_sample(big_img_q, warped[1:2], sample_skip_fn)
+
+    desire, traffic_convention, action_t, prev_feat = (t.reshape(s) for t, s in zip(packed_npy_inputs.split(npy_sizes), npy_shapes.values(), strict=True))
+    desire_buf = shift_and_sample(desire_q, desire.reshape(1, 1, -1), sample_desire_fn)
+    feat_buf = shift_and_sample(feat_q, prev_feat.reshape(1, 1, -1), sample_skip_fn)
+
+    inputs = {
+      "img": img,
+      "big_img": big_img,
+      "features_buffer": feat_buf.reshape(model_metadata["input_shapes"]["features_buffer"]),
+      "desire_pulse": desire_buf,
+      "traffic_convention": traffic_convention,
+      "action_t": action_t,
+    }
+    inputs = {name: value.cast(model_input_dtypes[name]) for name, value in inputs.items()}
+    out = next(iter(model_runner(inputs).values())).cast("float32")
+    return out,
+  return run_policy
+
+
+def make_run_model(warp, run_policy, model_metadata, frame_copy_size):
+  _, policy_sizes = get_policy_npy_shapes(model_metadata["input_shapes"])
+  packed_npy_size = (18 + sum(policy_sizes)) * np.dtype(np.float32).itemsize
+
+  def run_model(img_q, big_img_q, feat_q, desire_q, packed_npy_inputs):
+    packed_input = packed_npy_inputs.to(Device.DEFAULT)
+    Tensor.realize(packed_input)
+    packed_npy_inputs = packed_input[:packed_npy_size].bitcast("float32")
+    frame = packed_input[packed_npy_size:packed_npy_size + frame_copy_size]
+    big_frame = packed_input[packed_npy_size + frame_copy_size:]
+    tfm, big_tfm, policy_inputs = packed_npy_inputs.split([9, 9, sum(policy_sizes)])
+    warped = warp(tfm.reshape(3, 3), big_tfm.reshape(3, 3), frame, big_frame)
+    return run_policy(warped, img_q, big_img_q, feat_q, desire_q, policy_inputs)
+  return run_model
+
+
+def compile_jit(jit, input_keys, make_queues, benchmark_runs):
+  if benchmark_runs < 1:
+    raise ValueError("benchmark_runs must be at least 1")
+
+  SEED = 42
+  def random_inputs_run(fn, seed, n_runs, test_val=None, test_buffers=None, expect_match=True):
+    input_queues, npy, frame_views = make_queues(Device.DEFAULT)
+    rng = np.random.default_rng(seed)
+
+    for i in range(n_runs):
+      for v in npy.values():
+        v[:] = rng.standard_normal(v.shape).astype(v.dtype)
+      for v in frame_views.values():
+        v[:] = rng.integers(0, 256, size=v.shape, dtype=np.uint8)
+      Device.default.synchronize()
+      st = time.perf_counter()
+      outs = fn(**{k: input_queues[k] for k in input_keys})
+      mt = time.perf_counter()
+      Device.default.synchronize()
+      et = time.perf_counter()
+      print(f"  [{i+1}/{n_runs}] enqueue {(mt-st)*1e3:6.2f} ms -- total {(et-st)*1e3:6.2f} ms")
+
+      if i == 0:
+        val = [np.copy(v.numpy()) for v in outs]
+        buffers = [np.copy(v.numpy().copy()) for v in input_queues.values()]
+
+    if test_val is not None:
+      match = all(np.array_equal(a, b) for a, b in zip(val, test_val, strict=True))
+      assert match == expect_match, f"outputs {'differ from' if expect_match else 'match'} baseline (seed={seed})"
+    if test_buffers is not None:
+      match = all(np.array_equal(a, b) for a, b in zip(buffers, test_buffers, strict=True))
+      assert match == expect_match, f"buffers {'differ from' if expect_match else 'match'} baseline (seed={seed})"
+    return val, buffers
+
+  print("capture + replay")
+  test_val, test_buffers = random_inputs_run(jit, SEED, 3)
+  print(f"pickle round trip ({benchmark_runs} runs per seed)")
+  with tempfile.TemporaryFile(dir=_scratch_dir()) as f:
+    dump_oob(jit, f)
+    f.seek(0)
+    from moonpilot.modelruntime import _load_fork_oob
+    loaded_jit = _load_fork_oob(f)
+  random_inputs_run(loaded_jit, SEED, benchmark_runs, test_val, test_buffers, expect_match=True)
+  random_inputs_run(loaded_jit, SEED+1, benchmark_runs, test_val, test_buffers, expect_match=False)
+  # Keep the original so per-resolution JITs share model weight buffers in the final pickle.
+  return jit
+
+
 from openpilot.system.camerad.cameras.nv12_info import get_nv12_info
 
 from moonpilot.vendor.openmodels import metadata as onnx_metadata
@@ -123,11 +371,9 @@ def pin_compiler() -> None:
 
 
 def dump_oob(obj: Any, handle) -> None:
-  """The fork's copy of upstream `helpers.dump_oob`, with one difference: the scratch file lives in
-  the store's temp directory, not the checkout. Upstream's version uses `tempfile.TemporaryFile(dir=
-  ".")`, which on a device means writing the model's buffers into git state (AGENTS.md, Storage).
-  The format is byte-identical, and the test round-trips a fork-written file through upstream's
-  `load_oob`."""
+  """The fork's OOB writer, matching `moonpilot/modelruntime.py::_load_fork_oob`. The scratch file
+  lives in the store's temp directory, not the checkout: a checkout temp means writing the model's
+  buffers into git state (AGENTS.md, Storage)."""
   with tempfile.TemporaryFile(dir=_scratch_dir()) as tmp:
 
     def buffer_callback(pickle_buffer: pickle.PickleBuffer):
@@ -173,7 +419,7 @@ def _model_size(input_shapes: dict) -> tuple[int, int]:
 
 
 def _npy_layout(input_shapes: dict) -> tuple[list[list[Any]], list[int]]:
-  """The packed float views upstream's `make_input_queues` builds, in its order: the transforms, then
+  """The packed float views `make_input_queues` builds, in its order: the transforms, then
   the policy scalars and the recurrent feature. `sizes` is the same list in elements, so a split
   family can lay its per-role fields out with the same arithmetic."""
   desire_pulse = input_shapes["desire_pulse"]
@@ -198,7 +444,7 @@ def _product(shape) -> int:
 
 def _sfx(role: str, name: str) -> str:
   """A packed field's name for one role. Single-role families keep upstream's own names, so the
-  supercombo metadata is the metadata `compile_modeld.py` builds; a split namespaces them, because
+  supercombo metadata is the metadata `make_input_queues` builds; a split namespaces them, because
   two policy members have two `desire` views. `moonpilot/modelruntime.py` resolves either."""
   return name if role == models.SUPERCOMBO.roles[0] else f"{name}_{role}"
 
@@ -233,7 +479,7 @@ def _family_metadata(
 
 
 def _compile_supercombo(proto, members: dict[str, str], interfaces: dict[str, dict], configuration: dict, camera_resolutions, payload: dict) -> None:
-  """Upstream's own path, with the selected ONNX instead of the bundled one. The JIT it captures
+  """The single-role path, with the selected ONNX instead of the bundled one. The JIT it captures
   already returns a one-tuple, which is the tuple-of-roles contract every family follows."""
   from tinygrad.nn.onnx import OnnxRunner
 
@@ -251,7 +497,7 @@ def _compile_supercombo(proto, members: dict[str, str], interfaces: dict[str, di
   queues: list[list[Any]] = []
   for cam_w, cam_h in camera_resolutions:
     nv12 = NV12Frame(cam_w, cam_h, *get_nv12_info(cam_w, cam_h))
-    frame_copy_size = nv12_copy_size(nv12.stride, nv12.y_height, nv12.uv_height)
+    frame_copy_size = models.nv12_copy_size(nv12.stride, nv12.y_height, nv12.uv_height)
     make_queues = partial(make_input_queues, input_shapes, frame_skip, frame_copy_size=frame_copy_size)
     warp = make_warp(nv12, model_w, model_h)
     jit = TinyJit(make_run_model(warp, run_policy, {"input_shapes": input_shapes}, frame_copy_size), prune=True)
@@ -260,12 +506,12 @@ def _compile_supercombo(proto, members: dict[str, str], interfaces: dict[str, di
       queues = _queue_shapes_for_record(input_shapes, frame_skip)
 
   payload["metadata"] = _family_metadata(proto, interfaces, configuration, npy_shapes, packed_npy_size, queues, list(MODELD_INPUTS))
-  # The runtime rebuilds the queues from the record, so they have to be the two upstream built.
+  # The runtime rebuilds the queues from the record, so they have to be the two the capture built.
   assert set(vision_input_names) == {"img", "big_img"}, vision_input_names
 
 
 def _queue_shapes_for_record(input_shapes: dict, frame_skip: int) -> list[list[Any]]:
-  """The queues upstream's `make_input_queues` creates, minus the packed buffer: its size depends on
+  """The queues `make_input_queues` creates, minus the packed buffer: its size depends on
   the camera's frame copy size, so the runtime computes it from the camera it is handed."""
   img = input_shapes["img"]
   features = input_shapes["features_buffer"]
@@ -282,7 +528,7 @@ def _queue_shapes_for_record(input_shapes: dict, frame_skip: int) -> list[list[A
 
 def _compile_split(proto, members: dict[str, str], interfaces: dict[str, dict], configuration: dict,
                    camera_resolutions, payload: dict) -> None:
-  """The historical split glue, adapted to the current helpers.
+  """The historical split glue, on the moved compiler helpers.
 
   The vision member runs once per frame; its `hidden_state` slice is the feature the policy members'
   queues carry -- one queue per policy role, because two policy members may declare different
@@ -333,11 +579,11 @@ def _compile_split(proto, members: dict[str, str], interfaces: dict[str, dict], 
     queue_shapes.append([f"desire_q_{index}", [frame_skip * desire_pulse[1], desire_pulse[0], desire_pulse[2]], "float32"])
     queue_keys.extend([f"feat_q_{index}", f"desire_q_{index}"])
 
-  sample_skip_fn = partial(_sample_skip, frame_skip=frame_skip)
-  sample_desire_fn = partial(_sample_desire, frame_skip=frame_skip)
+  sample_skip_fn = partial(sample_skip, frame_skip=frame_skip)
+  sample_desire_fn = partial(sample_desire, frame_skip=frame_skip)
   hidden_slice = slice(*vision_hidden)
 
-  def make_run_policy(warp, frame_copy_size):
+  def make_split_run_policy(warp, frame_copy_size):
     """One `run_policy` per camera resolution: the warp and the frame copy size are the resolution's,
     and the JIT captured against them is what gets pickled for that resolution."""
 
@@ -350,8 +596,8 @@ def _compile_split(proto, members: dict[str, str], interfaces: dict[str, dict], 
       tfm, big_tfm, rest = floats.split([9, 9, sum(sizes) - 18])
       warped = warp(tfm.reshape(3, 3), big_tfm.reshape(3, 3), frame, big_frame)
 
-      img_tensor = _shift_and_sample(img_q, warped[0:1], sample_skip_fn)
-      big_img_tensor = _shift_and_sample(big_img_q, warped[1:2], sample_skip_fn)
+      img_tensor = shift_and_sample(img_q, warped[0:1], sample_skip_fn)
+      big_img_tensor = shift_and_sample(big_img_q, warped[1:2], sample_skip_fn)
       vision_out = next(iter(vision_runner({"img": img_tensor, "big_img": big_img_tensor}).values())).cast("float32")
       new_feature = vision_out[:, hidden_slice].reshape(1, -1).unsqueeze(0)
 
@@ -364,9 +610,9 @@ def _compile_split(proto, members: dict[str, str], interfaces: dict[str, dict], 
         values = {name: tensor.reshape(shape) for (name, shape), tensor in zip(fields, chunk, strict=True)}
         feat_q, desire_q = queues[2 * index:2 * index + 2]
         inputs = {
-          "features_buffer": _shift_and_sample(feat_q, new_feature, sample_skip_fn).reshape(
+          "features_buffer": shift_and_sample(feat_q, new_feature, sample_skip_fn).reshape(
             interfaces[role]["input_shapes"]["features_buffer"]),
-          "desire_pulse": _shift_and_sample(desire_q, values[_sfx(role, "desire")].reshape(1, 1, -1), sample_desire_fn),
+          "desire_pulse": shift_and_sample(desire_q, values[_sfx(role, "desire")].reshape(1, 1, -1), sample_desire_fn),
           "traffic_convention": values[_sfx(role, "traffic_convention")],
         }
         if _sfx(role, "action_t") in values:
@@ -382,9 +628,9 @@ def _compile_split(proto, members: dict[str, str], interfaces: dict[str, dict], 
 
   for cam_w, cam_h in camera_resolutions:
     nv12 = NV12Frame(cam_w, cam_h, *get_nv12_info(cam_w, cam_h))
-    frame_copy_size = nv12_copy_size(nv12.stride, nv12.y_height, nv12.uv_height)
+    frame_copy_size = models.nv12_copy_size(nv12.stride, nv12.y_height, nv12.uv_height)
     warp = make_warp(nv12, model_w, model_h)
-    run_policy = make_run_policy(warp, frame_copy_size)
+    run_policy = make_split_run_policy(warp, frame_copy_size)
     make_queues = partial(_make_split_queues, queue_shapes, packed_npy_size, frame_copy_size)
     jit = TinyJit(run_policy, prune=True)
     payload["run_model"][(cam_w, cam_h)] = compile_jit(jit, queue_keys + ["packed_npy_inputs"], make_queues, BENCHMARK_RUNS)
@@ -394,7 +640,7 @@ def _compile_split(proto, members: dict[str, str], interfaces: dict[str, dict], 
 
 
 def _make_split_queues(queue_shapes, packed_npy_size, frame_copy_size, device):
-  """`compile_jit`'s queue factory: the same buffers the runtime rebuilds, per camera resolution."""
+  """This module's `compile_jit` queue factory: the same buffers the runtime rebuilds, per camera resolution."""
   queues = {}
   for key, shape, dtype in queue_shapes:
     array = np.zeros(tuple(shape), dtype=np.uint8 if dtype == "uint8" else np.float32)
@@ -402,19 +648,6 @@ def _make_split_queues(queue_shapes, packed_npy_size, frame_copy_size, device):
   packed_input = np.zeros(packed_npy_size + 2 * frame_copy_size, dtype=np.uint8)
   queues["packed_npy_inputs"] = Tensor(packed_input, device="NPY").realize()
   return queues
-
-
-def _shift_and_sample(buf, new_val, sample_fn):
-  buf.assign(buf[1:].cat(new_val, dim=0).contiguous())
-  return sample_fn(buf)
-
-
-def _sample_skip(buf, frame_skip):
-  return buf[::frame_skip].contiguous().flatten(0, 1).unsqueeze(0)
-
-
-def _sample_desire(buf, frame_skip):
-  return buf.reshape(-1, frame_skip, *buf.shape[1:]).max(1).flatten(0, 1).unsqueeze(0)
 
 
 def _compile_dmonitoring(proto, members: dict[str, str], interfaces: dict[str, dict], configuration: dict, camera_resolutions, payload: dict) -> None:
@@ -527,14 +760,6 @@ def build(
     },
   )
   return directory
-
-
-def _member_record(path: str) -> dict:
-  """One member as the record keeps it: the digest and the size of the bytes that were compiled."""
-  import hashlib
-
-  with open(path, "rb") as handle:
-    return {"sha256": hashlib.file_digest(handle, "sha256").hexdigest(), "size": os.path.getsize(path)}
 
 
 def _member_record(path: str) -> dict:
