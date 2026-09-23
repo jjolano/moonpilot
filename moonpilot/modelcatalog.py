@@ -168,11 +168,25 @@ def admit(catalog, recipe: str) -> dict:
   return result
 
 
+def _model_row(candidates: list[dict]) -> dict | None:
+  """The one variant a model group shows: an admitted recipe first, then the newest.
+
+  Preferring admit over recency is deliberate -- a newer refused variant of the same model is not
+  a second thing to pick, it is the same model the driver cannot run.
+  """
+  if not candidates:
+    return None
+  return max(candidates, key=lambda e: (e["admitted"], e["updated_at"], e["name"], e["recipe"]))
+
+
 def browse_index(catalog) -> dict:
-  """The display index the panels page: one entry per recipe variant, in the order a driver wants
-  them -- newest first -- with the verdict the panel prints."""
+  """The display index the panels page: one entry per *model group* -- the admitted variant when
+  any of its recipes admit, else the newest -- sorted newest first, with the verdict the panel
+  prints. The catalog groups recipe variants under one model id; a flat per-recipe list showed the
+  same name many times and put every refused twin in front of a driver who can only pick one."""
   entries = []
   for model in catalog.models(include_archive=True):
+    candidates = []
     for variant in model["variants"]:
       recipe = variant["recipe"]
       try:
@@ -180,7 +194,7 @@ def browse_index(catalog) -> dict:
       except contracts.ContractError:
         continue
       verdict = admit(catalog, recipe)
-      entries.append(
+      candidates.append(
         {
           "recipe": recipe,
           "name": str(model.get("name", "")),
@@ -199,6 +213,8 @@ def browse_index(catalog) -> dict:
           "notes": verdict["notes"],
         }
       )
+    if (row := _model_row(candidates)) is not None:
+      entries.append(row)
   entries.sort(key=lambda e: (e["updated_at"], e["name"], e["recipe"]), reverse=True)
   return {"schema": models.SCHEMA, "revision": catalog.revision, "generated_at": catalog.data["generated_at"], "total": len(entries), "entries": entries}
 
@@ -269,5 +285,3 @@ def artifact_bytes(catalog, recipe: str) -> int:
   """What a recipe would put on disk, for the capacity check before any download starts."""
   recipe_object = catalog.resolve(recipe)
   return sum(int(member["artifact"]["size"]) for member in recipe_object.data["members"].values())
-
-

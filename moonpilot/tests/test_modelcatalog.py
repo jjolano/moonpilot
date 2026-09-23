@@ -162,10 +162,14 @@ class TestAdmission(CatalogCase):
 
 
 class TestBrowse(CatalogCase):
-  def test_the_index_is_one_entry_per_recipe_with_its_verdict(self):
+  def test_the_index_is_one_row_per_model_with_its_verdict(self):
     index = modelcatalog.browse_index(self.catalog)
-    self.assertEqual(index["total"], len(self.snapshot["entries"]))
+    groups = self.catalog.models(include_archive=True)
+    self.assertEqual(index["total"], len(groups))
+    self.assertEqual(len(index["entries"]), len(groups))
     self.assertEqual(index["revision"], self.catalog.revision)
+    recipes = [entry["recipe"] for entry in index["entries"]]
+    self.assertEqual(len(recipes), len(set(recipes)), "one row per model, not per recipe variant")
     entries = {entry["recipe"]: entry for entry in index["entries"]}
     self.assertTrue(STOCK in entries)
     self.assertTrue(entries[STOCK]["admitted"])
@@ -192,6 +196,35 @@ class TestBrowse(CatalogCase):
           "notes",
         },
       )
+
+  def test_variants_of_one_model_collapse_to_the_admitted_one(self):
+    # The fixture has no multi-variant group, so synthesize one: a newer refused twin next to the
+    # stock recipe. The row has to stay the admitted stock -- not the newer dead end.
+    groups = self.catalog.models(include_archive=True)
+    stock = next(g for g in groups if any(v["recipe"] == STOCK for v in g["variants"]))
+    twin = {**stock["variants"][0], "recipe": SPLIT_NEW_ACTION, "updated_at": "2099-01-01"}
+    merged = []
+    for group in groups:
+      if group is stock:
+        merged.append({**group, "variants": [*group["variants"], twin]})
+      else:
+        merged.append(group)
+    with mock.patch.object(self.catalog, "models", return_value=merged):
+      index = modelcatalog.browse_index(self.catalog)
+    self.assertEqual(index["total"], len(groups))
+    by_name = {entry["name"]: entry for entry in index["entries"]}
+    self.assertEqual(by_name[stock["name"]]["recipe"], STOCK, "the admitted variant must win over the newer refused twin")
+    self.assertTrue(by_name[stock["name"]]["admitted"])
+
+  def test_an_admitted_variant_beats_a_newer_refused_one(self):
+    rows = [
+      {"admitted": False, "updated_at": "2099-01-01", "name": "m", "recipe": "b" * 64},
+      {"admitted": True, "updated_at": "2020-01-01", "name": "m", "recipe": "a" * 64},
+    ]
+    picked = modelcatalog._model_row(rows)
+    assert picked is not None
+    self.assertEqual(picked["recipe"], "a" * 64)
+    self.assertIsNone(modelcatalog._model_row([]))
 
   def test_the_index_is_newest_first(self):
     index = modelcatalog.browse_index(self.catalog)

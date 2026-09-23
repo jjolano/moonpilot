@@ -291,22 +291,35 @@ class InstalledPage(Page):
 
 
 class ChooserPage(Page):
-  """One kind-filtered chooser: stock, built models, and admitted catalog models."""
+  """One kind-filtered chooser: stock, built models, and admitted catalog models, paged the same
+  way the catalog list is."""
 
   def __init__(self, params: Params, kind: str, back: Callable):
     self._params = params
     self._kind = kind
     self._back = back
+    self._page = 0
     self._choices_cache = models.chooser_entries(self._params, self._kind)
-    self._rows: list[BigButton] = []
-    super().__init__([], models.TITLE_DRIVING if kind == models.DRIVING else models.TITLE_MONITORING, models.DESCRIPTION_MODELS, back)
-    self._ensure_rows(max(1, len(self._choices_cache)))
+    self._rows = [BigButton("") for _ in range(PAGE_ROWS)]
+    for index, row in enumerate(self._rows):
+      row.set_click_callback(lambda index=index: self._select(index))
+    self._page_row = BigButton("page")
+    self._older = BigButton("older", models.LABEL_OLDER)
+    self._older.set_click_callback(lambda: self._offset(1))
+    self._newer = BigButton("newer", models.LABEL_NEWER)
+    self._newer.set_click_callback(lambda: self._offset(-1))
+    super().__init__(
+      [*self._rows, self._page_row, self._older, self._newer],
+      models.TITLE_DRIVING if kind == models.DRIVING else models.TITLE_MONITORING,
+      models.DESCRIPTION_MODELS,
+      back,
+    )
     self._update_rows()
 
   def show_event(self):
     super().show_event()
+    self._page = 0
     self._choices_cache = models.chooser_entries(self._params, self._kind)
-    self._ensure_rows(max(1, len(self._choices_cache)))
     self._update_rows()
 
   def _update_state(self):
@@ -316,17 +329,20 @@ class ChooserPage(Page):
   def _choices(self) -> list[dict | None]:
     return self._choices_cache
 
-  def _ensure_rows(self, count: int) -> None:
-    while len(self._rows) < count:
-      index = len(self._rows)
-      row = BigButton("")
-      row.set_click_callback(lambda index=index: self._select(index))
-      self._rows.append(row)
-      self._scroller.add_widgets([row])
+  def _pages(self) -> int:
+    return max(1, (len(self._choices_cache) + PAGE_ROWS - 1) // PAGE_ROWS)
+
+  def _offset(self, delta: int) -> None:
+    self._page = min(max(0, self._page + delta), self._pages() - 1)
+    self._update_rows()
 
   def _choice(self, index: int) -> dict | None:
+    position = self._page * PAGE_ROWS + index
     choices = self._choices()
-    return choices[index] if index < len(choices) else None
+    return choices[position] if position < len(choices) else None
+
+  def _present(self, index: int) -> bool:
+    return self._page * PAGE_ROWS + index < len(self._choices_cache)
 
   def _selection(self, index: int) -> str:
     choice = self._choice(index)
@@ -337,10 +353,9 @@ class ChooserPage(Page):
     self._back()
 
   def _select(self, index: int) -> None:
-    choices = self._choices()
-    if index >= len(choices):
+    if not self._present(index):
       return
-    choice = choices[index]
+    choice = self._choice(index)
     selection = "" if choice is None else models.selection_of(choice)
     if choice is not None and choice.get("state") != "built":
       _confirm(models.INSTALL_TEXT, ICON_INSTALL, lambda: self._install(selection))
@@ -350,16 +365,16 @@ class ChooserPage(Page):
     _confirm(models.CONFIRM_SELECT, ICON_INSTALL, lambda: models.select(self._params, self._kind, selection))
 
   def _update_rows(self):
+    self._page = min(self._page, self._pages() - 1)
     desired = models.desired(self._params, self._kind)
-    choices = self._choices()
-    self._ensure_rows(max(1, len(choices)))
     offroad = ui_state.is_offroad()
     for index, row in enumerate(self._rows):
-      choice = choices[index] if index < len(choices) else None
-      row.set_visible(index < len(choices))
-      row.set_enabled(offroad or choice is not None and choice.get("state") != "built")
-      if index >= len(choices):
+      present = self._present(index)
+      row.set_visible(present)
+      if not present:
         continue
+      choice = self._choice(index)
+      row.set_enabled(offroad or choice is not None and choice.get("state") != "built")
       selection = "" if choice is None else models.selection_of(choice)
       row.set_text("stock" if choice is None else str(choice.get("name") or selection[:12]))
       row.set_value(
@@ -369,3 +384,7 @@ class ChooserPage(Page):
         if selection == desired
         else models.LABEL_SELECT
       )
+    multi = self._pages() > 1
+    self._page_row.set_value(f"{self._page + 1} / {self._pages()}")
+    self._older.set_visible(multi)
+    self._newer.set_visible(multi)

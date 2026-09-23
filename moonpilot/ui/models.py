@@ -376,14 +376,15 @@ class InstalledLayout(Page):
 
 
 class ChooserLayout(Page):
-  """One kind-filtered chooser: stock, built models and admitted catalog models."""
+  """One kind-filtered chooser: stock, built models and admitted catalog models, paged the same
+  way the catalog list is."""
 
   def __init__(self, params: Params, kind: str, back: Callable):
     self._params = params
     self._kind = kind
     self._back = back
+    self._page = 0
     self._choices_cache = models.chooser_entries(self._params, self._kind)
-    choices = self._choices_cache
     rows = [
       button_item(
         lambda index=index: self._name(index),
@@ -392,18 +393,36 @@ class ChooserLayout(Page):
         callback=lambda index=index: self._select(index),
         enabled=lambda index=index: self._row_enabled(index),
       )
-      for index in range(len(choices))
+      for index in range(PAGE_ROWS)
     ]
-    self._rows = rows
-    for index, row in enumerate(rows):
-      row.set_visible(lambda index=index: self._choice(index) is not _INVALID)
+    for row in rows:
+      row.set_visible(lambda row=row: self._choice_of(row) is not _INVALID)
+    rows += [
+      text_item("page", lambda: self._page_text(), description=models.DESCRIPTION_MODELS),
+      button_item("older", models.LABEL_OLDER, callback=lambda: self._offset(1), enabled=lambda: self._pages() > 1),
+      button_item("newer", models.LABEL_NEWER, callback=lambda: self._offset(-1), enabled=lambda: self._pages() > 1),
+    ]
+    self._rows = rows[:PAGE_ROWS]
     super().__init__(rows, models.TITLE_DRIVING if kind == models.DRIVING else models.TITLE_MONITORING, models.DESCRIPTION_MODELS, back)
 
   def _choices(self) -> list[dict | None]:
     return self._choices_cache
 
+  def _pages(self) -> int:
+    return max(1, (len(self._choices_cache) + PAGE_ROWS - 1) // PAGE_ROWS)
+
+  def _offset(self, delta: int) -> None:
+    self._page = min(max(0, self._page + delta), self._pages() - 1)
+
+  def _page_text(self) -> str:
+    return f"{self._page + 1} / {self._pages()}"
+
+  def _choice_of(self, row) -> dict | None | object:
+    return self._choice(self._rows.index(row))
+
   def _choice(self, index: int) -> dict | None | object:
-    return self._choices_cache[index] if index < len(self._choices_cache) else _INVALID
+    position = self._page * PAGE_ROWS + index
+    return self._choices_cache[position] if position < len(self._choices_cache) else _INVALID
 
   def _catalog_only(self, index: int) -> bool:
     choice = self._choice(index)
