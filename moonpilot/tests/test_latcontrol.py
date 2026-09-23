@@ -1,3 +1,4 @@
+import math
 import unittest
 from typing import cast
 
@@ -12,7 +13,13 @@ from openpilot.common.constants import ACCELERATION_DUE_TO_GRAVITY
 from openpilot.common.params import Params
 from openpilot.common.realtime import DT_CTRL
 
-from moonpilot.latcontrol import MOONPILOT_JERK_LOOKAHEAD_T, MOONPILOT_KI, MoonpilotLatControlTorque, moonpilot_latcontrol
+from moonpilot.latcontrol import (
+  MOONPILOT_JERK_LOOKAHEAD_T,
+  MOONPILOT_KI,
+  MOONPILOT_MEAS_CUTOFF_HZ,
+  MoonpilotLatControlTorque,
+  moonpilot_latcontrol,
+)
 
 # A request small enough that the controller runs inside its own limits, so the integrator
 # is not anti-windup frozen at zero (the PID freezes it once the sum clips).
@@ -208,6 +215,53 @@ class TestMoonpilotLatControlTorque(unittest.TestCase):
 
     self.assertIsNone(moonpilot_latcontrol(CP, CI, DT_CTRL, _params(on=False)))
     self.assertIsInstance(moonpilot_latcontrol(CP, CI, DT_CTRL, _params(on=True)), MoonpilotLatControlTorque)
+
+  def test_measurement_filter_rejects_a_single_frame_angle_spike(self):
+    """A road step on steeringAngleDeg must not land whole in feedback: friction tracks error
+    and was the term driving torque sign-flips on a rough-highway route."""
+    lac, VM, _ = _controller()
+    CS, params = _state(25.0), log.VehicleParameters.new_message()
+    _run(lac, VM, CS, params, 100, desired_curvature=0.0)
+    self.assertEqual(lac.meas_filter.x, 0.0)
+
+    CS.steeringAngleDeg = 2.0
+    raw = -VM.calc_curvature(math.radians(2.0), 25.0, 0.0) * 25.0**2
+    lac_log = _run(lac, VM, CS, params, 1)
+    # First frame of an 8 Hz RC at 100 Hz: alpha ~ 0.33 of the step, not the whole thing.
+    self.assertLess(abs(lac_log.actualLateralAccel), 0.5 * abs(raw))
+    self.assertGreater(abs(lac_log.actualLateralAccel), 0.1 * abs(raw))
+
+    # Held, it converges to the raw measurement — the filter is a lag, not a clamp.
+    lac_log = _run(lac, VM, CS, params, 200)
+    self.assertAlmostEqual(lac_log.actualLateralAccel, raw, delta=0.05 * abs(raw))
+
+    # And it keeps tracking the wheel across a reset, like the delay line.
+    CS.steeringAngleDeg = 0.0
+    _run(lac, VM, CS, params, 100)
+    lac.reset()
+    lac_log = _run(lac, VM, CS, params, 1)
+    self.assertAlmostEqual(lac_log.actualLateralAccel, 0.0, delta=0.05 * abs(raw))
+    self.assertEqual(MOONPILOT_MEAS_CUTOFF_HZ, 8.0)
+
+  def test_angle_square_wave_does_not_flip_output_every_frame(self):
+    """High-frequency angle noise (the bump signature) must not produce a torque sign-flip
+    per half-cycle once the measurement is low-passed."""
+    lac, VM, _ = _controller()
+    CS, params = _state(25.0), log.VehicleParameters.new_message()
+    _run(lac, VM, CS, params, 100, desired_curvature=LINEAR_REQUEST)
+
+    torques: list[float] = []
+    for i in range(100):
+      CS.steeringAngleDeg = 1.5 if (i // 2) % 2 == 0 else -1.5
+      _run(lac, VM, CS, params, 1, desired_curvature=LINEAR_REQUEST, torques=torques)
+
+    flips = sum(
+      1 for a, b in zip(torques, torques[1:], strict=False)
+      if abs(a) > 1e-4 and abs(b) > 1e-4 and (a > 0) != (b > 0)
+    )
+    # Unfiltered, each 2-frame half-cycle of ±1.5° at 25 m/s is a multi-m/s² measurement step
+    # and would flip every cycle (up to 50). The LPF must keep that well under half.
+    self.assertLess(flips, 25)
 
 
 if __name__ == "__main__":

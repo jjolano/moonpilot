@@ -45,6 +45,9 @@ MOONPILOT_JERK_GAIN = 0.3  # how much anticipated jerk counts as error when brea
 MOONPILOT_JERK_LOOKAHEAD_T = 0.19  # s ahead of the delayed setpoint the jerk is read at
 MOONPILOT_BUFFER_SECONDS = 1.0  # ceiling on the steering delay this can match
 MOONPILOT_INTEGRATOR_MIN_SPEED = 5.0  # m/s; below it the angle measurement is too coarse to integrate
+# Road steps kick steeringAngleDeg hard enough that the friction feedforward (corr ~0.9 with
+# output on a rough-highway route) chases them and weaves; a few Hz still tracks real cornering.
+MOONPILOT_MEAS_CUTOFF_HZ = 8.0
 MOONPILOT_VERSION = 1000  # logged; a fork band upstream's counter will not reach
 
 
@@ -63,6 +66,7 @@ class MoonpilotLatControlTorque(LatControl):
     self.buffer_len = int(MOONPILOT_BUFFER_SECONDS / self.dt)
     self.requests = deque([0.0] * self.buffer_len, maxlen=self.buffer_len)
     self.jerk_filter = FirstOrderFilter(0.0, 1 / (2 * np.pi * MOONPILOT_JERK_CUTOFF_HZ), self.dt)
+    self.meas_filter = FirstOrderFilter(0.0, 1 / (2 * np.pi * MOONPILOT_MEAS_CUTOFF_HZ), self.dt)
 
   def update_torque_parameters(self, latAccelFactor, latAccelOffset, friction):
     # controlsd calls this whenever torqued publishes a new fit; the limits move with the factor.
@@ -82,6 +86,8 @@ class MoonpilotLatControlTorque(LatControl):
     super().reset()
     self.pid.reset()
     self.jerk_filter.x = 0.0
+    # The measurement filter is not reset: it keeps tracking the wheel while inactive, the same
+    # way the delay line does, so re-engaging does not start from a stale zero.
 
   def _setpoint(self, lat_delay: float) -> float:
     # The request that should be showing up in the measurement now. lateralDelay is continuous,
@@ -105,7 +111,9 @@ class MoonpilotLatControlTorque(LatControl):
     torque_log.version = MOONPILOT_VERSION
 
     measured_curvature = -VM.calc_curvature(math.radians(CS.steeringAngleDeg - params.angleOffsetDeg), CS.vEgo, params.roll)
-    measured_lat_accel = measured_curvature * CS.vEgo**2
+    # Raw is what the road put on the sensor; the filter is what feedback (P and friction) sees.
+    measured_lat_accel_raw = measured_curvature * CS.vEgo**2
+    measured_lat_accel = self.meas_filter.update(measured_lat_accel_raw)
     desired_lat_accel = desired_curvature * CS.vEgo**2
     # Fed whether or not lateral is active, so the delay line is warm on engage.
     self.requests.append(desired_lat_accel)
