@@ -88,7 +88,7 @@ with car.CarParams.from_bytes(raw) as CP:
    cruise main switch the panda arms on openpilot's own engaged heartbeat, so a car outside
    Toyota/Honda/Volkswagen is in scope and a missing `controlsAllowedLateral` there means the
    heartbeat, not the car, is the thing to look at.
-   AGENTS.md, **The lateral controller** and **Lateral-only engagement**, hold the exact ceilings.
+   AGENTS.md and `moonpilot/docs/engage.md` (with AGENTS.md's **The lateral controller**), hold the exact ceilings.
    `safetyParam` is a bitfield: `0x1049` on this RAV4 is the Toyota TSS2 flag plus the fork's
    `LATERAL_ENGAGE` (`16 << 8`), so the fork's safety param is present on the car.
 4. If the param looks right and the car qualifies, the behaviour is picked once at construction,

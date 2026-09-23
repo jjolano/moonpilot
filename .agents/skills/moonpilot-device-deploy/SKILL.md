@@ -100,5 +100,5 @@ turn the param on and copy the outgoing daemon's state file to
 `/data/moonpilot/tailscale/tailscaled.state` (root-owned, mode 600) — that file carries the node
 identity, so the tailnet name and IP survive. The fork's supervisor installs its own pinned client
 and restarts the daemon from there; the mechanism is `moonpilot/tailscale.py` and AGENTS.md,
-*A binary the device doesn't ship*. `device-status.sh` prints the state file and
+`moonpilot/docs/tailscale.md`. `device-status.sh` prints the state file and
 `MoonpilotTailscaleStatus`, which is how you confirm it reconnected.

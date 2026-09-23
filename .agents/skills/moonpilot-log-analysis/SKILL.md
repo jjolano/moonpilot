@@ -79,7 +79,7 @@ Prints `{'carState': 5809, 'modelV2': 1200, 'radarState': 1200, 'can': 6000}` an
   conventions; AGENTS.md **Features** says what they are for.
 - `pandaStates[].controlsAllowedLateral` (`cereal/log.capnp:573`) and the `lateralEngageOff`
   onroad event (`log.capnp:120`) — the half-engagement state, AGENTS.md
-  **Lateral-only engagement**. The seam table there maps each field to the file that writes it.
+  `moonpilot/docs/engage.md`. The seam table in AGENTS.md maps each field to the file that writes it.
 
 ## Patterns worth keeping
 

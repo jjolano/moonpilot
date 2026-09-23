@@ -590,7 +590,7 @@ class TestWorkerPredicate(unittest.TestCase):
 class TestDeclaredSmoothing(unittest.TestCase):
   """One number for the model's timing: modeld decodes with the selection's declared smoothing, and
   controlsd's curvature reference and torque controller must time against that same value rather than
-  modeld's module default (AGENTS.md, **The model marketplace**)."""
+  modeld's module default (moonpilot/docs/models.md)."""
 
   def test_the_boot_snapshot_carries_the_declared_value(self):
     params = FakeParams()
