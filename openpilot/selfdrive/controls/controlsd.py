@@ -140,7 +140,7 @@ class Controls:
     else:
       new_desired_curvature = model_v2.action.desiredCurvature if CC.latActive else self.curvature
     if self.curvature_reference is not None and CC.latActive and not self.sm.valid['lateralManeuverPlan']:  # moonpilot seam, see AGENTS.md
-      new_desired_curvature = self.curvature_reference.update(
+      new_desired_curvature = self.curvature_reference(
         model_v2, new_desired_curvature, v_ego=CS.vEgo, lat_delay=self.sm['lateralDelay'].lateralDelay + self.moonpilot_lat_smooth,
         model_recv_time=self.sm.recv_time['modelV2'], now=self.sm.recv_time['selfdriveState'],
         model_valid=self.sm.valid['modelV2'] and self.sm.alive['modelV2'])

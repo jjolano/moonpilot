@@ -27,28 +27,10 @@ from unittest import mock
 import numpy as np
 
 from moonpilot import models
+from moonpilot.tests.test_models import FakeParams
 
 ROOT = Path(__file__).resolve().parents[2]
 RECIPE = "a" * 64
-
-
-class FakeParams:
-  """`Params` as the fork reads it, without the param service: the declared default when asked,
-  `None` otherwise."""
-
-  def __init__(self, values: dict | None = None):
-    self.values = dict(values or {})
-
-  def get(self, key, block=False, return_default=False):
-    if key in self.values:
-      return self.values[key]
-    return "" if return_default and key in (models.DRIVING_KEY, models.MONITORING_KEY) else None
-
-  def put(self, key, value, block=False):
-    self.values[key] = value
-
-  def remove(self, key):
-    self.values.pop(key, None)
 
 
 class PrevAction:

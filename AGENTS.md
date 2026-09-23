@@ -12,7 +12,6 @@ New fork behavior: write it under `moonpilot/`, hook it at the seam that already
 
 | Upstream file | Seam |
 | --- | --- |
-| `SConstruct` | `SConscript(['moonpilot/SConscript'])` — fork native targets |
 | `pyproject.toml` | `moonpilot` in the hatch wheel packages, so `import moonpilot` resolves; `moonpilot/vendor/openmodels/*` in the codespell `skip`, because that copy is third-party text with third-party spelling |
 | `scripts/lint/lint.sh` | ruff / ty / `git ls-files` cover `moonpilot/` |
 | `tools/test_runner.py` | `moonpilot` in the default test targets |
@@ -55,7 +54,7 @@ Pick by need — reuse a seam, never invent one:
 - Setting or small persisted value → a row in `moonpilot/params_keys.h`, named `Moonpilot*`. Anything bigger goes to a root from `moonpilot/paths.py` — see **Storage** below.
 - Long-running work → `MOONPILOT_PROCS` in `moonpilot/procs.py`. The name must be unique (`test_manager.test_duplicate_procs`).
 - State other components observe → fill in `MoonpilotState`, then publish `moonpilotState`. Add a row to `openpilot/cereal/services.py` only once a publisher exists — that file then joins the table above and `ALLOWED`.
-- Native binary → `moonpilot/SConscript`.
+- Native binary → no seam yet: add a `SConscript([...])` line to `SConstruct`, with its row in the table above and in `ALLOWED`.
 - UI → a panel under `moonpilot/ui/`, registered in **both** UI trees.
 
 ## Features
@@ -153,7 +152,7 @@ The control law is upstream's family — feedforward in lateral acceleration, PI
 
 ### The rolling-window ego correction
 
-`moonpilot/slam.py` blends the wheel-speed/gyro prior against camera odometry over a 5 s window and publishes the disagreement as `moonpilotState.egoCorrection`, which the longitudinal planner adds to `v_ego` — one added number, so the pass-through case (off, invalid, stale, dead publisher) is the stock planner exactly. One process publishes `moonpilotState` and it is `leadd`; a second publisher would take the leads down with it. The correction is `smoothed minus the raw prior` (sign load-bearing), the gate is live not restart-gated, and a standstill gets nothing. `moonpilot/tests/test_slam.py` pins the sign, clamps, staleness and frame conversion. Full details: `moonpilot/docs/slam.md`.
+`moonpilot/slam.py` blends the wheel-speed prior against camera odometry's forward translation over a 5 s window and publishes the disagreement as `moonpilotState.egoCorrection`, which the longitudinal planner adds to `v_ego` — one added number, so the pass-through case (off, invalid, stale, dead publisher) is the stock planner exactly. One process publishes `moonpilotState` and it is `leadd`; a second publisher would take the leads down with it. The correction is `smoothed minus the raw prior` (sign load-bearing), the gate is live not restart-gated, and a standstill gets nothing. `moonpilot/tests/test_slam.py` pins the sign, clamps, staleness and calibration ingest. Full details: `moonpilot/docs/slam.md`.
 
 ### Lateral-only engagement
 
@@ -332,14 +331,14 @@ The `import` line is not decoration. Upstream renaming a symbol the fork imports
 | Upstream does | Merge | Action |
 | --- | --- | --- |
 | Rewrites a line a seam sits on — the brand string, `COMMA_VERSION`, the wheel `packages` list, a `PanelType` entry | conflict | take upstream's version on their line, keep the fork's intent on ours, re-add the `# moonpilot` marker |
-| Adds rows/lines near a seam — a param, a proc, a `SConscript`, a settings panel | usually clean | rebuild and re-check. A new settings panel is clean to merge but shifts the fork panel down the tizi sidebar (it sits at y 960–1070 of 1080); re-verify it is not clipped. The mici scroller scrolls, so it absorbs the extra entry |
+| Adds rows/lines near a seam — a param, a proc, a settings panel | usually clean | rebuild and re-check. A new settings panel is clean to merge but shifts the fork panel down the tizi sidebar (it sits at y 960–1070 of 1080); re-verify it is not clipped. The mici scroller scrolls, so it absorbs the extra entry |
 | Renames or removes a symbol the fork imports | clean | the `import moonpilot…` line fails. Fix `moonpilot/`, never upstream |
 | Deletes a file the fork hooked | modify/delete conflict | re-attach the seam at the nearest equivalent point, then drop the dead row from the table above and from `ALLOWED` — upstream's commit reaches the merge base with the merge, so the path leaves the diff then and the row goes with it |
 | Renames or restructures the safety layer the fork forked | clean in the superproject | the fork's `opendbc_repo` merge is where it lands, and `moonpilot/engage.py` is what breaks if a symbol it imports is gone. Merge the submodule first, then the superproject |
 | Adds its own `AGENTS.md` | add/add conflict | this file stays fork-owned; fold in anything useful from upstream's |
 | Wants a reserved struct or param name the fork also uses | conflict | upstream's ids and names win — move the fork to the next free `CustomReservedN`, never the reverse |
 
-Last 2000 upstream commits, per seam file: `pyproject.toml` (391) and `SConstruct` (320) move almost weekly, so those two conflict most; `cereal/log.capnp` (31), `common/params_keys.h` (18) and `scripts/lint/lint.sh` (16) are moderate; `process_config.py`, the UI settings panels, `home.py`, `version.h`, `custom.capnp` and `controlsd.py` have moved 2–7 times. A new seam is a permanent recurring conflict surface — add one only when no existing seam reaches.
+Last 2000 upstream commits, per seam file: `pyproject.toml` (391) moves almost weekly, so it conflicts most; `cereal/log.capnp` (31), `common/params_keys.h` (18) and `scripts/lint/lint.sh` (16) are moderate; `process_config.py`, the UI settings panels, `home.py`, `version.h`, `custom.capnp` and `controlsd.py` have moved 2–7 times. A new seam is a permanent recurring conflict surface — add one only when no existing seam reaches; `SConstruct` (320) would be as bad as `pyproject.toml`.
 
 ## Working here
 

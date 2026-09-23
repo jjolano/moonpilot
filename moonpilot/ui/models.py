@@ -251,34 +251,23 @@ class CatalogLayout(Page):
       )
       for index in range(PAGE_ROWS)
     ]
-    for row in rows[2:]:
-      row.set_visible(lambda row=row: self._entry_of(row) is not None)
+    for index, row in enumerate(rows[2:]):
+      row.set_visible(lambda index=index: self._entry_at(index) is not None)
     rows += [
       text_item("page", lambda: self._page_text(), description=models.DESCRIPTION_BROWSE),
       button_item("older", models.LABEL_OLDER, callback=lambda: self._offset(1), enabled=lambda: self._pages() > 1),
       button_item("newer", models.LABEL_NEWER, callback=lambda: self._offset(-1), enabled=lambda: self._pages() > 1),
     ]
-    self._rows = rows[2 : 2 + PAGE_ROWS]
     super().__init__(rows, models.TITLE_BROWSE, models.DESCRIPTION_BROWSE, back)
 
   def _status(self) -> dict:
     return models.status(self._params)
 
   def _entries(self) -> list[dict]:
-    entries = [entry for entry in models.browse().get("entries", []) if entry.get("admitted")]
-    kind = KIND_FILTERS[self._kind]
-    return entries if kind == models.FILTER_ALL else [entry for entry in entries if entry.get("kind") == kind]
+    return models.admitted_entries(KIND_FILTERS[self._kind])
 
   def _pages(self) -> int:
-    return max(1, (len(self._entries()) + PAGE_ROWS - 1) // PAGE_ROWS)
-
-  def _index_of(self, row) -> int:
-    return self._rows.index(row)
-
-  def _entry_of(self, row) -> dict | None:
-    entries = self._entries()
-    position = self._page * PAGE_ROWS + self._index_of(row)
-    return entries[position] if position < len(entries) else None
+    return models.page_count(self._entries(), PAGE_ROWS)
 
   def _installed(self) -> set[str]:
     return {models.selection_of(entry) for entry in self._status()["installed"]}
@@ -300,9 +289,7 @@ class CatalogLayout(Page):
     return entry is not None and models.selection_of(entry) not in self._installed()
 
   def _entry_at(self, index: int) -> dict | None:
-    entries = self._entries()
-    position = self._page * PAGE_ROWS + index
-    return entries[position] if position < len(entries) else None
+    return models.page_item(self._entries(), self._page, PAGE_ROWS, index)
 
   def _page_text(self) -> str:
     if not self._entries():
@@ -313,7 +300,7 @@ class CatalogLayout(Page):
     self._kind, self._page = index, 0
 
   def _offset(self, delta: int) -> None:
-    self._page = min(max(0, self._page + delta), self._pages() - 1)
+    self._page = models.clamp_page(self._entries(), self._page + delta, PAGE_ROWS)
 
   def _install(self, index: int) -> None:
     entry = self._entry_at(index)
@@ -352,8 +339,7 @@ class InstalledLayout(Page):
     super().__init__(rows, models.TITLE_INSTALLED, models.DESCRIPTION_INSTALLED, back)
 
   def _entry(self, index: int) -> dict | None:
-    entries = models.status(self._params)["installed"]
-    return entries[index] if index < len(entries) else None
+    return models.page_item(models.status(self._params)["installed"], 0, INSTALLED_ROWS, index)
 
   def _name(self, index: int) -> str:
     entry = self._entry(index)
@@ -395,34 +381,26 @@ class ChooserLayout(Page):
       )
       for index in range(PAGE_ROWS)
     ]
-    for row in rows:
-      row.set_visible(lambda row=row: self._choice_of(row) is not _INVALID)
+    for index, row in enumerate(rows):
+      row.set_visible(lambda index=index: self._choice(index) is not _INVALID)
     rows += [
       text_item("page", lambda: self._page_text(), description=models.DESCRIPTION_MODELS),
       button_item("older", models.LABEL_OLDER, callback=lambda: self._offset(1), enabled=lambda: self._pages() > 1),
       button_item("newer", models.LABEL_NEWER, callback=lambda: self._offset(-1), enabled=lambda: self._pages() > 1),
     ]
-    self._rows = rows[:PAGE_ROWS]
     super().__init__(rows, models.TITLE_DRIVING if kind == models.DRIVING else models.TITLE_MONITORING, models.DESCRIPTION_MODELS, back)
 
-  def _choices(self) -> list[dict | None]:
-    return self._choices_cache
-
   def _pages(self) -> int:
-    return max(1, (len(self._choices_cache) + PAGE_ROWS - 1) // PAGE_ROWS)
+    return models.page_count(self._choices_cache, PAGE_ROWS)
 
   def _offset(self, delta: int) -> None:
-    self._page = min(max(0, self._page + delta), self._pages() - 1)
+    self._page = models.clamp_page(self._choices_cache, self._page + delta, PAGE_ROWS)
 
   def _page_text(self) -> str:
     return f"{self._page + 1} / {self._pages()}"
 
-  def _choice_of(self, row) -> dict | None | object:
-    return self._choice(self._rows.index(row))
-
   def _choice(self, index: int) -> dict | None | object:
-    position = self._page * PAGE_ROWS + index
-    return self._choices_cache[position] if position < len(self._choices_cache) else _INVALID
+    return models.page_item(self._choices_cache, self._page, PAGE_ROWS, index, _INVALID)
 
   def _catalog_only(self, index: int) -> bool:
     choice = self._choice(index)

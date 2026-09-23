@@ -9,7 +9,6 @@ import itertools
 import math
 import unittest
 from pathlib import Path
-from typing import cast
 from unittest import mock
 
 import numpy as np
@@ -20,7 +19,6 @@ from opendbc.car.interfaces import ACCEL_MIN
 from opendbc.car.structs import car
 from opendbc.car.vehicle_model import VehicleModel
 from openpilot.cereal import custom, log, messaging
-from openpilot.common.params import Params
 from openpilot.common.constants import CV
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.controls.lib.drive_helpers import CONTROL_N
@@ -100,6 +98,7 @@ from moonpilot.longitudinal import (
   required_decel,
   stopping_decel,
 )
+from moonpilot.tests.fakes import _params
 
 Personality = log.LongitudinalPersonality
 Source = log.LongitudinalPlan.LongitudinalPlanSource
@@ -108,29 +107,6 @@ COAST_DESCENT_PITCH = -0.1
 COAST_CLIMB_PITCH = 0.1
 COAST_SET_SPEED = 30.0
 COAST_SUBTHRESHOLD_PITCH = 0.06  # ~6 %: the latest route's moderate grade, below the high-grade gate
-
-
-class FakeParams:
-  """Duck-typed stand-in for Params, so the tests never touch the real param store.
-
-  `on` is the answer for every key, which is what keeps a test that only cares about one feature
-  readable; `overrides` names a single key when a test needs one feature off and the rest on. `puts`
-  records what the planner persisted, which is the only way to see `_persist_lat_scale` from here."""
-
-  def __init__(self, on=True, overrides=None):
-    self._on = on
-    self._overrides = dict(overrides or {})
-    self.puts: dict[str, float] = {}
-
-  def get(self, key, return_default=False):
-    return self._overrides.get(key, self._on)
-
-  def put(self, key, value, block=False):
-    self.puts[key] = value
-
-
-def _params(on=True, overrides=None) -> Params:
-  return cast(Params, FakeParams(on, overrides))
 
 
 def _admission(v_ego):

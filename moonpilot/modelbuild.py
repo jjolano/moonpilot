@@ -5,10 +5,10 @@
 the only module that runs tinygrad's compiler. Five things are not obvious.
 
 **The tinygrad flags are the SConscript's, and they must be in the environment before tinygrad is
-imported.** `openpilot/selfdrive/modeld/SConscript` prefixes its compile commands with them and the
-device build pins the compiler to CPU 7 (`isolcpus` on AGNOS); this module does the same, and
-`moonpilot/tests/test_modelruntime.py` fails if the two strings drift. The import order is why the
-flags are set at module import rather than in a function: `DEV=` is read when a device is opened.
+imported.** `openpilot/selfdrive/modeld/SConscript` prefixes its compile commands with them; this
+module sets the same ones, and `moonpilot/tests/test_modelruntime.py` fails if the two strings
+drift. The import order is why the flags are set at module import rather than in a function: `DEV=`
+is read when a device is opened.
 
 **The families are compiled by different code, all of it fork-owned.** `comma.supercombo.v1` follows
 the deleted `openpilot/selfdrive/modeld/compile_modeld.py`, moved here verbatim, because the fork's
@@ -103,14 +103,7 @@ class NV12Frame(NamedTuple):
 MODELD_INPUTS = ["img_q", "big_img_q", "feat_q", "desire_q", "packed_npy_inputs"]
 
 
-def read_file_chunked_to_disk(path: str) -> str:
-  """The selected ONNX as a path `OnnxRunner` can open. Deleted `file_chunker` only existed for
-  upstream's chunked checkouts; the fork's members are single files, so an unchunked path is used
-  directly and never copied to a `.unchunked` staging file."""
-  return path
-
-
-def warp_perspective_tinygrad(src_flat, M_inv, dst_shape, src_shape, stride_pad, border_fill_val=None):
+def warp_perspective_tinygrad(src_flat, M_inv, dst_shape, src_shape, stride_pad):
   w_dst, h_dst = dst_shape
   h_src, w_src = src_shape
 
@@ -130,14 +123,7 @@ def warp_perspective_tinygrad(src_flat, M_inv, dst_shape, src_shape, stride_pad,
   x_nn_clipped = x_round.clip(0, w_src - 1).cast("int")
   y_nn_clipped = y_round.clip(0, h_src - 1).cast("int")
   idx = y_nn_clipped * (w_src + stride_pad) + x_nn_clipped
-  sampled = src_flat[idx]
-
-  if border_fill_val is None:
-    return sampled
-
-  in_bounds = ((x_round >= 0) & (x_round <= w_src - 1) &
-               (y_round >= 0) & (y_round <= h_src - 1)).cast(sampled.dtype)
-  return sampled * in_bounds + Tensor(border_fill_val, dtype=sampled.dtype) * (1 - in_bounds)
+  return src_flat[idx]
 
 
 def frames_to_tensor(frames):
@@ -350,26 +336,6 @@ from moonpilot.vendor.openmodels import metadata as onnx_metadata
 BENCHMARK_RUNS = 1
 
 
-def prepare_environment() -> None:
-  """Idempotent: the flags are already set at import, and this is for a caller that wants to be
-  explicit about it before touching anything."""
-  for flag in TG_FLAGS.split():
-    name, value = flag.split("=", 1)
-    os.environ.setdefault(name, value)
-
-
-def pin_compiler() -> None:
-  """The SConscript pins the device's compiler to CPU 7, which AGNOS isolates; the worker's own
-  compile should not compete with realtime processes either. Best effort on purpose: a container
-  whose affinity mask excludes CPU 7 keeps whatever scheduling it had."""
-  if platform.machine() not in ("aarch64", "arm64"):
-    return
-  try:
-    os.sched_setaffinity(0, {7})
-  except (AttributeError, OSError):
-    pass
-
-
 def dump_oob(obj: Any, handle) -> None:
   """The fork's OOB writer, matching `moonpilot/modelruntime.py::_load_fork_oob`. The scratch file
   lives in the store's temp directory, not the checkout: a checkout temp means writing the model's
@@ -487,7 +453,7 @@ def _compile_supercombo(proto, members: dict[str, str], interfaces: dict[str, di
   input_shapes = interfaces[role]["input_shapes"]
   frame_skip = int(configuration["frame_skip"])
   model_w, model_h = _model_size(input_shapes)
-  runner = OnnxRunner(read_file_chunked_to_disk(members[role]))
+  runner = OnnxRunner(members[role])
   run_policy = make_run_policy(runner, {"input_shapes": input_shapes}, frame_skip)
 
   shapes, sizes = _npy_layout(input_shapes)
@@ -550,8 +516,8 @@ def _compile_split(proto, members: dict[str, str], interfaces: dict[str, dict], 
   vision_hidden = interfaces[vision_role]["slices"]["hidden_state"]
   model_w, model_h = _model_size(vision_shapes)
 
-  vision_runner = OnnxRunner(read_file_chunked_to_disk(members[vision_role]))
-  policy_runners = {role: OnnxRunner(read_file_chunked_to_disk(members[role])) for role in policy_roles}
+  vision_runner = OnnxRunner(members[vision_role])
+  policy_runners = {role: OnnxRunner(members[role]) for role in policy_roles}
   input_dtypes = {role: {name: spec.dtype for name, spec in policy_runners[role].graph_inputs.items()} for role in policy_roles}
 
   # The packed layout, in call order: the transforms, then each policy role's fields.
@@ -665,7 +631,7 @@ def _compile_dmonitoring(proto, members: dict[str, str], interfaces: dict[str, d
   if input_img is None or int(_product(input_img)) != int(_product(models.DM_INPUT_SIZE)):
     raise ValueError(f"input_img {input_img} is not the {models.DM_INPUT_SIZE} the DM warp produces")
 
-  runner = OnnxRunner(read_file_chunked_to_disk(members[role]))
+  runner = OnnxRunner(members[role])
 
   # The parameter names and their order are the runtime's: `dmonitoringmodeld` calls the loaded JIT
   # with `**self.tensor_inputs`, which is `{'calib': ..., 'input_img': ...}`. A JIT is captured

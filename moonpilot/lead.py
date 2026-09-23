@@ -37,6 +37,11 @@ MOONPILOT_INPATH_HORIZON = 4.0  # s; the last sample the grid is evaluated at, a
 # the planner can act on. The renderers stop their lead line here too: past it the model's own
 # yStd is ~1 m and the drawn 10 s tail landed beyond the white path's own 100 m cap.
 MOONPILOT_INPATH_GRID = np.arange(0.0, MOONPILOT_INPATH_HORIZON + 1e-9, 0.25)
+# The renderers' lead path line. Width, not alpha, carries the model's uncertainty -- a faint band at a
+# fixed 1 m read as a squiggle rather than as a measurement, and yStd is the model's own answer to
+# "how much do I know here".
+MOONPILOT_LEAD_PATH_PX_PER_M = 8.0  # px of line width per meter of yStd
+MOONPILOT_LEAD_PATH_WIDTH = (2.0, 18.0)  # px clamp
 # The model's own confidence in a slot, below which normalize_lead publishes it as empty rather
 # than as a lead. radard refuses a vision lead at this same threshold (radard.py:156-165) — and, as
 # there, only behind an asymmetric filter (MOONPILOT_LEAD_PROB_RC), because slot 0 crosses it in
@@ -404,3 +409,48 @@ def nearest_lead_in_path(sm) -> float:
   if leads is None or len(leads) == 0 or not leads[0].present:
     return 1.0
   return float(leads[0].inPath)
+
+
+_NO_LEAD_LINE = (np.empty((0, 3), dtype=np.float32), np.empty((0, 2), dtype=np.float32), np.empty((0,), dtype=np.float32), 1.0)
+
+
+def lead_path_line(renderer, moonpilot_state, path_x, params):
+  """The nearest lead's predicted path projected into a line, out to the planner's horizon.
+
+  `renderer` is either tree's ModelRenderer, duck-typed so this module imports no UI: its ego path
+  gives the line its z and its own `_map_to_screen` projects it. `moonpilot_state` is None when the
+  message is invalid or its publisher dead. Returns (raw_points, projected_points, widths, in_path),
+  with every array empty and in_path 1.0 when there is no line to draw.
+  """
+  # Off with the feature: the line shows the inPath the fork planner acts on, so with upstream's
+  # MPC back in the line there is no decision on screen to visualize. Cleared rather than skipped,
+  # so a line drawn before the toggle went off does not linger.
+  lead = moonpilot_state.leads[0] if moonpilot_state is not None and len(moonpilot_state.leads) else None
+  if lead is None or not lead.present or len(lead.x) < 2 or not enabled(LEAD_LATERAL, params):
+    return _NO_LEAD_LINE
+
+  # Densify with the same helper the planner path uses, so both agree on the shape, and stop at
+  # the horizon the planner reads: the 6-10 s tail is drawn from samples the model itself rates
+  # +-1 m on, and it landed past the end of the white path. y is negated back into the model's
+  # right-positive convention the projection works in.
+  t_dense = np.arange(0.0, MOONPILOT_INPATH_HORIZON + 1e-9, 0.5)
+  x_d = resample(lead.t, lead.x, t_dense)
+  y_d = -resample(lead.t, lead.y, t_dense)
+  if x_d.size < 2 or y_d.size < 2:  # resample()'s answer to a lead with a single sample
+    return _NO_LEAD_LINE
+  s_d = resample(lead.t, lead.yStd, t_dense) if len(lead.yStd) == len(lead.t) else np.full(t_dense.shape, MOONPILOT_MIN_Y_STD)
+  # z follows the ego path at the lead's distance.
+  z = np.array([renderer._path.raw_points[renderer._get_path_length_idx(path_x, x), 2] for x in x_d], dtype=np.float32)
+
+  # Projected point by point rather than as a ribbon: the width is per sample, and the ribbon
+  # helper returns the two chains interleaved with anything off screen silently dropped. Stop at
+  # the first point that is not visible -- a polyline must not bridge a hole.
+  points = []
+  for x, y, zi in zip(x_d, y_d, z, strict=True):
+    pt = renderer._map_to_screen(float(x), float(y), float(zi) + renderer._path_offset_z)
+    if pt is None:
+      break
+    points.append(pt)
+
+  widths = np.clip(s_d[:len(points)] * MOONPILOT_LEAD_PATH_PX_PER_M, *MOONPILOT_LEAD_PATH_WIDTH).astype(np.float32)
+  return np.array([x_d, y_d, z], dtype=np.float32).T, np.array(points, dtype=np.float32).reshape(-1, 2), widths, float(lead.inPath)

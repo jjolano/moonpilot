@@ -8,13 +8,11 @@ triple selfdrived would publish, not as a set of events the module happened to p
 import re
 import unittest
 from pathlib import Path
-from typing import cast
 
 from opendbc.car.structs import car
 from opendbc.car.toyota.values import ToyotaFlags
 from opendbc.car.volkswagen.values import VolkswagenFlags, VolkswagenSafetyFlags
 from openpilot.cereal import log
-from openpilot.common.params import Params
 from openpilot.common.realtime import DT_CTRL
 from openpilot.selfdrive.selfdrived.events import ET, EVENTS, Events
 from openpilot.selfdrive.selfdrived.alertmanager import AlertManager
@@ -29,6 +27,7 @@ from moonpilot.engage import (
   moonpilot_engage,
   moonpilot_engage_safety_param,
 )
+from moonpilot.tests.fakes import _params
 
 ButtonType = car.CarState.ButtonEvent.Type
 GearShifter = car.CarState.GearShifter
@@ -84,20 +83,6 @@ def _mode_bit(name: str) -> int:
   raise AssertionError(f"no safety mode declares {name}")
 
 
-class FakeParams:
-  """Duck-typed stand-in for Params, so the tests never touch the real param store."""
-
-  def __init__(self, on=True):
-    self._on = on
-
-  def get(self, key, return_default=False):
-    return self._on
-
-
-def _params(on=True) -> Params:
-  return cast(Params, FakeParams(on))
-
-
 def _cp(
   brand='toyota',
   pcm_cruise=True,
@@ -122,6 +107,17 @@ def _cp(
   for c in configs:
     c.safetyParam = safety_param
   return cp
+
+
+def _out_of_scope():
+  """Every (CarParams, Params) pair the feature must leave at upstream's behavior."""
+  return (
+    (_cp(), _params(on=False)),
+    (_cp(brand='fakebrand'), _params(on=True)),
+    (_cp(pcm_cruise=False), _params(on=True)),
+    (_cp(passive=True), _params(on=True)),
+    (_cp(flags=ToyotaFlags.UNSUPPORTED_DSU), _params(on=True)),
+  )
 
 
 def _cs(available=False, enabled=False, buttons=(), gear=GearShifter.drive):
@@ -197,13 +193,7 @@ class TestEngageSafetyParam(unittest.TestCase):
 
 class TestEngageScope(unittest.TestCase):
   def test_inert_when_out_of_scope_or_off(self):
-    for cp, params in (
-      (_cp(), _params(on=False)),
-      (_cp(brand='fakebrand'), _params(on=True)),
-      (_cp(pcm_cruise=False), _params(on=True)),
-      (_cp(passive=True), _params(on=True)),
-      (_cp(flags=ToyotaFlags.UNSUPPORTED_DSU), _params(on=True)),
-    ):
+    for cp, params in _out_of_scope():
       engage = moonpilot_engage(cp, params)
       self.assertFalse(engage.enabled)
 
@@ -239,13 +229,7 @@ class TestActuatorGate(unittest.TestCase):
   def test_inert_when_out_of_scope_or_off(self):
     # Upstream's behavior for every car the feature is not enabled on: both permissions pass
     # through whatever the panda says, including saying nothing at all.
-    for cp, params in (
-      (_cp(), _params(on=False)),
-      (_cp(brand='fakebrand'), _params(on=True)),
-      (_cp(pcm_cruise=False), _params(on=True)),
-      (_cp(passive=True), _params(on=True)),
-      (_cp(flags=ToyotaFlags.UNSUPPORTED_DSU), _params(on=True)),
-    ):
+    for cp, params in _out_of_scope():
       gate = moonpilot_actuator_gate(cp, params)
       for states in ([], [_ps()], [_ps(controls_allowed=True)], [_ps(controls_allowed_lateral=True)]):
         self.assertTrue(gate.lateral(states), states)

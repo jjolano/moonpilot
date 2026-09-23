@@ -1,6 +1,7 @@
 """Mici model settings rendered as inline vertical pages inside Moonpilot settings."""
 
 from collections.abc import Callable, Sequence
+from typing import cast
 
 import pyray as rl
 
@@ -13,8 +14,6 @@ from openpilot.system.ui.lib.application import gui_app
 from openpilot.system.ui.widgets import Widget
 from openpilot.system.ui.widgets.scroller import Scroller
 
-JOB_TRACK_COLOR = rl.Color(57, 57, 57, 255)
-JOB_FILL_COLOR = rl.Color(51, 171, 76, 255)
 PAGE_ROWS = 6
 INSTALLED_ROWS = 8
 KIND_FILTERS = (models.FILTER_ALL, models.FILTER_DRIVING, models.FILTER_MONITORING)
@@ -22,6 +21,7 @@ ICON_INSTALL = "icons_mici/settings/software.png"
 ICON_REMOVE = "icons_mici/settings/device/uninstall.png"
 ICON_REBUILD = "icons_mici/settings/device/update.png"
 _CHEVRON_PATH = "icons/chevron_right.png"
+_INVALID = object()
 BAR_TRACK = rl.Color(57, 57, 57, 255)
 BAR_FILL = rl.Color(51, 171, 76, 255)
 BAR_HEIGHT = 10
@@ -176,20 +176,13 @@ class CatalogPage(Page):
     self._update_rows()
 
   def _entries(self) -> list[dict]:
-    entries = [entry for entry in models.browse().get("entries", []) if entry.get("admitted")]
-    kind = self._kind_toggle.get_value()
-    return entries if kind == models.FILTER_ALL else [entry for entry in entries if entry.get("kind") == kind]
-
-  def _pages(self) -> int:
-    return max(1, (len(self._entries()) + PAGE_ROWS - 1) // PAGE_ROWS)
+    return models.admitted_entries(self._kind_toggle.get_value())
 
   def _entry_at(self, index: int) -> dict | None:
-    entries = self._entries()
-    position = self._page * PAGE_ROWS + index
-    return entries[position] if position < len(entries) else None
+    return models.page_item(self._entries(), self._page, PAGE_ROWS, index)
 
   def _offset(self, delta: int) -> None:
-    self._page = min(max(0, self._page + delta), self._pages() - 1)
+    self._page = models.clamp_page(self._entries(), self._page + delta, PAGE_ROWS)
     self._update_rows()
 
   def _install(self, index: int) -> None:
@@ -204,7 +197,7 @@ class CatalogPage(Page):
     _confirm(models.INSTALL_TEXT, ICON_INSTALL, lambda: _request(self._params, "install", selection))
 
   def _update_rows(self):
-    self._page = min(self._page, self._pages() - 1)
+    self._page = models.clamp_page(self._entries(), self._page, PAGE_ROWS)
     installed = {models.selection_of(entry) for entry in models.status(self._params)["installed"]}
     catalog = models.status(self._params)["catalog"]
     self._refresh.set_value(models.catalog_text(catalog))
@@ -219,9 +212,8 @@ class CatalogPage(Page):
       row.set_enabled(True)
       row.set_click_callback(lambda index=index: self._install(index))
     entries = self._entries()
-    self._page_row.set_value(
-      f"{self._page + 1} / {self._pages()}" if entries else (models.BROWSE_EMPTY if not models.browse().get("revision") else models.BROWSE_NONE)
-    )
+    pages = models.page_count(entries, PAGE_ROWS)
+    self._page_row.set_value(f"{self._page + 1} / {pages}" if entries else (models.BROWSE_EMPTY if not models.browse().get("revision") else models.BROWSE_NONE))
     self._older.set_visible(bool(entries))
     self._newer.set_visible(bool(entries))
 
@@ -246,8 +238,7 @@ class InstalledPage(Page):
     self._update_rows()
 
   def _entry(self, index: int) -> dict | None:
-    entries = models.status(self._params)["installed"]
-    return entries[index] if index < len(entries) else None
+    return models.page_item(models.status(self._params)["installed"], 0, INSTALLED_ROWS, index)
 
   def show_event(self):
     super().show_event()
@@ -326,37 +317,22 @@ class ChooserPage(Page):
     super()._update_state()
     self._update_rows()
 
-  def _choices(self) -> list[dict | None]:
-    return self._choices_cache
-
-  def _pages(self) -> int:
-    return max(1, (len(self._choices_cache) + PAGE_ROWS - 1) // PAGE_ROWS)
-
   def _offset(self, delta: int) -> None:
-    self._page = min(max(0, self._page + delta), self._pages() - 1)
+    self._page = models.clamp_page(self._choices_cache, self._page + delta, PAGE_ROWS)
     self._update_rows()
 
-  def _choice(self, index: int) -> dict | None:
-    position = self._page * PAGE_ROWS + index
-    choices = self._choices()
-    return choices[position] if position < len(choices) else None
-
-  def _present(self, index: int) -> bool:
-    return self._page * PAGE_ROWS + index < len(self._choices_cache)
-
-  def _selection(self, index: int) -> str:
-    choice = self._choice(index)
-    return "" if choice is None else models.selection_of(choice)
+  def _choice(self, index: int) -> dict | None | object:
+    return models.page_item(self._choices_cache, self._page, PAGE_ROWS, index, _INVALID)
 
   def _install(self, selection: str) -> None:
     _request(self._params, "install", selection)
     self._back()
 
   def _select(self, index: int) -> None:
-    if not self._present(index):
-      return
     choice = self._choice(index)
-    selection = "" if choice is None else models.selection_of(choice)
+    if choice is _INVALID:
+      return
+    selection = "" if choice is None else models.selection_of(cast(dict, choice))
     if choice is not None and choice.get("state") != "built":
       _confirm(models.INSTALL_TEXT, ICON_INSTALL, lambda: self._install(selection))
       return
@@ -365,17 +341,16 @@ class ChooserPage(Page):
     _confirm(models.CONFIRM_SELECT, ICON_INSTALL, lambda: models.select(self._params, self._kind, selection))
 
   def _update_rows(self):
-    self._page = min(self._page, self._pages() - 1)
+    self._page = models.clamp_page(self._choices_cache, self._page, PAGE_ROWS)
     desired = models.desired(self._params, self._kind)
     offroad = ui_state.is_offroad()
     for index, row in enumerate(self._rows):
-      present = self._present(index)
-      row.set_visible(present)
-      if not present:
-        continue
       choice = self._choice(index)
+      row.set_visible(choice is not _INVALID)
+      if choice is _INVALID:
+        continue
       row.set_enabled(offroad or choice is not None and choice.get("state") != "built")
-      selection = "" if choice is None else models.selection_of(choice)
+      selection = "" if choice is None else models.selection_of(cast(dict, choice))
       row.set_text("stock" if choice is None else str(choice.get("name") or selection[:12]))
       row.set_value(
         models.LABEL_INSTALL
@@ -384,7 +359,8 @@ class ChooserPage(Page):
         if selection == desired
         else models.LABEL_SELECT
       )
-    multi = self._pages() > 1
-    self._page_row.set_value(f"{self._page + 1} / {self._pages()}")
+    pages = models.page_count(self._choices_cache, PAGE_ROWS)
+    multi = pages > 1
+    self._page_row.set_value(f"{self._page + 1} / {pages}")
     self._older.set_visible(multi)
     self._newer.set_visible(multi)

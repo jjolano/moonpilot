@@ -291,9 +291,6 @@ SConscript([
   'openpilot/selfdrive/ui/SConscript',
 ])
 
-# Build moonpilot
-SConscript(['moonpilot/SConscript'])  # moonpilot seam, see AGENTS.md
-
 # Build desktop-only tools
 if GetOption('extras') and arch != "comma_arm64":
   SConscript([

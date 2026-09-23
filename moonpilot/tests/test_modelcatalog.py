@@ -2,8 +2,9 @@
 
 The fixture (`fixtures/catalog.json`) is a trimmed snapshot at the catalog's own revision
 `2026-09-19T06:48:29Z`: recipe and profile documents are copied byte for byte, and their digests
-are hashes of those bytes. `test_fixture_is_a_valid_snapshot_twice_over` re-checks the copy against
-the vendored SDK, which is also what makes this file the vendored copy's test.
+are hashes of those bytes; each entry keeps only its newest occurrence (the one date anything reads)
+and the unread `evidence` list is empty. `test_fixture_is_a_valid_snapshot_twice_over` re-checks
+the copy against the vendored SDK, which is also what makes this file the vendored copy's test.
 
 The cases cover admitted recipe families, action-head era refusals, driver-monitoring generations,
 and refusals for missing feature ports or required heads.
@@ -44,8 +45,18 @@ DM_MISSING_HEADS = "3870150bbb21a19f29730ba327ce0595f425a37e17f51291700b54381f0d
 SPLIT_NO_FEATURE_PORT = "17b12acc43b4ee54e44cb9c7ea2a95a3f274b16d05499840f295610e659816fc"
 
 
-class CatalogCase(unittest.TestCase):
-  """The fixture, loaded once per test, with a temp store so nothing touches the real one."""
+class TempStoreCase(unittest.TestCase):
+  """A temp store so nothing touches the real one."""
+
+  def setUp(self):
+    self.tmp = tempfile.mkdtemp()
+    patcher = mock.patch.object(models.paths, "data_dir", lambda feature: os.path.join(self.tmp, feature))
+    patcher.start()
+    self.addCleanup(patcher.stop)
+
+
+class CatalogCase(TempStoreCase):
+  """The fixture, loaded once per test, over a temp store."""
 
   @classmethod
   def setUpClass(cls):
@@ -53,10 +64,7 @@ class CatalogCase(unittest.TestCase):
     cls.snapshot = json.loads(cls.raw)
 
   def setUp(self):
-    self.tmp = tempfile.mkdtemp()
-    patcher = mock.patch.object(models.paths, "data_dir", lambda feature: os.path.join(self.tmp, feature))
-    patcher.start()
-    self.addCleanup(patcher.stop)
+    super().setUp()
     self.catalog = client.Catalog(self.raw, base_url="https://catalog.invalid/")
 
   def admit(self, digest: str) -> dict:
@@ -238,14 +246,8 @@ class TestBrowse(CatalogCase):
     self.assertEqual(models.browse()["entries"], written["entries"])
 
 
-class TestInterfaceVerification(unittest.TestCase):
+class TestInterfaceVerification(TempStoreCase):
   """A downloaded artifact is only usable if its bytes declare the interface its recipe recorded."""
-
-  def setUp(self):
-    self.tmp = tempfile.mkdtemp()
-    patcher = mock.patch.object(models.paths, "data_dir", lambda feature: os.path.join(self.tmp, feature))
-    patcher.start()
-    self.addCleanup(patcher.stop)
 
   def package_from_onnx(self, *, tamper: bool = False, slice_mutation: str | None = None) -> str:
     """A package whose single artifact is the bundled DM ONNX, symlinked so nothing is copied.
@@ -316,12 +318,9 @@ class TestInterfaceVerification(unittest.TestCase):
 
 
 @unittest.skipUnless(CRYPTOGRAPHY_AVAILABLE, "cryptography is not importable")
-class TestCatalogSignature(unittest.TestCase):
+class TestCatalogSignature(TempStoreCase):
   def setUp(self):
-    self.tmp = tempfile.mkdtemp()
-    patcher = mock.patch.object(models.paths, "data_dir", lambda feature: os.path.join(self.tmp, feature))
-    patcher.start()
-    self.addCleanup(patcher.stop)
+    super().setUp()
     self.raw = FIXTURE.read_bytes()
 
   def key_pair(self):
@@ -377,13 +376,7 @@ class TestCatalogSignature(unittest.TestCase):
         modelcatalog.refresh(url, require_signature=True)
 
 
-class TestCatalogNoPinnedKey(unittest.TestCase):
-  def setUp(self):
-    self.tmp = tempfile.mkdtemp()
-    patcher = mock.patch.object(models.paths, "data_dir", lambda feature: os.path.join(self.tmp, feature))
-    patcher.start()
-    self.addCleanup(patcher.stop)
-
+class TestCatalogNoPinnedKey(TempStoreCase):
   def test_signature_requirement_without_a_pinned_key_is_refused(self):
     url = "https://catalog.invalid/catalog.json"
     calls = []

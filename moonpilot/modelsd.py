@@ -51,13 +51,6 @@ NETWORK_INTERVAL = 5.0  # the network is unusable right now
 PROGRESS_INTERVAL = 1.0  # at most one status publish per second while downloading
 
 
-def _models_wanted(started: bool, params, CP) -> bool:
-  """The manager's predicate (moonpilot/procs.py): run while a request is waiting, or until this
-  boot has published a status at all. Params only -- onroad and offroad alike, because a refresh
-  and a download are both usual while parked."""
-  return params.get(models.REQUEST_KEY) is not None or params.get(models.STATUS_KEY) is None
-
-
 class _Canceled(Exception):
   """The driver moved on: a different request, or none. Never a partial package -- the SDK's staging
   directory is removed by its own `finally`."""
@@ -182,7 +175,7 @@ class Worker:
     # A catalog is 7 MB and not worth a metered connection, so an unusable network holds the
     # request rather than dropping it: the driver asked for this refresh, and it runs the moment
     # there is a connection worth using. The process stays alive while a request exists
-    # (`_models_wanted`), which is what makes waiting here possible.
+    # (`moonpilot/procs.py::_models_wanted`), which is what makes waiting here possible.
     while not self._network_usable():
       job.phase = "waiting-network"
       job.metered = bool(self.sm["deviceState"].networkMetered)

@@ -23,16 +23,13 @@ from moonpilot.slam import (
   MOONPILOT_SLAM_CORR_STD_MAX,
   MOONPILOT_SLAM_CORR_STD_MIN,
   MOONPILOT_SLAM_MAX_AGE,
-  MOONPILOT_SLAM_MAX_CORR_POS,
   MOONPILOT_SLAM_MAX_CORR_VEL,
-  MOONPILOT_SLAM_MAX_CORR_YAW,
   MOONPILOT_SLAM_MAX_SCALE_ERR,
   MOONPILOT_SLAM_MIN_NODES,
   MOONPILOT_SLAM_MIN_STD,
   MOONPILOT_SLAM_POSE_DELAY,
   MOONPILOT_SLAM_PRIOR_WINDOW_S,
   MOONPILOT_SLAM_RATE_HZ,
-  MOONPILOT_SLAM_ROT_STD_MULT,
   MOONPILOT_SLAM_TRANS_STD_MULT,
   MOONPILOT_SLAM_WINDOW_S,
   Node,
@@ -50,19 +47,10 @@ DT = 1.0 / MOONPILOT_SLAM_RATE_HZ
 ODOMETRY_MONO = 5_980_000.0
 
 
-def _node(t, v_ego, trans_x, trans_y=0.0, yaw_rate=0.0, rot_z=0.0, trans_std=0.02, rot_std=0.02):
-  """One window sample, in the car frame the window is written in. The odometry stds are
-  posenet-sized: locationd multiplies them by 4 and 10, which the smoother mirrors."""
-  return Node(
-    mono_time=t,
-    v_ego=v_ego,
-    yaw_rate=yaw_rate,
-    trans_x=trans_x,
-    trans_y=trans_y,
-    rot_z=rot_z,
-    trans_std_x=trans_std,
-    rot_std_z=rot_std,
-  )
+def _node(t, v_ego, trans_x, trans_std=0.02):
+  """One window sample. The odometry std is posenet-sized: locationd multiplies it by 4, which the
+  smoother mirrors."""
+  return Node(mono_time=t, v_ego=v_ego, trans_x=trans_x, trans_std_x=trans_std)
 
 
 def _window(nodes):
@@ -94,9 +82,6 @@ class TestWindow(unittest.TestCase):
     self.assertTrue(corr["valid"])
     self.assertAlmostEqual(corr["dVel"], 0.5, delta=0.05)
     self.assertAlmostEqual(19.5 + corr["dVel"], 20.0, delta=0.05)  # the consumer's arithmetic
-    # The wheel speed was low for the whole window, so the position the two chains disagree by is
-    # that bias times the window's span.
-    self.assertAlmostEqual(corr["dPos"], 0.5 * (MOONPILOT_SLAM_WINDOW_S - DT), delta=0.05)
 
   def test_the_applied_speed_is_closer_to_truth_than_the_wheel_speed(self):
     """The feature's reason to exist, in the currency the plan's replay check measures: across the
@@ -119,35 +104,12 @@ class TestWindow(unittest.TestCase):
     corr = _window(_straight(time.monotonic(), v_ego=20.0, trans_x=20.0)).update()
     self.assertTrue(corr["valid"])
     self.assertAlmostEqual(corr["dVel"], 0.0, delta=1e-6)
-    self.assertAlmostEqual(corr["dPos"], 0.0, delta=1e-6)
-    self.assertAlmostEqual(corr["dYaw"], 0.0, delta=1e-9)
-
-  def test_a_healthy_yaw_rate_is_left_alone(self):
-    """The gyro's plausible error is far below the odometry's own rot std, so the weights hand this
-    channel to the prior: 0.02 rad of drift over the window reaches a consumer as ~1 % of itself.
-    That is the channel working -- the fork does not inject posenet's yaw noise into a good sensor."""
-    t0 = time.monotonic()
-    nodes = [_node(t0 + i * DT, 10.0, 10.0, yaw_rate=0.204, rot_z=0.2) for i in range(100)]
-    corr = _window(nodes).update()
-    self.assertTrue(corr["valid"])
-    self.assertLess(abs(corr["dYaw"]), 0.1 * 0.02)
-
-  def test_a_broken_yaw_rate_is_pulled_toward_the_odometry(self):
-    """The other side of the same weights: a yaw rate wrong by far more than the odometry's own
-    uncertainty is still the prior's error to give up, and the clamp is what bounds what it gives."""
-    t0 = time.monotonic()
-    nodes = [_node(t0 + i * DT, 10.0, 10.0, yaw_rate=2.0, rot_z=0.2) for i in range(100)]
-    corr = _window(nodes).update()
-    self.assertTrue(corr["valid"])
-    self.assertLess(corr["dYaw"], 0.0)  # toward the odometry's 0.2 rad/s, not away from it
-    self.assertAlmostEqual(corr["dYaw"], -MOONPILOT_SLAM_MAX_CORR_YAW, delta=1e-6)
 
   def test_a_wide_disagreement_is_clamped_not_trusted(self):
     """A 10 m/s disagreement is a broken sensor, not a scale error: it reaches a consumer as the
     clamp, and the clamps are what bound every term the planner reads."""
     corr = _window(_straight(time.monotonic(), v_ego=20.0, trans_x=30.0)).update()
     self.assertTrue(corr["valid"])
-    self.assertAlmostEqual(abs(corr["dPos"]), MOONPILOT_SLAM_MAX_CORR_POS, delta=1e-6)
     self.assertAlmostEqual(abs(corr["dVel"]), MOONPILOT_SLAM_MAX_CORR_VEL, delta=1e-6)
 
   def test_a_dropped_tick_stream_keeps_the_correction_finite(self):
@@ -160,7 +122,7 @@ class TestWindow(unittest.TestCase):
     corr = _window(nodes).update()
     self.assertTrue(corr["valid"])
     self.assertAlmostEqual(corr["dVel"], 0.5, delta=0.05)
-    self.assertTrue(all(math.isfinite(v) for v in (corr["dPos"], corr["dVel"], corr["dYaw"], corr["corrStd"])))
+    self.assertTrue(all(math.isfinite(v) for v in (corr["dVel"], corr["corrStd"])))
 
   def test_a_non_finite_sample_is_dropped_and_not_carried(self):
     """One bad frame must cost one frame. A NaN that reached the least squares would poison every
@@ -170,7 +132,7 @@ class TestWindow(unittest.TestCase):
     nodes[40] = nodes[40]._replace(trans_x=float("nan"))
     corr = _window(nodes).update()
     self.assertTrue(corr["valid"])
-    self.assertTrue(all(math.isfinite(v) for v in (corr["dPos"], corr["dVel"], corr["dYaw"], corr["corrStd"])))
+    self.assertTrue(all(math.isfinite(v) for v in (corr["dVel"], corr["corrStd"])))
 
   def test_a_window_that_cannot_speak_says_nothing(self):
     """Fewer than MIN_NODES samples, a repeated timestamp, or a time running backwards: all three
@@ -185,7 +147,7 @@ class TestWindow(unittest.TestCase):
       with self.subTest(nodes=len(nodes)):
         corr = _window(nodes).update()
         self.assertFalse(corr["valid"])
-        self.assertEqual((corr["dPos"], corr["dVel"], corr["dYaw"]), (0.0, 0.0, 0.0))
+        self.assertEqual(corr["dVel"], 0.0)
 
   def test_the_window_forgets_what_left_it(self):
     """The rotating part: a sample older than the window is gone, so the estimate tracks the car
@@ -204,15 +166,13 @@ class TestWindow(unittest.TestCase):
     self.assertLess(corr["age"], MOONPILOT_SLAM_MAX_AGE)
 
 
-def _with_correction(sm, d_vel=0.0, d_pos=0.0, d_yaw=0.0, age=0.0, corr_std=MOONPILOT_SLAM_CORR_STD_MIN, valid=True, alive=True):
+def _with_correction(sm, d_vel=0.0, age=0.0, corr_std=MOONPILOT_SLAM_CORR_STD_MIN, valid=True, alive=True):
   """The correction a publisher would have left on `sm`, and its validity flags."""
   corr = sm["moonpilotState"].egoCorrection
   corr.valid = valid
   corr.monoTime = int(time.monotonic() * 1e9)
   corr.age = age
-  corr.dPos = d_pos
   corr.dVel = d_vel
-  corr.dYaw = d_yaw
   corr.corrStd = corr_std
   sm.valid["moonpilotState"] = True
   sm.alive["moonpilotState"] = alive
@@ -420,8 +380,8 @@ class TestUpstreamManeuverWithCorrection(unittest.TestCase):
 
 
 class TestMirroredConstants(unittest.TestCase):
-  """The smoother trusts the two sensors on locationd's terms, not on its own: the stds it refuses
-  below and the multipliers it discounts temporally correlated odometry noise by. Mirrored rather
+  """The smoother trusts the odometry on locationd's terms, not on its own: the std floor it refuses
+  below and the multiplier it discounts temporally correlated odometry noise by. Mirrored rather
   than imported for the init-path reason -- locationd is a daemon, and the planner's seam path
   imports this module -- so a change there has to fail here instead of silently retuning the fork."""
 
@@ -430,7 +390,6 @@ class TestMirroredConstants(unittest.TestCase):
 
     self.assertEqual(MOONPILOT_SLAM_MIN_STD, locationd.MIN_STD_SANITY_CHECK)
     self.assertEqual(MOONPILOT_SLAM_TRANS_STD_MULT, locationd.CAM_ODO_TRANS_STD_MULT)
-    self.assertEqual(MOONPILOT_SLAM_ROT_STD_MULT, locationd.CAM_ODO_ROT_STD_MULT)
 
 
 class TestPriorChannel(unittest.TestCase):
@@ -471,14 +430,9 @@ class TestPriorChannel(unittest.TestCase):
 
 
 class TestIngest(unittest.TestCase):
-  """Calibration-frame odometry is rotated into the device frame before the window's car-frame
-  conversion.
-
-  The device frame is x forward, y right, z down (`openpilot/common/transformations/camera.py`).
-  The window is written in the car's frame, x forward, y left and yaw left-positive. A dropped
-  negation here is invisible to every other test in this file -- they build `Node`s directly,
-  already in car-frame units -- and on the road it makes a left turn's gyro and odometry cancel
-  each other instead of agreeing.
+  """The odometry-to-node ingest: calibration-frame translation rotated into the device frame, and
+  the prior read at the pose time. Every other test in this file builds `Node`s directly, so this is
+  the only place the ingest itself is checked.
   """
 
   # The publish time trails the exposure: measured 30.5 ms median (p95 33.5) over 13k corpus frames.
@@ -486,17 +440,17 @@ class TestIngest(unittest.TestCase):
   PUBLISH_LAG = 0.0305
 
   class _Sm(dict):
-    def __init__(self, odometry, device_motion, car_state, extrinsics_calibration=None, calibration_valid=True):
-      super().__init__(cameraOdometry=odometry, deviceMotion=device_motion, carState=car_state)
+    def __init__(self, odometry, car_state, extrinsics_calibration=None, calibration_valid=True):
+      super().__init__(cameraOdometry=odometry, carState=car_state)
       if extrinsics_calibration is not None:
         self["extrinsicsCalibration"] = extrinsics_calibration
       odometry.timestampEof = int(ODOMETRY_MONO * 1e9)
       published = int((ODOMETRY_MONO + TestIngest.PUBLISH_LAG) * 1e9)
-      self.updated = {"cameraOdometry": True, "deviceMotion": True, "carState": True}
-      self.valid = {"cameraOdometry": True, "deviceMotion": True, "carState": True}
+      self.updated = {"cameraOdometry": True, "carState": True}
+      self.valid = {"cameraOdometry": True, "carState": True}
       if extrinsics_calibration is not None:
         self.valid["extrinsicsCalibration"] = calibration_valid
-      self.logMonoTime = {"cameraOdometry": published, "deviceMotion": published, "carState": published}
+      self.logMonoTime = {"cameraOdometry": published, "carState": published}
 
   @staticmethod
   def _calibration(rpy_calib):
@@ -504,51 +458,40 @@ class TestIngest(unittest.TestCase):
     calibration.extrinsicsCalibration.rpyCalib = rpy_calib
     return calibration.extrinsicsCalibration
 
-  def test_calibration_rotates_vectors_and_stds_before_sign_conversion(self):
+  @staticmethod
+  def _prior(v_ego=20.0):
+    prior = PriorChannel()
+    for i in range(20):
+      prior.push(ODOMETRY_MONO - 0.2 + i * 0.01, v_ego)
+    return prior
+
+  def test_calibration_rotates_the_translation_and_its_std(self):
     from moonpilot.leadd import _slam_node
 
     odometry = messaging.new_message("cameraOdometry")
     odometry.cameraOdometry.trans = [20.0, 1.0, 2.0]
-    odometry.cameraOdometry.rot = [0.1, 0.3, -0.2]
     odometry.cameraOdometry.transStd = [0.02, 0.04, 0.06]
-    odometry.cameraOdometry.rotStd = [0.03, 0.04, 0.05]
-    device_motion = messaging.new_message("deviceMotion")
-    device_motion.deviceMotion.angularVelocityDevice.z = -0.2
     car_state = messaging.new_message("carState")
     car_state.carState.vEgo = 19.5
-    sm = self._Sm(
-      odometry.cameraOdometry,
-      device_motion.deviceMotion,
-      car_state.carState,
-      self._calibration([0.0, 0.1, 0.0]),
-    )
+    sm = self._Sm(odometry.cameraOdometry, car_state.carState, self._calibration([0.0, 0.1, 0.0]))
 
-    node = _slam_node(sm, self._priors(v_ego=19.5))
+    node = _slam_node(sm, self._prior(v_ego=19.5))
     assert node is not None
     c, s = math.cos(0.1), math.sin(0.1)
     self.assertAlmostEqual(node.trans_x, c * 20.0 + s * 2.0)
-    self.assertAlmostEqual(node.trans_y, -1.0)
-    self.assertAlmostEqual(node.rot_z, s * 0.1 + c * 0.2)
     self.assertAlmostEqual(node.trans_std_x, math.sqrt((c * 0.02) ** 2 + (s * 0.06) ** 2))
-    self.assertAlmostEqual(node.rot_std_z, math.sqrt((s * 0.03) ** 2 + (c * 0.05) ** 2))
-    self.assertAlmostEqual(node.yaw_rate, 0.2)  # gyro path remains device-frame and unchanged
 
   def test_identity_and_untrusted_calibration_fall_back_to_identity(self):
     from moonpilot.leadd import _slam_node
 
     odometry = messaging.new_message("cameraOdometry")
     odometry.cameraOdometry.trans = [20.0, 1.0, 2.0]
-    odometry.cameraOdometry.rot = [0.1, 0.3, -0.2]
     odometry.cameraOdometry.transStd = [0.02, 0.04, 0.06]
-    odometry.cameraOdometry.rotStd = [0.03, 0.04, 0.05]
-    device_motion = messaging.new_message("deviceMotion")
-    device_motion.deviceMotion.angularVelocityDevice.z = -0.2
     car_state = messaging.new_message("carState")
     car_state.carState.vEgo = 19.5
-    priors = self._priors(v_ego=19.5)
-    common = (odometry.cameraOdometry, device_motion.deviceMotion, car_state.carState)
-    expected = _slam_node(self._Sm(*common), priors)
-    identity = _slam_node(self._Sm(*common, self._calibration([0.0, 0.0, 0.0])), self._priors(v_ego=19.5))
+    common = (odometry.cameraOdometry, car_state.carState)
+    expected = _slam_node(self._Sm(*common), self._prior(v_ego=19.5))
+    identity = _slam_node(self._Sm(*common, self._calibration([0.0, 0.0, 0.0])), self._prior(v_ego=19.5))
     assert expected is not None and identity is not None
     self.assertEqual(identity, expected)
 
@@ -559,41 +502,9 @@ class TestIngest(unittest.TestCase):
     ):
       actual = _slam_node(
         self._Sm(*common, self._calibration(rpy_calib), calibration_valid),
-        self._priors(v_ego=19.5),
+        self._prior(v_ego=19.5),
       )
       self.assertEqual(actual, expected)
-
-  @staticmethod
-  def _priors(v_ego=20.0, gyro_z=-0.2):
-    priors = {"carState": PriorChannel(), "deviceMotion": PriorChannel()}
-    for i in range(20):
-      t = ODOMETRY_MONO - 0.2 + i * 0.01
-      priors["carState"].push(t, v_ego)
-      priors["deviceMotion"].push(t, gyro_z)
-    return priors
-
-  def test_a_left_turn_arrives_left_positive(self):
-    from moonpilot.leadd import _slam_node
-
-    odometry = messaging.new_message("cameraOdometry")
-    odometry.cameraOdometry.trans = [20.0, 1.0, 0.0]  # y rightward in the device frame
-    odometry.cameraOdometry.rot = [0.0, 0.0, -0.2]  # z down: a left turn is negative
-    odometry.cameraOdometry.transStd = [0.02, 0.02, 0.02]
-    odometry.cameraOdometry.rotStd = [0.02, 0.02, 0.02]
-
-    device_motion = messaging.new_message("deviceMotion")
-    device_motion.deviceMotion.angularVelocityDevice.z = -0.2
-    car_state = messaging.new_message("carState")
-    car_state.carState.vEgo = 19.5
-
-    node = _slam_node(self._Sm(odometry.cameraOdometry, device_motion.deviceMotion, car_state.carState), self._priors(v_ego=19.5))
-    assert node is not None
-    self.assertAlmostEqual(node.mono_time, ODOMETRY_MONO - MOONPILOT_SLAM_POSE_DELAY, delta=1e-9)
-    self.assertGreater(node.yaw_rate, 0.0)  # the gyro, left-positive
-    self.assertGreater(node.rot_z, 0.0)  # the odometry agrees with it instead of canceling
-    self.assertLess(node.trans_y, 0.0)  # leftward
-    self.assertAlmostEqual(node.trans_x, 20.0, delta=1e-9)
-    self.assertAlmostEqual(node.v_ego, 19.5, delta=1e-9)
 
   def test_the_node_is_stamped_from_the_exposure_not_the_publish_time(self):
     """`cameraOdometry` describes the pose MOONPILOT_SLAM_POSE_DELAY before the frame's end of
@@ -610,20 +521,16 @@ class TestIngest(unittest.TestCase):
 
     odometry = messaging.new_message("cameraOdometry")
     odometry.cameraOdometry.trans = [20.0, 0.0, 0.0]
-    odometry.cameraOdometry.rot = [0.0, 0.0, 0.0]
     odometry.cameraOdometry.transStd = [0.02, 0.02, 0.02]
-    odometry.cameraOdometry.rotStd = [0.02, 0.02, 0.02]
-    device_motion = messaging.new_message("deviceMotion")
     car_state = messaging.new_message("carState")
 
     # 10 m/s^2 of ramp over the prior window, so a 30.5 ms error is 0.305 m/s of prior speed
-    priors = {"carState": PriorChannel(), "deviceMotion": PriorChannel()}
+    prior = PriorChannel()
     for i in range(40):
       t = ODOMETRY_MONO - 0.2 + i * 0.01
-      priors["carState"].push(t, 20.0 + 10.0 * (t - ODOMETRY_MONO))
-      priors["deviceMotion"].push(t, 0.0)
+      prior.push(t, 20.0 + 10.0 * (t - ODOMETRY_MONO))
 
-    node = _slam_node(self._Sm(odometry.cameraOdometry, device_motion.deviceMotion, car_state.carState), priors)
+    node = _slam_node(self._Sm(odometry.cameraOdometry, car_state.carState), prior)
     assert node is not None
     self.assertAlmostEqual(node.mono_time, ODOMETRY_MONO - MOONPILOT_SLAM_POSE_DELAY, delta=1e-9)
     self.assertAlmostEqual(node.v_ego, 20.0 - 10.0 * MOONPILOT_SLAM_POSE_DELAY, delta=1e-6)
@@ -633,33 +540,25 @@ class TestIngest(unittest.TestCase):
   def test_a_frame_the_prior_cannot_cover_is_skipped(self):
     from moonpilot.leadd import _slam_node
 
-    def node_for(priors, odometry_valid=True):
+    def node_for(prior, odometry_valid=True):
       odometry = messaging.new_message("cameraOdometry")
       odometry.cameraOdometry.trans = [20.0, 0.0, 0.0]
-      odometry.cameraOdometry.rot = [0.0, 0.0, 0.0]
       odometry.cameraOdometry.transStd = [0.02, 0.02, 0.02]
-      odometry.cameraOdometry.rotStd = [0.02, 0.02, 0.02]
-      device_motion = messaging.new_message("deviceMotion")
       car_state = messaging.new_message("carState")
       car_state.carState.vEgo = 19.5
-      sm = self._Sm(odometry.cameraOdometry, device_motion.deviceMotion, car_state.carState)
+      sm = self._Sm(odometry.cameraOdometry, car_state.carState)
       sm.valid["cameraOdometry"] = odometry_valid
-      return _slam_node(sm, priors)
+      return _slam_node(sm, prior)
 
-    self.assertIsNotNone(node_for(self._priors()))  # the control: this frame does produce a node
+    self.assertIsNotNone(node_for(self._prior()))  # the control: this frame does produce a node
     # Nothing pushed at all: there is no prior to read at the pose time
-    self.assertIsNone(node_for({"carState": PriorChannel(), "deviceMotion": PriorChannel()}))
+    self.assertIsNone(node_for(PriorChannel()))
     # A prior that starts at the pose time and never before it: read, never extrapolated backwards
-    late = {"carState": PriorChannel(), "deviceMotion": PriorChannel()}
-    for channel in late.values():
-      channel.push(ODOMETRY_MONO, 20.0)
+    late = PriorChannel()
+    late.push(ODOMETRY_MONO, 20.0)
     self.assertIsNone(node_for(late))
     # An odometry the model itself does not trust is not an observation
-    self.assertIsNone(node_for(self._priors(), odometry_valid=False))
-    # A gyro that never produced a usable sample leaves the second channel with nothing to offer
-    nan_gyro = self._priors(gyro_z=float("nan"))
-    self.assertEqual(len(nan_gyro["deviceMotion"].window), 0)
-    self.assertIsNone(node_for(nan_gyro))
+    self.assertIsNone(node_for(self._prior(), odometry_valid=False))
 
 
 class TestWiring(unittest.TestCase):

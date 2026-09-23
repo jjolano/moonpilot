@@ -1,6 +1,5 @@
 import math
 import unittest
-from typing import cast
 
 from opendbc.car.car_helpers import interfaces
 from opendbc.car.gm.values import CAR as GM
@@ -10,7 +9,6 @@ from opendbc.car.vehicle_model import VehicleModel
 
 from openpilot.cereal import log
 from openpilot.common.constants import ACCELERATION_DUE_TO_GRAVITY
-from openpilot.common.params import Params
 from openpilot.common.realtime import DT_CTRL
 
 from moonpilot.latcontrol import (
@@ -20,24 +18,11 @@ from moonpilot.latcontrol import (
   MoonpilotLatControlTorque,
   moonpilot_latcontrol,
 )
+from moonpilot.tests.fakes import _params
 
 # A request small enough that the controller runs inside its own limits, so the integrator
 # is not anti-windup frozen at zero (the PID freezes it once the sum clips).
 LINEAR_REQUEST = 0.3 / 625
-
-
-class FakeParams:
-  """Duck-typed stand-in for Params, so the tests never touch the real param store."""
-
-  def __init__(self, on=True):
-    self._on = on
-
-  def get(self, key, return_default=False):
-    return self._on
-
-
-def _params(on=True) -> Params:
-  return cast(Params, FakeParams(on))
 
 
 def _controller(car_name=TOYOTA.TOYOTA_RAV4):

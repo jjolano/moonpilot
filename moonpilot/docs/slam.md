@@ -1,10 +1,10 @@
 # The rolling-window ego correction
 `moonpilot/slam.py` is the fork's answer to a single question: is the speed the planner plans from
-right? It blends two sources the car already has — the prior, which is `carState`'s wheel speed and
-`deviceMotion`'s gyro, against the observation, which is `cameraOdometry`'s `trans`/`rot` and what
-the model saw move — over a 5 s rotating window, and publishes the disagreement at the window's end
-as `moonpilotState.egoCorrection`. Stage 1, on purpose: no new vision frontend, no new service,
-numpy only, so it runs on the device's own CPU. Eight things about it are not obvious.
+right? It blends two sources the car already has — the prior, which is `carState`'s wheel speed,
+against the observation, which is `cameraOdometry`'s forward `trans` and what the model saw move —
+over a 5 s rotating window, and publishes the disagreement at the window's end as
+`moonpilotState.egoCorrection.dVel`. Stage 1, on purpose: no new vision frontend, no new service,
+numpy only, so it runs on the device's own CPU. Seven things about it are not obvious.
 
 - **One process publishes `moonpilotState`, and it is `leadd`.** msgq allows exactly one publisher
   per service: a second `PubMaster` on the same service connects, overwrites the write uid, and the
@@ -13,19 +13,7 @@ numpy only, so it runs on the device's own CPU. Eight things about it are not ob
   manager never restarts that process, because `ensure_running` reaps only on the `should_run`-false
   path. So the correction rides `leadd`, and the gate is read per frame in its loop; a second
   process for it would silently take the leads down with it.
-- **The yaw prior is the gyro, not `carState.yawRate`, and that is why `deviceMotion` is subscribed
-  at all.** Only ford, psa and volkswagen assign `carState.yawRate` and nothing in `openpilot/` reads
-  it, so it is exactly `0.0` on Toyota/Lexus — the fork's own target — and on Honda. A zero prior
-  yaw rate would never turn the raw chain: `dYaw` stays ~0 through a real corner and the corner's
-  lateral travel folds into `dPos` as though it were along-track. `deviceMotion` is always published
-  and `valid` from the filter, so its `angularVelocityDevice.z` is the signal that exists.
-- **Both sources are read in the car's frame, and the device's is not it.** The device frame is x
-  forward, y right, z down (`openpilot/common/transformations/camera.py`), and the window is written
-  x forward, y left, yaw left-positive — so the ingest negates `trans_y`, `rot_z` and the gyro's z.
-  A dropped negation is invisible to a self-consistent test and on the road makes a left turn's gyro
-  and odometry cancel instead of agree, which is why `test_slam.py`'s ingest test builds a
-  device-frame left turn and asserts the node comes out left-positive.
-- **Calibration is applied before the frame conversion.** `cameraOdometry`'s `trans`/`rot` are in the camera's calibration frame, which differs from the device frame by the mounting angle `extrinsicsCalibration.rpyCalib` measures — upstream `locationd` applies exactly that rotation (`device_from_calib`, `rot_from_euler`, `rotate_std`). `leadd` ingests the newest trusted calibration and applies it before the left-positive sign conversion, with identity whenever the message is absent, invalid, malformed or outside the sanity bound, so a device without a trusted calibration behaves exactly as before. The device frame is still treated as the car frame; a calibration shift mid-window affects only newly ingested samples.
+- **Calibration is applied at ingest.** `cameraOdometry`'s `trans` is in the camera's calibration frame, which differs from the device frame by the mounting angle `extrinsicsCalibration.rpyCalib` measures — upstream `locationd` applies exactly that rotation (`device_from_calib`, `rot_from_euler`, `rotate_std`). `leadd` ingests the newest trusted calibration and applies it to `trans` and its std, with identity whenever the message is absent, invalid, malformed or outside the sanity bound, so a device without a trusted calibration behaves exactly as before. The device frame is still treated as the car frame; a calibration shift mid-window affects only newly ingested samples.
 
 
 - **The prior is read at the odometry's pose time, which is the frame's exposure and not the
@@ -86,12 +74,12 @@ untouched, and absent, invalid, stale or dead-publisher all give zero, which is 
 this fork had before the correction existed. Staleness is honest: `age` is the window end to now and
 therefore includes `MOONPILOT_SLAM_POSE_DELAY`, so the consumer's budget is `MAX_AGE +
 POSE_DELAY` rather than spending a third of a 0.3 s allowance on the sensor's own lag. The numbers
-are in `slam.py`'s header block — including which of them are mirrors of `locationd`'s own stds and
-multipliers, which `test_slam.py` pins against that file. That test also pins the sign convention,
-the clamps, the staleness contract, the ingest's frame conversion and the pass-through, and then
-drives upstream's plant — the 20 m/s follow-then-stop maneuver, with the correction and without it —
-to hold that a correction of half a meter per second moves the plan without reshaping it. The
-on-device proof the plan calls for is a replay: logged `carState` + `cameraOdometry` +
-`deviceMotion` through the window, against `gpsLocationExternal` as truth, RMSE down or equal, and
+are in `slam.py`'s header block — including which of them are mirrors of `locationd`'s own std floor
+and odometry multiplier, which `test_slam.py` pins against that file. That test also pins the sign
+convention, the clamps, the staleness contract, the ingest's calibration and pose-time stamp and the
+pass-through, and then drives upstream's plant — the 20 m/s follow-then-stop maneuver, with the
+correction and without it — to hold that a correction of half a meter per second moves the plan
+without reshaping it. The on-device proof the plan calls for is a replay: logged `carState` +
+`cameraOdometry` through the window, against `gpsLocationExternal` as truth, RMSE down or equal, and
 `egoCorrection.valid` duty ≥ 95 % onroad — met on this route at 100.00 % (14,955/14,955): PASS.
 

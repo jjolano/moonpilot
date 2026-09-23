@@ -35,7 +35,7 @@ import json
 import os
 import shutil
 import time
-from collections.abc import Collection
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -96,10 +96,6 @@ def browse_file() -> str:
 
 def packages_dir() -> str:
   return os.path.join(models_root(), "packages")
-
-
-def artifacts_dir() -> str:
-  return os.path.join(packages_dir(), ".artifacts")
 
 
 def builds_dir() -> str:
@@ -932,12 +928,6 @@ def _boot_entry(entry: dict) -> dict:
   }
 
 
-def boot_model(kind: str, entry: dict) -> str:
-  """The `model.pkl` path inside a custom boot entry's build."""
-  key = os.path.basename(entry.get("build", ""))
-  return build_model(key)
-
-
 def commit_boot_selection(params: Any) -> dict:
   """Resolve both desired selections against the store and publish the result. Called once per
   boot, from `manager_init` (openpilot/system/manager/manager.py), before any process starts.
@@ -1048,12 +1038,10 @@ DESCRIPTION_STORAGE = "Space the model store uses on the data partition. Install
 the package, the digest cache and the build."
 DESCRIPTION_REFRESH = "Fetch the catalog again. Needs a network; a failed refresh keeps the copy \
 this device already has."
-LABEL_REFRESH = "REFRESH"
 LABEL_REBOOT = "REBOOT NOW"
 LABEL_INSTALL = "INSTALL"
 LABEL_INSTALLED = "INSTALLED"
 LABEL_SELECT = "SELECT"
-LABEL_DESELECT = "DESELECT"
 LABEL_REBUILD = "REBUILD"
 LABEL_REMOVE = "REMOVE"
 LABEL_CANCEL = "CANCEL"
@@ -1064,25 +1052,17 @@ FILTER_DRIVING = "driving"
 # Short on purpose: the filter row's buttons are 250 px wide, and "driver monitoring" overflows
 # them (the label is drawn centered and clipped). The kind itself is named in full elsewhere.
 FILTER_MONITORING = "monitoring"
-FILTER_RUNNABLE = "runnable only"
 REBOOT_KEY = "DoReboot"  # upstream's own, read by the manager's power path (manager.py:199)
 CONFIRM_SELECT = "Use this model?"
-CONFIRM_REMOVE = "Remove this model?"
 CONFIRM_CANCEL = "Cancel the current model job?"
-SELECT_TEXT = "This model has not been tested by comma or moonpilot. Select it, then restart to use \
-it."
 REMOVE_TEXT = "This deletes the package and its build from the device. The model can be installed \
 again from the catalog."
 DESCRIPTION_CANCEL = "Canceling stops the current model job. You can start it again later."
 DESCRIPTION_REBOOT = "A selected model starts after restart. Restart after installing and selecting."
 REASON_SELECTED = "in effect"
-REASON_INSTALLED = "installed"
-DRIVING_ONLY = "PARKED ONLY"
 LABEL_BACK = "BACK"
-LABEL_OPEN = "OPEN"
 BROWSE_EMPTY = "no catalog yet"
 BROWSE_NONE = "nothing matches"
-BROWSE_STALE = "refresh the catalog first"
 INSTALL_TEXT = "Download and build this model. Then choose it from the model chooser and restart to use it."
 # The protocol ids are precise and unreadable; these are what a driver picks between.
 PROTOCOL_LABELS = {
@@ -1091,8 +1071,6 @@ PROTOCOL_LABELS = {
   "comma.split-vision-off-on.v1": "vision + off + on",
   "comma.dmonitoring.v1": "driver monitoring",
 }
-OFFROAD_NOTE = "Installation runs while driving; selecting and removing wait until the car is parked \
-and openpilot is off."
 PHASE_TEXT = {
   "waiting-network": "waiting for network",
   "waiting-offroad": "waiting for offroad",
@@ -1221,17 +1199,6 @@ def catalog_description(catalog: dict) -> str:
   return " ".join(parts)
 
 
-def installed_action(entry: dict, params: Any) -> tuple[str, str]:
-  """What an installed model's first action row offers: the label, and which way it toggles.
-  `select` is per kind, and the desired value is the recipe digest.
-  """
-  selection = selection_of(entry)
-  kind = entry.get("kind", DRIVING)
-  if desired(params, kind) == selection:
-    return LABEL_DESELECT, "deselect"
-  return LABEL_SELECT, "select"
-
-
 def installed_detail(entry: dict) -> str:
   parts = [f"{entry.get('protocol', '')}", f"roles: {', '.join(entry.get('roles', []))}", human_size(int(entry.get("size", 0))), str(entry.get("state", ""))]
   if entry.get("provenance"):
@@ -1316,6 +1283,27 @@ def chooser_entries(params: Any, kind: str) -> list[dict | None]:
     seen.add(recipe)
     entries.append(entry)
   return entries
+
+
+def admitted_entries(kind: str) -> list[dict]:
+  """The catalog rows both panes list: admitted entries, all of them or only those of `kind`."""
+  entries = [entry for entry in browse()["entries"] if entry.get("admitted")]
+  return entries if kind == FILTER_ALL else [entry for entry in entries if entry.get("kind") == kind]
+
+
+# Both panes page their lists the same way: `rows` per page, and an empty list is still one page.
+def page_count(items: Sequence, rows: int) -> int:
+  return max(1, (len(items) + rows - 1) // rows)
+
+
+def clamp_page(items: Sequence, page: int, rows: int) -> int:
+  return min(max(0, page), page_count(items, rows) - 1)
+
+
+def page_item(items: Sequence, page: int, rows: int, index: int, missing: Any = None) -> Any:
+  """Row `index` of page `page`, or `missing` past the end of `items`."""
+  position = page * rows + index
+  return items[position] if position < len(items) else missing
 
 
 def entry_action(entry: dict, installed_selections: Collection[str]) -> str:

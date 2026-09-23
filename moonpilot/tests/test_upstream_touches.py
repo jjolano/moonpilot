@@ -35,7 +35,6 @@ NEVER_ALLOWED = (
 ALLOWED = {
   "launch_chffrplus.sh": "boot-success rollback for the finalized swap",
   ".gitmodules": "forked opendbc/panda submodules",
-  "SConstruct": "moonpilot/SConscript registration",
   "pyproject.toml": "moonpilot in the editable install",
   "scripts/lint/lint.sh": "lint moonpilot/",
   "tools/test_runner.py": "test moonpilot/ by default",

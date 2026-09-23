@@ -43,7 +43,7 @@ def _device_from_calib(sm):
   return rot_from_euler(rpy_calib)
 
 
-def _slam_node(sm, priors) -> Node | None:
+def _slam_node(sm, prior: PriorChannel) -> Node | None:
   """One window sample, or None when this frame has no interval to close.
 
   The odometry's own `valid` is the gate that matters here -- `fill_pose_msg` sets it from extrinsics
@@ -57,7 +57,7 @@ def _slam_node(sm, priors) -> Node | None:
     return None
 
   odometry = sm['cameraOdometry']
-  if min(len(odometry.trans), len(odometry.rot), len(odometry.transStd), len(odometry.rotStd)) < 3:
+  if min(len(odometry.trans), len(odometry.transStd)) < 3:
     return None
 
   # The pose the odometry describes is one MOONPILOT_SLAM_POSE_DELAY before the frame's *end of
@@ -68,44 +68,26 @@ def _slam_node(sm, priors) -> Node | None:
   # the prior with that instead leaves 30 % of the very `a * dt` error this read exists to remove,
   # correlated -0.85 with `aEgo` and worth +0.019 m/s of under-correction while braking.
   mono_time = odometry.timestampEof * 1e-9 - MOONPILOT_SLAM_POSE_DELAY
-  v_ego = priors['carState'].at(mono_time)
-  yaw_rate = priors['deviceMotion'].at(mono_time)
-  if v_ego is None or yaw_rate is None:
+  v_ego = prior.at(mono_time)
+  if v_ego is None:
     return None
 
-  trans, rot = odometry.trans, odometry.rot
-  trans_std, rot_std = odometry.transStd, odometry.rotStd
+  trans, trans_std = odometry.trans, odometry.transStd
   device_from_calib = _device_from_calib(sm)
   if device_from_calib is not None:
     trans = device_from_calib @ np.asarray(odometry.trans, dtype=float)[:3]
-    rot = device_from_calib @ np.asarray(odometry.rot, dtype=float)[:3]
     trans_std = rotate_std(device_from_calib, np.asarray(odometry.transStd, dtype=float)[:3])
-    rot_std = rotate_std(device_from_calib, np.asarray(odometry.rotStd, dtype=float)[:3])
 
-  return Node(
-    mono_time=mono_time,
-    v_ego=v_ego,
-    # The gyro, left-positive by negating z: the device frame is x forward, y right, z down, so a
-    # left turn is negative z. carState.yawRate is not the alternative -- it is 0.0 on Toyota and
-    # Honda, which is most of what this fork drives. See moonpilot/slam.py.
-    yaw_rate=-yaw_rate,
-    trans_x=float(trans[0]),
-    # Same frame: trans_y is right-positive and rot_z is down-positive, and the window is written in
-    # the car's left-positive frame.
-    trans_y=-float(trans[1]),
-    rot_z=-float(rot[2]),
-    trans_std_x=float(trans_std[0]),
-    rot_std_z=float(rot_std[2]),
-  )
+  return Node(mono_time=mono_time, v_ego=v_ego, trans_x=float(trans[0]), trans_std_x=float(trans_std[0]))
 
 
 def main() -> None:
-  sm = messaging.SubMaster(['modelV2', 'radarState', 'carState', 'cameraOdometry', 'deviceMotion', 'extrinsicsCalibration'], poll='modelV2')
+  sm = messaging.SubMaster(['modelV2', 'radarState', 'carState', 'cameraOdometry', 'extrinsicsCalibration'], poll='modelV2')
   pm = messaging.PubMaster(['moonpilotState'])
   params = Params()
   window = RotatingPoseWindow()
-  # The two prior channels, each fed with its own message times and read at the odometry's pose time.
-  priors = {'carState': PriorChannel(), 'deviceMotion': PriorChannel()}
+  # The wheel-speed prior, fed with its own message times and read at the odometry's pose time.
+  prior = PriorChannel()
 
   # Owned here and created once: per-frame filters would silently drop the smoothing.
   in_path_filters = [FirstOrderFilter(1.0, MOONPILOT_INPATH_RC, DT_MDL) for _ in range(N_LEADS)]
@@ -115,12 +97,10 @@ def main() -> None:
   while True:
     sm.update()
 
-    # Fed every frame, not only on the polled one: carState runs at 100 Hz and deviceMotion at 20,
-    # and `PriorChannel.at` can only interpolate over what it was given.
+    # Fed every frame, not only on the polled one: carState runs at 100 Hz, and `PriorChannel.at`
+    # can only interpolate over what it was given.
     if sm.updated['carState']:
-      priors['carState'].push(sm.logMonoTime['carState'] * 1e-9, float(sm['carState'].vEgo))
-    if sm.updated['deviceMotion'] and sm.valid['deviceMotion']:
-      priors['deviceMotion'].push(sm.logMonoTime['deviceMotion'] * 1e-9, float(sm['deviceMotion'].angularVelocityDevice.z))
+      prior.push(sm.logMonoTime['carState'] * 1e-9, float(sm['carState'].vEgo))
 
     if not sm.updated['modelV2']:
       continue
@@ -128,7 +108,7 @@ def main() -> None:
     # The window is fed whether or not the correction is wanted, so toggling it on is immediate
     # rather than waiting five seconds for a window to fill. `enabled`, not the raw param: a feature
     # whose dependencies are missing is off, and this is where that has to be asked.
-    node = _slam_node(sm, priors)
+    node = _slam_node(sm, prior)
     if node is not None:
       window.push(node)
 

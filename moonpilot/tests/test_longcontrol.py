@@ -8,12 +8,10 @@ the stopping ramp.
 """
 
 import unittest
-from typing import cast
 
 from opendbc.car.honda.interface import CarInterface
 from opendbc.car.honda.values import CAR
 from opendbc.car.structs import car
-from openpilot.common.params import Params
 from openpilot.common.realtime import DT_CTRL
 
 from moonpilot.longcontrol import (
@@ -22,24 +20,11 @@ from moonpilot.longcontrol import (
   MoonpilotLongControl,
   moonpilot_longcontrol,
 )
+from moonpilot.tests.fakes import _params
 
 LongCtrlState = car.CarControl.Actuators.LongControlState
 
 ACCEL_LIMITS = (-4.0, 2.0)
-
-
-class FakeParams:
-  """Duck-typed stand-in for Params, so the tests never touch the real param store."""
-
-  def __init__(self, on=True):
-    self._on = on
-
-  def get(self, key, return_default=False):
-    return self._on
-
-
-def _params(on=True) -> Params:
-  return cast(Params, FakeParams(on))
 
 
 def _controller():

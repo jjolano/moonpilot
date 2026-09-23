@@ -4,28 +4,16 @@ import os
 import sys
 import tempfile
 import unittest
-from typing import cast
 from unittest import mock
-
-from openpilot.common.params import Params
 
 from moonpilot import deps, paths
 from moonpilot.features import FEATURES, Feature, available, enabled, missing_modules, wanted
+from moonpilot.tests.fakes import _params
 
 # A name no distribution can provide, so `available()` is False without depending on the
 # environment. 'json' is stdlib and always present.
 ABSENT = "moonpilot_no_such_package_anywhere"
 PRESENT = "json"
-
-
-class FakeParams:
-  """Duck-typed stand-in for Params, so the tests never touch the real param store."""
-
-  def __init__(self, on=True):
-    self._on = on
-
-  def get(self, key, return_default=False):
-    return self._on
 
 
 class ParamStore:
@@ -42,10 +30,6 @@ class ParamStore:
 
   def remove(self, key):
     self.values.pop(key, None)
-
-
-def _params(on=True) -> Params:
-  return cast(Params, FakeParams(on))
 
 
 def _feature(requires: tuple[str, ...]) -> Feature:
@@ -182,8 +166,7 @@ class TestStatusAndRetry(unittest.TestCase):
 
   def test_retry_request_is_consumed_once(self):
     params = ParamStore()
-    nonce = deps.request_retry(params)
-    self.assertEqual(params.values[deps.REQUEST_KEY], nonce)
+    deps.request_retry(params)
     self.assertTrue(deps.take_retry(params))
     self.assertFalse(deps.take_retry(params))
 

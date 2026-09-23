@@ -3,11 +3,9 @@ import unittest
 import numpy as np
 import pyray as rl
 from types import SimpleNamespace
-from typing import cast
 from unittest import mock
 
 from openpilot.common.filter_simple import FirstOrderFilter
-from openpilot.common.params import Params
 from openpilot.common.realtime import DT_MDL
 from openpilot.cereal import log, messaging
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import LEAD_DANGER_FACTOR
@@ -24,6 +22,8 @@ from moonpilot.lead import (
   MOONPILOT_LEAD_ACCEL_FAST_STREAK,
   MOONPILOT_LEAD_ACCEL_TAU,
   MOONPILOT_LEAD_ACCEL_WINDOW,
+  MOONPILOT_LEAD_PATH_PX_PER_M,
+  MOONPILOT_LEAD_PATH_WIDTH,
   MOONPILOT_LEAD_PROB_GATE,
   MOONPILOT_LEAD_PROB_RC,
   MOONPILOT_LEAD_SPEED_JUMP,
@@ -39,6 +39,7 @@ from moonpilot.lead import (
   normalize_lead,
   resample,
 )
+from moonpilot.tests.fakes import _params
 
 STRAIGHT_PATH_X = list(np.linspace(0.0, 60.0, 33))
 STRAIGHT_PATH_Y = [0.0] * 33
@@ -114,20 +115,6 @@ class FakeLead:
   def __init__(self, present=True, in_path=1.0):
     self.present = present
     self.inPath = in_path
-
-
-class FakeParams:
-  """Duck-typed stand-in for Params, so the tests never touch the real param store."""
-
-  def __init__(self, on=True):
-    self._on = on
-
-  def get(self, key, return_default=False):
-    return self._on
-
-
-def _params(on=True) -> Params:
-  return cast(Params, FakeParams(on))
 
 
 def _filter(x0=1.0):
@@ -622,11 +609,10 @@ class TestRendererLeadPath(unittest.TestCase):
   def test_width_comes_from_the_models_own_std(self):
     for tree in ("tizi", "mici"):
       with self.subTest(tree=tree):
-        r = self._renderer(tree)
-        floor, ceiling = r.MOONPILOT_LEAD_PATH_WIDTH
+        floor, ceiling = MOONPILOT_LEAD_PATH_WIDTH
         np.testing.assert_allclose(self._projected(tree, [0.0] * 6, y_std=[0.0] * 6)[2], floor)
         np.testing.assert_allclose(self._projected(tree, [0.0] * 6, y_std=[10.0] * 6)[2], ceiling)
-        middle = np.clip(1.0 * r.MOONPILOT_LEAD_PATH_PX_PER_M, floor, ceiling)
+        middle = np.clip(1.0 * MOONPILOT_LEAD_PATH_PX_PER_M, floor, ceiling)
         np.testing.assert_allclose(self._projected(tree, [0.0] * 6, y_std=[1.0] * 6)[2], middle)
 
   def test_a_short_y_std_falls_back_instead_of_raising(self):
@@ -634,10 +620,9 @@ class TestRendererLeadPath(unittest.TestCase):
     # populated yStd must not reach it.
     for tree in ("tizi", "mici"):
       with self.subTest(tree=tree):
-        r = self._renderer(tree)
         points, _, widths = self._projected(tree, [0.0] * 6, y_std=[0.9])
         assert points.shape[0] >= 2, points.shape
-        expected = np.clip(MOONPILOT_MIN_Y_STD * r.MOONPILOT_LEAD_PATH_PX_PER_M, *r.MOONPILOT_LEAD_PATH_WIDTH)
+        expected = np.clip(MOONPILOT_MIN_Y_STD * MOONPILOT_LEAD_PATH_PX_PER_M, *MOONPILOT_LEAD_PATH_WIDTH)
         np.testing.assert_allclose(widths, expected)
 
   def test_lateral_prediction_reaches_the_projection(self):

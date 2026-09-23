@@ -25,16 +25,12 @@ from moonpilot import tailscale
 INSTRUCTIONS = ("Scan this code with your phone", "Or open this link: {}", "Approve this device in your tailnet if your tailnet requires it")
 
 
-class TailscaleSignInDialog(Widget):
-  """Full-screen QR dialog for the pending tailscale login."""
+class QrTexture:
+  """The login URL's QR texture, shared by both trees' dialogs; the mici one sets `_qr_inverted`."""
 
-  def __init__(self):
-    super().__init__()
-    self._params = Params()
-    self._url = ""
-    self._qr: rl.Texture | None = None
-    self._close_btn = IconButton(gui_app.texture("icons/close.png", 80, 80))
-    self._close_btn.set_click_callback(gui_app.pop_widget)
+  _qr_inverted = False
+  _url = ""
+  _qr: "rl.Texture | None" = None  # quoted: pyray's Texture is a function, so `|` fails at class scope
 
   def _update_qr(self, url: str) -> None:
     # Driven by the URL string, not a timer: it arrives from a param the supervisor rewrites, and
@@ -50,10 +46,24 @@ class TailscaleSignInDialog(Widget):
     if not url:
       return
     try:
-      self._qr = make_texture(url)
+      self._qr = make_texture(url, inverted=self._qr_inverted)
     except Exception:
       cloudlog.exception("tailscale QR generation failed")
       self._qr = None
+
+  def __del__(self):
+    if self._qr is not None and self._qr.id != 0:
+      rl.unload_texture(self._qr)
+
+
+class TailscaleSignInDialog(QrTexture, Widget):
+  """Full-screen QR dialog for the pending tailscale login."""
+
+  def __init__(self):
+    super().__init__()
+    self._params = Params()
+    self._close_btn = IconButton(gui_app.texture("icons/close.png", 80, 80))
+    self._close_btn.set_click_callback(gui_app.pop_widget)
 
   def _update_state(self):
     if not tailscale.auth_url(self._params):
@@ -116,10 +126,6 @@ class TailscaleSignInDialog(Widget):
       return
     source = rl.Rectangle(0, 0, self._qr.width, self._qr.height)
     rl.draw_texture_pro(self._qr, source, rect, rl.Vector2(0, 0), 0, rl.WHITE)
-
-  def __del__(self):
-    if self._qr is not None and self._qr.id != 0:
-      rl.unload_texture(self._qr)
 
 
 class _Background(Widget):

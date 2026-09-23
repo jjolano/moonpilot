@@ -91,15 +91,3 @@ class PitchOffsetEstimator:
       return
     self.filter.update(float(pitch))
     self.samples += 1
-
-
-if __name__ == "__main__":
-  # Smoke check: a constant 2.16 deg of reported pitch on level road is learned as the offset.
-  # Five time constants of driving, because one drive's worth is deliberately only part of the way.
-  bias = math.radians(2.16)
-  estimator = PitchOffsetEstimator()
-  for _ in range(int(5 * MOONPILOT_PITCH_RC / DT_MDL)):
-    estimator.update(bias, True)
-  assert estimator.status == "estimated"
-  assert abs(estimator.applied() - bias) < math.radians(0.05), estimator.applied()
-  assert MOONPILOT_PITCH_OFFSET_MAX > bias

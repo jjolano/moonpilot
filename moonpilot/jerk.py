@@ -96,14 +96,3 @@ class LongitudinalComfortJerkEstimator:
     ratio = min(max(ratio, 1.0 / MOONPILOT_LONG_JERK_MAX_RATIO), MOONPILOT_LONG_JERK_MAX_RATIO)
     self.filter.update(1.0 / ratio)
     self.samples += 1
-
-
-if __name__ == "__main__":
-  # Tiny smoke check for the pure estimator: twice the requested positive jerk tightens to <= 1.
-  estimator = LongitudinalComfortJerkEstimator()
-  delay_frames = 3
-  command = [0.5 + 0.75 * math.sin(2.0 * math.pi * i / 40.0) for i in range(500)]
-  actual = [2.0 * command[i - delay_frames] if i >= delay_frames else 0.0 for i in range(500)]
-  for cmd, acc in zip(command, actual, strict=True):
-    estimator.update(cmd, acc, delay_frames * estimator.dt, True)
-  assert estimator.estimate <= 1.0

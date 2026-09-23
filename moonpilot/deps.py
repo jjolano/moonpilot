@@ -145,16 +145,9 @@ def status_text(params) -> tuple[str, str]:
   return labels.get(state, "starting"), detail
 
 
-_last_retry_nonce = 0
-
-
-def request_retry(params) -> str:
+def request_retry(params) -> None:
   """Authorize one install attempt over a metered connection."""
-  global _last_retry_nonce
-  _last_retry_nonce = max(_last_retry_nonce + 1, time.monotonic_ns())
-  nonce = str(_last_retry_nonce)
-  params.put(REQUEST_KEY, nonce)
-  return nonce
+  params.put(REQUEST_KEY, "1")
 
 
 def take_retry(params) -> bool:
