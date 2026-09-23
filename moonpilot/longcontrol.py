@@ -89,12 +89,21 @@ class MoonpilotLongControl:
     if self.long_control_state == LongCtrlState.stopping:
       output_accel = max(min(self.last_output_accel, 0.0) - MOONPILOT_STOPPING_JERK * DT_CTRL, self.CP.stopAccel)
       self.reset()
-    else:  # LongCtrlState.pid
-      error = a_target - CS.aEgo
-      # Standing still, or with the driver on a pedal, the integrator would wind up on error that
-      # is a measurement artifact or a command the driver is overriding.
-      freeze = CS.vEgo < MOONPILOT_STANDSTILL_SPEED or CS.brakePressed or CS.gasPressed
-      output_accel = self.pid.update(error, speed=CS.vEgo, feedforward=a_target, freeze_integrator=freeze)
+      # Both clips stay on this path: STOPPING_JERK is the tighter ramp once last is already ≤ 0,
+      # but entering stopping from a positive last_output_accel only the ACCEL_JERK window keeps
+      # the step down to min(last, 0) - STOPPING_JERK*dt from jumping the command.
+      output_accel = float(
+        np.clip(output_accel, self.last_output_accel - MOONPILOT_ACCEL_JERK * DT_CTRL, self.last_output_accel + MOONPILOT_ACCEL_JERK * DT_CTRL)
+      )
+      self.last_output_accel = float(np.clip(output_accel, accel_limits[0], accel_limits[1]))
+      return self.last_output_accel
+
+    # LongCtrlState.pid
+    error = a_target - CS.aEgo
+    # Standing still, or with the driver on a pedal, the integrator would wind up on error that
+    # is a measurement artifact or a command the driver is overriding.
+    freeze = CS.vEgo < MOONPILOT_STANDSTILL_SPEED or CS.brakePressed or CS.gasPressed
+    output_accel = self.pid.update(error, speed=CS.vEgo, feedforward=a_target, freeze_integrator=freeze)
 
     output_accel = float(
       np.clip(output_accel, self.last_output_accel - MOONPILOT_ACCEL_JERK * DT_CTRL, self.last_output_accel + MOONPILOT_ACCEL_JERK * DT_CTRL)

@@ -184,35 +184,35 @@ MOONPILOT_TTC_TARGET_V = [1.5, MOONPILOT_TTC_TARGET]  # s
 MOONPILOT_K_TTC = 1.0  # 1/s on the excess closing rate
 MOONPILOT_MIN_SLACK = 1.0  # m; the standstill target is soft inside this final meter: the exact
 # kinematic floor gives way to the TTC/regulator profile there, while higher-speed stops still bind
-MOONPILOT_LEAD_PREVIEW_T = 0.5  # s of the lead's own braking credited to the safety terms' lead speed
-# It is one-sided, and the only *prediction* in this function: a lead that is braking is matched as if
-# it had already shed this much speed, which is what makes the onset early — measured on a settled
-# follow at 20 m/s, a lead braking at -3.5 m/s^2 brings the command to -2.0 m/s^2 at 0.50 s here against
-# 0.95 s with no credit — and it is also the one thing here that can brake for a lead whose brake is not
-# real. It stops at this length rather than a full second on both counts: measured closed-loop from
-# 60 m at 30 m/s, a lead tapping -5 m/s^2 for 0.5 s peaks the command at 1.58 here against 3.36 at a
-# full second, and the ego stays 1.33 m/s above the slowest the lead ever went where the full second put
-# it 1.98 m/s below; while the margin on a *sustained* brake is untouched — from the 1.45 s follow gap
-# at 20 m/s, a lead holding -5 m/s^2 to rest leaves 5.77 m of end gap against 5.33 m at a full second
-# and 0.60 m with no credit at all. Nothing else about a lead's accel is predicted: the acceleration
-# credit below is the regulator's alone, and the TTC term reads the same credited speed this does. The
-# estimator's accel does still reach both terms one other way, and that is the delay match rather than a
-# credit — `update` hands the policy `lead_state_at`'s speed at `action_t + lead_age`, which carries
-# ~0.25 s of it. This constant is the extra prediction on top of that.
-MOONPILOT_LEAD_PREVIEW_T_ACCEL = 0.5  # s of the lead's own acceleration credited to the *regulator's*
-# lead-speed term, where the cruise cap already bounds what it can ask for. This is what makes the plan
-# answer a lead that is pulling away rather than only a lead that has already gone: the speed being
-# matched is the lead's next one, so the ego anticipates the gap opening instead of chasing it. It is
-# one-sided — a braking lead gets nothing here — and it never reaches the safety terms, so no predicted
-# launch can release braking. Cost, by construction: while a lead accelerates at `a_lead` the regulator's
-# equilibrium moves from `gap == target` to `gap == target - (K_V / K_GAP) * a_lead * this` — 1 m
-# closer per m/s^2 of lead accel, held only as long as the estimate says the lead is still gaining.
-# Measured: a settled follow behind a lead holding 0.5 m/s^2 sits 0.35 m closer than the setpoint where
-# the uncredited law sits 0.13 m behind it, and a lead that launches at 1 m/s^2 for 3 s and then brakes
-# at -3 to rest ends 6 cm *further* back — the transient does not survive the approach. At a launch it
-# is a live term on its own against a slow lead — a 0.5 m/s^2 launch draws 0.292 m/s^2 at 0.25 s against
-# 0.165, and 0.15 m of gap by 2 s — while against a hard one (2 m/s^2) the comfort ramp is what binds
-# and this term moves 0.005 m until `MOONPILOT_JERK_LAUNCH` unlocks it.
+MOONPILOT_LEAD_PREVIEW_T = 0.5  # s of a lead's own accel credited into the speed each side reads
+# One length; direction picks which term it feeds. Braking goes to the safety terms' lead speed
+# (`v_lead_eff`): a lead that is braking is matched as if it had already shed this much speed, which
+# is what makes the onset early — measured on a settled follow at 20 m/s, a lead braking at
+# -3.5 m/s^2 brings the command to -2.0 m/s^2 at 0.50 s here against 0.95 s with no credit — and it
+# is also the one thing here that can brake for a lead whose brake is not real. It stops at this
+# length rather than a full second on both counts: measured closed-loop from 60 m at 30 m/s, a lead
+# tapping -5 m/s^2 for 0.5 s peaks the command at 1.58 here against 3.36 at a full second, and the
+# ego stays 1.33 m/s above the slowest the lead ever went where the full second put it 1.98 m/s
+# below; while the margin on a *sustained* brake is untouched — from the 1.45 s follow gap at 20 m/s,
+# a lead holding -5 m/s^2 to rest leaves 5.77 m of end gap against 5.33 m at a full second and 0.60 m
+# with no credit at all. Acceleration goes to the *regulator's* lead-speed term only
+# (`v_lead_match`), where the cruise cap already bounds what it can ask for: the speed being matched
+# is the lead's next one, so the ego anticipates the gap opening instead of chasing it. That half is
+# one-sided the other way — a braking lead gets nothing there — and it never reaches the safety
+# terms, so no predicted launch can release braking. Cost of the accel half, by construction: while a
+# lead accelerates at `a_lead` the regulator's equilibrium moves from `gap == target` to
+# `gap == target - (K_V / K_GAP) * a_lead * this` — 1 m closer per m/s^2 of lead accel, held only as
+# long as the estimate says the lead is still gaining. Measured: a settled follow behind a lead
+# holding 0.5 m/s^2 sits 0.35 m closer than the setpoint where the uncredited law sits 0.13 m behind
+# it, and a lead that launches at 1 m/s^2 for 3 s and then brakes at -3 to rest ends 6 cm *further*
+# back — the transient does not survive the approach. At a launch it is a live term on its own
+# against a slow lead — a 0.5 m/s^2 launch draws 0.292 m/s^2 at 0.25 s against 0.165, and 0.15 m of
+# gap by 2 s — while against a hard one (2 m/s^2) the comfort ramp is what binds and this term moves
+# 0.005 m until `MOONPILOT_JERK_LAUNCH` unlocks it. Nothing else about a lead's accel is predicted:
+# the TTC term reads the same braking-credited speed as the safety terms, and the estimator's accel
+# reaches both terms one other way — the delay match rather than a credit — `update` hands the
+# policy `lead_state_at`'s speed at `action_t + lead_age`, which carries ~0.25 s of it. This
+# constant is the extra prediction on top of that.
 MOONPILOT_LEAD_BRAKE_SUSTAIN_T = 2.0  # s; how long `stopping_decel` assumes a braking lead keeps
 # braking. It is the one dial between the two ways that term can be wrong, and both ends were flown
 # through this planner (closed loop, `_planner`/`_inputs`, contact = gap < 0.4 m):
@@ -347,9 +347,14 @@ def cruise_cap(v_ego, e2e, steer_angle_deg, CP, accel_coast, allow_throttle) -> 
   return cap
 
 
-def _coast_applies(v_ego, v_cruise, e2e, accel_coast, allow_throttle, coast_band) -> bool:
+def _coast_grade(accel_coast) -> tuple[float, float]:
+  """(coast, grade) for this frame: the fitted coast accel for the pitch, and its road term."""
   coast = float(np.clip(accel_coast, -MOONPILOT_COAST_ACCEL_MAX, MOONPILOT_COAST_ACCEL_MAX))
-  grade = coast - MOONPILOT_COAST_FLAT_ACCEL
+  return coast, coast - MOONPILOT_COAST_FLAT_ACCEL
+
+
+def _coast_applies(v_ego, v_cruise, e2e, accel_coast, allow_throttle, coast_band) -> bool:
+  _, grade = _coast_grade(accel_coast)
   error = v_cruise - v_ego
   return (
     coast_band > 0.0
@@ -364,8 +369,7 @@ def _coast_applies(v_ego, v_cruise, e2e, accel_coast, allow_throttle, coast_band
 def _climb_recovery_applies(v_ego, v_cruise, e2e, accel_coast, allow_throttle, coast_band) -> bool:
   """Just past the climb band the plain law would pull back with a full ladder rung; hold the positive
   ask to a gentle constant so recovery from the sag is slow and steady on the same steep grade."""
-  coast = float(np.clip(accel_coast, -MOONPILOT_COAST_ACCEL_MAX, MOONPILOT_COAST_ACCEL_MAX))
-  grade = coast - MOONPILOT_COAST_FLAT_ACCEL
+  _, grade = _coast_grade(accel_coast)
   error = v_cruise - v_ego
   return (
     coast_band > 0.0
@@ -406,7 +410,7 @@ def cruise_accel(v_ego, v_cruise, e2e, steer_angle_deg, CP, accel_coast, allow_t
   ]
   a = min(float(np.interp(v_cruise - v_ego, MOONPILOT_CRUISE_ERR_BP, rungs)), cap)
   if _coast_applies(v_ego, v_cruise, e2e, accel_coast, allow_throttle, coast_band):
-    coast = float(np.clip(accel_coast, -MOONPILOT_COAST_ACCEL_MAX, MOONPILOT_COAST_ACCEL_MAX))
+    coast, _ = _coast_grade(accel_coast)
     # Only where the hill is the thing moving the car — it pushes the car away from the set speed —
     # and only inside the band. A descent needs this even when the model disallows throttle: the
     # existing cap limits positive acceleration but never relaxes braking above the set speed. On a
@@ -549,7 +553,7 @@ def lead_accel(v_ego, gap, v_lead, a_lead, t_follow) -> float:
   # speed *this* regulator matches, and never to the safety terms: crediting it there would release
   # braking on nothing but a predicted launch.
   v_lead_eff = max(0.0, v_lead + min(float(a_lead), 0.0) * MOONPILOT_LEAD_PREVIEW_T)
-  v_lead_match = v_lead + max(float(a_lead), 0.0) * MOONPILOT_LEAD_PREVIEW_T_ACCEL
+  v_lead_match = v_lead + max(float(a_lead), 0.0) * MOONPILOT_LEAD_PREVIEW_T
   gap_target = max(MOONPILOT_STOP_DISTANCE, t_follow * v_ego)
   closing_match = max(v_ego - v_lead_match, 0.0)
   gap_cushion = min(

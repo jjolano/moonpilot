@@ -74,7 +74,6 @@ from moonpilot.longitudinal import (
   MOONPILOT_K_TTC,
   MOONPILOT_K_V,
   MOONPILOT_LEAD_PREVIEW_T,
-  MOONPILOT_LEAD_PREVIEW_T_ACCEL,
   MOONPILOT_MIN_SLACK,
   MOONPILOT_MODEL_BRAKE_THRESHOLD,
   MOONPILOT_OUT_OF_PATH_T_FOLLOW,
@@ -450,7 +449,7 @@ class TestPolicyFunctions(unittest.TestCase):
     where each one lands is the whole contract. Braking goes into the speed the safety terms are
     measured against (`MOONPILOT_LEAD_PREVIEW_T`) — the cautious direction, and the only prediction
     either term makes; the constant carries why it stops at half a second. Acceleration goes into the
-    speed the *regulator* matches (`MOONPILOT_LEAD_PREVIEW_T_ACCEL`), and must not reach the safety
+    speed the *regulator* matches (`MOONPILOT_LEAD_PREVIEW_T`), and must not reach the safety
     terms at all: releasing braking on a predicted launch is the fork braking for a prediction where
     the geometry had not moved. Pinned by arithmetic on both halves, at states where each is the term
     that governs — every other `lead_accel` call in this file passes `a_lead=0.0`, so this is the only
@@ -478,7 +477,7 @@ class TestPolicyFunctions(unittest.TestCase):
     a_track_free = MOONPILOT_K_GAP * (20.0 - gap_target) + MOONPILOT_K_V * 2.0
     for a_lead, expected in (
       (0.0, a_track_free),
-      (2.0, a_track_free + MOONPILOT_K_V * MOONPILOT_LEAD_PREVIEW_T_ACCEL * 2.0),
+      (2.0, a_track_free + MOONPILOT_K_V * MOONPILOT_LEAD_PREVIEW_T * 2.0),
       (-2.0, a_track_free),  # a braking lead adds nothing to what the car matches
     ):
       self.assertAlmostEqual(lead_accel(10.0, 20.0, 12.0, a_lead, t_follow), expected, places=9)
@@ -1112,7 +1111,7 @@ class TestPlanner(unittest.TestCase):
   def test_a_launch_is_answered_through_the_projection_and_the_regulator(self):
     """Both positive channels, and nothing else. `lead_state_at` projects the lead's own accel over
     `action_t + lead_age`, so the gap the policy sees is the lead's future *position*; `lead_accel`'s
-    regulator then matches `v_lead + MOONPILOT_LEAD_PREVIEW_T_ACCEL * a_lead`, its future *speed*. The
+    regulator then matches `v_lead + MOONPILOT_LEAD_PREVIEW_T * a_lead`, its future *speed*. The
     safety terms stay on the raw speed (`v_ego - v_lead_eff` is still positive here — the braking
     credit is one-sided, and this lead is accelerating — so no approach term is even consulted); that
     split is the point, because a launch is the one moment there is nothing to brake for and a credit
@@ -1126,7 +1125,7 @@ class TestPlanner(unittest.TestCase):
     self.assertGreater(projected[1], unprojected[1])  # and faster
 
     a_track = MOONPILOT_K_GAP * (gap - MOONPILOT_STOP_DISTANCE) + MOONPILOT_K_V * v_lead
-    for a_lead, expected in ((0.0, min(a_track, MOONPILOT_FAST_CRAWL)), (2.0, a_track + MOONPILOT_K_V * MOONPILOT_LEAD_PREVIEW_T_ACCEL * 2.0)):
+    for a_lead, expected in ((0.0, min(a_track, MOONPILOT_FAST_CRAWL)), (2.0, a_track + MOONPILOT_K_V * MOONPILOT_LEAD_PREVIEW_T * 2.0)):
       self.assertAlmostEqual(lead_accel(0.0, gap, v_lead, a_lead, t_follow), expected, places=9)
     self.assertGreater(lead_accel(0.0, gap, v_lead, 2.0, t_follow), 0.0)
 

@@ -263,12 +263,7 @@ def lead_in_path(t, x, y, y_std, ego_path_x, ego_path_y, filt) -> float:
   s_clamped = np.maximum(s_d[: probs.size], MOONPILOT_MIN_Y_STD)
   weights = 1.0 / s_clamped**2
   raw = float(np.sum(probs * weights) / np.sum(weights))
-
-  if raw > filt.x:
-    filt.x = raw
-  else:
-    filt.update(raw)
-  return float(filt.x)
+  return _rise_hold(raw, filt)
 
 
 def _empty(slot: int, filt) -> dict:
@@ -283,14 +278,18 @@ def _empty(slot: int, filt) -> dict:
   }
 
 
-def _filtered_prob(prob: float, filt) -> float:
-  """radard's own gate filter: a rise is instant, a fall decays, so one low-prob frame cannot drop
-  a lead. Same shape as the inPath filter, and the same reason."""
-  if prob > filt.x:
-    filt.x = prob
+def _rise_hold(raw: float, filt) -> float:
+  """radard's gate shape: a rise is instant, a fall decays, so one low frame cannot drop the value."""
+  if raw > filt.x:
+    filt.x = raw
   else:
-    filt.update(prob)
+    filt.update(raw)
   return float(filt.x)
+
+
+def _filtered_prob(prob: float, filt) -> float:
+  """The lead-prob gate through `_rise_hold`: one low-prob frame cannot drop a lead."""
+  return _rise_hold(prob, filt)
 
 
 def normalize_lead(slot, model_lead, fused_lead, ego_path_x, ego_path_y, in_path_filter, prob_filter) -> dict:
