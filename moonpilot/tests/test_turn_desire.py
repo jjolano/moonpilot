@@ -204,6 +204,27 @@ class TestTurnDesireBanner(unittest.TestCase):
     self.assertEqual(right.alert_text_1, "Turning Right")
     self.assertEqual(right.alert_text_2, "")
 
+  def test_explicit_car_state_when_sm_lacks_carState(self):
+    # selfdrived's SubMaster has no carState (separate conflate socket); the
+    # KeyError there killed selfdrived on the first latActive frame.
+    class _NoCarStateSM(_FakeSubMaster):
+      def __init__(self, **kw):
+        super().__init__(**kw)
+        self.carState = None
+
+      def __getitem__(self, key):
+        if key == "carState":
+          raise KeyError(key)
+        return super().__getitem__(key)
+
+    cs = _FakeCarState(vEgo=5.0, leftBlinker=True)
+    sm = _NoCarStateSM(car_state=None, lat_active=True)
+    params = _params({"MoonpilotTurnDesire": 1})
+    self.assertEqual(turn_desire(sm, params=params, car_state=cs), log.Desire.turnLeft)
+    self.assertEqual(turn_desire_alert(sm, params, car_state=cs), log.OnroadEvent.EventName.turnLeft)
+    with self.assertRaises(KeyError):
+      turn_desire(sm, params=params)
+
 
 class TestLaneChangeSpeedMin(unittest.TestCase):
   def test_matches_upstream(self):

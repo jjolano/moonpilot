@@ -335,7 +335,7 @@ class SelfdriveD:
     # applied turn desire is never published, so this recomputes modeld's own predicate -- plus the
     # one thing modeld does not check, `carControl.latActive`: the pulse is fed to the model while
     # disengaged too, and a banner there would claim a turn nobody is taking.
-    turn_alert = turn_desire_alert(self.sm, self.params)
+    turn_alert = turn_desire_alert(self.sm, self.params, CS)
     if turn_alert is not None:
       self.events.add(turn_alert)
 

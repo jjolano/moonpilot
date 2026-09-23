@@ -8,7 +8,7 @@ from openpilot.common.constants import CV
 LANE_CHANGE_SPEED_MIN = 20 * CV.MPH_TO_MS  # ~32 km/h, same as upstream
 
 
-def turn_desire(sm, desire_state=None, params=None) -> int | None:
+def turn_desire(sm, desire_state=None, params=None, car_state=None) -> int | None:
   """Return a turn desire (log.Desire.turnLeft / turnRight) or None.
 
   Conditions:
@@ -16,6 +16,9 @@ def turn_desire(sm, desire_state=None, params=None) -> int | None:
   - Speed must be below LANE_CHANGE_SPEED_MIN
   - A blinker must be on (leftBlinker != rightBlinker)
   - A strong current model desireState prediction overrides the blinker
+
+  `car_state` overrides `sm["carState"]` for callers whose SubMaster does not
+  subscribe to carState — selfdrived reads it through a separate conflate socket.
   """
   from openpilot.common.params import Params
   from moonpilot.features import TURN_DESIRE, enabled
@@ -25,11 +28,12 @@ def turn_desire(sm, desire_state=None, params=None) -> int | None:
   if not enabled(TURN_DESIRE, params):
     return None
 
-  v_ego = max(sm["carState"].vEgo, 0.0)
+  cs = car_state if car_state is not None else sm["carState"]
+  v_ego = max(cs.vEgo, 0.0)
   if v_ego >= LANE_CHANGE_SPEED_MIN:
     return None
 
-  one_blinker = sm["carState"].leftBlinker != sm["carState"].rightBlinker
+  one_blinker = cs.leftBlinker != cs.rightBlinker
   if not one_blinker:
     return None
 
@@ -44,15 +48,15 @@ def turn_desire(sm, desire_state=None, params=None) -> int | None:
       return log.Desire.turnRight
 
   # Blinker fallback: left = turnLeft, right = turnRight
-  if sm["carState"].leftBlinker:
+  if cs.leftBlinker:
     return log.Desire.turnLeft
-  elif sm["carState"].rightBlinker:
+  elif cs.rightBlinker:
     return log.Desire.turnRight
 
   return None
 
 
-def turn_desire_alert(sm, params=None) -> int | None:
+def turn_desire_alert(sm, params=None, car_state=None) -> int | None:
   """The banner for an active turn desire: `log.OnroadEvent.EventName.turnLeft` / `turnRight`, or None.
 
   The same predicate modeld feeds the model, plus the one thing the model side does not need:
@@ -71,7 +75,7 @@ def turn_desire_alert(sm, params=None) -> int | None:
   desire_state = model.meta.desireState
   if len(desire_state) <= log.Desire.turnRight:
     desire_state = None
-  desire = turn_desire(sm, desire_state, params)
+  desire = turn_desire(sm, desire_state, params, car_state)
   if desire == log.Desire.turnLeft:
     return log.OnroadEvent.EventName.turnLeft
   if desire == log.Desire.turnRight:
