@@ -168,6 +168,18 @@ class TestStatusAndRetry(unittest.TestCase):
         deps.put_status(params, state, "cryptography is missing.")
         self.assertEqual(deps.read_status(params), (state, "cryptography is missing."))
 
+  def test_empty_status_reads_ready_when_nothing_is_missing(self):
+    # depsd never starts when missing() is empty, so MoonpilotDepsStatus stays cleared at
+    # boot — the row used to sit on the unknown-state fallback ("starting") forever.
+    params = ParamStore()
+    with mock.patch.object(deps, "missing", return_value=[]):
+      self.assertEqual(deps.status_text(params), ("ready", "All required modules are installed."))
+
+  def test_empty_status_stays_starting_while_something_is_missing(self):
+    params = ParamStore()
+    with mock.patch.object(deps, "missing", return_value=[deps.Requirement(ABSENT, "x==1")]):
+      self.assertEqual(deps.status_text(params), ("starting", ""))
+
   def test_retry_request_is_consumed_once(self):
     params = ParamStore()
     nonce = deps.request_retry(params)

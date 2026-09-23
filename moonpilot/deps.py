@@ -130,6 +130,11 @@ def read_status(params) -> tuple[str, str]:
 def status_text(params) -> tuple[str, str]:
   """Return the driver-facing value and detail for the dependency status row."""
   state, detail = read_status(params)
+  # depsd only runs while something is missing (moonpilot/procs.py), and the status is
+  # CLEAR_ON_MANAGER_START — so after boot an empty status with nothing missing is the
+  # normal case, not "still starting". Answer from reality until depsd has written.
+  if not state and not missing():
+    return "ready", "All required modules are installed."
   labels = {
     READY: "ready",
     WAITING_NETWORK: "waiting for network",
