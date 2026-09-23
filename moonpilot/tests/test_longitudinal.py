@@ -51,10 +51,15 @@ from moonpilot.features import FEATURES
 from moonpilot.lead import MOONPILOT_LEAD_ACCEL_TAU, LeadAccelEstimator
 from moonpilot.longitudinal import (
   MOONPILOT_APPROACH_DECEL,
+  MOONPILOT_BRAKE_LIGHT,
+  MOONPILOT_BRAKE_MEDIUM,
   MOONPILOT_COAST_BAND,
   MOONPILOT_COAST_FLAT_ACCEL,
   MOONPILOT_COAST_GRADE_MIN,
   MOONPILOT_CONTROL_T_IDX,
+  MOONPILOT_CREEP_SPEED,
+  MOONPILOT_FAST_ACCEL_V,
+  MOONPILOT_FAST_CRAWL,
   MOONPILOT_FCW_DECEL,
   MOONPILOT_FOLLOW_CUSHION,
   MOONPILOT_JERK_EMERGENCY,
@@ -62,18 +67,22 @@ from moonpilot.longitudinal import (
   MOONPILOT_JERK_LAUNCH,
   MOONPILOT_JERK_LAUNCH_SPEED,
   MOONPILOT_JERK_UP,
+  MOONPILOT_LADDER_V_BP,
   MOONPILOT_K_GAP,
   MOONPILOT_K_TTC,
   MOONPILOT_K_V,
   MOONPILOT_LEAD_PREVIEW_T,
   MOONPILOT_LEAD_PREVIEW_T_ACCEL,
+  MOONPILOT_MIN_SLACK,
   MOONPILOT_MODEL_BRAKE_THRESHOLD,
   MOONPILOT_OUT_OF_PATH_T_FOLLOW,
+  MOONPILOT_SLOW_ACCEL_V,
   MOONPILOT_STOP_DISTANCE,
   MOONPILOT_T_FOLLOW,
   MOONPILOT_TTC_TARGET,
   MoonpilotLongitudinalPlanner,
   coast_accel,
+  crawl_accel,
   cruise_accel,
   jerk_limit,
   lead_accel,
@@ -82,6 +91,7 @@ from moonpilot.longitudinal import (
   moonpilot_longitudinal_planner,
   policy,
   required_decel,
+  stopping_decel,
 )
 
 Personality = log.LongitudinalPersonality
@@ -288,6 +298,41 @@ def _planner(car=CAR.HONDA_CIVIC, params_on=True, params_overrides=None, **kwarg
   return planner
 
 
+def _fly(v0, v_set_kph, gap0, v_lead0, a_lead_fn, T, dt=DT_MDL):
+  """Fly the shipped planner against a scripted lead, point-mass plant, and summarise the run.
+
+  The lead is rebuilt every frame from its own integrated speed rather than handed an `a_lead`, so
+  `LeadAccelEstimator` reads a real speed history — the same thing it reads on the road. Scenarios
+  give the lead a second of steady following before any brake onset, which is what the estimator
+  needs before it can speak. `contact` is upstream's maneuver bar, a gap under 0.4 m.
+  """
+  planner = _planner()
+  v, gap, v_lead, a_prev = v0, gap0, v_lead0, 0.0
+  vs, gaps, v_leads, cmds = [], [], [], []
+  for frame in range(round(T / dt)):
+    a_lead = float(a_lead_fn(frame * dt))
+    planner.update(_inputs(v_ego=max(v, 0.0), v_cruise_kph=v_set_kph, a_ego=a_prev, lead=_lead(max(gap, 0.0), max(v_lead, 0.0)), personality=1))
+    a_prev = float(planner.output_a_target)
+    vs.append(v)
+    gaps.append(gap)
+    v_leads.append(v_lead)
+    cmds.append(a_prev)
+    v = max(0.0, v + a_prev * dt)
+    v_lead_next = max(0.0, v_lead + a_lead * dt)
+    gap = max(0.0, gap + (0.5 * (v_lead + v_lead_next) - v) * dt)
+    v_lead = v_lead_next
+  return {
+    "v": vs,
+    "vl": v_leads,
+    "gap": gaps,
+    "cmd": cmds,
+    "peak": min(cmds),
+    "min_gap": min(gaps),
+    "end_gap": gaps[-1],
+    "contact": min(gaps) < 0.4,
+  }
+
+
 def _gap_target(v_ego, t_follow):
   """The spacing regulator's setpoint: the time gap, floored at the standstill distance.
 
@@ -331,15 +376,19 @@ class TestPolicyFunctions(unittest.TestCase):
     self.assertAlmostEqual(gap_errors[-1], 0.0, delta=1e-3)
 
   def test_the_approach_handover_has_the_stopping_geometry(self):
-    """The regulator hands over to the approach term at gap == STOP_DISTANCE + (v^2 - v_lead^2) / 2,
-    which is the point where stopping needs more than the approach decel — the crossing the old
-    kinematic term had. It is now the *stopping floor* that binds there (the TTC term is still
-    dormant: +37.5 m/s^2 at 25 m/s), and 0.15 m/s^2 of probe either side of the crossing reads -1.0
-    or the regulator, exactly as it did before the approach term changed.
+    """The regulator hands over to the approach term at gap == STOP_DISTANCE + (v_ego - v_lead)^2 / 2,
+    which is the point where stopping needs more than the approach decel. That is the relative-frame
+    crossing the shipped floor measures: the gap closes at the relative rate while the lead keeps
+    travelling, so the absolute-frame form it replaced (`(v^2 - v_lead^2) / 2`) was exact only for a
+    stopped lead and sat further out by `(v + v_lead) / (v - v_lead)` everywhere else — 118.5 m
+    against 18.5 m at 25/20 m/s. For a stopped lead the two crossings coincide, so those probes are
+    unchanged; the (25, 20) probe is at 18.5 m, where the regulator's own output is already capped at
+    the approach decel on both sides of the crossing (measured +69.98/+106.05/+41.40/+6.75 m/s^2 above
+    it on the stopped cases, -1.0 on the moving one).
     """
     t_follow = MOONPILOT_T_FOLLOW[int(Personality.standard)]
     for v_ego, v_lead in ((25.0, 0.0), (30.0, 0.0), (20.0, 0.0), (25.0, 20.0), (10.0, 0.0)):
-      gap_star = MOONPILOT_STOP_DISTANCE + (v_ego**2 - v_lead**2) / 2
+      gap_star = MOONPILOT_STOP_DISTANCE + (v_ego - v_lead) ** 2 / 2
       cushion = min(MOONPILOT_FOLLOW_CUSHION, (v_ego - v_lead) * MOONPILOT_K_V / MOONPILOT_K_GAP)
       a_track = max(
         MOONPILOT_K_GAP * (gap_star - _gap_target(v_ego, t_follow) + cushion) + MOONPILOT_K_V * (v_lead - v_ego),
@@ -353,24 +402,38 @@ class TestPolicyFunctions(unittest.TestCase):
     asks for more braking than stopping requires — the fork's own response, which is the reason it is
     here rather than the old term alone. Exactly its value, and the floor is provably not what is
     being read (it is shallower at every one of these points).
+
+    The window moved with the floor: at 25 m/s against a stopped lead the floor/TTC crossover is at
+    65.1 m (floor -5.25, TTC -5.17 at 65.5 m; TTC -5.50, floor -5.34 at 64.5 m), so TTC governs
+    65.1 m down to 21.9 m, where the floor takes over again at the end of the approach. The old
+    window's outer probe (64 m) still governs; the inner one (30 m) is unchanged in kind.
     """
     for v_ego, gap in ((25.0, 60.0), (20.0, 50.0), (25.0, 30.0)):
       a_ttc = -MOONPILOT_K_TTC * (v_ego - (gap - MOONPILOT_STOP_DISTANCE) / MOONPILOT_TTC_TARGET)
       a_stop = -(v_ego**2) / (2 * (gap - MOONPILOT_STOP_DISTANCE))
       self.assertLess(a_ttc, a_stop)  # the premise: TTC is the deeper of the two here
       self.assertAlmostEqual(lead_accel(v_ego, gap, 0.0, 0.0, 1.45), a_ttc, delta=1e-9)
+    # the crossover itself, and the floor retaking the end of the approach
+    floor_out = -(25.0**2) / (2 * (65.5 - MOONPILOT_STOP_DISTANCE))
+    ttc_out = -MOONPILOT_K_TTC * (25.0 - (65.5 - MOONPILOT_STOP_DISTANCE) / MOONPILOT_TTC_TARGET)
+    self.assertGreater(ttc_out, floor_out)  # outside the window the floor is deeper
+    self.assertAlmostEqual(lead_accel(25.0, 65.5, 0.0, 0.0, 1.45), floor_out, delta=1e-9)
+    floor_in = -(25.0**2) / (2 * (20.0 - MOONPILOT_STOP_DISTANCE))
+    self.assertAlmostEqual(lead_accel(25.0, 20.0, 0.0, 0.0, 1.45), floor_in, delta=1e-9)
 
   def test_the_stopping_floor_governs_where_the_ttc_target_is_not_enough(self):
     """And the floor wins where it is the deeper one: just inside its own crossing, at the very end
     of an approach, and for a lead that is already moving — the last is the case the TTC term is
-    dormant for, where `a_stop` is the only thing braking at all. Each value is the exact kinematic
-    decel that arrives at STOP_DISTANCE with the lead's speed.
+    dormant for, where the floor is the only thing braking at all. Each value is the relative-frame
+    match `-(v_ego - v_lead)^2 / (2 * slack)`: the old absolute-frame helper read -3.31 at the moving
+    case below where the geometry asks -0.37, and at that slack the regulator's own cap (-1.0) is the
+    deeper term, so the case it pins moved to a gap where the floor genuinely governs.
     """
 
     def a_stop(v_ego, gap, v_lead):
-      return -(v_ego**2 - v_lead**2) / (2 * (gap - MOONPILOT_STOP_DISTANCE))
+      return -((v_ego - v_lead) ** 2) / (2 * (gap - MOONPILOT_STOP_DISTANCE))
 
-    for v_ego, gap, v_lead in ((25.0, 120.0, 0.0), (25.0, 8.0, 0.0), (25.0, 40.0, 20.0)):
+    for v_ego, gap, v_lead in ((25.0, 120.0, 0.0), (25.0, 8.0, 0.0), (25.0, 46.0, 15.0), (20.0, 40.0, 10.0)):
       self.assertAlmostEqual(lead_accel(v_ego, gap, v_lead, 0.0, 1.45), a_stop(v_ego, gap, v_lead), delta=1e-6)
 
   def test_the_last_meter_is_a_soft_stop_target(self):
@@ -379,11 +442,13 @@ class TestPolicyFunctions(unittest.TestCase):
     v_lead_eff = max(0.0, v_lead + a_lead * MOONPILOT_LEAD_PREVIEW_T)
     a_ttc = -MOONPILOT_K_TTC * (v_ego - v_lead_eff - (gap - MOONPILOT_STOP_DISTANCE) / MOONPILOT_TTC_TARGET)
     exact_floor = -(v_ego**2 - v_lead_eff**2) / (2 * (gap - MOONPILOT_STOP_DISTANCE))
+    rel_floor = stopping_decel(v_ego, v_lead_eff, a_lead, max(gap - MOONPILOT_STOP_DISTANCE, MOONPILOT_MIN_SLACK))
 
     actual = lead_accel(v_ego, gap, v_lead, a_lead, MOONPILOT_T_FOLLOW[int(Personality.standard)])
     self.assertLess(a_ttc, -MOONPILOT_APPROACH_DECEL)
     self.assertAlmostEqual(actual, a_ttc, places=9)
     self.assertGreater(actual, exact_floor)
+    self.assertLess(actual, rel_floor)  # the soft meter admits the TTC profile (-1.18), not the floor (-0.94)
 
   def test_the_lead_accel_credit_splits_by_direction_and_by_term(self):
     """The lead's own accel is credited forward into two different speeds, one direction each, and
@@ -395,14 +460,19 @@ class TestPolicyFunctions(unittest.TestCase):
     the geometry had not moved. Pinned by arithmetic on both halves, at states where each is the term
     that governs — every other `lead_accel` call in this file passes `a_lead=0.0`, so this is the only
     coverage either has.
+
+    The braking arm moved with the floor: at (20, 40, 10, -2) the old absolute-frame helper read
+    -4.41 where the shipped sustain law reads -2.9605 (predicted speed 9.0 held 2 s against a 34 m
+    slack), and the uncredited arms read the relative match -1.4706.
     """
     v_ego, gap, v_lead = 20.0, 40.0, 10.0
     t_follow = MOONPILOT_T_FOLLOW[int(Personality.standard)]
 
     # the floor reads the braking credit only, and it governs this state
-    for a_lead, credit in ((0.0, 0.0), (2.0, 0.0), (-2.0, MOONPILOT_LEAD_PREVIEW_T)):
-      v_lead_eff = v_lead + a_lead * credit
-      a_stop = -(v_ego**2 - v_lead_eff**2) / (2 * (gap - MOONPILOT_STOP_DISTANCE))
+    for a_lead, expected in ((0.0, -1.4705882352941178), (2.0, -1.4705882352941178), (-2.0, -2.960526315789474)):
+      v_lead_eff = v_lead + min(a_lead, 0.0) * MOONPILOT_LEAD_PREVIEW_T
+      a_stop = stopping_decel(v_ego, v_lead_eff, a_lead, gap - MOONPILOT_STOP_DISTANCE)
+      self.assertAlmostEqual(a_stop, expected, places=9)
       self.assertLess(a_stop, -MOONPILOT_APPROACH_DECEL)
       self.assertAlmostEqual(lead_accel(v_ego, gap, v_lead, a_lead, t_follow), a_stop, places=9)
 
@@ -470,9 +540,11 @@ class TestPolicyFunctions(unittest.TestCase):
         if v_ego < 0.05 and abs(planner.output_a_target) < 0.05:
           break
       # Strictly inside the actuator's limit, which is also what separates the two laws: with the
-      # floor this loop peaks at 1.38 / 1.93 / 2.31 / 2.87 m/s^2 for the four speeds, where the bare
-      # TTC term sits at exactly ACCEL_MIN at all four. `<=` would be vacuous, since `update` clips
-      # the command to ACCEL_MIN before it ever reaches `output_a_target`.
+      # floor this loop peaks at 2.02 / 2.32 / 2.43 / 2.51 m/s^2 for the four speeds (end gaps
+      # 5.18/5.18/5.17/5.17, bit-identical to the old law — closing at those speeds is the stopped
+      # lead the frame fix does not move), where the bare TTC term sits at exactly ACCEL_MIN at all
+      # four. `<=` would be vacuous, since `update` clips the command to ACCEL_MIN before it ever
+      # reaches `output_a_target`.
       self.assertLess(peak, abs(ACCEL_MIN), f"{v0_kph} kph used the whole actuator limit")
       self.assertLess(v_ego, 0.5)  # it stopped
       self.assertGreater(gap, 5.0)  # without reaching the lead, from a speed it can really be at
@@ -484,7 +556,11 @@ class TestPolicyFunctions(unittest.TestCase):
     Filtered on the same bind condition lead_accel uses — closing, and whichever of the two approach
     terms is past the approach decel — not on required_decel: that helper keeps only a 0.25 m contact
     margin, so it is less conservative than the fork's own terms, and filtering on it would assert a
-    bound the design gives way on exactly where braking harder is genuinely needed.
+    bound the design gives way on exactly where braking harder is genuinely needed. The `a_stop` arm
+    is the shipped sustain law, which is why the old absolute-frame grid cells at (10, 20, 5),
+    (20, 20, 15), (20, 50, 15), (30, 20, 25), (30, 50, 25) and (30, 200, 15) no longer bind: the
+    relative match reads -0.89/-0.89/-0.28/-0.89/-0.28/-0.58 there, inside the approach decel, and the
+    regulator (or its cap) is what the output reads.
     """
     checked = boarded = 0
     for v_ego in (0.0, 5.0, 10.0, 20.0, 30.0):
@@ -494,7 +570,7 @@ class TestPolicyFunctions(unittest.TestCase):
           a_ttc = a_stop = 0.0
           if closing > 0.0:
             a_ttc = -MOONPILOT_K_TTC * (closing - (gap - MOONPILOT_STOP_DISTANCE) / MOONPILOT_TTC_TARGET)
-            a_stop = -(v_ego**2 - v_lead**2) / (2 * max(gap - MOONPILOT_STOP_DISTANCE, 0.5))
+            a_stop = stopping_decel(v_ego, v_lead, 0.0, max(gap - MOONPILOT_STOP_DISTANCE, MOONPILOT_MIN_SLACK))
           binds = min(a_ttc, a_stop) < -MOONPILOT_APPROACH_DECEL
           for t_follow in MOONPILOT_T_FOLLOW.values():
             a = lead_accel(v_ego, gap, v_lead, 0.0, t_follow)
@@ -514,9 +590,10 @@ class TestPolicyFunctions(unittest.TestCase):
     is what absorbs it, which is what the maneuver suite exercises.)
 
     The sweep is the window where the TTC term is the deeper of the two: from the floor/TTC crossover
-    inward, since below that the floor takes over again.
+    (65.1 m at 25 m/s against a stopped lead) inward to 21.9 m, since below that the floor takes over
+    again.
     """
-    gaps = np.linspace(64.0, 26.0, 400)
+    gaps = np.linspace(64.0, 23.0, 400)
     outputs = [lead_accel(25.0, float(gap), 0.0, 0.0, 1.45) for gap in gaps]
     self.assertLess(max(outputs), -MOONPILOT_APPROACH_DECEL)  # the whole sweep is in that regime
     self.assertLess(float(np.abs(np.diff(outputs)).max()), 0.05)
@@ -594,12 +671,146 @@ class TestPolicyFunctions(unittest.TestCase):
 
   def test_required_decel_counts_a_braking_lead(self):
     """FCW's input: a lead braking hard at matched speed is a threat even at zero relative speed,
-    and routine lead braking is not."""
+    and routine lead braking is not. The shipped `stopping_decel` has no `closing > 0` gate for
+    exactly this reason — a draft of it did, and `required_decel(20, 20, 20, -8)` read -0.0 there,
+    the "reads as no threat until the speed measurement catches up" the helper exists to close —
+    while an ego slower than a braking lead still reads through the prediction branch, and a lead
+    holding its speed is the plain relative match.
+
+    FCW predicts the lead all the way to rest (`sustain=inf`), so these are the to-rest values, not
+    the planner's 2 s horizon: (20, 20, -8) reads -4.47 (the old second constraint read -4.47 there
+    too), the routine cases stay silent, and the overtake probe (30 behind 28 holding speed at 12 m)
+    reads -0.17 where the absolute-frame form fired at -4.94.
+    """
+    self.assertAlmostEqual(required_decel(20.0, 20.0, 20.0, -8.0), -4.4692737430167595, delta=1e-9)
     self.assertLess(required_decel(20.0, 20.0, 20.0, -8.0), MOONPILOT_FCW_DECEL)
+    self.assertAlmostEqual(required_decel(15.0, 26.0, 20.0, -8.0), -2.2167487684729066, delta=1e-9)
     self.assertGreater(required_decel(20.0, 35.0, 20.0, -5.0), MOONPILOT_FCW_DECEL)
     self.assertGreater(required_decel(20.0, 25.0, 20.0, -3.0), MOONPILOT_FCW_DECEL)
     # a lead holding its speed is unchanged: the stopped-car case the threshold was set on
     self.assertAlmostEqual(required_decel(20.0, 30.0, 0.0, 0.0), -(20.0**2) / (2 * (30.0 - 0.25)), delta=1e-9)
+    # and the overtake that must stay silent: 30 behind 28 holding speed at 12 m
+    self.assertAlmostEqual(required_decel(30.0, 12.0, 28.0, 0.0), -0.1702127659574468, delta=1e-9)
+    self.assertGreater(required_decel(30.0, 12.0, 28.0, 0.0), MOONPILOT_FCW_DECEL)
+    # the hard-brake probe that must fire: 30 behind 28 braking at -6 at 25 m
+    self.assertAlmostEqual(required_decel(30.0, 25.0, 28.0, -6.0), -4.995374653098982, delta=1e-9)
+    self.assertLess(required_decel(30.0, 25.0, 28.0, -6.0), MOONPILOT_FCW_DECEL)
+
+  def test_a_stopped_lead_is_bit_identical_to_the_old_law(self):
+    """The frame fix must not move any pinned stopping-distance number: with `v_lead == 0` both the
+    sustain arm (skipped — there is no lead speed to predict from) and the `a_lead < 0` arm collapse
+    to `-v_ego^2 / (2 * slack)`, exactly. Bit-identical (`==`, not almost), over the speeds and slacks
+    the suite pins, so the four reachable-speed approaches and the reference approach are the old
+    law's numbers by construction rather than by re-measurement.
+    """
+    for v_ego in (5.0, 10.0, 20.0, 25.0, 36.0):
+      for slack in (2.0, 20.0, 100.0, 312.5):
+        old = -(v_ego**2) / (2 * slack)
+        self.assertEqual(stopping_decel(v_ego, 0.0, 0.0, slack), old)
+        self.assertEqual(stopping_decel(v_ego, 0.0, -5.0, slack), old)
+    # and through the floor's own call shape, with the soft-meter clamp in place
+    for v_ego, gap in ((25.0, 120.0), (25.0, 8.0), (10.0, 114.0)):
+      slack = max(gap - MOONPILOT_STOP_DISTANCE, MOONPILOT_MIN_SLACK)
+      self.assertEqual(
+        stopping_decel(v_ego, 0.0, 0.0, slack),
+        -(v_ego**2) / (2 * (gap - MOONPILOT_STOP_DISTANCE))
+        if gap - MOONPILOT_STOP_DISTANCE >= MOONPILOT_MIN_SLACK
+        else -(v_ego**2) / (2 * MOONPILOT_MIN_SLACK),
+      )
+
+  def test_a_far_steady_lead_draws_no_floor_governed_brake(self):
+    """The complaint case: route 000003c8's engaged block (70-115 m, 4-7 m/s of closing, ego 17-19
+    m/s behind a lead doing 11-14) sat flat at -1.0..-1.17 for ~8 s because the absolute-frame floor
+    was the only admitted braking term. The relative frame asks ~5x less there, inside the approach
+    decel, so the floor is not admitted at all and the regulator — positive at those gaps — governs.
+    Each case computes the old value inline, so the test documents the delta it removes.
+    """
+    for v_ego, gap, v_lead in ((18.0, 90.0, 12.5), (19.0, 70.0, 14.0), (17.0, 115.0, 11.0)):
+      slack = gap - MOONPILOT_STOP_DISTANCE
+      new = stopping_decel(v_ego, v_lead, 0.0, slack)
+      old = -(v_ego**2 - v_lead**2) / (2 * slack)
+      self.assertGreater(new, -MOONPILOT_APPROACH_DECEL)  # not admitted: the floor cannot govern here
+      self.assertGreater(old / new, 4.0)  # ~4.7-6.6x across these cases (-0.77..-1.29 vs -0.17..-0.20)
+      self.assertGreater(lead_accel(v_ego, gap, v_lead, 0.0, 1.45), 0.0)  # the regulator governs, positive
+    # the first case sits exactly on the old admission edge (old -0.9985), which is the point: the old
+    # floor governed by default at 70-115 m while the geometry asks for a ramp, and the route's 45/45
+    # engaged braking ticks sat on it at -1.0..-1.17.
+    # the analysed scene itself: (19.09, 12.25, -1.28, slack 106.9) reads -0.404, not -1.003
+    self.assertAlmostEqual(stopping_decel(19.09, 12.25, -1.28, 106.9), -0.40361775991229676, delta=1e-9)
+    self.assertAlmostEqual(-(19.09**2 - 12.25**2) / (2 * 106.9), -1.002645463049579, delta=1e-9)
+
+  def test_a_braking_lead_matched_at_speed_still_stops_without_contact(self):
+    """The safety direction that forbids the naive relative form: from the 1.45 s follow gap at
+    20 m/s behind a lead holding -5 m/s^2 to rest, the plain match reads -0.0 at matched speed and
+    contacts it. The sustain law holds 5.70 m of end gap (5.51 before; 5.00 at -3.5 against 5.09),
+    flown through the shared closed-loop harness with 1 s of steady following before the onset.
+    """
+    for brake, end_gap in ((-3.5, 5.00), (-5.0, 5.70)):
+      with self.subTest(brake=brake):
+        s = _fly(20.0, 72.0, 29.0, 20.0, lambda t, b=brake: b if t > 1 else 0.0, 25.0)
+        self.assertFalse(s["contact"])
+        self.assertAlmostEqual(s["end_gap"], end_gap, delta=0.05)
+        self.assertAlmostEqual(s["min_gap"], end_gap, delta=0.05)  # the gap never dips below its rest
+    # and the direct assertion: at matched speed the prediction branch, not the match, is what binds
+    self.assertAlmostEqual(stopping_decel(20.0, 20.0, -5.0, 23.0), -1.5151515151515151, delta=1e-9)
+    self.assertLess(stopping_decel(20.0, 20.0, -5.0, 23.0), -MOONPILOT_APPROACH_DECEL)
+
+  def test_a_tap_does_not_buy_a_sustain_stop(self):
+    """The bound's other direction: a lead tapping -5 m/s^2 for 0.5 s at 30 m/s from 60 m costs
+    -1.00 m/s^2 of peak command, below the absolute-frame law's -1.89 and the unbounded sustain's
+    -3.50, for an end gap of ~40 m either way. That tap peak is the same trade that capped
+    `MOONPILOT_LEAD_PREVIEW_T` at 0.5 s (3.36 there on the same scenario), so this is the number the
+    2.0 s horizon was sized to hold under.
+    """
+    s = _fly(30.0, 108.0, 60.0, 30.0, lambda t: -5.0 if 1 < t < 1.5 else 0.0, 20.0)
+    self.assertAlmostEqual(s["peak"], -1.00, delta=0.05)
+    self.assertFalse(s["contact"])
+
+  def test_the_early_crossing_branch_is_exact_and_continuous(self):
+    """Where the ego matches the lead's speed while the lead is still braking, the late form credits
+    travel the lead has not made yet — at (25, 10, -0.5, slack 25, sustain=inf) it reads -2.50 where
+    the true constant decel is -5.00 — so that case has its own closed form, `|a_lead| +
+    closing^2 / (2 * slack)`. It applies exactly when `2 * slack <= closing * t`, agrees with the
+    late form at that boundary, and binds mostly on the FCW arm where `t` runs to tens of seconds.
+    """
+    import math
+
+    self.assertAlmostEqual(stopping_decel(25.0, 10.0, -0.5, 25.0, sustain=math.inf), -5.0, delta=1e-9)
+    self.assertAlmostEqual(required_decel(25.0, 25.25, 10.0, -0.5), -5.0, delta=1e-9)
+    # continuity at the boundary: (20, 10, -2) has t = 2, closing = 10, so 2*slack == 20 at slack 10
+    self.assertAlmostEqual(stopping_decel(20.0, 10.0, -2.0, 10.0), -7.0, delta=1e-9)
+    self.assertLess(abs(stopping_decel(20.0, 10.0, -2.0, 9.99) - -7.005005005005005), 1e-9)
+    self.assertLess(abs(stopping_decel(20.0, 10.0, -2.0, 10.01) - -6.995003568879372), 1e-9)
+    # and it is what fires FCW where the late form stays silent: (30, 28, -6, 25 m) reads -5.00
+    self.assertLess(required_decel(30.0, 25.0, 28.0, -6.0), MOONPILOT_FCW_DECEL)
+
+
+class TestDriverLadder(unittest.TestCase):
+  """The cruise candidate lands on the driver's measured rungs at each speed-error threshold and
+  interpolates between them; forceDecel keeps the pre-ladder law; the crawl cap only holds a creep."""
+
+  def test_the_cruise_rungs(self):
+    CP = _cp()
+    for v in (0.0, 10.0, 20.0):
+      rung = lambda err, v=v: cruise_accel(v, v + err, False, 0.0, CP, -0.3, True)  # noqa: E731
+      self.assertAlmostEqual(rung(5.0), float(np.interp(v, MOONPILOT_LADDER_V_BP, MOONPILOT_FAST_ACCEL_V)))
+      self.assertAlmostEqual(rung(2.0), float(np.interp(v, MOONPILOT_LADDER_V_BP, MOONPILOT_SLOW_ACCEL_V)))
+      self.assertAlmostEqual(rung(1.0), 0.5 * rung(2.0))  # interpolated, not stepped
+      self.assertEqual(rung(0.0), 0.0)
+    self.assertAlmostEqual(cruise_accel(20.0, 18.5, False, 0.0, CP, -0.3, True), -0.33)  # coasting
+    self.assertAlmostEqual(cruise_accel(20.0, 17.0, False, 0.0, CP, -0.3, True), MOONPILOT_BRAKE_LIGHT)
+    self.assertAlmostEqual(cruise_accel(20.0, 10.0, False, 0.0, CP, -0.3, True), MOONPILOT_BRAKE_MEDIUM)
+
+  def test_force_decel_is_not_softened(self):
+    CP = _cp()
+    self.assertEqual(cruise_accel(1.0, 0.0, False, 0.0, CP, -0.3, True), -1.0)
+    self.assertEqual(cruise_accel(20.0, 0.0, False, 0.0, CP, -0.3, True), MOONPILOT_BRAKE_MEDIUM)
+
+  def test_the_crawl_cap_holds_a_creep_not_a_launch(self):
+    self.assertEqual(crawl_accel(0.8, 0.5, 0.5, 0.0), MOONPILOT_FAST_CRAWL)  # creeping lead
+    self.assertEqual(crawl_accel(0.8, 0.5, 0.5, 1.0), 0.8)  # a lead pulling away is a launch
+    self.assertEqual(crawl_accel(-0.8, 0.5, 0.5, 0.0), -0.8)  # braking is never shaped
+    self.assertEqual(crawl_accel(0.8, 2 * MOONPILOT_CREEP_SPEED, 0.0, 0.0), 0.8)  # faded out
 
 
 class TestCoastGrade(unittest.TestCase):
@@ -740,13 +951,22 @@ class TestCoastGrade(unittest.TestCase):
 class TestStalenessScope(unittest.TestCase):
   """The scope of `lead_age`'s safety claim, which the AGENTS.md bullet states.
 
-  Structural, and stated as such: while the ego is closing (`v_lead <= v_ego`) on a lead that is not
-  speeding up (`a_lead <= 0`), the extra interval the correction adds shrinks the gap by
-  `(v_lead - v_ego) * age` and lowers the lead's predicted speed under the decay, so the closing rate
-  rises and `a_track`, `a_ttc` and `a_stop` are each non-increasing — and `min`, with the clip the
-  command passes through, preserves that. The grid here is the coarse copy of the 160k-state sweep the
-  bullet quotes (0 violations there at 46 ms, 0.2 s and 0.5 s), and it fails the moment `lead_state_at`
-  or a candidate stops being monotone in the age.
+  Partitioned, and stated as such. Where the floor does not read the lead's accel (`a_lead == 0`
+  here), ageing the lead shrinks the gap by `(v_lead - v_ego) * age` and lowers the lead's predicted
+  speed under the decay, so the closing rate rises and `a_track`, `a_ttc` and `a_stop` are each
+  non-increasing — and `min`, with the clip the command passes through, preserves that. That half
+  is strict: 0 violations on all 170 in-scope cells at 46 ms and 0.2 s, and 0 on the 78,260-state
+  full sweep at 46 ms, the measured median lead age.
+
+  Where the floor does read it (`a_lead < 0`), the aged lead carries a decayed `a_traj`
+  (`exp(-a_lead_tau * t^2 / 2)`), i.e. weaker predicted braking and a longer predicted lead travel,
+  so the requirement can read genuinely shallower — the physically correct direction, and the reason
+  the old absolute-frame form was monotone there (it ignored `a_lead` entirely). That half is
+  bounded, not strict: worst rise on this grid is +0.010 m/s^2 at (0.2 s, v_ego 20, gap 90, v_lead 20,
+  a_lead -6.0), fresh -1.2966 against aged -1.2866, both sustain-law bound; the full sweep goes
+  non-zero only at ages this pipeline does not produce (1,218 states at 0.2 s, 7,563 at 0.5 s), all
+  of it -1.0-gate admission flicker at 160-300 m. The `differ` counter below is over the strict half
+  only, so the bound means something where it is claimed.
   """
 
   AGES = (0.046, 0.2)
@@ -755,6 +975,7 @@ class TestStalenessScope(unittest.TestCase):
   V_LEAD = (0.0, 5.0, 12.0, 20.0)
   A_LEAD = (-6.0, -3.0, -1.0, 0.0)
   ACTION_T = 0.2  # the test CP's longitudinalActuatorDelay + DT_MDL, as the planner computes it
+  RISE_BOUND = 0.02  # twice the worst measured rise on this grid (+0.010), for the a_lead < 0 half
 
   def test_the_correction_never_reads_optimistic_where_the_ego_is_closing(self):
     CP = _cp()
@@ -772,14 +993,19 @@ class TestStalenessScope(unittest.TestCase):
               aged = lead_state_at(lead, self.ACTION_T + age, v_ego * (self.ACTION_T + age), a_lead, MOONPILOT_LEAD_ACCEL_TAU)
               a_fresh = lead_accel(v_ego, *fresh, t_follow)
               a_aged = lead_accel(v_ego, *aged, t_follow)
-              self.assertLessEqual(
-                a_aged, a_fresh + 1e-9, f"the lead candidate rose with the age at v_ego {v_ego}, gap {gap}, v_lead {v_lead}, a_lead {a_lead}"
-              )
-              self.assertLessEqual(
-                policy(v_ego, [(Source.lead0, *aged)], 30.0, t_follow, False, None, 0.0, CP, -0.3, True)[0],
-                policy(v_ego, [(Source.lead0, *fresh)], 30.0, t_follow, False, None, 0.0, CP, -0.3, True)[0] + 1e-9,
-              )
-              differ += a_aged < a_fresh - 1e-9
+              p_fresh = policy(v_ego, [(Source.lead0, *fresh)], 30.0, t_follow, False, None, 0.0, CP, -0.3, True)[0]
+              p_aged = policy(v_ego, [(Source.lead0, *aged)], 30.0, t_follow, False, None, 0.0, CP, -0.3, True)[0]
+              if a_lead == 0.0:
+                self.assertLessEqual(
+                  a_aged, a_fresh + 1e-9, f"the lead candidate rose with the age at v_ego {v_ego}, gap {gap}, v_lead {v_lead}, a_lead {a_lead}"
+                )
+                self.assertLessEqual(p_aged, p_fresh + 1e-9)
+                differ += a_aged < a_fresh - 1e-9
+              else:
+                self.assertLessEqual(
+                  a_aged, a_fresh + self.RISE_BOUND, f"the lead candidate rose past the bound at v_ego {v_ego}, gap {gap}, v_lead {v_lead}, a_lead {a_lead}"
+                )
+                self.assertLessEqual(p_aged, p_fresh + self.RISE_BOUND)
     self.assertGreater(differ, 0)  # the arms are not identical over this grid, so the bound means something
 
 
@@ -837,30 +1063,22 @@ class TestPlanner(unittest.TestCase):
 
   def test_mid_approach_lead_brake_stays_safe(self):
     """A lead braking at -3.5 m/s^2 mid-approach while TTC is 4–7 s exercises the floor admission
-    with the regulator capped at -1.0. The 17 m/s ego stays clear: minimum gap is 32.55 m and the
-    peak command is -1.79 m/s^2 in this measured case (rest 32.39 m at 12 s; carried to rest over
-    25 s the minima are 10.54 m against the old 1.15 gate's 9.33 m — no contact either way)."""
-    planner = _planner()
-    v_ego, v_lead, gap = 17.0, 17.0, 90.0
-    active_ttc = []
-    minimum_gap, peak = gap, 0.0
-    for frame in range(round(12.0 / DT_MDL)):
-      t = frame * DT_MDL
-      a_lead = -3.5 if 2.0 <= t < 5.0 else 0.0
-      planner.update(_inputs(v_ego=v_ego, v_cruise_kph=108.0, lead=_lead(gap, v_lead, a_lead=a_lead), standstill=False))
-      command = float(planner.output_a_target)
-      closing = v_ego - v_lead
-      if closing > 0.0 and 4.0 <= (gap - MOONPILOT_STOP_DISTANCE) / closing <= 7.0:
-        active_ttc.append(t)
-      minimum_gap = min(minimum_gap, gap)
-      peak = min(peak, command)
-      v_ego = max(0.0, v_ego + command * DT_MDL)
-      v_lead = max(0.0, v_lead + a_lead * DT_MDL)
-      gap = max(0.0, gap + (v_lead - v_ego) * DT_MDL)
-    self.assertTrue(active_ttc)
-    self.assertAlmostEqual(minimum_gap, 32.55, delta=0.05)
-    self.assertAlmostEqual(peak, -1.79, delta=0.05)
-    self.assertGreater(peak, ACCEL_MIN)
+    with the regulator capped at -1.0. Flown closed-loop with 1 s of steady following before the
+    onset so the estimator has a real speed history: the new law peaks at -1.50 m/s^2 with a 6.96 m
+    minimum gap and a 9.26 m
+    end gap, against the old law's -1.41 / 11.72 / 11.72 — shallower braking held longer, no contact
+    either way. The old pin (32.55 m / -1.79) was the absolute-frame floor braking from 90 m out;
+    the relative frame does not.
+    """
+    s = _fly(17.0, 61.2, 90.0, 17.0, lambda t: -3.5 if 2 <= t < 5 else 0.0, 25.0)
+    self.assertTrue(any((v - vl) > 0.0 and 4.0 <= (g - MOONPILOT_STOP_DISTANCE) / (v - vl) <= 7.0 for v, vl, g in zip(s["v"], s["vl"], s["gap"], strict=True)))
+    # 7.09 on the driver's cruise ladder (6.96 on the old 1/s cruise gain): the gentler hold gain
+    # re-closes the gap more slowly, so the minimum lands further back.
+    self.assertAlmostEqual(s["min_gap"], 7.09, delta=0.05)
+    self.assertAlmostEqual(s["peak"], -1.50, delta=0.05)
+    self.assertAlmostEqual(s["end_gap"], 9.26, delta=0.05)
+    self.assertFalse(s["contact"])
+    self.assertGreater(s["peak"], ACCEL_MIN)
 
   def test_a_radar_dropout_releases_the_lead_candidate(self):
     """A missing slot is not a held stop: once the radar lead leaves, policy sees cruise rather than
@@ -887,7 +1105,7 @@ class TestPlanner(unittest.TestCase):
     self.assertGreater(projected[1], unprojected[1])  # and faster
 
     a_track = MOONPILOT_K_GAP * (gap - MOONPILOT_STOP_DISTANCE) + MOONPILOT_K_V * v_lead
-    for a_lead, expected in ((0.0, a_track), (2.0, a_track + MOONPILOT_K_V * MOONPILOT_LEAD_PREVIEW_T_ACCEL * 2.0)):
+    for a_lead, expected in ((0.0, min(a_track, MOONPILOT_FAST_CRAWL)), (2.0, a_track + MOONPILOT_K_V * MOONPILOT_LEAD_PREVIEW_T_ACCEL * 2.0)):
       self.assertAlmostEqual(lead_accel(0.0, gap, v_lead, a_lead, t_follow), expected, places=9)
     self.assertGreater(lead_accel(0.0, gap, v_lead, 2.0, t_follow), 0.0)
 
@@ -1193,7 +1411,9 @@ class TestPlanner(unittest.TestCase):
 
   def test_a_vision_lead_accel_uses_the_half_second_preview(self):
     """A vision-only matched-speed lead gets the half-second preview while jerk limiting shapes the
-    delivered braking command."""
+    delivered braking command. The first-frame policy ask is -2.145 m/s^2 (sustain law against the
+    credited speed), which the jerk limit delivers as -0.1388; by frame 10 the command is -1.2604.
+    The old pins (-0.2972 / -2.2863) were the absolute-frame floor answering the same preview."""
     gap, v_ego = 25.0, 20.0
     zero_accel = _planner()
     zero_accel.update(_inputs(v_ego=v_ego, v_cruise_kph=108.0, lead=_lead(gap, v_ego)))
@@ -1207,11 +1427,11 @@ class TestPlanner(unittest.TestCase):
     self.assertEqual(zero_accel.source, Source.lead0)
     self.assertEqual(vision.source, Source.lead0)
     self.assertLess(vision.output_a_target, zero_accel.output_a_target)
-    self.assertAlmostEqual(vision.output_a_target, -0.2972136, delta=1e-7)
+    self.assertAlmostEqual(vision.output_a_target, -0.13875371166584527, delta=1e-7)
 
     for _ in range(9):
       vision.update(vision_input)
-    self.assertAlmostEqual(vision.output_a_target, -2.2863, delta=1e-4)
+    self.assertAlmostEqual(vision.output_a_target, -1.2603791557257866, delta=1e-4)
     self.assertGreater(vision.output_a_target, ACCEL_MIN)
 
   def test_a_braking_lead_reaches_the_command_from_its_speed_history(self):
@@ -1219,11 +1439,16 @@ class TestPlanner(unittest.TestCase):
     frame carries `a_lead=0.0` — has to bring the braking into the command.
 
     Measured on this loop's clock, a lead braking at -3.5 m/s^2 from a settled follow: -0.5 m/s^2 at
-    0.20 s, -1.0 at 0.30 and -2.0 at 0.50 through the fork's slope estimate, against 0.30 / 0.55 / 1.15
-    for the same planner reading radard's `aLeadK` directly (which is a revert's shape here, since
-    every `_lead` carries `a_lead=0.0`); the bounds sit between the arms, not on the measurement. The
-    onset window in `moonpilot/lead.py` is worth one frame at -0.5 s and none at -2.0 with the credit
-    at half a second, so what separates the arms below is the estimator itself, not the window.
+    0.30 s, -1.0 at 0.55 and -2.0 at 0.90 through the fork's slope estimate, against 0.40 / 0.70 / 2.65
+    for the same planner with the estimator forced to zero (which is a revert's shape here, since
+    every `_lead` carries `a_lead=0.0` — forcing zero is also the no-credit law, as the preview
+    credit derives from that same estimate); each bound sits strictly between the arms, not on a
+    measurement, so the test still fails on a revert. The -0.5 bound moved 0.25 -> 0.35 with the
+    sustain floor (estimator 0.30, forced-zero 0.40); the -1.0/-2.0 bounds moved 0.40/0.80 -> 0.60/1.00
+    (estimator 0.55/0.90, forced-zero 0.70/2.65 — the old bounds do not hold: 0.55 > 0.40, 0.90 > 0.80).
+    The onset window in `moonpilot/lead.py` is worth one frame at -0.5 s and
+    none at -2.0 with the credit at half a second, so what separates the arms below is the estimator
+    itself, not the window.
 
     The floor is what makes any of it that early: without a credit the same flight reaches -1.0 at
     0.55 s and -2.0 at 0.95, and a *bare* TTC approach term is later still — it keys off the closing
@@ -1248,13 +1473,11 @@ class TestPlanner(unittest.TestCase):
             reached[threshold] = since_onset
       v_ego = max(0.0, v_ego + planner.output_a_target * DT_MDL)
       gap = max(0.0, gap - (v_ego - v_lead) * DT_MDL)
-    self.assertTrue(-1.0 in reached)
-    self.assertTrue(-2.0 in reached)
-    # Between the arms with margin on both sides: the aLeadK revert needs 0.55 s to -1.0 and 1.15 to
-    # -2.0, so these separate it, and the no-credit law needs 0.55 / 0.95.
-    self.assertLessEqual(reached[-0.5], 0.25)
-    self.assertLessEqual(reached[-1.0], 0.40)
-    self.assertLessEqual(reached[-2.0], 0.80)
+    # Between the arms with margin on both sides: the forced-zero estimator needs 0.70 s to -1.0 and
+    # 2.65 to -2.0, so these separate it, and the no-credit law needs 0.55 / 0.95.
+    self.assertLessEqual(reached[-0.5], 0.35)
+    self.assertLessEqual(reached[-1.0], 0.60)
+    self.assertLessEqual(reached[-2.0], 1.00)
 
   def test_a_stale_lead_is_planned_as_if_it_were_fresh(self):
     """radarState lands a full cycle behind the modelV2 tick that polls it, and both inputs get
