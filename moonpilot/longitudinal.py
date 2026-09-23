@@ -150,6 +150,18 @@ MOONPILOT_FOLLOW_CUSHION = 1.0  # m; a closing approach may spend this much of t
 MOONPILOT_APPROACH_DECEL = 1.0  # m/s^2; the spacing regulator's braking authority, and the
 # decel the approach term binds past — one number, so the
 # two terms meet at the same output
+# The stopping floor's admission, scheduled on the ego's speed: it is also the approach plateau, because
+# the floor is a constant-decel stop that takes over once it needs this much. Measured on this driver's
+# 47 manual stops behind a stopped lead: a median plateau near -1.0 from 6-12 m/s and -1.5..-1.7 from
+# 12-20 m/s, held to ~2 m/s. Held at 1.0 below 8 m/s, so it matches the regulator's and TTC term's
+# shared gate (MOONPILOT_APPROACH_DECEL) there. This is the admission split that was once measured and
+# reverted for raising the average decel and peak; that raise is now the point, on the driver's data.
+MOONPILOT_FLOOR_ADMISSION_BP = [8.0, 14.0]  # m/s
+MOONPILOT_FLOOR_ADMISSION_V = [1.0, 1.6]  # m/s^2
+# Where a stop behind a stopped lead finishes, as a constant-decel finish below creep speed (`lead_accel`).
+# 5.2 m is where the soft final meter already parks the car on every pinned approach (5.17-5.19 m), so
+# the finish changes the tail's shape, not its rest point; the driver rests a median 4.2 m back.
+MOONPILOT_STOP_REST = 5.2  # m
 MOONPILOT_TTC_TARGET = 3.0  # s; headway the approach term holds the closing rate inside. Lower is
 # shallower — a_ttc = -K*(closing - slack/T) deepens with T, so this
 # is the dial between the floor's plateau (T below ~2 the term never
@@ -162,6 +174,13 @@ MOONPILOT_TTC_TARGET = 3.0  # s; headway the approach term holds the closing rat
 # settled follow at 25 m/s behind a -2 m/s^2 lead brake, TTC is the
 # governing term on 14 % of the lead-term calls at T=3 and 17 % at T=5 —
 # a minority either way, which is what the dial is choosing between)
+# The TTC headway on the ego's speed: MOONPILOT_TTC_TARGET from 8 m/s up, 1.5 s by 2 m/s. At 3 s all the
+# way down, the term governs a stop from ~5 m/s at -1.8 m/s^2 — harder than the driver brakes there —
+# which reaches 2 m/s with ~3.3 m to go and leaves a ~4 s creep. The driver reaches 2 m/s ~2.3 m before
+# rest and finishes in ~2 s (median of 47 manual stops behind a stopped lead); this schedule plus the
+# finish below `MOONPILOT_CREEP_SPEED` takes the planner's tail to ~2.9 s over ~2.1 m.
+MOONPILOT_TTC_TARGET_BP = [2.0, 8.0]  # m/s
+MOONPILOT_TTC_TARGET_V = [1.5, MOONPILOT_TTC_TARGET]  # s
 MOONPILOT_K_TTC = 1.0  # 1/s on the excess closing rate
 MOONPILOT_MIN_SLACK = 1.0  # m; the standstill target is soft inside this final meter: the exact
 # kinematic floor gives way to the TTC/regulator profile there, while higher-speed stops still bind
@@ -216,13 +235,18 @@ MOONPILOT_OUT_OF_PATH_T_FOLLOW = 0.7  # time-gap scale for a lead predicted to l
 # on the RAV4 (308 segments: `~/route-corpus` plus routes 000003c2/c6/c8 and 000003bc; stock ACC off,
 # gear drive). The planner interpolates between rungs instead of scaling a gain, so what it asks for
 # is always something this driver does. Grade is removed (pitch relative to its segment median).
-# Accel rungs are per start-speed band (0, 0.5-5, 5-10, 10-15, 15+ m/s) of accelerating gas episodes:
-# slow = median of the episode's mean accel, fast = p90. The 15+ band read 0.66 on 21 episodes and is
-# held at 0.60 so fast accel never rises with speed. The corpus tops out at 25 m/s; interp holds the
-# last rung above it.
+# Slow accel is the median of accelerating gas episodes' mean accel per start-speed band (0,
+# 0.5-5, 5-10, 10-15, 15+ m/s); the 0 m/s point is held at the 2.5 m/s value so slow never exceeds
+# fast. Fast accel is instantaneous: p75 of accel at each speed while the episode is still >= 5 m/s
+# short of the speed it ends at — the ladder's own fast-rung condition — so it carries the shape of a
+# launch rather than its average: ramping in to ~1.97 at 2.5-3.5 m/s and tapering after (a noisy
+# 5.5 m/s bin, 1.50 between 1.81 and 1.60, is dropped). `cruise_cap`'s combined budget
+# (`MOONPILOT_A_TOTAL_MAX_V`, 1.7 below 20 m/s) still bounds the peak. The corpus tops out at
+# 25 m/s; interp holds the last rung above it.
 MOONPILOT_LADDER_V_BP = [0.0, 2.5, 7.5, 12.5, 20.0]  # m/s
-MOONPILOT_SLOW_ACCEL_V = [0.95, 0.77, 0.67, 0.42, 0.31]  # m/s^2
-MOONPILOT_FAST_ACCEL_V = [1.26, 1.12, 0.96, 0.60, 0.60]  # m/s^2
+MOONPILOT_SLOW_ACCEL_V = [0.77, 0.77, 0.67, 0.42, 0.31]  # m/s^2
+MOONPILOT_FAST_ACCEL_BP = [0.5, 1.5, 2.5, 3.5, 4.5, 7.0, 9.0, 11.0, 13.5, 17.5]  # m/s
+MOONPILOT_FAST_ACCEL_V = [0.83, 1.70, 1.96, 1.97, 1.81, 1.60, 1.47, 1.27, 1.13, 0.87]  # m/s^2
 # Coasting: no pedals, level road, median by speed (2-5, 5-10, 10-25 m/s). Agrees with `coast_accel`'s -0.3.
 MOONPILOT_COASTING_BP = [3.5, 7.5, 15.0]  # m/s
 MOONPILOT_COASTING_V = [-0.10, -0.30, -0.33]  # m/s^2
@@ -308,7 +332,7 @@ def cruise_cap(v_ego, e2e, steer_angle_deg, CP, accel_coast, allow_throttle) -> 
   driver's fast-accel rung `MOONPILOT_FAST_ACCEL_V`, the combined accel budget less the cornering
   demand, and the coast limit when the model expects the driver on the gas. `ACCEL_MAX` in
   experimental mode, where neither the cornering budget nor the coast limit applies."""
-  cap = ACCEL_MAX if e2e else float(np.interp(v_ego, MOONPILOT_LADDER_V_BP, MOONPILOT_FAST_ACCEL_V))
+  cap = ACCEL_MAX if e2e else float(np.interp(v_ego, MOONPILOT_FAST_ACCEL_BP, MOONPILOT_FAST_ACCEL_V))
   if not e2e:
     a_total_max = float(np.interp(v_ego, MOONPILOT_A_TOTAL_MAX_BP, MOONPILOT_A_TOTAL_MAX_V))
     a_y = v_ego**2 * steer_angle_deg * CV.DEG_TO_RAD / (CP.steerRatio * CP.wheelbase)
@@ -359,7 +383,7 @@ def cruise_accel(v_ego, v_cruise, e2e, steer_angle_deg, CP, accel_coast, allow_t
     float(np.interp(v_ego, MOONPILOT_COASTING_BP, MOONPILOT_COASTING_V)),
     0.0,
     float(np.interp(v_ego, MOONPILOT_LADDER_V_BP, MOONPILOT_SLOW_ACCEL_V)),
-    float(np.interp(v_ego, MOONPILOT_LADDER_V_BP, MOONPILOT_FAST_ACCEL_V)),
+    float(np.interp(v_ego, MOONPILOT_FAST_ACCEL_BP, MOONPILOT_FAST_ACCEL_V)),
   ]
   a = min(float(np.interp(v_cruise - v_ego, MOONPILOT_CRUISE_ERR_BP, rungs)), cap)
   if _coast_applies(v_ego, v_cruise, e2e, accel_coast, allow_throttle, coast_band):
@@ -521,7 +545,7 @@ def lead_accel(v_ego, gap, v_lead, a_lead, t_follow) -> float:
   if closing <= 0.0:
     return a_track  # not closing: nothing to brake for
   slack = max(gap - MOONPILOT_STOP_DISTANCE, 0.0)
-  a_ttc = -MOONPILOT_K_TTC * (closing - slack / MOONPILOT_TTC_TARGET)
+  a_ttc = -MOONPILOT_K_TTC * (closing - slack / float(np.interp(v_ego, MOONPILOT_TTC_TARGET_BP, MOONPILOT_TTC_TARGET_V)))
   a = min(a_track, a_ttc) if a_ttc < -MOONPILOT_APPROACH_DECEL else a_track
   # The stopping floor makes this law safe outside the final soft meter rather than merely responsive.
   # A TTC term ramps on closing rate, and ramping is not stopping: at 36 m/s with TTC_TARGET = 5 it
@@ -529,7 +553,14 @@ def lead_accel(v_ego, gap, v_lead, a_lead, t_follow) -> float:
   # remains the bound throughout that regime. Only inside MOONPILOT_MIN_SLACK does its denominator
   # stop shrinking, so the exact standstill point is not chased with increasing crawl-speed braking.
   a_stop = stopping_decel(v_ego, v_lead_eff, a_lead, max(gap - MOONPILOT_STOP_DISTANCE, MOONPILOT_MIN_SLACK))
-  return min(a, a_stop) if a_stop < -MOONPILOT_APPROACH_DECEL else a
+  a = min(a, a_stop) if a_stop < -float(np.interp(v_ego, MOONPILOT_FLOOR_ADMISSION_BP, MOONPILOT_FLOOR_ADMISSION_V)) else a
+  if a < 0.0 and v_ego < MOONPILOT_CREEP_SPEED and v_lead_eff < MOONPILOT_SHOULD_STOP_SPEED:
+    # The stop finish: behind a stopped lead below creep speed, a constant decel to MOONPILOT_STOP_REST
+    # instead of the regulator's asymptotic creep. Only once the other terms already brake: while the
+    # regulator still asks to close a wide gap the finish's small ask would otherwise win `min` and
+    # hold the car to a crawl (from 0.3 m/s at 25 m, still 17 m out after 30 s).
+    a = min(a, -(v_ego**2) / (2.0 * max(gap - MOONPILOT_STOP_REST, 0.1)))
+  return a
 
 
 def jerk_limit(a_cmd, a_prev, dt, v_ego, comfort_scale=1.0) -> float:
