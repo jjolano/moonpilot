@@ -277,6 +277,10 @@ MOONPILOT_COAST_GRADE_MIN = 0.4  # m/s^2; minimum road term (`accel_coast - coas
 # Below this is a moderate road, about a 7 % grade; only high-grade hills get the coast band.
 MOONPILOT_COAST_ACCEL_MAX = 1.0  # m/s^2; bound on the coast command for garbage pitch and the ACCEL_MAX sentinel
 # Both bad pose input and the missing-pose sentinel must not turn into an unbounded coast command.
+MOONPILOT_COAST_RECOVERY_ACCEL = 0.15  # m/s^2; positive-ask cap just past the climb band edge
+# At the edge the coast taper is already 0; the plain ladder's slow/fast rung would surge back toward
+# set speed on the same hill that just earned the sag. Cap holds only in [band, 2*band) of underspeed —
+# further out (a launch, a long deficit) the plain law still runs.
 MOONPILOT_JERK_UP = 1.5  # m/s^3
 MOONPILOT_JERK_LAUNCH = 4.0  # m/s^3; the up-limit at and below MOONPILOT_JERK_LAUNCH_SPEED, tapering
 # back to `MOONPILOT_JERK_UP` at twice it, and only from the second frame of a ramp — `jerk_limit`
@@ -357,6 +361,21 @@ def _coast_applies(v_ego, v_cruise, e2e, accel_coast, allow_throttle, coast_band
   )
 
 
+def _climb_recovery_applies(v_ego, v_cruise, e2e, accel_coast, allow_throttle, coast_band) -> bool:
+  """Just past the climb band the plain law would pull back with a full ladder rung; hold the positive
+  ask to a gentle constant so recovery from the sag is slow and steady on the same steep grade."""
+  coast = float(np.clip(accel_coast, -MOONPILOT_COAST_ACCEL_MAX, MOONPILOT_COAST_ACCEL_MAX))
+  grade = coast - MOONPILOT_COAST_FLAT_ACCEL
+  error = v_cruise - v_ego
+  return (
+    coast_band > 0.0
+    and not e2e
+    and grade < -MOONPILOT_COAST_GRADE_MIN
+    and allow_throttle
+    and coast_band <= error < 2.0 * coast_band
+  )
+
+
 def cruise_accel(v_ego, v_cruise, e2e, steer_angle_deg, CP, accel_coast, allow_throttle, coast_band: float = 0.0) -> float:
   """Return the speed-error cruise candidate, clipped to its normal cap.
 
@@ -393,6 +412,8 @@ def cruise_accel(v_ego, v_cruise, e2e, steer_angle_deg, CP, accel_coast, allow_t
     # existing cap limits positive acceleration but never relaxes braking above the set speed. On a
     # climb with throttle already disallowed, that existing cap is the requested coast behavior.
     a = coast * (coast_band - abs(v_cruise - v_ego)) / coast_band
+  elif _climb_recovery_applies(v_ego, v_cruise, e2e, accel_coast, allow_throttle, coast_band):
+    a = min(a, MOONPILOT_COAST_RECOVERY_ACCEL)
   return float(a)
 
 

@@ -56,6 +56,7 @@ from moonpilot.longitudinal import (
   MOONPILOT_COAST_BAND,
   MOONPILOT_COAST_FLAT_ACCEL,
   MOONPILOT_COAST_GRADE_MIN,
+  MOONPILOT_COAST_RECOVERY_ACCEL,
   MOONPILOT_CONTROL_T_IDX,
   MOONPILOT_CREEP_SPEED,
   MOONPILOT_FAST_ACCEL_BP,
@@ -876,7 +877,7 @@ class TestCoastGrade(unittest.TestCase):
 
   def test_climb_inside_band_tapers_to_negative_coast_and_edge_restores_acceleration(self):
     """Below the set speed but inside the climb band, the command is negative tapered coast rather
-    than acceleration; past 1.5 m/s under, the plain speed-error law is back."""
+    than acceleration; past 1.5 m/s under, recovery resumes as a gentle capped pull, not the ladder."""
     coast = coast_accel(float(np.float32(COAST_CLIMB_PITCH)))
     actual = self._cruise(COAST_CLIMB_PITCH, COAST_SET_SPEED - self.ERROR_INSIDE)
     expected = coast * (MOONPILOT_COAST_BAND - self.ERROR_INSIDE) / MOONPILOT_COAST_BAND
@@ -890,7 +891,29 @@ class TestCoastGrade(unittest.TestCase):
 
     past = self._cruise(COAST_CLIMB_PITCH, COAST_SET_SPEED - self.ERROR_PAST_EDGE)
     plain = self._cruise(COAST_CLIMB_PITCH, COAST_SET_SPEED - self.ERROR_PAST_EDGE, coast_band=0.0)
-    self.assertAlmostEqual(past, plain, delta=1e-12)
+    self.assertAlmostEqual(past, MOONPILOT_COAST_RECOVERY_ACCEL, delta=1e-12)
+    self.assertGreater(plain, past)
+
+  def test_climb_recovery_is_capped_only_near_the_edge(self):
+    """The gentle pull binds in [band, 2*band) of underspeed on a steep climb; deeper deficits and
+    every non-climb grade keep the plain law, so a launch or a descent is not held to it."""
+    near = self._cruise(COAST_CLIMB_PITCH, COAST_SET_SPEED - 2.9)
+    self.assertAlmostEqual(near, MOONPILOT_COAST_RECOVERY_ACCEL, delta=1e-12)
+    deep = self._cruise(COAST_CLIMB_PITCH, COAST_SET_SPEED - 3.0)
+    deep_plain = self._cruise(COAST_CLIMB_PITCH, COAST_SET_SPEED - 3.0, coast_band=0.0)
+    self.assertAlmostEqual(deep, deep_plain, delta=1e-12)
+    self.assertGreater(deep, MOONPILOT_COAST_RECOVERY_ACCEL)
+    # a descent above the set speed by the same amount still brakes on the plain law
+    descent = self._cruise(COAST_DESCENT_PITCH, COAST_SET_SPEED - self.ERROR_PAST_EDGE)
+    self.assertAlmostEqual(
+      descent,
+      self._cruise(COAST_DESCENT_PITCH, COAST_SET_SPEED - self.ERROR_PAST_EDGE, coast_band=0.0),
+      delta=1e-12,
+    )
+    # feature off / e2e: no cap
+    off = self._cruise(COAST_CLIMB_PITCH, COAST_SET_SPEED - self.ERROR_PAST_EDGE, coast_band=0.0)
+    e2e = self._cruise(COAST_CLIMB_PITCH, COAST_SET_SPEED - self.ERROR_PAST_EDGE, e2e=True)
+    self.assertAlmostEqual(e2e, off, delta=1e-12)
 
   def test_band_never_fires_against_gravity(self):
     """A descent below the set speed and a climb above it have the band disabled, exactly matching
