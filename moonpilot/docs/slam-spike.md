@@ -10,7 +10,7 @@ VO pose time is `timestampEof − 0.1 s` (already nanoseconds). Extrinsics appli
 | Option | Result |
 | --- | --- |
 | **A** — posenet only (`cameraOdometry`) | Viable for short-horizon pose and for the existing speed correction. Dead-reckoned alone it does not hold a map-scale trajectory. |
-| **B** — own feature tracks on narrow frames (cv2) | Not measured here (no cv2 on PC; aarch64 wheel `opencv-python-headless==4.12.0.88` resolves). Required if landmark mapping is wanted. |
+| **B** — own feature tracks on narrow frames (cv2) | **Measured** (Phase 3): fits the CPU budget on PC; still optional (only if landmark mapping returns). See below. |
 | **C** — model intermediates | **No spatial feature maps.** Parser exposes only structured heads (`pose`, `road_transform`, `wide_from_device_euler`, lane lines, road edges, leads, plan, desire, meta) plus a 512-d `hidden_state`. `modelV2.rawPredictions` is empty unless `SEND_RAW_PRED`. Not usable for landmark SLAM. |
 
 **Pick: A for Phase 1 ego pose; C-shaped geometry (`modelV2.roadEdges` / `laneLines`) for Phase 2 corridor occupancy; B only if Phase 3+ needs landmarks.**
@@ -28,7 +28,7 @@ Per-segment: integrate `trans`/`rot` in the calib frame (rotated by extrinsics),
 | path length VO/ref | **0.981** (4870 / 4966) — scale ≈ 1 |
 | chained 5 segs, no mid-route re-align | dist 2627 m → RMSE **341 m (13 %)**, final 198 m |
 
-Reading: raw VO is excellent over a ~60 s window (sub-meter to a few metres on clean segs) and
+Reading: raw VO is excellent over a ~60 s window (sub-meter to a few meters on clean segs) and
 falls apart over minutes without a correction source. That is exactly what the rolling-window
 correction already papers over for *speed*, and why a map or GPS/LLK gate is required for *pose*.
 
@@ -59,16 +59,38 @@ Implication: a Phase 1/2 worker must either (a) be tiny (numpy pose math, piggyb
 process or a low-duty `PythonProcess`), or (b) free budget elsewhere. Feature tracking (option B)
 at 20 Hz on narrow frames is unlikely to fit in 8 % without measurement on-device.
 
+## Option B — feature tracks (Phase 3 measurement)
+
+PC venv, `opencv-python-headless==4.12.0.88` (uv-pip only; not in `uv.lock` / device deps).
+Segment `000003c6--4c941e9a66--4` pulled from the device (rlog + `fcamera.hevc`, 1200 frames
+@ 20 Hz, AR0231-class narrow 1928×1208). Spike: `/tmp/moonpilot-spike/landmark.py` (not checked in).
+
+| metric | value |
+| --- | --- |
+| ORB detect + LK, half-res, ≤400 pts | med **3.4 ms**, mean 3.5, p95 4.1, max 6.6 |
+| tracks kept / pair | med **400**, min 393, 400/400 pairs ≥ 30 tracks |
+| `findEssentialMat` RANSAC inliers (every 10th pair) | med **100 %**, min 95 %, mean 99 % |
+| decode+prep via `FrameReader` (PC only) | ~18 ms/frame — on device frames arrive free from VisionIPC |
+| share of a 50 ms period (detect+LK only) | **~7 %** of one core continuously — under the 8 % headroom |
+
+Reading: correspondence quality is excellent (essential-matrix inliers), and the CV front-end
+itself is cheap. Naive median-flow vs `carState.vEgo` rank correlation is **not** a useful score
+here: ORB locks mostly onto high-contrast non-road texture (~2 % of tracks in the lower image
+band), and this segment sits at 15–16 m/s with almost no dynamic range. Metric scale still needs
+depth or a fusing odometry source — same conclusion as Phase 0 option A. **Pick stays A + model
+geometry; B is viable when a landmark map is wanted, and the CPU argument against it is gone on PC
+( device measurement still outstanding ).**
+
 ## Packaging
 
 - No venv on device; third-party deps only via `moonpilot/deps.py` + `deps.lock` (aarch64 pins).
 - `opencv-python-headless==4.12.0.88` resolves for `aarch64-unknown-linux-gnu` / py3.12.
 - g2o / ceres Python bindings: not probed; avoid unless option B + nonlinear optimization is chosen.
-- PC spike ran in `/tmp/moonpilot-spike/drift.py` against the project venv; script is not checked in.
+- PC spike ran in `/tmp/moonpilot-spike/{drift,landmark}.py` against the project venv; scripts are not checked in.
 
 ## Exit (Phase 0)
 
-1. Front-end: **A** now, **B** only if landmark mapping returns to scope.
+1. Front-end: **A** now, **B** measured and still optional (landmark maps out of scope).
 2. Phase 1: better ego pose = fuse A with wheel + LLK/GPS gates over a longer window; keep
    observation-only until RMSE-vs-truth improves or holds.
 3. Phase 2 occupancy: **`modelV2.roadEdges`/`laneLines` only** — no new vision, no new service

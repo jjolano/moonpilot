@@ -68,7 +68,7 @@ struct MoonpilotState @0x81c2f05a394cf4af {  # moonpilot seam: upstream's reserv
 
   # moonpilot seam, see AGENTS.md. Observation-only GPS-gated dead-reckon pose (moonpilot/pose.py),
   # filled by the same moonpilotState publisher when MoonpilotSlam is on. valid is false until the
-  # first accepted fix has set the origin; x/y are metres east/north of that fix, yaw is rad CCW from
+  # first accepted fix has set the origin; x/y are meters east/north of that fix, yaw is rad CCW from
   # east.
   egoPose @2 :EgoPose;
 

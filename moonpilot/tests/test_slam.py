@@ -584,7 +584,7 @@ class TestWiring(unittest.TestCase):
     from openpilot.common.params import Params
 
     params = Params()
-    self.assertIn(get_gps_location_service(params), ("gpsLocation", "gpsLocationExternal"))
+    self.assertTrue(get_gps_location_service(params) in ("gpsLocation", "gpsLocationExternal"))
 
   def test_pose_push_stamps_the_odometry_pose_time_and_reads_the_prior(self):
     from moonpilot.leadd import _pose_push

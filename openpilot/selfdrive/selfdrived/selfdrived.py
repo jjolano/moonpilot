@@ -28,6 +28,7 @@ from openpilot.common.hardware import HARDWARE
 from moonpilot.engage import moonpilot_engage  # moonpilot seam, see AGENTS.md
 from moonpilot.features import is_fork_build  # moonpilot seam, see AGENTS.md
 from moonpilot.turn_desire import turn_desire_alert  # moonpilot seam, see AGENTS.md
+from moonpilot.corridor import path_outside_alert  # moonpilot seam, see AGENTS.md
 
 REPLAY = "REPLAY" in os.environ
 SIMULATION = "SIMULATION" in os.environ
@@ -338,6 +339,11 @@ class SelfdriveD:
     turn_alert = turn_desire_alert(self.sm, self.params, CS)
     if turn_alert is not None:
       self.events.add(turn_alert)
+    # moonpilot seam, see AGENTS.md: path-outside banner — the model's path left the free corridor
+    # while openpilot is steering. Separate from turn_desire (blinker) and LDW (lane lines).
+    path_alert = path_outside_alert(self.sm, self.params)
+    if path_alert is not None:
+      self.events.add(path_alert)
 
     for i, pandaState in enumerate(self.sm['pandaStates']):
       # All pandas must match the list of safetyConfigs, and if outside this list, must be silent or noOutput

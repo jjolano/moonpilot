@@ -97,7 +97,7 @@ from moonpilot.curve import (
   lat_accel_hold,
   predicted_lat_accel,
 )
-from moonpilot.corridor import squeeze_accel
+from moonpilot.corridor import RollingCorridor, squeeze_accel
 from moonpilot.features import COAST_GRADE, CURVE_SPEED, LEAD_LATERAL, LONGITUDINAL, MODEL_BRAKING, SQUEEZE, enabled
 from moonpilot.latency import (
   MOONPILOT_LAG_BLOCKS_KEY,
@@ -449,7 +449,7 @@ def cruise_accel(v_ego, v_cruise, e2e, steer_angle_deg, CP, accel_coast, allow_t
 
 
 def stopping_decel(v_ego, v_lead, a_lead, slack, sustain=MOONPILOT_LEAD_BRAKE_SUSTAIN_T) -> float:
-  """The constant decel that keeps `slack` metres of gap, in the frame the gap actually closes in.
+  """The constant decel that keeps `slack` meters of gap, in the frame the gap actually closes in.
 
   One law, relative frame throughout, against the speed the lead is *predicted* to hold: it keeps
   its current braking for at most `MOONPILOT_LEAD_BRAKE_SUSTAIN_T` and never past its own rest,
@@ -864,6 +864,9 @@ class MoonpilotLongitudinalPlanner:
     # One per radarState slot, ticked every frame so an absent or replaced lead resets its window.
     self.lead_accel = (LeadAccelEstimator(dt), LeadAccelEstimator(dt))
     self.radar_latency = MOONPILOT_RADAR_LATENCY.get(str(CP.carFingerprint), 0.0)
+    # Pose-stitched free-space history for squeeze: empty until a valid egoPose arrives, cleared
+    # whenever the pose goes invalid so a rebase cannot mix two origins.
+    self.corridor = RollingCorridor()
 
     self.output_a_target = init_a
     self.output_should_stop = False
@@ -1062,14 +1065,24 @@ class MoonpilotLongitudinalPlanner:
     # The path is re-referenced here, once, rather than folded into each caller's `x_ego`: both the
     # command and the published rollout then pass plain ego travel and share one target.
     curve = curve_targets(sm['modelV2'], curve_allowed, vp.roll, scale, ahead=x_path)
-    # The corridor squeeze: same re-reference as the curve (so the window is metres ahead of the
+    # The corridor squeeze: same re-reference as the curve (so the window is meters ahead of the
     # car now), same cruise-slot min, gated on the toggle every frame like the other path consumers.
-    # Empty or unknown edges give the ACCEL_MAX sentinel and leave the cruise term alone.
+    # Empty or unknown edges give the ACCEL_MAX sentinel and leave the cruise term alone. When a
+    # valid egoPose is published the free-space strips are pose-stitched over a short history so a
+    # single frame's edge dropout does not release the brake; without a pose (SLAM off, first fix,
+    # invalid) this is the single-frame squeeze it was before the history existed.
     squeeze = ACCEL_MAX
     if enabled(SQUEEZE, self.params):
       edges = sm['modelV2'].roadEdges
       if len(edges) >= 2:
-        squeeze = squeeze_accel(edges[0], edges[1], ModelConstants.X_IDXS, x_ego=x_path)
+        pose = self._ego_pose(sm)
+        if pose is not None:
+          now = time.monotonic()
+          self.corridor.push(now, pose, edges[0], edges[1], now=now)
+          squeeze = self.corridor.squeeze_accel(pose, ModelConstants.X_IDXS, x_ego=x_path)
+        else:
+          self.corridor.clear()
+          squeeze = squeeze_accel(edges[0], edges[1], ModelConstants.X_IDXS, x_ego=x_path)
 
     a_prev = float(self.output_a_target)
     if CS.standstill:
@@ -1284,6 +1297,22 @@ class MoonpilotLongitudinalPlanner:
     """How old a lead's `dRel` is at this tick: the message's age, and a radar lead's own sensor
     latency on top where it is measured (`MOONPILOT_RADAR_LATENCY`)."""
     return lead_age + (self.radar_latency if lead.radar else 0.0)
+
+  def _ego_pose(self, sm):
+    """`(x, y, yaw)` from a fresh, valid `moonpilotState.egoPose`, or None.
+
+    Same getattr probes as `ego_speed_correction`: the maneuver harness passes a plain dict as
+    `sm`, and a dead publisher or an unset pose must fall through to the single-frame squeeze
+    rather than raise.
+    """
+    if not (getattr(sm, "valid", {}).get("moonpilotState", False) and getattr(sm, "alive", {}).get("moonpilotState", False)):
+      return None
+    pose = sm["moonpilotState"].egoPose
+    if not pose.valid:
+      return None
+    if not all(math.isfinite(v) for v in (pose.x, pose.y, pose.yaw)):
+      return None
+    return (pose.x, pose.y, pose.yaw)
 
   def _t_follow(self, sm):
     personality = sm['selfdriveState'].personality.raw

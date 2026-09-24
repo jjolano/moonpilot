@@ -640,6 +640,14 @@ EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
       Priority.LOW, VisualAlert.none, AudibleAlert.none, .1),
   },
 
+  EventName.pathOutside: {  # moonpilot seam, see AGENTS.md: model path left the free corridor
+    ET.WARNING: Alert(
+      "Path Outside Road",
+      "",
+      AlertStatus.userPrompt, AlertSize.small,
+      Priority.LOW, VisualAlert.none, AudibleAlert.prompt, 1.5),
+  },
+
   EventName.steerSaturated: {
     ET.WARNING: Alert(
       "Take Control",

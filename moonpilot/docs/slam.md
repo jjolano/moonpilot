@@ -87,21 +87,37 @@ without reshaping it. The on-device proof the plan calls for is a replay: logged
 
 The same toggle and the same publisher also fill `moonpilotState.egoPose` from `moonpilot/pose.py`:
 observation-only, dead-reckon + GPS gate, valid from the first accepted fix (the origin) onward.
-x/y are metres east/north of that fix, yaw is rad CCW from east, `monoTime` is the last odom pose
-time stamped the same way as the correction's window end. Nothing in the control path reads it yet;
-it is there so a replay can score chained-pose RMSE against LLK, and so Phase 2 has a frame to
-work in. Off (`MoonpilotSlam` unset or false) leaves `valid` false — the pass-through case.
+x/y are meters east/north of that fix, yaw is rad CCW from east, `monoTime` is the last odom pose
+time stamped the same way as the correction's window end. Off (`MoonpilotSlam` unset or false)
+leaves `valid` false — the pass-through case. Its first control-path consumer is the pose-stitched
+corridor below: without a valid pose that consumer is the single-frame form it had before.
 
 ## Corridor occupancy (Phase 2)
 
 `moonpilot/corridor.py` is the on-road free-space strip from `modelV2.roadEdges` alone — pure
-numpy, no publisher, no toggle of its own — so a planner seam or a replay can call it the same way
-`lead_in_path` is called. At each sample along a path it returns the free lateral bounds (ordered
-by y, never by edge index), the free width, and an in-corridor flag with a small margin; a sample
-the edges do not span is NaN, not free. Lane lines are the same shape and remain available if a
-consumer needs them; a persistent map across drives is out of scope (`slam-spike.md`).
+numpy for the geometry, no publisher, no toggle of its own — so a planner seam or a replay can call
+it the same way `lead_in_path` is called. At each sample along a path it returns the free lateral
+bounds (ordered by y, never by edge index), the free width, and an in-corridor flag with a small
+margin; a sample the edges do not span is NaN, not free. Lane lines are the same shape and remain
+available if a consumer needs them; a persistent map across drives is out of scope (`slam-spike.md`).
 
-The first consumer is `MoonpilotSqueeze` (`squeeze_accel`): when the free width pinches under
-about two car widths over the next 40 m, a bounded ramp is fed into the fork planner's cruise-slot
-`min` the same way the curve terms are — see `moonpilot/docs/longitudinal.md`.
+Two consumers ship. `MoonpilotSqueeze` (`squeeze_accel`) is the cruise-slot brake when free width
+pinches under about two car widths over the next 40 m — see `moonpilot/docs/longitudinal.md`.
+`MoonpilotPathOutside` (`path_outside_alert`) is selfdrived's banner when enough of the near model
+path leaves that corridor while `carControl.latActive` is true — see `moonpilot/docs/longitudinal.md`
+and the seam table in `AGENTS.md`.
+
+## Pose-stitched free space (Phase 3)
+
+The model repaints `roadEdges` every frame; a strip solid for half a second and missing for one
+frame should not release squeeze or clear the path-outside banner on that frame. `RollingCorridor`
+keeps a short history (1.5 s / 40 frames) of strips, each stamped with the `egoPose` the frame was
+captured in, and warps them into the caller's current pose by relative SE2 before intersecting the
+free regions (max of lefts, min of rights — the narrowest strip any frame saw). Unknown samples stay
+unknown: intersection only tightens where both frames had an answer. A `pose is None` or an empty
+history is all-NaN / `ACCEL_MAX`, and an invalid pose clears the history so a rebase cannot mix two
+origins. The planner's squeeze path is the first caller: with a valid `moonpilotState.egoPose` it
+pushes each frame and queries the fused strip; without a pose (SLAM off, first fix, dead publisher)
+it clears and falls back to the single-frame `squeeze_accel` — exactly the planner this fork had
+before the history existed.
 

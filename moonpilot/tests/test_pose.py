@@ -432,7 +432,7 @@ class TestChainRmse(unittest.TestCase):
       fused["rmse"], raw["rmse"],
       msg=f"fused {fused['rmse']:.1f} m not below raw {raw['rmse']:.1f} m (dist {fused['dist']:.0f} m, n={fused['n']})",
     )
-    # And fused should be in the metres, not tens of metres, on a 1 Hz gate.
+    # And fused should be in the meters, not tens of meters, on a 1 Hz gate.
     self.assertLess(fused["rmse"], 20.0, msg=f"fused RMSE {fused['rmse']:.1f} m too large")
 
 
