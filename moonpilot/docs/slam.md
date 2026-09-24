@@ -26,8 +26,8 @@ numpy only, so it runs on the device's own CPU. Seven things about it are not ob
   the exposure by modeld's inference and send latency, a measured 30.5 ms median (p95 33.5, max
   200) over 13k corpus frames, and replaying the corpus through both arms puts the difference at
   −0.85 correlation with `aEgo` and +0.019 m/s of under-correction while braking, 23 % of the
-  correction's own size there. `PriorChannel` samples each channel with its own message times and
-  interpolates both onto that time; a frame the samples do not span is skipped, never extrapolated.
+  correction's own size there. `PriorChannel` samples the wheel speed with its own message times and
+  interpolates it onto that time; a frame the samples do not span is skipped, never extrapolated.
 - **The gate is live, not restart-gated.** `leadd` feeds the window whether or not `MoonpilotSlam`
   is on, so turning it on is immediate instead of five seconds of refill. That is also why the
   description does not claim a restart, unlike the fork's controller toggles.

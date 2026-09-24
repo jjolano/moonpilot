@@ -28,7 +28,7 @@ is one dict member and the line that refreshes it. Everything downstream follows
   and openpilot is not engaged. The row is a `button_item` in `moonpilot/ui/settings.py` and a pushed
   `BigButton` in `moonpilot/ui/settings_mici.py`; the gesture is tizi's
   `moonpilot/ui/offroad_mode.py` and mici's `moonpilot/ui/offroad_mode_mici.py`, each with its own
-  dialog and its own widgets — self-contained per tree, like the tailscale QR dialogs. The gesture
+  dialog and its own widgets — self-contained per tree. The gesture
   offers **entering only**, so a hold can never take a device that is already offroad back onroad.
 - **Leaving is never gated.** The mode's own state is `started` false, so a gate on the way out would
   strand the device on a screen with nothing to press: `enabled()` is `requested or parked`, and the
