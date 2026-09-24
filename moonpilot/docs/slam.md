@@ -110,7 +110,7 @@ and the seam table in `AGENTS.md`.
 ## Pose-stitched free space (Phase 3)
 
 The model repaints `roadEdges` every frame; a strip solid for half a second and missing for one
-frame should not release squeeze or clear the path-outside banner on that frame. `RollingCorridor`
+frame should not release squeeze on that frame. `RollingCorridor`
 keeps a short history (1.5 s / 40 frames) of strips, each stamped with the `egoPose` the frame was
 captured in, and warps them into the caller's current pose by relative SE2 before intersecting the
 free regions (max of lefts, min of rights — the narrowest strip any frame saw). Unknown samples stay
@@ -119,5 +119,6 @@ history is all-NaN / `ACCEL_MAX`, and an invalid pose clears the history so a re
 origins. The planner's squeeze path is the first caller: with a valid `moonpilotState.egoPose` it
 pushes each frame and queries the fused strip; without a pose (SLAM off, first fix, dead publisher)
 it clears and falls back to the single-frame `squeeze_accel` — exactly the planner this fork had
-before the history existed.
+before the history existed. The path-outside banner stays single-frame on purpose so the window
+cannot hold a stale outside-fraction up between frames.
 
