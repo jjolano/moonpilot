@@ -1,12 +1,14 @@
 # The model marketplace
 A driver may replace the model this car drives. The panes are `moonpilot/ui/models.py` (tizi) and
-`moonpilot/ui/models_mici.py` (mici); the rules are `moonpilot/models.py`; the catalog side is
-`moonpilot/modelcatalog.py`; the worker is `moonpilot/modelsd.py`; the compiler is
-`moonpilot/modelbuild.py`; the runtime is `moonpilot/modelruntime.py`. The catalog itself —
+`moonpilot/ui/models_mici.py` (mici), and the tizi picker they open is
+`moonpilot/ui/model_picker.py`; the rules are `moonpilot/models.py`; the catalog side is
+`moonpilot/modelcatalog.py`; the worker is
+`moonpilot/modelsd.py`; the compiler is `moonpilot/modelbuild.py`; the runtime is
+`moonpilot/modelruntime.py`. The catalog itself —
 `https://jjolano.github.io/openmodels/catalog.json` — publishes bytes and a structural identity and
 owns no activation, scheduling or qualification, so everything below is the consumer half.
 
-Ten things are not obvious.
+Eleven things are not obvious.
 
 - **A selection is a string, and the boot commit is the only gate.** `""` is the bundled model, or a
   64-hex digest for one catalog recipe. The driver's choice goes in
@@ -82,22 +84,48 @@ Ten things are not obvious.
 - **Catalog bytes can be authenticated, and exact interfaces are enforced.** The `Catalog signatures` toggle is off by default; `modelcatalog.refresh(require_signature=True)` fetches the `.sig` sidecar and verifies it at point of use with the optional `cryptography` dependency, refusing when no pinned `CATALOG_PUBKEY` or signature is available. `verify_downloaded` compares every recorded output slice's start, stop and step, so a shifted or resampled interface is not admitted.
 - **The panel names the model actually driving.** The active-model rows use an explicit `stock:` fallback when the selected runtime is unavailable, while the desired selection and boot/restart semantics remain separate.
 - **Model jobs are cancellable from both UI trees.** A running download or build exposes cancel through the existing request protocol; tizi and mici both confirm before writing the cancellation request, and the worker publishes the terminal status before it exits.
-- **Both trees page the catalog, and the index behind those pages is parsed once per file version.**
-  The marketplace, chooser and installed lists render a fixed window of rows (`PAGE_ROWS` 8 on tizi,
-  6 on mici) with older/newer paging — the catalog is never rendered whole. What would slow the UI is
-  the data behind the rows: both trees re-resolve their row callables every frame, so `models.browse()`
-  keeps one stat-keyed slot (path, `mtime_ns`, size, inode — the worker's `atomic_write` rename is what
-  moves the key) and `admitted_entries` memoizes its filter per kind, cleared whenever `browse()`
-  reloads. A missing file reads as empty rather than serving a stale slot.
+- **The names and the groups are the catalog's, and the fork names nothing.** openmodels carries a
+  model's own display `name`, a `short_name` and a `folder` as reviewed claims from a pinned naming
+  source, each checked against an exact commit and artifact set before it is published (`index/names.py`,
+  `index/model_names.json`); the browse index copies all three and the picker prints them verbatim.
+  A row the catalog has no claims for keeps its generated name and falls back to the group the fork
+  *does* own — the protocol the recipe needs, then the model class it was built for — so an older
+  snapshot, or the ~1000 models with no published name, still group sensibly. The only fork-side
+  edit is a row's name dropping the `Driving · ` prefix a generated name repeats, because the picker
+  is already scoped to one kind. **The vendored `contracts.py` line that lets those two keys through
+  is load-bearing**: the catalog's `model` object is closed, so a device that refreshed a catalog
+  carrying them against a copy without the line would reject the whole snapshot. That is why
+  `test_modelcatalog.py` synthesizes a snapshot with the keys and reads it through the vendored loader.
+- **The picker is a tree, and the two device trees differ.** tizi
+  opens `ModelTreeDialog` — the model in effect pinned at the top, `+`/`-` group headers over
+  indented rows, a star per row, a search box, Cancel/Select with Select live only when the pick
+  would change something — built on upstream's `MultiOptionDialog`, `Button`, `Scroller` and
+  `Keyboard`, so it is fork code with no new seam. mici is a two-level drill-down (groups, then one
+  group's models) because a card column has no room for a tree, and a long press is its star. What
+  choosing a row does is one sentence in one place (`chooser_hint`): a row that is not built is an
+  install, a built row applies after a restart, and a built row may only be swapped while offroad.
+  There is no separate marketplace page any more — the picker *is* the catalog list, and what is left
+  on the models page is the download-management half (job, cancel, reboot, storage, refresh).
+- **Stars are recipe digests in one param, and a stale one is free.** `MoonpilotModelsFavs` is
+  `;`-joined digests, so a favorite whose catalog entry is gone simply matches no row and the string
+  is rewritten on the next change; the bundled model is not a recipe and cannot be starred. The
+  starred models get their own group *and* stay in the group the catalog gave them, because a group
+  is where a model is and a star is a separate fact about it.
 
 The vendored SDK is a copy, not a dependency: `moonpilot/vendor/openmodels/` carries the files and the
 sync command in its `README.md`, and is reached only by `moonpilot/modelcatalog.py`, `moonpilot/modelbuild.py`
 and the tests, so the manager, the planner and both panels import without it. `moonpilot/models.py` is
 stdlib plus `moonpilot/paths.py` for that reason — it is on the init path (`moonpilot/procs.py`, both
-panels). The copy and the catalog fixture are the two paths in this tree whose prose is not en-US, and
+panels). Its README names every local edit, the presentation-key line above among them. The copy and
+the catalog fixture are the two paths in this tree whose prose is not en-US, and
 they are the two fork entries in `pyproject.toml`'s codespell `skip`; `ruff` and `ty` see
 both, and `moonpilot/tests/test_modelcatalog.py` reads the fixture through the vendored SDK, so a copy
 that drifts fails the suite rather than compiling.
+
+The one ceiling the picker cannot lift: a model reaches a group only if the catalog publishes one, and
+at the revision above that is 50 of 1146 entries. The rest group by protocol and class under generated
+names, which is the honest answer — a marketing name for a comma commit would be a claim nobody
+checked. openmodels is where that would change, through a reviewed naming record.
 
 Three ways to check this feature without a car: `.venv/bin/python3 -m unittest` runs of
 `moonpilot/tests/test_models.py`, `test_modelcatalog.py` and `test_modelruntime.py`;

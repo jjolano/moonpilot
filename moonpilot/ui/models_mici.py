@@ -1,22 +1,25 @@
-"""Mici model settings rendered as inline vertical pages inside Moonpilot settings."""
+"""Mici model settings rendered as inline vertical pages inside Moonpilot settings.
+
+The picker is a drill-down rather than a tree, because a mici screen is a column of cards: the
+groups first, then one group's models. The grouping, the names and the stars are `moonpilot/models.py`'s
+— the same ones the tizi tree dialog draws — and a star here is a long press, since there is no room
+for a star glyph beside a card's value.
+"""
 
 from collections.abc import Callable, Sequence
-from typing import cast
 
 import pyray as rl
 
 from moonpilot import models
 from openpilot.common.params import Params
-from openpilot.selfdrive.ui.mici.widgets.button import BigButton, BigMultiToggle
+from openpilot.selfdrive.ui.mici.widgets.button import BigButton
 from openpilot.selfdrive.ui.mici.widgets.dialog import BigConfirmationDialog, SettingDescriptionDialog
 from openpilot.selfdrive.ui.ui_state import ui_state
 from openpilot.system.ui.lib.application import gui_app
 from openpilot.system.ui.widgets import Widget
 from openpilot.system.ui.widgets.scroller import Scroller
 
-PAGE_ROWS = 6
 INSTALLED_ROWS = 8
-KIND_FILTERS = (models.FILTER_ALL, models.FILTER_DRIVING, models.FILTER_MONITORING)
 ICON_INSTALL = "icons_mici/settings/software.png"
 ICON_REMOVE = "icons_mici/settings/device/uninstall.png"
 ICON_REBUILD = "icons_mici/settings/device/update.png"
@@ -25,6 +28,7 @@ _INVALID = object()
 BAR_TRACK = rl.Color(57, 57, 57, 255)
 BAR_FILL = rl.Color(51, 171, 76, 255)
 BAR_HEIGHT = 10
+FAVORITE_MARK = "fav"
 
 
 def _request(params: Params, op: str, selection: str = "") -> None:
@@ -75,6 +79,12 @@ class Page(Scroller):
     super().__init__(horizontal=False)
     self._scroller.add_widgets([back_card, *rows])
 
+  def replace_rows(self, rows: Sequence[Widget]) -> None:
+    """Swap everything after the Back card. The picker's groups come from the catalog, so the row
+    count is not known until the page opens. `_Scroller.items` is the live list, so this is an
+    in-place swap rather than a rebuild."""
+    self._scroller.items[:] = [*self._scroller.items[:1], *rows]
+
 
 class _JobCard(BigButton):
   def __init__(self, params: Params):
@@ -99,23 +109,23 @@ class ModelsPage(Page):
     self._params = params
     self._open_page = open_page
     self._current = submenu_button(models.TITLE_CURRENT_MODEL, description=models.DESCRIPTION_CURRENT_MODEL)
-    self._current.set_click_callback(lambda: open_page(ChooserPage(params, models.DRIVING, back)))
+    self._current.set_click_callback(lambda: open_page(GroupsPage(params, models.DRIVING, open_page, back)))
     self._monitoring = submenu_button(models.TITLE_MONITORING, description=models.model_description(params, models.MONITORING))
-    self._monitoring.set_click_callback(lambda: open_page(ChooserPage(params, models.MONITORING, back)))
+    self._monitoring.set_click_callback(lambda: open_page(GroupsPage(params, models.MONITORING, open_page, back)))
     self._job = _JobCard(params)
     self._cancel = BigButton(models.LABEL_CANCEL, models.LABEL_CANCEL, description=models.DESCRIPTION_CANCEL)
     self._cancel.set_click_callback(self._cancel_action)
     self._job.set_click_callback(lambda: _describe("job", models.job_description(models.status(params)["job"], params)))
     self._reboot = BigButton(models.LABEL_REBOOT, models.LABEL_REBOOT, description=models.DESCRIPTION_REBOOT)
     self._reboot.set_click_callback(lambda: models.request_reboot(params))
-    self._browse = submenu_button(models.TITLE_BROWSE, description=models.DESCRIPTION_BROWSE)
-    self._browse.set_click_callback(lambda: open_page(CatalogPage(params, back)))
     self._installed = submenu_button(models.TITLE_INSTALLED, description=models.DESCRIPTION_INSTALLED)
     self._installed.set_click_callback(lambda: open_page(InstalledPage(params, back)))
+    self._refresh = BigButton(models.TITLE_REFRESH, description=models.DESCRIPTION_REFRESH)
+    self._refresh.set_click_callback(lambda: _request(params, "refresh"))
     self._storage = BigButton(models.TITLE_STORAGE, description=models.DESCRIPTION_STORAGE)
     self._storage.set_click_callback(lambda: _describe(models.TITLE_STORAGE, models.DESCRIPTION_STORAGE))
     super().__init__(
-      [self._current, self._monitoring, self._browse, self._installed, self._job, self._cancel, self._reboot, self._storage],
+      [self._current, self._monitoring, self._installed, self._refresh, self._job, self._cancel, self._reboot, self._storage],
       models.TITLE_MODELS,
       models.DESCRIPTION_MODELS,
       back,
@@ -142,80 +152,10 @@ class ModelsPage(Page):
     self._job.set_enabled(status["job"] is not None)
     self._cancel.set_visible(models.job_active(status["job"]))
     self._installed.set_value(str(len(status["installed"])))
+    self._refresh.set_value(models.catalog_text(status["catalog"]))
+    self._refresh.set_long_press_callback(lambda: _describe(models.TITLE_REFRESH, models.catalog_description(status["catalog"])))
     self._reboot.set_visible(models.restart_needed(self._params))
     self._reboot.set_enabled(ui_state.is_offroad())
-
-
-class CatalogPage(Page):
-  """The compatible marketplace, including refresh and paging."""
-
-  def __init__(self, params: Params, back: Callable):
-    self._params = params
-    self._page = 0
-    self._kind_toggle = BigMultiToggle("show", list(KIND_FILTERS))
-    self._rows = [BigButton("") for _ in range(PAGE_ROWS)]
-    self._refresh = BigButton(models.TITLE_REFRESH, description=models.DESCRIPTION_REFRESH)
-    self._refresh.set_click_callback(lambda: _request(params, "refresh"))
-    self._page_row = BigButton("catalog")
-    self._older = BigButton("older", models.LABEL_OLDER)
-    self._older.set_click_callback(lambda: self._offset(1))
-    self._newer = BigButton("newer", models.LABEL_NEWER)
-    self._newer.set_click_callback(lambda: self._offset(-1))
-    super().__init__(
-      [self._refresh, self._kind_toggle, *self._rows, self._page_row, self._older, self._newer], models.TITLE_BROWSE, models.DESCRIPTION_BROWSE, back
-    )
-    self._update_rows()
-
-  def show_event(self):
-    super().show_event()
-    self._page = 0
-    self._update_rows()
-
-  def _update_state(self):
-    super()._update_state()
-    self._update_rows()
-
-  def _entries(self) -> list[dict]:
-    return models.admitted_entries(self._kind_toggle.get_value())
-
-  def _entry_at(self, index: int) -> dict | None:
-    return models.page_item(self._entries(), self._page, PAGE_ROWS, index)
-
-  def _offset(self, delta: int) -> None:
-    self._page = models.clamp_page(self._entries(), self._page + delta, PAGE_ROWS)
-    self._update_rows()
-
-  def _install(self, index: int) -> None:
-    entry = self._entry_at(index)
-    if entry is None:
-      return
-    installed = {models.selection_of(item) for item in models.status(self._params)["installed"]}
-    selection = models.selection_of(entry)
-    if not entry.get("admitted") or selection in installed:
-      _describe(str(entry.get("name", "")), models.entry_detail(entry))
-      return
-    _confirm(models.INSTALL_TEXT, ICON_INSTALL, lambda: _request(self._params, "install", selection))
-
-  def _update_rows(self):
-    self._page = models.clamp_page(self._entries(), self._page, PAGE_ROWS)
-    installed = {models.selection_of(entry) for entry in models.status(self._params)["installed"]}
-    catalog = models.status(self._params)["catalog"]
-    self._refresh.set_value(models.catalog_text(catalog))
-    self._refresh.set_long_press_callback(lambda: _describe(models.TITLE_REFRESH, models.catalog_description(catalog)))
-    for index, row in enumerate(self._rows):
-      entry = self._entry_at(index)
-      row.set_visible(entry is not None)
-      if entry is None:
-        continue
-      row.set_text(str(entry.get("name", "")))
-      row.set_value(models.entry_action(entry, installed))
-      row.set_enabled(True)
-      row.set_click_callback(lambda index=index: self._install(index))
-    entries = self._entries()
-    pages = models.page_count(entries, PAGE_ROWS)
-    self._page_row.set_value(f"{self._page + 1} / {pages}" if entries else (models.BROWSE_EMPTY if not models.browse().get("revision") else models.BROWSE_NONE))
-    self._older.set_visible(bool(entries))
-    self._newer.set_visible(bool(entries))
 
 
 class InstalledPage(Page):
@@ -281,86 +221,125 @@ class InstalledPage(Page):
       info.set_value(f"{entry.get('state', '')} {models.human_size(int(entry.get('size', 0)))}".strip())
 
 
-class ChooserPage(Page):
-  """One kind-filtered chooser: stock, built models, and admitted catalog models, paged the same
-  way the catalog list is."""
+class GroupsPage(Page):
+  """The picker's groups for one kind: the catalog's own folders, the starred models, and whatever
+  the compatibility-class fallback groups. A tap opens one group."""
 
-  def __init__(self, params: Params, kind: str, back: Callable):
+  def __init__(self, params: Params, kind: str, open_page: Callable, back: Callable):
     self._params = params
     self._kind = kind
+    self._open_page = open_page
     self._back = back
-    self._page = 0
-    self._choices_cache = models.chooser_entries(self._params, self._kind)
-    self._rows = [BigButton("") for _ in range(PAGE_ROWS)]
-    for index, row in enumerate(self._rows):
-      row.set_click_callback(lambda index=index: self._select(index))
-    self._page_row = BigButton("page")
-    self._older = BigButton("older", models.LABEL_OLDER)
-    self._older.set_click_callback(lambda: self._offset(1))
-    self._newer = BigButton("newer", models.LABEL_NEWER)
-    self._newer.set_click_callback(lambda: self._offset(-1))
-    super().__init__(
-      [*self._rows, self._page_row, self._older, self._newer],
-      models.TITLE_DRIVING if kind == models.DRIVING else models.TITLE_MONITORING,
-      models.DESCRIPTION_MODELS,
-      back,
-    )
-    self._update_rows()
+    self._rows: list[tuple[str, BigButton]] = []
+    super().__init__([], models.TITLE_DRIVING if kind == models.DRIVING else models.TITLE_MONITORING, models.DESCRIPTION_MODELS, back)
+    self._rebuild()
 
   def show_event(self):
     super().show_event()
-    self._page = 0
-    self._choices_cache = models.chooser_entries(self._params, self._kind)
-    self._update_rows()
+    self._rebuild()
 
   def _update_state(self):
     super()._update_state()
-    self._update_rows()
+    self._rebuild()
 
-  def _offset(self, delta: int) -> None:
-    self._page = models.clamp_page(self._choices_cache, self._page + delta, PAGE_ROWS)
-    self._update_rows()
-
-  def _choice(self, index: int) -> dict | None | object:
-    return models.page_item(self._choices_cache, self._page, PAGE_ROWS, index, _INVALID)
-
-  def _install(self, selection: str) -> None:
-    _request(self._params, "install", selection)
-    self._back()
-
-  def _select(self, index: int) -> None:
-    choice = self._choice(index)
-    if choice is _INVALID:
+  def _rebuild(self):
+    groups = models.chooser_groups(self._params, self._kind)
+    if [label for label, _button in self._rows] == [label for label, _rows in groups]:
+      for index, (_label, button) in enumerate(self._rows):
+        button.set_value(str(len(groups[index][1])))
       return
-    selection = "" if choice is None else models.selection_of(cast(dict, choice))
-    if choice is not None and choice.get("state") != "built":
-      _confirm(models.INSTALL_TEXT, ICON_INSTALL, lambda: self._install(selection))
+    self._rows = []
+    widgets: list[Widget] = []
+    for label, rows in groups:
+      # The bundled model's group is the catalog's own unnamed group, which reads as "stock" here.
+      first = rows[0] if rows else None
+      button = submenu_button(label or models.BUNDLED_LABEL, str(len(rows)),
+                              description=models.DESCRIPTION_MODELS if first is None else models.entry_detail(first))
+      button.set_click_callback(lambda label=label: self._open_page(GroupPage(self._params, self._kind, label, self._open_page, self._back)))
+      self._rows.append((label, button))
+      widgets.append(button)
+    if not widgets:
+      widgets = [submenu_button(models.BROWSE_EMPTY)]
+    self.replace_rows(widgets)
+
+
+class GroupPage(Page):
+  """One group's models. A tap installs a model that is not built yet and selects one that is; a long
+  press stars it, which is the mici stand-in for the tree's star."""
+
+  def __init__(self, params: Params, kind: str, label: str, open_page: Callable, back: Callable):
+    self._params = params
+    self._kind = kind
+    self._label = label
+    self._back = back
+    self._rows: list[tuple[BigButton, dict | None]] = []
+    super().__init__([], label or models.TITLE_CURRENT_MODEL, models.DESCRIPTION_MODELS, back)
+    self._rebuild()
+
+  def show_event(self):
+    super().show_event()
+    self._rebuild()
+
+  def _update_state(self):
+    super()._update_state()
+    self._update_values()
+
+  def _rows_for_label(self) -> list[dict | None]:
+    return next((rows for label, rows in models.chooser_groups(self._params, self._kind) if label == self._label), [])
+
+  def _rebuild(self):
+    entries = self._rows_for_label()
+    # By selection, not by identity: an installed entry is re-merged from the index on every read, so
+    # its dict is a new object each time and identity would rebuild the cards every frame.
+    if ["" if entry is None else models.selection_of(entry) for _button, entry in self._rows] == [
+        "" if entry is None else models.selection_of(entry) for entry in entries
+    ]:
+      self._update_values()
       return
-    if not ui_state.is_offroad() or selection == models.desired(self._params, self._kind):
+    self._rows = []
+    widgets: list[Widget] = []
+    for entry in entries:
+      button = BigButton("")
+      button.set_click_callback(lambda entry=entry: self._choose(entry))
+      button.set_long_press_callback(lambda entry=entry: self._star(entry))
+      self._rows.append((button, entry))
+      widgets.append(button)
+    if not widgets:
+      widgets = [submenu_button(models.BROWSE_NONE)]
+    self.replace_rows(widgets)
+    self._update_values()
+
+  def _update_values(self):
+    desired = models.desired(self._params, self._kind)
+    starred = models.favorites(self._params)
+    offroad = ui_state.is_offroad()
+    for button, entry in self._rows:
+      selection = "" if entry is None else models.selection_of(entry)
+      if entry is None or entry.get("state") == "built":
+        action = models.REASON_SELECTED if selection == desired else models.LABEL_SELECT
+        button.set_enabled(offroad)
+      else:
+        action = models.LABEL_INSTALL
+        button.set_enabled(True)
+      button.set_text(models.entry_display(entry, self._kind))
+      button.set_value(f"{action} {FAVORITE_MARK}" if selection in starred else action)
+
+  def _show_detail(self, entry: dict | None) -> None:
+    _describe(models.entry_display(entry, self._kind), models.model_description(self._params, self._kind) if entry is None else models.entry_detail(entry))
+
+  def _star(self, entry: dict | None) -> None:
+    if entry is None:
+      return
+    selection = models.selection_of(entry)
+    models.set_favorite(self._params, selection, selection not in models.favorites(self._params))
+    self._rebuild()
+
+  def _choose(self, entry: dict | None) -> None:
+    selection = "" if entry is None else models.selection_of(entry)
+    if entry is not None and entry.get("state") != "built":
+      _confirm(models.INSTALL_TEXT, ICON_INSTALL, lambda: _request(self._params, "install", selection))
+      return
+    if selection == models.desired(self._params, self._kind) or not ui_state.is_offroad():
+      self._show_detail(entry)
       return
     _confirm(models.CONFIRM_SELECT, ICON_INSTALL, lambda: models.select(self._params, self._kind, selection))
-
-  def _update_rows(self):
-    self._page = models.clamp_page(self._choices_cache, self._page, PAGE_ROWS)
-    desired = models.desired(self._params, self._kind)
-    offroad = ui_state.is_offroad()
-    for index, row in enumerate(self._rows):
-      choice = self._choice(index)
-      row.set_visible(choice is not _INVALID)
-      if choice is _INVALID:
-        continue
-      row.set_enabled(offroad or choice is not None and choice.get("state") != "built")
-      selection = "" if choice is None else models.selection_of(cast(dict, choice))
-      row.set_text("stock" if choice is None else str(choice.get("name") or selection[:12]))
-      row.set_value(
-        models.LABEL_INSTALL
-        if choice is not None and choice.get("state") != "built"
-        else models.REASON_SELECTED
-        if selection == desired
-        else models.LABEL_SELECT
-      )
-    pages = models.page_count(self._choices_cache, PAGE_ROWS)
-    multi = pages > 1
-    self._page_row.set_value(f"{self._page + 1} / {pages}")
-    self._older.set_visible(multi)
-    self._newer.set_visible(multi)

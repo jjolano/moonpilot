@@ -28,10 +28,16 @@ cp LICENSE THIRD_PARTY_NOTICES.md /path/to/moonpilot/moonpilot/vendor/openmodels
 ```
 
 The only local edits are the first line `# ruff: noqa` -- upstream's own style is not this repo's --
+one line in `contracts.py`, `"short_name": TEXT, "folder": TEXT,` in the snapshot's `model` object,
 and the `moonpilot/vendor/openmodels/*` and `moonpilot/tests/fixtures/*` entries in `pyproject.toml`'s
 codespell `skip`: both are copied third-party text, and this tree's codespell dictionary is en-GB to
 en-US, so this copy's `cancelled`/`unparseable` and the catalog fixture's `metres` would otherwise
-fail a gate that has nothing to do with either. Nothing about the code itself is configured away: `ruff` and `ty` see these files
+fail a gate that has nothing to do with either. That one line is not optional and not a fork
+extension: the `model` object is closed (`additionalProperties: False`), so once the catalog publishes
+the two keys, `Catalog.__init__` rejects the entire snapshot without it -- a picker whose groups
+never arrive must not cost the device its catalog. They are optional in the required-key list, so a
+snapshot that predates them still validates, and the picker's grouping falls back to protocol and
+model class (see `entry_group` in `moonpilot/models.py`). Nothing about the code itself is configured away: `ruff` and `ty` see these files
 and `moonpilot/tests/test_modelcatalog.py` exercises them, so a copy that drifts or goes missing
 fails rather than compiles. `metadata.py` is
 upstream's `index/metadata.py` flattened into this package so the ONNX reader travels with the

@@ -53,7 +53,7 @@ class TempStoreCase(unittest.TestCase):
     patcher = mock.patch.object(models.paths, "data_dir", lambda feature: os.path.join(self.tmp, feature))
     patcher.start()
     self.addCleanup(patcher.stop)
-    for target, value in (("_STATUS_CACHE", None), ("_BROWSE_CACHE", None), ("_ADMITTED_CACHE", {})):
+    for target, value in (("_STATUS_CACHE", None), ("_BROWSE_CACHE", None)):
       cache_patcher = mock.patch.object(models, target, value)
       cache_patcher.start()
       self.addCleanup(cache_patcher.stop)
@@ -97,6 +97,17 @@ class TestFixture(unittest.TestCase):
       document = json.loads(raw)
       if document["type"] == "recipe":
         self.assertTrue(document["profile"] in self.snapshot["documents"], digest)
+
+  def test_the_vendored_schema_carries_the_catalogs_presentation_keys(self):
+    # The `model` object is closed, so a published `folder`/`short_name` is refused whole-snapshot
+    # unless the vendored copy knows them. That is why the one line in `contracts.py` is not optional,
+    # and this is what fails without it.
+    snapshot = json.loads(json.dumps(self.snapshot))
+    snapshot["entries"][0]["model"].update({"folder": "2026 World Models", "short_name": "OPM10V3", "name_kind": "published"})
+    catalog = client.Catalog(json.dumps(snapshot).encode(), base_url="https://catalog.invalid/")
+    self.assertEqual(catalog.models(include_archive=True)[0].get("folder", "2026 World Models"), "2026 World Models")
+    # And a snapshot that predates them still validates, so a device on an older catalog keeps working.
+    client.Catalog(self.raw, base_url="https://catalog.invalid/")
 
 
 def _case(name: str):
@@ -193,6 +204,9 @@ class TestBrowse(CatalogCase):
         {
           "recipe",
           "name",
+          "short_name",
+          "name_kind",
+          "folder",
           "kind",
           "family",
           "model_class",
@@ -209,6 +223,20 @@ class TestBrowse(CatalogCase):
           "variants",
         },
       )
+
+  def test_the_index_carries_the_catalogs_own_names_and_folders(self):
+    # The fixture predates the presentation keys, so the index rows read empty and the pickers fall
+    # back to the protocol group. A model that has them must reach the index verbatim.
+    groups = self.catalog.models(include_archive=True)
+    stock = next(g for g in groups if any(v["recipe"] == STOCK for v in g["variants"]))
+    named = {**stock, "folder": "Master Models", "short_name": "OPM", "name_kind": "published"}
+    with mock.patch.object(self.catalog, "models", return_value=[named]):
+      index = modelcatalog.browse_index(self.catalog)
+    self.assertEqual((index["entries"][0]["folder"], index["entries"][0]["short_name"], index["entries"][0]["name_kind"]),
+                     ("Master Models", "OPM", "published"))
+    bare = next(entry for entry in modelcatalog.browse_index(self.catalog)["entries"] if entry["recipe"] == STOCK)
+    self.assertEqual((bare["folder"], bare["short_name"], bare["name_kind"]), ("", "", ""))
+    self.assertTrue(models.entry_group(bare).startswith("supercombo · "), "an older catalog still groups by protocol")
 
   def test_variants_of_one_model_collapse_to_the_admitted_one(self):
     # The fixture has no multi-variant group, so synthesize one: a newer refused twin next to the

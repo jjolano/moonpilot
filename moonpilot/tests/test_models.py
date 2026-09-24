@@ -41,7 +41,7 @@ class FakeParams:
   otherwise, a `put` that stores, and a `remove`. Deliberately not `get_bool` -- the fork's own rule
   is that it ignores the declared default."""
 
-  DEFAULTS = {models.DRIVING_KEY: "", models.MONITORING_KEY: ""}
+  DEFAULTS = {models.DRIVING_KEY: "", models.MONITORING_KEY: "", models.FAVS_KEY: ""}
 
   def __init__(self, values: dict | None = None):
     self.values = dict(values or {})
@@ -82,7 +82,6 @@ class StoreCase(unittest.TestCase):
       mock.patch.object(models.paths, "data_dir", lambda feature: os.path.join(self._tmp.name, feature)),
       mock.patch.object(models, "_STATUS_CACHE", None),
       mock.patch.object(models, "_BROWSE_CACHE", None),
-      mock.patch.object(models, "_ADMITTED_CACHE", {}),
     ]
     for patch in self._patches:
       patch.start()
@@ -342,6 +341,132 @@ class TestChooserEntries(unittest.TestCase):
     self.assertTrue(catalog_entry["admitted"])
 
 
+class TestPicker(unittest.TestCase):
+  """What the pickers group, name, star and search. The catalog owns the names: a row's folder and
+  short name are its own reviewed claims, and everything else falls back to the protocol and model
+  class the fork admits -- so these tests pin both halves, and that nothing is invented between."""
+
+  def _params(self, **values) -> FakeParams:
+    params = FakeParams(values)
+    # A built model with no catalog row: the fallback grouping has only its protocol to go on.
+    models.publish_status(params, installed=[{"recipe": "b" * 64, "name": "built", "kind": models.DRIVING,
+                                               "state": "built", "protocol": "comma.supercombo.v1"}])
+    return params
+
+  def _browse(self, entries):
+    return mock.patch.object(models, "browse", return_value={"revision": "r", "generated_at": "", "entries": entries})
+
+  def test_the_catalogs_folder_wins_and_the_fallback_is_the_protocol_and_class(self):
+    self.assertEqual(models.entry_group(None), models.GROUP_STOCK)
+    self.assertEqual(models.entry_group({"folder": "2026 World Models"}), "2026 World Models")
+    self.assertEqual(models.entry_group({"protocol": "comma.supercombo.v1", "model_class": "big"}), "supercombo · big")
+    # Whatever the row carries: an installed model whose catalog entry is gone still knows its protocol.
+    self.assertEqual(models.entry_group({"protocol": "comma.split-vision-policy.v1"}), "vision + policy")
+    self.assertEqual(models.entry_group({"kind": models.MONITORING}), "Driver monitoring")
+    # A group name is carried verbatim, never normalized away.
+    self.assertEqual(models.entry_group({"folder": "Master Models", "protocol": "comma.supercombo.v1"}), "Master Models")
+
+  def test_stock_leads_then_the_starred_models_then_the_groups_newest_first(self):
+    params = self._params()
+    entries = [
+      {"recipe": "c" * 64, "name": "newer", "kind": models.DRIVING, "admitted": True, "folder": "World Models", "updated_at": "2026-03-26"},
+      {"recipe": "d" * 64, "name": "older", "kind": models.DRIVING, "admitted": True, "folder": "Legacy Models", "updated_at": "2020-11-11"},
+    ]
+    with self._browse(entries):
+      groups = models.chooser_groups(params, models.DRIVING)
+      models.set_favorite(params, "d" * 64, True)
+      starred = models.chooser_groups(params, models.DRIVING)
+
+    self.assertEqual([label for label, _rows in groups], ["", "supercombo", "World Models", "Legacy Models"])
+    self.assertEqual(groups[0][1], [None])
+    self.assertEqual([label for label, _rows in starred], ["", models.GROUP_FAVORITES, "supercombo", "World Models"])
+    self.assertEqual([models.selection_of(row) for row in starred[1][1] if row is not None], ["d" * 64])
+
+  def test_an_installed_model_keeps_the_group_the_catalog_gave_it(self):
+    params = self._params()
+    entries = [{"recipe": "b" * 64, "name": "built", "kind": models.DRIVING, "admitted": True,
+                "folder": "World Models", "short_name": "BUILT", "model_class": "big"}]
+    with self._browse(entries):
+      groups = models.chooser_groups(params, models.DRIVING)
+    self.assertEqual([label for label, _rows in groups], ["", "World Models"])
+    built = groups[1][1][0]
+    assert built is not None
+    self.assertEqual(models.entry_display(built, models.DRIVING), "built")
+    self.assertEqual(built["short_name"], "BUILT")
+
+  def test_every_row_lands_in_exactly_one_group(self):
+    params = self._params()
+    entries = [
+      {"recipe": "c" * 64, "name": "a", "kind": models.DRIVING, "admitted": True, "folder": "One"},
+      {"recipe": "d" * 64, "name": "b", "kind": models.DRIVING, "admitted": True, "folder": "Two"},
+      {"recipe": "e" * 64, "name": "c", "kind": models.MONITORING, "admitted": True, "folder": "One"},
+    ]
+    with self._browse(entries):
+      groups = models.chooser_groups(params, models.DRIVING)
+      models.set_favorite(params, "c" * 64, True)
+      starred = models.chooser_groups(params, models.DRIVING)
+    rows = [models.selection_of(row) for _label, group_rows in groups for row in group_rows if row]
+    self.assertEqual(sorted(rows), sorted(set(rows)))
+    # The monitoring row is not in the driving picker, and the star moves a row rather than copying it.
+    self.assertNotIn("e" * 64, rows)
+    self.assertEqual(sum(len(group_rows) for _label, group_rows in starred), len(rows) + 1)
+
+  def test_a_generated_name_loses_the_kind_the_picker_already_says(self):
+    generated = {"name": "Driving · split · standard · 2026-03-26 · bf430805", "name_kind": "generated"}
+    published = {"name": "OP Model 10 V3 (April 19, 2026)", "name_kind": "published", "short_name": "OPM10V3"}
+    self.assertEqual(models.entry_display(generated, models.DRIVING), "split · standard · 2026-03-26 · bf430805")
+    self.assertEqual(models.entry_display(published, models.DRIVING), "OP Model 10 V3 (April 19, 2026)")
+    self.assertEqual(models.entry_display(None, models.DRIVING), models.BUNDLED_LABEL)
+    self.assertEqual(models.entry_display({}, models.DRIVING), "")
+
+  def test_search_matches_the_short_name_the_group_and_the_date(self):
+    published = {"recipe": "b" * 64, "name": "OP Model 10 V3 (April 19, 2026)", "short_name": "OPM10V3",
+                 "folder": "2026 World Models", "updated_at": "2026-04-19", "kind": models.DRIVING, "admitted": True}
+        # subsequence, not substring
+    self.assertTrue(models.matches_query(published, "opm10", models.DRIVING))
+    self.assertTrue(models.matches_query(published, "world models", models.DRIVING))
+    self.assertTrue(models.matches_query(published, "2026-04", models.DRIVING))
+    self.assertTrue(models.matches_query(None, "stock", models.DRIVING))
+    self.assertFalse(models.matches_query(published, "tomb raider", models.DRIVING))
+    self.assertTrue(models.matches_query(published, "  ", models.DRIVING))
+
+  def test_search_keeps_a_group_that_has_a_match_and_drops_one_that_has_not(self):
+    groups = [("World Models", [{"short_name": "OPM10V3", "name": "OP Model 10 V3"}]), ("Legacy Models", [{"short_name": "ND", "name": "Notre Dame"}])]
+    kept = models.search_groups(groups, "opm10")
+    self.assertEqual([label for label, _rows in kept], ["World Models"])
+    self.assertEqual(models.search_groups(groups, "  "), groups)
+
+  def test_the_footer_says_what_choosing_the_row_does(self):
+    params = self._params()
+    built = {"recipe": "b" * 64, "name": "built", "state": "built"}
+    catalog = {"recipe": "c" * 64, "name": "catalog"}
+    self.assertEqual(models.chooser_hint(None, models.DRIVING, params, True), models.CHOOSER_HINT_STOCK)
+    self.assertEqual(models.chooser_hint(built, models.DRIVING, params, True), models.CHOOSER_HINT_BUILT)
+    self.assertEqual(models.chooser_hint(catalog, models.DRIVING, params, True), models.CHOOSER_HINT_INSTALL)
+    self.assertTrue(models.CHOOSER_HINT_OFFROAD in models.chooser_hint(built, models.DRIVING, params, False))
+    models.select(params, models.DRIVING, "b" * 64)
+    self.assertEqual(models.chooser_hint(built, models.DRIVING, params, True), models.CHOOSER_HINT_SELECTED)
+
+  def test_only_a_built_selection_can_be_chosen(self):
+    params = self._params()
+    self.assertTrue(models.is_built(params, models.DRIVING, ""))
+    self.assertTrue(models.is_built(params, models.DRIVING, "b" * 64))
+    self.assertFalse(models.is_built(params, models.DRIVING, "c" * 64))
+    self.assertFalse(models.is_built(params, models.MONITORING, "b" * 64))
+
+  def test_a_star_survives_a_stale_digest_and_the_bundled_model_cannot_be_starred(self):
+    params = FakeParams()
+    models.set_favorite(params, "b" * 64, True)
+    self.assertEqual(models.favorites(params), {"b" * 64})
+    models.set_favorite(params, "not-a-recipe", True)
+    self.assertEqual(models.favorites(params), {"b" * 64})
+    models.set_favorite(params, "", True)
+    self.assertEqual(models.favorites(params), {"b" * 64})
+    models.set_favorite(params, "b" * 64, False)
+    self.assertEqual(models.favorites(params), set())
+    self.assertEqual(params.get(models.FAVS_KEY), "")
+
+
 class TestBrowseCache(StoreCase):
   """Both trees resolve their row callables every frame, so the index must be parsed once per file
   version -- the worker's atomic rewrite is what invalidates the slot."""
@@ -359,18 +484,18 @@ class TestBrowseCache(StoreCase):
       },
     )
 
-  def test_an_unchanged_index_is_parsed_once_and_the_filter_memoized(self):
+  def test_an_unchanged_index_is_parsed_once(self):
     self._write_browse("r1", ["a"])
     first = models.browse()
     self.assertIs(models.browse(), first, "an unchanged index must not be re-parsed")
-    self.assertIs(models.admitted_entries(models.FILTER_DRIVING), models.admitted_entries(models.FILTER_DRIVING))
+    self.assertEqual([e["name"] for e in models.admitted_entries(models.DRIVING)], ["a"])
 
   def test_a_rewrite_is_picked_up_and_refilters(self):
     self._write_browse("r1", ["a"])
-    self.assertEqual(models.admitted_entries(models.FILTER_DRIVING)[0]["name"], "a")
+    self.assertEqual(models.admitted_entries(models.DRIVING)[0]["name"], "a")
     self._write_browse("r2", ["a", "b"])
     self.assertEqual(models.browse()["revision"], "r2", "the worker's rewrite must invalidate the slot")
-    self.assertEqual([e["name"] for e in models.admitted_entries(models.FILTER_DRIVING)], ["a", "b"])
+    self.assertEqual([e["name"] for e in models.admitted_entries(models.DRIVING)], ["a", "b"])
 
   def test_a_missing_index_reads_empty_and_never_serves_stale(self):
     self._write_browse("r1", ["a"])

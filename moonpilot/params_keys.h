@@ -92,6 +92,11 @@
     // "restart to apply").
     {"MoonpilotModelsDriving", {PERSISTENT, STRING}},
     {"MoonpilotModelsMonitoring", {PERSISTENT, STRING}},
+    // The starred models in the pickers, ";"-joined recipe digests, written by
+    // the star on a row and read back into the "favorites" group. A digest
+    // whose catalog entry is gone simply matches no row, so a stale star costs
+    // nothing and is rewritten on the next change.
+    {"MoonpilotModelsFavs", {PERSISTENT, STRING}},
     // The committed per-boot decision: what each kind actually loads, with
     // every check the boot made recorded beside it. Written once by
     // commit_boot_selection() from openpilot/system/manager/manager.py, after

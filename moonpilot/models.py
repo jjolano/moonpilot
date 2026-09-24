@@ -35,7 +35,7 @@ import json
 import os
 import shutil
 import time
-from collections.abc import Collection, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -52,6 +52,7 @@ REQUEST_KEY = "MoonpilotModelsRequest"
 STATUS_KEY = "MoonpilotModelsStatus"
 ACTIVE_DRIVING_KEY = "MoonpilotModelsActiveDriving"
 ACTIVE_MONITORING_KEY = "MoonpilotModelsActiveMonitoring"
+FAVS_KEY = "MoonpilotModelsFavs"
 
 # Two kinds, because two processes run models and a param has one writer: `modeld` reads the
 # driving half of the boot snapshot, `dmonitoringmodeld` the monitoring half.
@@ -1023,8 +1024,10 @@ BUNDLED_LABEL = "stock"
 RESTART_NOTE = "(restart to apply)"
 TITLE_MODELS = "models"
 TITLE_CURRENT_MODEL = "current model"
+TITLE_SELECT_MODEL = "select a model"
+TITLE_FAVORITES = "favorites"
+LABEL_SEARCH = "SEARCH"
 DESCRIPTION_CURRENT_MODEL = "Select the model used for driving. Driver monitoring uses a separate model."
-TITLE_BROWSE = "model marketplace"
 TITLE_INSTALLED = "downloaded models"
 TITLE_STORAGE = "storage"
 TITLE_DRIVING = "driving model"
@@ -1040,18 +1043,10 @@ DESCRIPTION_REFRESH = "Fetch the catalog again. Needs a network; a failed refres
 this device already has."
 LABEL_REBOOT = "REBOOT NOW"
 LABEL_INSTALL = "INSTALL"
-LABEL_INSTALLED = "INSTALLED"
 LABEL_SELECT = "SELECT"
 LABEL_REBUILD = "REBUILD"
 LABEL_REMOVE = "REMOVE"
 LABEL_CANCEL = "CANCEL"
-LABEL_NEWER = "NEWER"
-LABEL_OLDER = "OLDER"
-FILTER_ALL = "all"
-FILTER_DRIVING = "driving"
-# Short on purpose: the filter row's buttons are 250 px wide, and "driver monitoring" overflows
-# them (the label is drawn centered and clipped). The kind itself is named in full elsewhere.
-FILTER_MONITORING = "monitoring"
 REBOOT_KEY = "DoReboot"  # upstream's own, read by the manager's power path (manager.py:199)
 CONFIRM_SELECT = "Use this model?"
 CONFIRM_CANCEL = "Cancel the current model job?"
@@ -1061,6 +1056,13 @@ DESCRIPTION_CANCEL = "Canceling stops the current model job. You can start it ag
 DESCRIPTION_REBOOT = "A selected model starts after restart. Restart after installing and selecting."
 REASON_SELECTED = "in effect"
 LABEL_BACK = "BACK"
+# The picker's footer, one sentence per state of the highlighted row. Kept here with the other
+# wording because both trees print the same thing and a panel chooses layout, never words.
+CHOOSER_HINT_STOCK = "the bundled model. Applies after a restart."
+CHOOSER_HINT_SELECTED = "in effect since this boot."
+CHOOSER_HINT_BUILT = "built and ready. Applies after a restart."
+CHOOSER_HINT_INSTALL = "not built yet: this downloads and builds it, then applies after a restart."
+CHOOSER_HINT_OFFROAD = "available when the device is offroad."
 BROWSE_EMPTY = "no catalog yet"
 BROWSE_NONE = "nothing matches"
 INSTALL_TEXT = "Download and build this model. Then choose it from the model chooser and restart to use it."
@@ -1242,23 +1244,28 @@ def model_description(params: Any, kind: str) -> str:
   return f"in effect since this boot, built from {entry['id'][:12]}. {DESCRIPTION_MODELS}"
 
 
+def browse_row(selection: str) -> dict:
+  """The index row that names one selection, or `{}`. A selection that is a *variant* of the row's
+  model is named through that row, so a recipe the row does not show still has a name."""
+  for entry in browse().get("entries", []):
+    if selection_of(entry) == selection or selection in entry.get("variants", ()):
+      return entry
+  return {}
+
+
 def entry_name(selection: str) -> str:
   """The catalog's display name for a recipe, from the browse index the worker wrote, and `""`
   when the index does not know it -- neither does a recipe whose catalog entry is gone. A variant
   its group's row does not show is named through that row's `variants`."""
-  for entry in browse().get("entries", []):
-    if selection_of(entry) == selection or selection in entry.get("variants", ()):
-      return str(entry.get("name", ""))
-  return ""
+  return str(browse_row(selection).get("name", ""))
 
 
-# One slot of cache, like `_STATUS_CACHE`: both trees re-resolve their row callables every frame, and
-# without this every resolution would open, read and re-parse the whole index. The key is the file's
-# stat -- the worker writes through `atomic_write` (a rename), so a refresh changes the inode and the
-# panels pick the new index up on their next frame. A missing file reads as empty and never serves a
-# stale slot.
+# One slot of cache, like `_STATUS_CACHE`: the pickers re-resolve their rows on every tap and the
+# panels re-resolve their row callables every frame, and without this every resolution would open, read
+# and re-parse the whole index. The key is the file's stat -- the worker writes through `atomic_write`
+# (a rename), so a refresh changes the inode and the panels pick the new index up on their next frame.
+# A missing file reads as empty and never serves a stale slot.
 _BROWSE_CACHE: tuple[tuple | None, dict] | None = None
-_ADMITTED_CACHE: dict[str, list[dict]] = {}
 
 
 def browse() -> dict:
@@ -1283,12 +1290,16 @@ def browse() -> dict:
       "entries": [e for e in document["entries"] if isinstance(e, dict)],
     }
   _BROWSE_CACHE = (key, result)
-  _ADMITTED_CACHE.clear()
   return result
 
 
 def chooser_entries(params: Any, kind: str) -> list[dict | None]:
-  """Stock, built installed entries, then admitted catalog entries for one model kind."""
+  """Stock, built installed entries, then admitted catalog entries for one model kind.
+
+  An installed entry is merged over its index row (`{**row, **entry}`) so a model the driver has
+  already built carries the same folder, short name and model class as the catalog row beside it --
+  without that, the same model would land in two different groups depending on which list found it.
+  """
   installed = status(params)["installed"]
   installed_recipes = {selection_of(entry) for entry in installed}
   entries: list[dict | None] = [None]
@@ -1298,52 +1309,162 @@ def chooser_entries(params: Any, kind: str) -> list[dict | None]:
     if recipe in seen or entry.get("kind") != kind or entry.get("state") != "built":
       continue
     seen.add(recipe)
-    entries.append(entry)
-  for entry in browse().get("entries", []):
+    entries.append({**browse_row(recipe), **entry})
+  for entry in admitted_entries(kind):
     recipe = selection_of(entry)
-    if not recipe or recipe in installed_recipes or recipe in seen or entry.get("kind") != kind or not entry.get("admitted"):
+    if not recipe or recipe in installed_recipes or recipe in seen:
       continue
     seen.add(recipe)
     entries.append(entry)
   return entries
 
 
+# --- what the pickers group and search -----------------------------------------
+# The catalog owns every name and folder here: `folder` and `short_name` are its own reviewed,
+# evidence-checked claims (openmodels' naming records), and a device holding an older snapshot simply
+# has neither. So the grouping falls back to the one axis the fork owns -- the protocol a recipe
+# needs, and the model class it was built for -- rather than to a fork table that would rot against
+# every catalog refresh.
+GROUP_STOCK = ""  # no header: the bundled model leads the picker, as it leads sunnypilot's
+GROUP_FAVORITES = "favorites"
+KIND_TITLES = {DRIVING: "Driving", MONITORING: "Driver monitoring"}
+
+
+def is_built(params: Any, kind: str, selection: str) -> bool:
+  """Whether a selection can be chosen right now: the bundled model always can, and a recipe needs
+  a build of its own kind in the store. Whether that build may *run* is the boot commit's question."""
+  if not selection:
+    return True
+  return any(entry.get("kind") == kind and entry.get("state") == "built" and selection_of(entry) == selection
+             for entry in status(params)["installed"])
+
+
+def entry_group(entry: dict | None) -> str:
+  """The group one chooser row belongs under. `None` is the bundled model.
+
+  Whichever parts the row does carry are the group, so an installed model whose catalog entry is
+  gone still reads as the protocol it needs rather than as a row of unknowns."""
+  if entry is None:
+    return GROUP_STOCK
+  folder = str(entry.get("folder", ""))
+  if folder:
+    return folder
+  parts = [part for part in (protocol_label(str(entry.get("protocol", ""))), str(entry.get("model_class") or "")) if part]
+  return " · ".join(parts) or KIND_TITLES.get(str(entry.get("kind", "")), "models")
+
+
+def favorites(params: Any) -> set[str]:
+  """The driver's starred recipes. A stale digest -- one the catalog no longer lists -- matches no
+  row and is rewritten on the next change, so a star can outlive its model without cost."""
+  value = params.get(FAVS_KEY, return_default=True) or ""
+  return {part for part in str(value).split(";") if is_recipe(part)}
+
+
+def set_favorite(params: Any, selection: str, starred: bool) -> None:
+  """Star or unstar one recipe. The bundled model is not a recipe and cannot be starred."""
+  if not is_recipe(selection):
+    return
+  current = favorites(params)
+  current.add(selection) if starred else current.discard(selection)
+  params.put(FAVS_KEY, ";".join(sorted(current)), block=True)
+
+
+def chooser_groups(params: Any, kind: str) -> list[tuple[str, list[dict | None]]]:
+  """`[(group, rows)]` for one kind: the bundled model first with no header, then the starred
+  models, then the rest newest group first. Inside a group the chooser's own order stands, so an
+  installed model leads its group and the catalog follows newest first.
+
+  Group order is the order the rows were first seen in, which is `chooser_entries`' order -- and that
+  is the catalog's own newest-first order, so the groups come out newest first without a second sort.
+  """
+  entries = chooser_entries(params, kind)
+  starred = favorites(params)
+  order: list[str] = []
+  buckets: dict[str, list[dict | None]] = {}
+  for entry in entries:
+    selection = "" if entry is None else selection_of(entry)
+    group = GROUP_FAVORITES if selection in starred else entry_group(entry)
+    if group not in buckets:
+      buckets[group] = []
+      order.append(group)
+    buckets[group].append(entry)
+  leading = [group for group in (GROUP_STOCK, GROUP_FAVORITES) if group in buckets]
+  return [(group, buckets[group]) for group in leading + [group for group in order if group not in leading]]
+
+
+def entry_display(entry: dict | None, kind: str) -> str:
+  """One row's name. The catalog owns it; the only edit is dropping the kind prefix a generated name
+  repeats, because the picker is already scoped to one kind."""
+  if entry is None:
+    return BUNDLED_LABEL
+  name = str(entry.get("name", ""))
+  prefix = f"{KIND_TITLES.get(kind, '')} · "
+  if entry.get("name_kind") == "generated" and name.startswith(prefix):
+    name = name[len(prefix):]
+  return name or selection_of(entry)[:12]
+
+
+def _subsequence(query: str, text: str) -> bool:
+  """`query` in `text`, casefolded, as substring or as a subsequence -- so `wsplit` finds
+  `WMI V12`. The iterator is the trick: `in` on an iterator consumes up to the match."""
+  query, text = query.casefold().strip(), text.casefold()
+  if not query:
+    return True
+  if query in text:
+    return True
+  rest = iter(text)
+  return all(character in rest for character in query)
+
+
+def matches_query(entry: dict | None, query: str, kind: str = DRIVING) -> bool:
+  """Whether one row matches the picker's search: its short code, its name, its group or its date."""
+  if not query.strip():
+    return True
+  if entry is None:
+    return _subsequence(query, BUNDLED_LABEL)
+  haystacks = (str(entry.get("short_name", "")), entry_display(entry, kind), entry_group(entry), str(entry.get("updated_at", "")))
+  return any(_subsequence(query, text) for text in haystacks)
+
+
+def search_groups(groups: Sequence[tuple[str, list]], query: str, kind: str = DRIVING) -> list[tuple[str, list]]:
+  """The groups with their matching rows, and no group left empty. An empty query is the list
+  unchanged -- searching never hides a group that has rows."""
+  if not query.strip():
+    return list(groups)
+  result = []
+  for label, rows in groups:
+    kept = [row for row in rows if matches_query(row, query, kind)]
+    if kept:
+      result.append((label, kept))
+  return result
+
+
+def chooser_hint(entry: dict | None, kind: str, params: Any, offroad: bool) -> str:
+  """The picker's one-line footer: what choosing the highlighted row does. A tree has no room for a
+  verdict on every row, so the row under the driver's finger carries the sentence instead."""
+  if entry is None:
+    return CHOOSER_HINT_STOCK
+  if entry.get("state") != "built":
+    return CHOOSER_HINT_INSTALL
+  if selection_of(entry) == desired(params, kind):
+    return CHOOSER_HINT_SELECTED
+  return CHOOSER_HINT_BUILT if offroad else f"{CHOOSER_HINT_BUILT} {CHOOSER_HINT_OFFROAD}"
+
+
 def admitted_entries(kind: str) -> list[dict]:
-  """The catalog rows both panes list: admitted entries, all of them or only those of `kind`.
+  """The admitted catalog rows of one kind, newest first.
 
-  The filter is memoized per kind and cleared when `browse()` reloads, because both trees call this
-  once per row per frame -- `browse()` itself is what notices a new index."""
-  entries = browse()["entries"]
-  if kind not in _ADMITTED_CACHE:
-    admitted = [entry for entry in entries if entry.get("admitted")]
-    _ADMITTED_CACHE[kind] = admitted if kind == FILTER_ALL else [entry for entry in admitted if entry.get("kind") == kind]
-  return _ADMITTED_CACHE[kind]
-
-
-# Both panes page their lists the same way: `rows` per page, and an empty list is still one page.
-def page_count(items: Sequence, rows: int) -> int:
-  return max(1, (len(items) + rows - 1) // rows)
-
-
-def clamp_page(items: Sequence, page: int, rows: int) -> int:
-  return min(max(0, page), page_count(items, rows) - 1)
+  No memo of its own: `browse()` is already keyed on the index file's stat, and the pickers filter
+  once per rebuild rather than once per row per frame, so a second cache here would only be a way to
+  serve a stale list."""
+  return [entry for entry in browse()["entries"] if entry.get("admitted") and entry.get("kind") == kind]
 
 
 def page_item(items: Sequence, page: int, rows: int, index: int, missing: Any = None) -> Any:
-  """Row `index` of page `page`, or `missing` past the end of `items`."""
+  """Row `index` of page `page`, or `missing` past the end of `items`. The installed lists are the
+  only paged ones left: the pickers are trees, and a tree scrolls."""
   position = page * rows + index
   return items[position] if position < len(items) else missing
-
-
-def entry_action(entry: dict, installed_selections: Collection[str]) -> str:
-  """What the catalog row offers: an action for a runnable, uninstalled model, `INSTALLED`, or the
-  refusal reason. Dimmed rows are refusals -- the panel grays them and shows this string."""
-  selection = selection_of(entry)
-  if selection in installed_selections:
-    return LABEL_INSTALLED
-  if not entry.get("admitted"):
-    return str(entry.get("reason") or "not runnable here")
-  return LABEL_INSTALL
 
 
 def entry_detail(entry: dict) -> str:

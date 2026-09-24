@@ -184,7 +184,12 @@ def browse_index(catalog) -> dict:
   any of its recipes admit, else the newest -- sorted newest first, with the verdict the panel
   prints and, in `variants`, every recipe of the group so a variant the row does not show still has
   its name. The catalog groups recipe variants under one model id; a flat per-recipe list showed the
-  same name many times and put every refused twin in front of a driver who can only pick one."""
+  same name many times and put every refused twin in front of a driver who can only pick one.
+
+  `folder`, `short_name` and `name_kind` are the catalog's own presentation claims, carried when the
+  published naming record has them and empty when it does not: a device holding an older snapshot
+  reads every row through the same keys and falls back to grouping by protocol and model class.
+  """
   entries = []
   for model in catalog.models(include_archive=True):
     candidates = []
@@ -199,6 +204,9 @@ def browse_index(catalog) -> dict:
         {
           "recipe": recipe,
           "name": str(model.get("name", "")),
+          "short_name": str(model.get("short_name", "")),
+          "name_kind": str(model.get("name_kind", "")),
+          "folder": str(model.get("folder", "")),
           "kind": str(model.get("kind", "")),
           "family": str(model.get("family", "")),
           "model_class": str(model.get("model_class", "")),
