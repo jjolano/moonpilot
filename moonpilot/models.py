@@ -1252,17 +1252,39 @@ def entry_name(selection: str) -> str:
   return ""
 
 
+# One slot of cache, like `_STATUS_CACHE`: both trees re-resolve their row callables every frame, and
+# without this every resolution would open, read and re-parse the whole index. The key is the file's
+# stat -- the worker writes through `atomic_write` (a rename), so a refresh changes the inode and the
+# panels pick the new index up on their next frame. A missing file reads as empty and never serves a
+# stale slot.
+_BROWSE_CACHE: tuple[tuple | None, dict] | None = None
+_ADMITTED_CACHE: dict[str, list[dict]] = {}
+
+
 def browse() -> dict:
   """The worker's display index: `{"revision", "generated_at", "entries"}`. Stdlib JSON only, so a
-  panel can read it; entries keep the shape the worker wrote."""
-  document = read_json(browse_file())
+  panel can read it; entries keep the shape the worker wrote. Parsed at most once per file version."""
+  global _BROWSE_CACHE
+  path = browse_file()
+  try:
+    stat = os.stat(path)
+    key = (path, stat.st_mtime_ns, stat.st_size, stat.st_ino)
+  except OSError:
+    key = None
+  if _BROWSE_CACHE is not None and _BROWSE_CACHE[0] == key:
+    return _BROWSE_CACHE[1]
+  document = read_json(path)
   if not isinstance(document, dict) or not isinstance(document.get("entries"), list):
-    return {"revision": "", "generated_at": "", "entries": []}
-  return {
-    "revision": str(document.get("revision", "")),
-    "generated_at": str(document.get("generated_at", "")),
-    "entries": [e for e in document["entries"] if isinstance(e, dict)],
-  }
+    result = {"revision": "", "generated_at": "", "entries": []}
+  else:
+    result = {
+      "revision": str(document.get("revision", "")),
+      "generated_at": str(document.get("generated_at", "")),
+      "entries": [e for e in document["entries"] if isinstance(e, dict)],
+    }
+  _BROWSE_CACHE = (key, result)
+  _ADMITTED_CACHE.clear()
+  return result
 
 
 def chooser_entries(params: Any, kind: str) -> list[dict | None]:
@@ -1287,9 +1309,15 @@ def chooser_entries(params: Any, kind: str) -> list[dict | None]:
 
 
 def admitted_entries(kind: str) -> list[dict]:
-  """The catalog rows both panes list: admitted entries, all of them or only those of `kind`."""
-  entries = [entry for entry in browse()["entries"] if entry.get("admitted")]
-  return entries if kind == FILTER_ALL else [entry for entry in entries if entry.get("kind") == kind]
+  """The catalog rows both panes list: admitted entries, all of them or only those of `kind`.
+
+  The filter is memoized per kind and cleared when `browse()` reloads, because both trees call this
+  once per row per frame -- `browse()` itself is what notices a new index."""
+  entries = browse()["entries"]
+  if kind not in _ADMITTED_CACHE:
+    admitted = [entry for entry in entries if entry.get("admitted")]
+    _ADMITTED_CACHE[kind] = admitted if kind == FILTER_ALL else [entry for entry in admitted if entry.get("kind") == kind]
+  return _ADMITTED_CACHE[kind]
 
 
 # Both panes page their lists the same way: `rows` per page, and an empty list is still one page.

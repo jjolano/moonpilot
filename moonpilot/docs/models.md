@@ -6,7 +6,7 @@ A driver may replace the model this car drives. The panes are `moonpilot/ui/mode
 `https://jjolano.github.io/openmodels/catalog.json` — publishes bytes and a structural identity and
 owns no activation, scheduling or qualification, so everything below is the consumer half.
 
-Nine things are not obvious.
+Ten things are not obvious.
 
 - **A selection is a string, and the boot commit is the only gate.** `""` is the bundled model, or a
   64-hex digest for one catalog recipe. The driver's choice goes in
@@ -82,6 +82,13 @@ Nine things are not obvious.
 - **Catalog bytes can be authenticated, and exact interfaces are enforced.** The `Catalog signatures` toggle is off by default; `modelcatalog.refresh(require_signature=True)` fetches the `.sig` sidecar and verifies it at point of use with the optional `cryptography` dependency, refusing when no pinned `CATALOG_PUBKEY` or signature is available. `verify_downloaded` compares every recorded output slice's start, stop and step, so a shifted or resampled interface is not admitted.
 - **The panel names the model actually driving.** The active-model rows use an explicit `stock:` fallback when the selected runtime is unavailable, while the desired selection and boot/restart semantics remain separate.
 - **Model jobs are cancellable from both UI trees.** A running download or build exposes cancel through the existing request protocol; tizi and mici both confirm before writing the cancellation request, and the worker publishes the terminal status before it exits.
+- **Both trees page the catalog, and the index behind those pages is parsed once per file version.**
+  The marketplace, chooser and installed lists render a fixed window of rows (`PAGE_ROWS` 8 on tizi,
+  6 on mici) with older/newer paging — the catalog is never rendered whole. What would slow the UI is
+  the data behind the rows: both trees re-resolve their row callables every frame, so `models.browse()`
+  keeps one stat-keyed slot (path, `mtime_ns`, size, inode — the worker's `atomic_write` rename is what
+  moves the key) and `admitted_entries` memoizes its filter per kind, cleared whenever `browse()`
+  reloads. A missing file reads as empty rather than serving a stale slot.
 
 The vendored SDK is a copy, not a dependency: `moonpilot/vendor/openmodels/` carries the files and the
 sync command in its `README.md`, and is reached only by `moonpilot/modelcatalog.py`, `moonpilot/modelbuild.py`

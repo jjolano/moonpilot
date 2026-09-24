@@ -53,6 +53,10 @@ class TempStoreCase(unittest.TestCase):
     patcher = mock.patch.object(models.paths, "data_dir", lambda feature: os.path.join(self.tmp, feature))
     patcher.start()
     self.addCleanup(patcher.stop)
+    for target, value in (("_STATUS_CACHE", None), ("_BROWSE_CACHE", None), ("_ADMITTED_CACHE", {})):
+      cache_patcher = mock.patch.object(models, target, value)
+      cache_patcher.start()
+      self.addCleanup(cache_patcher.stop)
 
 
 class CatalogCase(TempStoreCase):

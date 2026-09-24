@@ -81,6 +81,8 @@ class StoreCase(unittest.TestCase):
     self._patches = [
       mock.patch.object(models.paths, "data_dir", lambda feature: os.path.join(self._tmp.name, feature)),
       mock.patch.object(models, "_STATUS_CACHE", None),
+      mock.patch.object(models, "_BROWSE_CACHE", None),
+      mock.patch.object(models, "_ADMITTED_CACHE", {}),
     ]
     for patch in self._patches:
       patch.start()
@@ -338,6 +340,43 @@ class TestChooserEntries(unittest.TestCase):
     assert catalog_entry is not None
     self.assertEqual(built["state"], "built")
     self.assertTrue(catalog_entry["admitted"])
+
+
+class TestBrowseCache(StoreCase):
+  """Both trees resolve their row callables every frame, so the index must be parsed once per file
+  version -- the worker's atomic rewrite is what invalidates the slot."""
+
+  def _write_browse(self, revision: str, names: list[str]) -> None:
+    models.write_json(
+      models.browse_file(),
+      {
+        "schema": models.SCHEMA,
+        "revision": revision,
+        "generated_at": "2026-09-19T00:00:00Z",
+        "entries": [
+          {"recipe": f"{index:064x}", "name": name, "kind": models.DRIVING, "admitted": True} for index, name in enumerate(names)
+        ],
+      },
+    )
+
+  def test_an_unchanged_index_is_parsed_once_and_the_filter_memoized(self):
+    self._write_browse("r1", ["a"])
+    first = models.browse()
+    self.assertIs(models.browse(), first, "an unchanged index must not be re-parsed")
+    self.assertIs(models.admitted_entries(models.FILTER_DRIVING), models.admitted_entries(models.FILTER_DRIVING))
+
+  def test_a_rewrite_is_picked_up_and_refilters(self):
+    self._write_browse("r1", ["a"])
+    self.assertEqual(models.admitted_entries(models.FILTER_DRIVING)[0]["name"], "a")
+    self._write_browse("r2", ["a", "b"])
+    self.assertEqual(models.browse()["revision"], "r2", "the worker's rewrite must invalidate the slot")
+    self.assertEqual([e["name"] for e in models.admitted_entries(models.FILTER_DRIVING)], ["a", "b"])
+
+  def test_a_missing_index_reads_empty_and_never_serves_stale(self):
+    self._write_browse("r1", ["a"])
+    self.assertEqual(models.browse()["revision"], "r1")
+    os.remove(models.browse_file())
+    self.assertEqual(models.browse(), {"revision": "", "generated_at": "", "entries": []})
 
 
 class TestBootCommit(StoreCase):
