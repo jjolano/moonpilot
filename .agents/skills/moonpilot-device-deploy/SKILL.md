@@ -37,8 +37,15 @@ for s in panda opendbc_repo; do
     && echo "$s pushed" || echo "$s UNPUSHED"
 done
 git -C opendbc_repo push origin master   # fix, then push the superproject
-git push origin master
+GIT_LFS_SKIP_PUSH=1 git push origin master  # LFS points at comma's HF, auth-walled; see AGENTS.md
 ```
+
+Submodules have no LFS, so their pushes need no skip. The superproject does: `.lfsconfig` sends
+`pushurl` to `https://huggingface.co/commaai/openpilot-lfs.git/info/lfs`, and `tools/op.sh setup`
+reinstalls the pre-push hook that calls it on every setup — a bare `git push` fails asking for HF
+credentials that this PC does not have. The fork contributes no LFS objects (new large files arrive
+from upstream merges and already live on that store), so `GIT_LFS_SKIP_PUSH=1` — what upstream's
+release scripts use — is always the right answer, not a workaround.
 
 ## Update an already-deployed device
 

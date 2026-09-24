@@ -294,7 +294,11 @@ Fork work lives on `master`. Merge, never rebase; no force-push.
     tools/op.sh test moonpilot
     tools/op.sh build
 
-Then bump `COMMA_VERSION`'s upstream part to the new upstream version, leaving the `-moonpilot.<n>` suffix alone. See **Versioning** below. The two forked submodules sync on their own schedule — see **Forked opendbc and panda** — and `git submodule update --init --recursive` after a merge is what puts their recorded commits in place.
+Push with LFS upload skipped: `.lfsconfig` points `url` and `pushurl` at comma's Hugging Face store (`https://huggingface.co/commaai/openpilot-lfs.git/info/lfs`), which this machine cannot authenticate to, and the pre-push hook `tools/op.sh` reinstalls on every setup will try it. The fork adds no LFS objects of its own — new files arrive from upstream merges and their contents already live on that store — so the skip is always correct here, and it is the same `GIT_LFS_SKIP_PUSH=1` upstream's own release scripts use:
+
+    GIT_LFS_SKIP_PUSH=1 git push origin master
+
+Then bump `COMMA_VERSION`'s upstream part to the new upstream version, leaving the `-moonpilot.<n>` suffix alone. See **Versioning** below. The two forked submodules sync on their own schedule — see **Forked opendbc and panda** — and `git submodule update --init --recursive` after a merge is what puts their recorded commits in place. Push each submodule to its `origin` first (they have no LFS, a plain `git push origin master` is fine), then the superproject with the skip above: a pin whose commit is not on the submodule's default branch is a device that cannot check its tree out.
 
 ### Versioning
 
