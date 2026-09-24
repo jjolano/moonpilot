@@ -202,12 +202,14 @@ class TestBrowse(CatalogCase):
           "admitted",
           "reason",
           "notes",
+          "variants",
         },
       )
 
   def test_variants_of_one_model_collapse_to_the_admitted_one(self):
     # The fixture has no multi-variant group, so synthesize one: a newer refused twin next to the
-    # stock recipe. The row has to stay the admitted stock -- not the newer dead end.
+    # stock recipe, its own group dropped so only the twin carries it. The row has to stay the
+    # admitted stock -- not the newer dead end -- and the hidden twin still has the model's name.
     groups = self.catalog.models(include_archive=True)
     stock = next(g for g in groups if any(v["recipe"] == STOCK for v in g["variants"]))
     twin = {**stock["variants"][0], "recipe": SPLIT_NEW_ACTION, "updated_at": "2099-01-01"}
@@ -215,14 +217,16 @@ class TestBrowse(CatalogCase):
     for group in groups:
       if group is stock:
         merged.append({**group, "variants": [*group["variants"], twin]})
-      else:
+      elif not any(v["recipe"] == SPLIT_NEW_ACTION for v in group["variants"]):
         merged.append(group)
     with mock.patch.object(self.catalog, "models", return_value=merged):
-      index = modelcatalog.browse_index(self.catalog)
-    self.assertEqual(index["total"], len(groups))
+      index = modelcatalog.write_browse(self.catalog)
+    self.assertEqual(index["total"], len(merged))
     by_name = {entry["name"]: entry for entry in index["entries"]}
     self.assertEqual(by_name[stock["name"]]["recipe"], STOCK, "the admitted variant must win over the newer refused twin")
     self.assertTrue(by_name[stock["name"]]["admitted"])
+    self.assertEqual(models.entry_name(SPLIT_NEW_ACTION), stock["name"], "a variant the row hides keeps its model's name")
+    self.assertEqual(models.entry_name("f" * 64), "")
 
   def test_an_admitted_variant_beats_a_newer_refused_one(self):
     rows = [

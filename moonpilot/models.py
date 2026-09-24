@@ -1244,9 +1244,10 @@ def model_description(params: Any, kind: str) -> str:
 
 def entry_name(selection: str) -> str:
   """The catalog's display name for a recipe, from the browse index the worker wrote, and `""`
-  when the index does not know it -- neither does a recipe whose catalog entry is gone."""
+  when the index does not know it -- neither does a recipe whose catalog entry is gone. A variant
+  its group's row does not show is named through that row's `variants`."""
   for entry in browse().get("entries", []):
-    if selection_of(entry) == selection:
+    if selection_of(entry) == selection or selection in entry.get("variants", ()):
       return str(entry.get("name", ""))
   return ""
 

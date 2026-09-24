@@ -182,7 +182,8 @@ def _model_row(candidates: list[dict]) -> dict | None:
 def browse_index(catalog) -> dict:
   """The display index the panels page: one entry per *model group* -- the admitted variant when
   any of its recipes admit, else the newest -- sorted newest first, with the verdict the panel
-  prints. The catalog groups recipe variants under one model id; a flat per-recipe list showed the
+  prints and, in `variants`, every recipe of the group so a variant the row does not show still has
+  its name. The catalog groups recipe variants under one model id; a flat per-recipe list showed the
   same name many times and put every refused twin in front of a driver who can only pick one."""
   entries = []
   for model in catalog.models(include_archive=True):
@@ -214,6 +215,7 @@ def browse_index(catalog) -> dict:
         }
       )
     if (row := _model_row(candidates)) is not None:
+      row["variants"] = sorted(c["recipe"] for c in candidates)
       entries.append(row)
   entries.sort(key=lambda e: (e["updated_at"], e["name"], e["recipe"]), reverse=True)
   return {"schema": models.SCHEMA, "revision": catalog.revision, "generated_at": catalog.data["generated_at"], "total": len(entries), "entries": entries}
