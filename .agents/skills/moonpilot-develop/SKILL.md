@@ -118,6 +118,15 @@ root, never from inside `panda/`.
   — `gcovr` needs a venv of its own and consumes the data it reads. Keep hunks in those two trees as
   small as the superproject's: nothing checks them for reformatting, where
   `test_upstream_touches.py` checks the superproject.
-- **Param or registry row** — after a manager start the key is seeded on disk:
-  `ssh moonpilot 'ls /data/params/d/ | grep Moonpilot'`. Absent means the manager never saw the
-  declaration, so every `return_default=True` read is running on the fallback.
+- **Param or registry row** — the manager seeds a key on disk only when the declaration carries a
+  default (`openpilot/system/manager/manager.py`: `get_default_value(k) is not None`), so a
+  `{PERSISTENT, STRING}` row with no default reads as absent until something writes it —
+  `MoonpilotModelsDriving` and `MoonpilotModelsFavs` both do. To prove a row is *declared* rather
+  than merely unwritten, ask the library, and decode: `all_keys()` returns **bytes**, so
+  `"Foo" in Params().all_keys()` is silently always False.
+  `ssh moonpilot 'cd /data/openpilot && PYTHONPATH=/data/openpilot /usr/local/venv/bin/python3 -c "
+  from openpilot.common.params import Params
+  keys = [k.decode() for k in Params().all_keys()]
+  print(len(keys), [k for k in keys if k.startswith(\"Moonpilot\")])"'`
+  Either way the fork's own reads stay correct: they use `get(key, return_default=True)`, which
+  answers for an unset key.
