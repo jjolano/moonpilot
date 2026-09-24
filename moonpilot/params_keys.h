@@ -71,6 +71,12 @@
     // nothing; the applied value is clamped so a wrong offset alone cannot
     // take level road past MOONPILOT_COAST_GRADE_MIN.
     {"MoonpilotPitchOffset", {PERSISTENT, FLOAT, "0.0"}},
+    // Learned onroad by moonpilot/radar_latency.py: a radar lead's sensor
+    // latency in seconds, added to the lead's age when planning. 0.0 means
+    // nothing measured yet (pass-through); the applied value is one-sided
+    // [0, 0.3]. The evidence count rides with it so partial drives accumulate.
+    {"MoonpilotRadarLatency", {PERSISTENT, FLOAT, "0.0"}},
+    {"MoonpilotRadarLatencySamples", {PERSISTENT, INT, "0"}},
     // Offroad mode, entered from the moonpilot panel's row or a hold on the
     // driving view: while it is set the device stays offroad with the ignition
     // on. CLEAR_ON_IGNITION_ON so a new drive always comes up onroad,

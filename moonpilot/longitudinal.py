@@ -123,6 +123,13 @@ from moonpilot.pitch import (
   MOONPILOT_PITCH_PERSIST_EVERY,
   PitchOffsetEstimator,
 )
+from moonpilot.radar_latency import (
+  MOONPILOT_RADAR_LATENCY_KEY,
+  MOONPILOT_RADAR_LATENCY_PERSIST_EVERY,
+  MOONPILOT_RADAR_LATENCY_SAMPLES_KEY,
+  RadarLatencyEstimator,
+  persisted_seed as radar_latency_seed,
+)
 from moonpilot.slam import ego_speed_correction
 
 LongCtrlState = car.CarControl.Actuators.LongControlState
@@ -198,14 +205,11 @@ MOONPILOT_MIN_SLACK = 1.0  # m; the standstill target is soft inside this final 
 # so nothing at speed moves — a braking lead matched at 20 m/s is planned exactly as before.
 MOONPILOT_STOP_TAPER_T = 0.2
 # s; how much older a radar lead's `dRel` is than the carState it is planned against, beyond the
-# message age `lead_age` already carries — by car, only where measured. radard composes `vLead` with
-# the current `vEgo` (upstream's `radarDelay` is 0 for Toyota), so a stationary target reads
-# `vLead = aEgo * latency`: over the 429 radar samples on route 000003d2 where a lead was near rest and
-# the ego was braking or accelerating past 0.6 m/s^2, the ratio was 0.136 s either way, and aligning
-# the ego speed by 0.16 s cut the stationary target's median |vLead| from 0.20 to 0.07 m/s. The gap is
-# that stale too — 0.75 m at 5 m/s — which is the closing the stopping floor then owed at the end.
-# ponytail: one measured car; learn it online like `moonpilot/latency.py` when a second car needs it.
-MOONPILOT_RADAR_LATENCY = {"TOYOTA_RAV4_TSS2": 0.15}
+# message age `lead_age` already carries — learned per car by `moonpilot/radar_latency.py` from
+# near-rest radar frames (`vLead / aEgo` under excitation), not keyed by fingerprint. A car whose
+# `CP.radarDelay` already aligns the composition reads ~0 there, so the residual is applied only
+# where it is measured. The gap is that stale too — 0.75 m at 5 m/s on the RAV4 — which is the
+# closing the stopping floor then owed at the end.
 MOONPILOT_LEAD_PREVIEW_T = 0.5  # s of a lead's own accel credited into the speed each side reads
 # One length; direction picks which term it feeds. Braking goes to the safety terms' lead speed
 # (`v_lead_eff`): a lead that is braking is matched as if it had already shed this much speed, which
@@ -863,7 +867,12 @@ class MoonpilotLongitudinalPlanner:
     self.frames = 0
     # One per radarState slot, ticked every frame so an absent or replaced lead resets its window.
     self.lead_accel = (LeadAccelEstimator(dt), LeadAccelEstimator(dt))
-    self.radar_latency = MOONPILOT_RADAR_LATENCY.get(str(CP.carFingerprint), 0.0)
+    # The radar lead's own sensor latency (`moonpilot/radar_latency.py`), added to a radar lead's age
+    # in `_lead_age`. Seeded from the last drive; zero until enough gated near-rest frames accumulate.
+    self.radar_latency = RadarLatencyEstimator()
+    radar_seed = radar_latency_seed(self.params)
+    if radar_seed is not None:
+      self.radar_latency.seed(*radar_seed)
     # Pose-stitched free-space history for squeeze: empty until a valid egoPose arrives, cleared
     # whenever the pose goes invalid so a rebase cannot mix two origins.
     self.corridor = RollingCorridor()
@@ -1009,6 +1018,10 @@ class MoonpilotLongitudinalPlanner:
       a_lead, a_lead_tau = estimator.update(lead)  # every frame, present or not: that is what resets the window
       if lead.present:
         leads.append((source, lead, a_lead, a_lead_tau))
+    # Learn the radar's sensor latency from the same pair of slots, on every frame (present or not):
+    # the gates inside `update` decide what teaches, so an absent lead is simply a no-op.
+    self.radar_latency.update(sm['radarState'].leadOne, a_ego)
+    self.radar_latency.update(sm['radarState'].leadTwo, a_ego)
 
     # Delay compensation by state prediction: where the car and the leads will be when this command
     # reaches the actuator. The policy is evaluated there, not inverted back through the plan.
@@ -1197,6 +1210,8 @@ class MoonpilotLongitudinalPlanner:
       self._persist_long_jerk()
     if self.pitch_offset.samples % MOONPILOT_PITCH_PERSIST_EVERY == 0 and self.pitch_offset.status == 'estimated':
       self._persist_pitch_offset()
+    if self.radar_latency.samples > 0 and self.frames % MOONPILOT_RADAR_LATENCY_PERSIST_EVERY == 0:
+      self._persist_radar_latency()
 
     if self.lat_bias.frames % MOONPILOT_CURVE_BIAS_PERSIST_EVERY == 0 and self.lat_bias.status == 'estimated':
       self._persist_lat_scale()
@@ -1221,6 +1236,15 @@ class MoonpilotLongitudinalPlanner:
     value = round(self.pitch_offset.applied(), 4)
     self.params.put(MOONPILOT_PITCH_OFFSET_KEY, value)
     cloudlog.info(f"moonpilot pitch offset {math.degrees(value):.2f} deg over {self.pitch_offset.samples} frames")
+
+  def _persist_radar_latency(self):
+    """Persist the learned latency *and its evidence* so the next boot continues from where this
+    drive got to: the count decides whether the value is applied, so a partial drive hands its
+    samples on rather than restarting."""
+    value = round(self.radar_latency.estimate, 4)
+    self.params.put(MOONPILOT_RADAR_LATENCY_KEY, value)
+    self.params.put(MOONPILOT_RADAR_LATENCY_SAMPLES_KEY, self.radar_latency.samples)
+    cloudlog.info(f"moonpilot radar latency {value:.3f} s over {self.radar_latency.samples} samples")
 
   def _persist_lat_scale(self):
     """Persist the learned value so the next boot plans with it from the first frame. Gated on a
@@ -1295,8 +1319,8 @@ class MoonpilotLongitudinalPlanner:
 
   def _lead_age(self, lead, lead_age):
     """How old a lead's `dRel` is at this tick: the message's age, and a radar lead's own sensor
-    latency on top where it is measured (`MOONPILOT_RADAR_LATENCY`)."""
-    return lead_age + (self.radar_latency if lead.radar else 0.0)
+    latency on top where it is measured (`moonpilot/radar_latency.applied()`)."""
+    return lead_age + (self.radar_latency.applied() if lead.radar else 0.0)
 
   def _ego_pose(self, sm):
     """`(x, y, yaw)` from a fresh, valid `moonpilotState.egoPose`, or None.

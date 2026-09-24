@@ -69,7 +69,6 @@ from moonpilot.longitudinal import (
   MOONPILOT_MODEL_STOP_SPEED,
   MOONPILOT_OUT_OF_PATH_T_FOLLOW,
   MOONPILOT_SLOW_ACCEL_V,
-  MOONPILOT_RADAR_LATENCY,
   MOONPILOT_STOP_DISTANCE,
   MOONPILOT_STOP_REST,
   MOONPILOT_STOP_TAPER_T,
@@ -1118,17 +1117,20 @@ class TestPlanner(unittest.TestCase):
     self.assertFalse(s["contact"])
 
   def test_a_radar_lead_is_planned_at_its_measured_sensor_latency(self):
-    """On the car where it is measured the radar's own latency is part of the lead's age: a radar lead
-    reported at 30 m is planned exactly like a lead with no sensor latency 0.15 s of travel nearer."""
+    """On a car where the radar latency is measured, it is part of the lead's age: a radar lead
+    reported at 30 m is planned exactly like a lead with no sensor latency 0.15 s of travel nearer.
+    Seeded directly — the estimator's gates are unit-tested in `test_radar_latency.py` — so this
+    pins only the `_lead_age` wiring."""
     rav4 = ToyotaInterface.get_non_essential_params(TOYOTA.TOYOTA_RAV4_TSS2)
     rav4.openpilotLongitudinalControl = True
-    latency = MOONPILOT_RADAR_LATENCY["TOYOTA_RAV4_TSS2"]
+    latency = 0.15
     fake = _params(on=True)
     commands = []
     for gap, radar in ((30.0, True), (30.0 - 10.0 * latency, False)):
       with mock.patch("moonpilot.longitudinal.Params", lambda: fake):
         planner = MoonpilotLongitudinalPlanner(rav4)
       planner.params = fake
+      planner.radar_latency.seed(latency, 50)
       lead = _lead(gap, 0.0)
       lead.radar = radar
       planner.update(_inputs(v_ego=10.0, v_cruise_kph=72.0, lead=lead))
