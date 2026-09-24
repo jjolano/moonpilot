@@ -385,6 +385,12 @@ class TestPolicyFunctions(unittest.TestCase):
     self.assertGreater(ask(3.0, 6.0, 3.0, 1.0)[0], 0.0)
     self.assertGreater(ask(MOONPILOT_LEAD_COAST_MAX_V + 0.1, 10.0, 4.0, -MOONPILOT_LEAD_COAST_BRAKE_A)[0], coast)
     self.assertGreater(ask(3.0, MOONPILOT_LEAD_COAST_MAX_GAP + 0.1, 1.5, -MOONPILOT_LEAD_COAST_BRAKE_A)[0], coast)
+    # Not closing is not a coast cue: a braking lead still pulling away, or holding the ego's speed,
+    # gets the uncapped ask -- the cap once braked a launching car here.
+    for v_ego, gap, v_lead in ((0.5, 8.0, 2.0), (3.0, 8.0, 3.0)):
+      uncapped = lead_accel(v_ego, gap, v_lead, -MOONPILOT_LEAD_COAST_BRAKE_A, t_follow)
+      self.assertGreater(uncapped, 0.0)
+      self.assertAlmostEqual(ask(v_ego, gap, v_lead, -MOONPILOT_LEAD_COAST_BRAKE_A)[0], uncapped)
 
   def test_the_approach_handover_has_the_stopping_geometry(self):
     """The regulator hands over to the approach term at gap == STOP_DISTANCE + (v_ego - v_lead)^2 /

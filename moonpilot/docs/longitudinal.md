@@ -20,9 +20,13 @@
   coasted before braking in every case; coast occupied 85 % of the first 1.5 s after the detected lead
   deceleration, against 8 % braking and 7 % gas. The follow cushion itself is already zero below
   `STOP_DISTANCE / t_follow` (4.1 m/s at the standard personality), so this is a separate cap inside
-  the lead slot: both cars must be moving at 0.1–4.0 m/s, the gap at most 10 m, and the estimated lead
-  acceleration at most −0.3 m/s². It takes the measured level-road coast value for the ego speed
-  (−0.10 m/s² throughout this band). `policy` applies it with `min` **after** `lead_accel`, so the TTC
+  the lead slot: both cars must be moving, the ego faster than the lead and at most 4.0 m/s, the gap
+  at most 10 m, and the estimated lead acceleration at most −0.3 m/s². It takes the measured
+  level-road coast value for the ego speed (−0.10 m/s² up to 3.5 m/s, easing to −0.125 at 4.0).
+  **Closing is the cue, not the lead's braking alone**: a braking lead that is still pulling away
+  opens the gap, and capping there braked a launching car behind it and, as the opening gap crossed
+  the 10 m edge, turned into an accelerate/brake/accelerate wave. While closing, the gap only shrinks,
+  so that edge is crossed inward once. `policy` applies the cap with `min` **after** `lead_accel`, so the TTC
   and stopping-floor candidates still win whenever the physical gap requires more braking. When the
   lead's estimated acceleration leaves that band, the cap disappears on the next frame and the ordinary
   spacing/cruise candidates recover follow distance; there is no stored cushion or launch state. The

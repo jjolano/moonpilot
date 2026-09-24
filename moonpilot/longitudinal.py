@@ -374,13 +374,7 @@ def _climb_recovery_applies(v_ego, v_cruise, e2e, accel_coast, allow_throttle, c
   ask to a gentle constant so recovery from the sag is slow and steady on the same steep grade."""
   _, grade = _coast_grade(accel_coast)
   error = v_cruise - v_ego
-  return (
-    coast_band > 0.0
-    and not e2e
-    and grade < -MOONPILOT_COAST_GRADE_MIN
-    and allow_throttle
-    and coast_band <= error < 2.0 * coast_band
-  )
+  return coast_band > 0.0 and not e2e and grade < -MOONPILOT_COAST_GRADE_MIN and allow_throttle and coast_band <= error < 2.0 * coast_band
 
 
 def cruise_accel(v_ego, v_cruise, e2e, steer_angle_deg, CP, accel_coast, allow_throttle, coast_band: float = 0.0) -> float:
@@ -745,8 +739,7 @@ def policy(
   for source, gap, v_lead, a_lead in leads:
     ask = lead_accel(v_ego, gap, v_lead, a_lead, t_follow)
     if (
-      MOONPILOT_SHOULD_STOP_SPEED < v_ego <= MOONPILOT_LEAD_COAST_MAX_V
-      and MOONPILOT_SHOULD_STOP_SPEED < v_lead <= MOONPILOT_LEAD_COAST_MAX_V
+      MOONPILOT_SHOULD_STOP_SPEED < v_lead < v_ego <= MOONPILOT_LEAD_COAST_MAX_V
       and gap <= MOONPILOT_LEAD_COAST_MAX_GAP
       and a_lead <= -MOONPILOT_LEAD_COAST_BRAKE_A
     ):
