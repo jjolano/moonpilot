@@ -55,6 +55,8 @@ from moonpilot.longitudinal import (
   MOONPILOT_COAST_FLAT_ACCEL,
   MOONPILOT_COAST_GRADE_MIN,
   MOONPILOT_COAST_RECOVERY_ACCEL,
+  MOONPILOT_COASTING_BP,
+  MOONPILOT_COASTING_V,
   MOONPILOT_CONTROL_T_IDX,
   MOONPILOT_CREEP_SPEED,
   MOONPILOT_FAST_ACCEL_BP,
@@ -69,10 +71,13 @@ from moonpilot.longitudinal import (
   MOONPILOT_JERK_LAUNCH,
   MOONPILOT_JERK_LAUNCH_SPEED,
   MOONPILOT_JERK_UP,
-  MOONPILOT_LADDER_V_BP,
   MOONPILOT_K_GAP,
   MOONPILOT_K_TTC,
   MOONPILOT_K_V,
+  MOONPILOT_LADDER_V_BP,
+  MOONPILOT_LEAD_COAST_BRAKE_A,
+  MOONPILOT_LEAD_COAST_MAX_GAP,
+  MOONPILOT_LEAD_COAST_MAX_V,
   MOONPILOT_LEAD_PREVIEW_T,
   MOONPILOT_MIN_SLACK,
   MOONPILOT_MODEL_BRAKE_THRESHOLD,
@@ -364,6 +369,22 @@ class TestPolicyFunctions(unittest.TestCase):
     self.assertGreater(min(gap_errors), -MOONPILOT_FOLLOW_CUSHION)
     self.assertAlmostEqual(v_ego, v_lead, delta=1e-3)
     self.assertAlmostEqual(gap_errors[-1], 0.0, delta=1e-3)
+
+  def test_low_speed_lead_braking_coasts_then_yields_to_safety_and_recovery(self):
+    CP = _cp()
+    t_follow = MOONPILOT_T_FOLLOW[int(Personality.standard)]
+    coast = float(np.interp(3.0, MOONPILOT_COASTING_BP, MOONPILOT_COASTING_V))
+
+    def ask(v_ego, gap, v_lead, a_lead):
+      return policy(v_ego, [(Source.lead0, gap, v_lead, a_lead)], 30.0, t_follow, False, None, 0.0, CP, -0.3, True)
+
+    coasted, source = ask(3.0, 10.0, 1.5, -MOONPILOT_LEAD_COAST_BRAKE_A)
+    self.assertAlmostEqual(coasted, coast)
+    self.assertEqual(source, Source.lead0)
+    self.assertLess(ask(3.0, 6.0, 1.0, -0.5)[0], coast)
+    self.assertGreater(ask(3.0, 6.0, 3.0, 1.0)[0], 0.0)
+    self.assertGreater(ask(MOONPILOT_LEAD_COAST_MAX_V + 0.1, 10.0, 4.0, -MOONPILOT_LEAD_COAST_BRAKE_A)[0], coast)
+    self.assertGreater(ask(3.0, MOONPILOT_LEAD_COAST_MAX_GAP + 0.1, 1.5, -MOONPILOT_LEAD_COAST_BRAKE_A)[0], coast)
 
   def test_the_approach_handover_has_the_stopping_geometry(self):
     """The regulator hands over to the approach term at gap == STOP_DISTANCE + (v_ego - v_lead)^2 /

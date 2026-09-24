@@ -250,6 +250,9 @@ MOONPILOT_FAST_ACCEL_V = [0.83, 1.70, 1.96, 1.97, 1.81, 1.60, 1.47, 1.27, 1.13, 
 # Coasting: no pedals, level road, median by speed (2-5, 5-10, 10-25 m/s). Agrees with `coast_accel`'s -0.3.
 MOONPILOT_COASTING_BP = [3.5, 7.5, 15.0]  # m/s
 MOONPILOT_COASTING_V = [-0.10, -0.30, -0.33]  # m/s^2
+MOONPILOT_LEAD_COAST_MAX_V = 4.0
+MOONPILOT_LEAD_COAST_MAX_GAP = 10.0
+MOONPILOT_LEAD_COAST_BRAKE_A = 0.3
 # Brake rungs: mean decel of 316 brake episodes starting above 5 m/s — light p90, medium median,
 # hard p10. Speed-independent above 5 m/s. Hard brake (-1.75, peaks near -2.9) is the driver's own
 # emergency-free ceiling and is not a cruise rung: set-speed control never brakes that hard.
@@ -738,7 +741,17 @@ def policy(
   a_curve = min(curve_accel(v_ego, x_ego, curve), lat_accel_hold(v_ego, v_hold))
   a_cruise_raw = cruise_accel(v_ego, v_cruise, e2e, steer_angle_deg, CP, accel_coast, allow_throttle, coast_band)
   a_cruise = min(a_cruise_raw, a_curve)
-  lead_asks = [(lead_accel(v_ego, gap, v_lead, a_lead, t_follow), source) for source, gap, v_lead, a_lead in leads]
+  lead_asks = []
+  for source, gap, v_lead, a_lead in leads:
+    ask = lead_accel(v_ego, gap, v_lead, a_lead, t_follow)
+    if (
+      MOONPILOT_SHOULD_STOP_SPEED < v_ego <= MOONPILOT_LEAD_COAST_MAX_V
+      and MOONPILOT_SHOULD_STOP_SPEED < v_lead <= MOONPILOT_LEAD_COAST_MAX_V
+      and gap <= MOONPILOT_LEAD_COAST_MAX_GAP
+      and a_lead <= -MOONPILOT_LEAD_COAST_BRAKE_A
+    ):
+      ask = min(ask, float(np.interp(v_ego, MOONPILOT_COASTING_BP, MOONPILOT_COASTING_V)))
+    lead_asks.append((ask, source))
   candidates = [(a_cruise, LongitudinalPlanSource.cruise)]
   candidates += lead_asks
   if model_accel is not None:
