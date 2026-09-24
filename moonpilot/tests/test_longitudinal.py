@@ -15,6 +15,8 @@ import numpy as np
 
 from opendbc.car.honda.interface import CarInterface
 from opendbc.car.honda.values import CAR
+from opendbc.car.toyota.interface import CarInterface as ToyotaInterface
+from opendbc.car.toyota.values import CAR as TOYOTA
 from opendbc.car.interfaces import ACCEL_MIN
 from opendbc.car.structs import car
 from opendbc.car.vehicle_model import VehicleModel
@@ -81,10 +83,14 @@ from moonpilot.longitudinal import (
   MOONPILOT_LEAD_PREVIEW_T,
   MOONPILOT_MIN_SLACK,
   MOONPILOT_MODEL_BRAKE_THRESHOLD,
+  MOONPILOT_MODEL_STOP_RELEASE,
+  MOONPILOT_MODEL_STOP_SPEED,
   MOONPILOT_OUT_OF_PATH_T_FOLLOW,
   MOONPILOT_SLOW_ACCEL_V,
+  MOONPILOT_RADAR_LATENCY,
   MOONPILOT_STOP_DISTANCE,
   MOONPILOT_STOP_REST,
+  MOONPILOT_STOP_TAPER_T,
   MOONPILOT_T_FOLLOW,
   MOONPILOT_TTC_TARGET,
   MOONPILOT_TTC_TARGET_BP,
@@ -97,6 +103,7 @@ from moonpilot.longitudinal import (
   lead_accel,
   lead_state_at,
   model_candidate,
+  model_release,
   moonpilot_longitudinal_planner,
   policy,
   required_decel,
@@ -764,10 +771,12 @@ class TestPolicyFunctions(unittest.TestCase):
   def test_a_braking_lead_matched_at_speed_still_stops_without_contact(self):
     """The safety direction that forbids the naive relative form: from the 1.45 s follow gap at
     20 m/s behind a lead holding -5 m/s^2 to rest, the plain match reads -0.0 at matched speed and
-    contacts it. The sustain law holds 5.70 m of end gap (5.51 before; 5.00 at -3.5 against 5.09),
-    flown through the shared closed-loop harness with 1 s of steady following before the onset.
+    contacts it. The sustain law holds 5.29 m of end gap (5.00 at -3.5), flown through the shared
+    closed-loop harness with 1 s of steady following before the onset. The -5 stop ended at 5.70 until
+    the floor's anchor tapered onto `MOONPILOT_STOP_REST` below 4 m/s: it now finishes at the rest
+    point every other stop uses instead of 0.5 m further back.
     """
-    for brake, end_gap in ((-3.5, 5.06), (-5.0, 5.70)):
+    for brake, end_gap in ((-3.5, 5.06), (-5.0, 5.29)):
       with self.subTest(brake=brake):
         s = _fly(20.0, 72.0, 29.0, 20.0, lambda t, b=brake: b if t > 1 else 0.0, 25.0)
         self.assertFalse(s["contact"])
@@ -1084,6 +1093,61 @@ class TestPlanner(unittest.TestCase):
     self.assertAlmostEqual(steps[0], MOONPILOT_JERK_UP * DT_MDL, delta=1e-9)
     self.assertAlmostEqual(steps[1], MOONPILOT_JERK_LAUNCH * DT_MDL, delta=1e-9)
     self.assertGreater(planner.output_a_target, MOONPILOT_JERK_UP * DT_MDL * 6)  # past what six comfort frames could deliver
+
+  def test_a_departing_lead_lifts_the_hold_at_once_from_inside_the_standstill_gap(self):
+    """Route 000003d2's launch: parked 4.5 m behind the lead — inside the 6 m standstill gap, where
+    every stop finishes — the regulator's spacing error was a -0.44 brake, and the hold stayed on for
+    a second after the lead moved. The crawl a departing lead is owed now lifts it two frames after
+    the lead's speed clears the rest deadband, and a lead that is braking is owed nothing."""
+    planner = _planner()
+    parked = _inputs(v_ego=0.0, v_cruise_kph=69.0, lead=_lead(4.5, 0.0), standstill=True)
+    for _ in range(20):
+      planner.update(parked)
+    self.assertTrue(planner.output_should_stop)
+
+    frames = 0
+    for frame in range(10):
+      planner.update(_inputs(v_ego=0.0, v_cruise_kph=69.0, lead=_lead(4.5 + 0.01 * frame, 0.2), standstill=True))
+      frames += 1
+      if not planner.output_should_stop:
+        break
+    self.assertLessEqual(frames, 2)
+    self.assertGreaterEqual(planner.output_a_target, 0.1)
+
+    t_follow = MOONPILOT_T_FOLLOW[int(Personality.standard)]
+    self.assertGreater(lead_accel(0.0, 4.5, 0.4, 0.0, t_follow), 0.0)
+    self.assertLess(lead_accel(0.0, 4.5, 0.4, -1.0, t_follow), 0.0)  # 0.4 - 1.0 * 0.5: stopping, not leaving
+
+  def test_a_stop_behind_a_stopped_lead_eases_in(self):
+    """Below `(STOP_DISTANCE - STOP_REST) / MOONPILOT_STOP_TAPER_T` the floor aims its own travel short
+    of the rest point, so the braking it asks for falls as the car slows: flown from 12 m/s, no frame
+    below 4 m/s re-deepens the command by more than 0.02 m/s^2 (the fixed anchor held -1.43 to 2.3 m/s,
+    let go to -0.93 and dug back in to -1.00), and the car still finishes at the rest point. The anchor
+    above that speed is the standstill gap, so nothing at speed moved."""
+    self.assertAlmostEqual((MOONPILOT_STOP_DISTANCE - MOONPILOT_STOP_REST) / MOONPILOT_STOP_TAPER_T, 4.0)
+    s = _fly(12.0, 43.2, 70.0, 0.0, lambda t: 0.0, 30.0)
+    tail = [a for v, a in zip(s["v"], s["cmd"], strict=True) if 0.3 < v < 4.0]
+    self.assertLess(max(earlier - later for earlier, later in zip(tail, tail[1:], strict=False)), 0.02)
+    self.assertAlmostEqual(s["end_gap"], MOONPILOT_STOP_REST, delta=0.15)
+    self.assertFalse(s["contact"])
+
+  def test_a_radar_lead_is_planned_at_its_measured_sensor_latency(self):
+    """On the car where it is measured the radar's own latency is part of the lead's age: a radar lead
+    reported at 30 m is planned exactly like a lead with no sensor latency 0.15 s of travel nearer."""
+    rav4 = ToyotaInterface.get_non_essential_params(TOYOTA.TOYOTA_RAV4_TSS2)
+    rav4.openpilotLongitudinalControl = True
+    latency = MOONPILOT_RADAR_LATENCY["TOYOTA_RAV4_TSS2"]
+    fake = _params(on=True)
+    commands = []
+    for gap, radar in ((30.0, True), (30.0 - 10.0 * latency, False)):
+      with mock.patch("moonpilot.longitudinal.Params", lambda: fake):
+        planner = MoonpilotLongitudinalPlanner(rav4)
+      planner.params = fake
+      lead = _lead(gap, 0.0)
+      lead.radar = radar
+      planner.update(_inputs(v_ego=10.0, v_cruise_kph=72.0, lead=lead))
+      commands.append(planner.output_a_target)
+    self.assertAlmostEqual(commands[0], commands[1], delta=1e-9)
 
   def test_accelerating_lead_launch_stays_near_the_live_target(self):
     """Measured stop-and-go launches from the 6 m standstill target do not need a positive-side
@@ -1820,6 +1884,41 @@ class TestModelBraking(unittest.TestCase):
             candidate = model_candidate(model, False, True)
             braked, _ = policy(v_ego, leads, v_cruise, t_follow, False, candidate, 0.0, CP, -0.3, True)
             self.assertLessEqual(braked, deterministic + 1e-12)
+
+  def test_a_stop_the_model_began_is_a_stop_the_model_finishes(self):
+    """Route 000003d2's defect, closed-loop: the model braked a clear-road stop from 17 m/s and its
+    ask tapered back over the -0.5 deadband at 0.9 m/s, where the cruise term took the slot and was
+    accelerating the car when the driver braked. Admitted once, the model now keeps the slot in the
+    crawl band until it asks to go — the car stops and holds — and gives it back on its first ask past
+    `should_stop`'s 0.1."""
+    planner = _planner()
+    v = 8.0
+    for _ in range(round(20.0 / DT_MDL)):
+      ask = max(-1.5, -0.35 * v - 0.05)  # a model stop that eases off as the car slows
+      planner.update(_inputs(v_ego=v, v_cruise_kph=62.0, model_accel=ask))
+      v = max(0.0, v + planner.output_a_target * DT_MDL)
+    self.assertLess(v, 0.05)
+    self.assertTrue(planner.output_should_stop)
+    self.assertEqual(planner.source, Source.e2e)
+
+    planner.update(_inputs(v_ego=0.0, v_cruise_kph=62.0, model_accel=0.05))
+    self.assertTrue(planner.output_should_stop)  # under the release: still the model's stop
+    for _ in range(3):
+      planner.update(_inputs(v_ego=0.0, v_cruise_kph=62.0, model_accel=0.15))
+    self.assertFalse(planner.output_should_stop)
+    self.assertEqual(planner.source, Source.cruise)
+
+  def test_the_hold_on_the_slot_is_a_low_speed_hysteresis_only(self):
+    """At speed the release is the entry deadband itself, so a model that braked and then relaxed to
+    -0.4 hands back to cruise exactly as a model that never braked — no ratchet below the set speed."""
+    self.assertEqual(model_release(MOONPILOT_MODEL_STOP_SPEED), MOONPILOT_MODEL_BRAKE_THRESHOLD)
+    self.assertEqual(model_release(0.0), MOONPILOT_MODEL_STOP_RELEASE)
+    braked = _planner()
+    for ask, frames in ((-1.5, 20), (-0.4, 40)):
+      for _ in range(frames):
+        braked.update(_inputs(v_ego=20.0, v_cruise_kph=108.0, model_accel=ask))
+    self.assertEqual(braked.source, Source.cruise)
+    self.assertAlmostEqual(braked.output_a_target, self._run(model_accel=-0.4).output_a_target, delta=1e-12)
 
   def test_the_feature_row_matches_the_params_default(self):
     feature = next(f for f in FEATURES if f.key == "MoonpilotModelBraking")

@@ -17,6 +17,7 @@ from openpilot.common.realtime import DT_CTRL
 from moonpilot.longcontrol import (
   MOONPILOT_ACCEL_JERK,
   MOONPILOT_STANDSTILL_SPEED,
+  MOONPILOT_STOPPING_ROLL_JERK,
   MoonpilotLongControl,
   moonpilot_longcontrol,
 )
@@ -90,16 +91,20 @@ class TestMoonpilotLongControl(unittest.TestCase):
       self.assertLessEqual(abs(output - previous), MOONPILOT_ACCEL_JERK * DT_CTRL + 1e-9)
       previous = output
 
-  def test_stopping_ramps_down_to_the_car_stop_accel(self):
+  def test_stopping_eases_while_rolling_then_ramps_to_the_car_stop_accel(self):
+    """Rolling into the stop the hold deepens at the rolling rate — the lurch a driver eases the pedal
+    to avoid — and only once the car is parked does it ramp to the car's own stop accel."""
     controller, CP = _controller()
-    CS = _state(v_ego=5.0, a_ego=0.0, standstill=True)
-    outputs = []
-    for _ in range(200):
-      outputs.append(_step(controller, CS, -1.0, should_stop=True))
+    rolling = _state(v_ego=0.2, a_ego=0.0)
+    outputs = [_step(controller, rolling, -1.0, should_stop=True) for _ in range(40)]
     self.assertEqual(controller.long_control_state, LongCtrlState.stopping)
+    self.assertAlmostEqual(outputs[-1], -MOONPILOT_STOPPING_ROLL_JERK * DT_CTRL * 40, delta=1e-6)
+
+    parked = _state(v_ego=0.0, a_ego=0.0, standstill=True)
+    outputs += [_step(controller, parked, -1.0, should_stop=True) for _ in range(300)]
     self.assertAlmostEqual(outputs[-1], CP.stopAccel, delta=1e-6)
     self.assertGreaterEqual(min(outputs), CP.stopAccel)
-    # monotone descent through the ramp
+    # monotone descent through both ramps
     for earlier, later in zip(outputs, outputs[1:], strict=False):
       self.assertLessEqual(later, earlier + 1e-12)
 
@@ -188,7 +193,7 @@ class TestMoonpilotLongControl(unittest.TestCase):
     """
     controller, _ = _controller()
     creeping = _state(v_ego=0.2, standstill=False)
-    for _ in range(20):
+    for _ in range(80):
       _step(controller, creeping, -0.5, should_stop=True)
     self.assertEqual(controller.long_control_state, LongCtrlState.stopping)
     self.assertAlmostEqual(controller.last_output_accel, -0.2, delta=1e-6)  # nowhere near the floor

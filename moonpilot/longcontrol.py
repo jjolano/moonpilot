@@ -32,7 +32,13 @@ LongCtrlState = car.CarControl.Actuators.LongControlState
 
 # Starting points, all fork-owned. Tune against logs.
 MOONPILOT_ACCEL_JERK = 8.0  # m/s^3 limit on the commanded accel, so a plan step is not an actuator step
-MOONPILOT_STOPPING_JERK = 1.0  # m/s^3 ramp toward CP.stopAccel while stopping
+MOONPILOT_STOPPING_JERK = 1.0  # m/s^3 ramp toward CP.stopAccel while stopping, once at a standstill
+# m/s^3 while the car is still rolling into the stop. The stop state begins at 0.3 m/s with the plan's
+# own gentle finish (~-0.4 m/s^2); ramping from there at the parked rate asked -0.83 by the time the
+# wheels stopped on route 000003d2, and the car answered with a -1.48 m/s^2 lurch in the last 0.1 s.
+# A driver eases the pedal at that moment rather than pressing it. From a 0.3 m/s entry at zero this
+# still stops the car inside 0.31 m; the hold deepens to stopAccel once it is parked.
+MOONPILOT_STOPPING_ROLL_JERK = 0.25
 MOONPILOT_STANDSTILL_SPEED = 0.1  # m/s; below it aEgo is noise, so the integrator freezes
 
 
@@ -87,7 +93,8 @@ class MoonpilotLongControl:
       self.last_output_accel = 0.0
 
     if self.long_control_state == LongCtrlState.stopping:
-      output_accel = max(min(self.last_output_accel, 0.0) - MOONPILOT_STOPPING_JERK * DT_CTRL, self.CP.stopAccel)
+      jerk = MOONPILOT_STOPPING_JERK if CS.vEgo < MOONPILOT_STANDSTILL_SPEED else MOONPILOT_STOPPING_ROLL_JERK
+      output_accel = max(min(self.last_output_accel, 0.0) - jerk * DT_CTRL, self.CP.stopAccel)
       self.reset()
       # Both clips stay on this path: STOPPING_JERK is the tighter ramp once last is already ≤ 0,
       # but entering stopping from a positive last_output_accel only the ACCEL_JERK window keeps

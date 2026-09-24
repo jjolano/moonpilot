@@ -184,6 +184,25 @@ MOONPILOT_TTC_TARGET_V = [1.5, MOONPILOT_TTC_TARGET]  # s
 MOONPILOT_K_TTC = 1.0  # 1/s on the excess closing rate
 MOONPILOT_MIN_SLACK = 1.0  # m; the standstill target is soft inside this final meter: the exact
 # kinematic floor gives way to the TTC/regulator profile there, while higher-speed stops still bind
+# s; the stopping floor's anchor slides from the standstill gap to `MOONPILOT_STOP_REST` below
+# `(STOP_DISTANCE - STOP_REST) / this` (4 m/s) of ego speed, as this much of the ego's own travel.
+# Aimed at a fixed point, a constant-decel stop is marginal: any closing the plan did not see — the
+# radar's own latency is the measured one — is owed at the end, where the demand grows fastest. On
+# route 000003d2 that was a -1.45 plateau that rose to -1.92 at 2.7 m/s and let go to -1.1 a second
+# later. Aimed `this * v_ego` short of the rest point, a law that is followed exactly asks less and
+# less (d|a|/dt = c v^4 / 4 q^3 with q the remaining slack) and still arrives at the rest point: the
+# stop eases in the way a driver's does. Above 4 m/s the anchor is the standstill gap it always was,
+# so nothing at speed moves — a braking lead matched at 20 m/s is planned exactly as before.
+MOONPILOT_STOP_TAPER_T = 0.2
+# s; how much older a radar lead's `dRel` is than the carState it is planned against, beyond the
+# message age `lead_age` already carries — by car, only where measured. radard composes `vLead` with
+# the current `vEgo` (upstream's `radarDelay` is 0 for Toyota), so a stationary target reads
+# `vLead = aEgo * latency`: over the 429 radar samples on route 000003d2 where a lead was near rest and
+# the ego was braking or accelerating past 0.6 m/s^2, the ratio was 0.136 s either way, and aligning
+# the ego speed by 0.16 s cut the stationary target's median |vLead| from 0.20 to 0.07 m/s. The gap is
+# that stale too — 0.75 m at 5 m/s — which is the closing the stopping floor then owed at the end.
+# ponytail: one measured car; learn it online like `moonpilot/latency.py` when a second car needs it.
+MOONPILOT_RADAR_LATENCY = {"TOYOTA_RAV4_TSS2": 0.15}
 MOONPILOT_LEAD_PREVIEW_T = 0.5  # s of a lead's own accel credited into the speed each side reads
 # One length; direction picks which term it feeds. Braking goes to the safety terms' lead speed
 # (`v_lead_eff`): a lead that is braking is matched as if it had already shed this much speed, which
@@ -312,6 +331,14 @@ MOONPILOT_MODEL_BRAKE_THRESHOLD = -0.5  # m/s^2; outside experimental mode the m
 # until it asks for at least this much braking, and past that its ask goes in whole: the floor under
 # it is the actuator's own ACCEL_MIN, not a fork value. See `model_candidate` for why a fork-owned
 # floor above that was measured and removed.
+# Once admitted, the model keeps its slot until its ask rises past this release, which climbs from the
+# entry threshold at `MOONPILOT_MODEL_STOP_SPEED` to upstream `should_stop`'s own 0.1 at creep speed.
+# The model tapers its ask as it finishes a stop — on route 000003d2 it braked from 17 m/s and crossed
+# back over -0.5 at 0.9 m/s — so a fixed deadband handed the last meter to the cruise term, which
+# asked +1.0 and was already moving the car when the driver braked. Below creep speed the release is
+# exactly experimental mode's stop contract: held while the model's ask is under 0.1.
+MOONPILOT_MODEL_STOP_SPEED = 5.0  # m/s
+MOONPILOT_MODEL_STOP_RELEASE = 0.1  # m/s^2; `should_stop`'s threshold
 MOONPILOT_CRASH_DISTANCE = 0.25  # m; FCW contact margin
 MOONPILOT_FCW_DECEL = -4.0  # m/s^2 required decel that means it cannot be avoided
 MOONPILOT_FCW_COUNT = 2  # frames above threshold before FCW latches
@@ -490,6 +517,28 @@ def crawl_accel(a_track, v_ego, v_lead, a_lead) -> float:
   return a_track + w * (MOONPILOT_FAST_CRAWL - a_track)
 
 
+def departure_crawl(a_track, v_ego, v_lead, a_lead) -> float:
+  """The spacing regulator's ask, floored at the crawl a lead pulling away is owed before the gap has
+  reopened.
+
+  A stop finishes inside the standstill gap — `MOONPILOT_STOP_REST` is 0.8 m short of it and the car
+  rests nearer 4.5 m on the road — so at the launch the regulator's spacing error is a brake: -0.44
+  m/s^2 from 4.5 m, held until the lead's speed alone outweighed it. On route 000003d2 that kept the
+  stop hold on for a second after the lead moved and the driver took over with the gas. The driver's
+  own launch is a brake release into idle creep the moment the lead goes, so while the lead is moving
+  and faster than the ego, the regulator's relative-speed term alone — capped at the fast-crawl rung
+  — is a floor under it, fading out over the crawl band like `crawl_accel`. The lead's speed carries
+  its accel both ways (`MOONPILOT_LEAD_PREVIEW_T`), so a lead that is braking is owed nothing until it
+  would still be the faster car. Speed matched, the floor is zero and the regulator is untouched: the
+  gap is not recovered at a crawl, only kept, and every braking term below still reads the physical gap.
+  """
+  if v_lead <= MOONPILOT_SHOULD_STOP_SPEED:
+    return a_track
+  w = float(np.interp(v_ego, [MOONPILOT_CREEP_SPEED, 2 * MOONPILOT_CREEP_SPEED], [1.0, 0.0]))
+  floor = w * min(MOONPILOT_K_V * (v_lead + float(a_lead) * MOONPILOT_LEAD_PREVIEW_T - v_ego), MOONPILOT_FAST_CRAWL)
+  return max(a_track, floor) if floor > 0.0 else a_track
+
+
 def lead_accel(v_ego, gap, v_lead, a_lead, t_follow) -> float:
   """Two terms, one number.
 
@@ -563,6 +612,7 @@ def lead_accel(v_ego, gap, v_lead, a_lead, t_follow) -> float:
     -MOONPILOT_APPROACH_DECEL,
   )
   a_track = crawl_accel(a_track, v_ego, v_lead, a_lead)
+  a_track = departure_crawl(a_track, v_ego, v_lead, a_lead)
   closing = v_ego - v_lead_eff
   if closing <= 0.0:
     return a_track  # not closing: nothing to brake for
@@ -574,7 +624,8 @@ def lead_accel(v_ego, gap, v_lead, a_lead, t_follow) -> float:
   # binds 175 m out, where coming to rest behind a stopped lead needs 185 m. The kinematic term
   # remains the bound throughout that regime. Only inside MOONPILOT_MIN_SLACK does its denominator
   # stop shrinking, so the exact standstill point is not chased with increasing crawl-speed braking.
-  a_stop = stopping_decel(v_ego, v_lead_eff, a_lead, max(gap - MOONPILOT_STOP_DISTANCE, MOONPILOT_MIN_SLACK))
+  anchor = MOONPILOT_STOP_REST + min(MOONPILOT_STOP_TAPER_T * v_ego, MOONPILOT_STOP_DISTANCE - MOONPILOT_STOP_REST)
+  a_stop = stopping_decel(v_ego, v_lead_eff, a_lead, max(gap - anchor, MOONPILOT_MIN_SLACK))
   a = min(a, a_stop) if a_stop < -float(np.interp(v_ego, MOONPILOT_FLOOR_ADMISSION_BP, MOONPILOT_FLOOR_ADMISSION_V)) else a
   if a < 0.0 and v_ego < MOONPILOT_CREEP_SPEED and v_lead_eff < MOONPILOT_SHOULD_STOP_SPEED:
     # The stop finish: behind a stopped lead below creep speed, a constant decel to MOONPILOT_STOP_REST
@@ -665,7 +716,7 @@ def required_decel(v_ego, gap, v_lead, a_lead=0.0) -> float:
   return stopping_decel(v_ego, max(float(v_lead), 0.0), lead_accel_estimate(a_lead), max(gap - MOONPILOT_CRASH_DISTANCE, 0.1), sustain=math.inf)
 
 
-def model_candidate(model, e2e, allowed) -> float | None:
+def model_candidate(model, e2e, allowed, threshold=MOONPILOT_MODEL_BRAKE_THRESHOLD) -> float | None:
   """The model's own accel as a candidate, and whether it gets one this frame.
 
   Experimental mode is unchanged: the accel goes in raw, which is what that mode means. Outside it
@@ -690,11 +741,20 @@ def model_candidate(model, e2e, allowed) -> float | None:
 
   None means no candidate, which is exactly the planner this fork had before this existed. A NaN
   takes that branch too, since the comparison is false.
+
+  `threshold` is the planner's hysteresis: the entry deadband until the model has a slot, then
+  `model_release` — so a stop the model began is a stop the model finishes.
   """
   a = float(model.action.desiredAcceleration)
-  if not e2e and (not allowed or not a < MOONPILOT_MODEL_BRAKE_THRESHOLD):
+  if not e2e and (not allowed or not a < threshold):
     return None
   return a
+
+
+def model_release(v_ego) -> float:
+  """The ask an admitted model has to rise past to give its slot back: the entry deadband at speed,
+  `should_stop`'s 0.1 in the crawl band, so the model holds a stop it is finishing until it asks to go."""
+  return float(np.interp(v_ego, [MOONPILOT_CREEP_SPEED, MOONPILOT_MODEL_STOP_SPEED], [MOONPILOT_MODEL_STOP_RELEASE, MOONPILOT_MODEL_BRAKE_THRESHOLD]))
 
 
 def policy(
@@ -798,6 +858,7 @@ class MoonpilotLongitudinalPlanner:
     self.frames = 0
     # One per radarState slot, ticked every frame so an absent or replaced lead resets its window.
     self.lead_accel = (LeadAccelEstimator(dt), LeadAccelEstimator(dt))
+    self.radar_latency = MOONPILOT_RADAR_LATENCY.get(str(CP.carFingerprint), 0.0)
 
     self.output_a_target = init_a
     self.output_should_stop = False
@@ -805,6 +866,7 @@ class MoonpilotLongitudinalPlanner:
     self.crash_cnt = 0
     self.allow_throttle = True
     self.source = LongitudinalPlanSource.cruise
+    self.model_braking = False  # the model held a braking slot last frame: `model_release` applies
     self.solve_time = 0.0
 
     self.v_desired_trajectory = np.zeros(CONTROL_N)
@@ -841,6 +903,7 @@ class MoonpilotLongitudinalPlanner:
     reset_state = reset_state or CS.vCruise == V_CRUISE_UNSET
     if reset_state:
       self.output_a_target = a_ego
+      self.model_braking = False
 
     # Learn the chain's lag from the command that was in effect last frame (`output_a_target` is
     # assigned at the end of this one) and the acceleration the car answered with. Gated to the frames
@@ -887,7 +950,9 @@ class MoonpilotLongitudinalPlanner:
     steer_angle = CS.steeringAngleDeg - sm['vehicleParameters'].angleOffsetDeg
     t_follow = self._t_follow(sm)
     e2e = sm['selfdriveState'].experimentalMode
-    model_accel = model_candidate(sm['modelV2'], e2e, enabled(MODEL_BRAKING, self.params))
+    threshold = model_release(v_ego) if self.model_braking else MOONPILOT_MODEL_BRAKE_THRESHOLD
+    model_accel = model_candidate(sm['modelV2'], e2e, enabled(MODEL_BRAKING, self.params), threshold)
+    self.model_braking = model_accel is not None and not e2e
 
     # The curve speed control. The measured curvature is the car's own — `-VM.calc_curvature` of the
     # steer angle, the same idiom controlsd and `moonpilot/latcontrol.py` use — and the model's path
@@ -957,9 +1022,8 @@ class MoonpilotLongitudinalPlanner:
     radar_mono = log_mono.get('radarState')
     lead_age = max(0.0, (model_mono - radar_mono) / 1e9) if model_mono and radar_mono else 0.0
     # Both halves of the stale interval, not just the lead's: the message's `dRel` predates the
-    # command by `lead_age`, and `x_pred` carries only the travel over `action_t`. The lead's own
-    # travel over `lead_age` rides on the extra time; the ego's rides on `x_stale`.
-    x_stale = v_ego * lead_age
+    # command by the lead's age, and `x_pred` carries only the travel over `action_t`. The lead's own
+    # travel over that age rides on the extra time; the ego's on `v_ego * age` (`_lead_age`).
 
     # The model path is the third stale stream, and the only one nothing re-references: its
     # `position.x` is measured from the pose of the frame the model saw, whose exposure ended at
@@ -995,9 +1059,17 @@ class MoonpilotLongitudinalPlanner:
     curve = curve_targets(sm['modelV2'], curve_allowed, vp.roll, scale, ahead=x_path)
 
     a_prev = float(self.output_a_target)
+    if CS.standstill:
+      # Parked, the stop hold owns the brake and a negative target is a command nothing tracks: ramping
+      # a launch up out of it spent 0.36 s from the -0.44 a stop inside the standstill gap leaves. The
+      # comfort first step (`jerk_limit`) still keeps one frame of a lead's speed from lifting the hold.
+      a_prev = max(a_prev, 0.0)
     v_pred = max(0.0, v_ego + a_prev * self.action_t)
     x_pred = 0.5 * (v_ego + v_pred) * self.action_t
-    lead_states = [(source, *lead_state_at(lead, self.action_t + lead_age, x_pred + x_stale, a_lead, a_lead_tau)) for source, lead, a_lead, a_lead_tau in leads]
+    lead_states = []
+    for source, lead, a_lead, a_lead_tau in leads:
+      age = self._lead_age(lead, lead_age)
+      lead_states.append((source, *lead_state_at(lead, self.action_t + age, x_pred + v_ego * age, a_lead, a_lead_tau)))
     a_cmd, source = policy(
       v_pred,
       lead_states,
@@ -1161,7 +1233,10 @@ class MoonpilotLongitudinalPlanner:
     v, a, x, t_prev = v_ego, a_target, 0.0, 0.0
     for i, t_idx in enumerate(MOONPILOT_CONTROL_T_IDX):
       t = float(t_idx)
-      states = [(source, *lead_state_at(lead, t + lead_age, x + v_ego * lead_age, a_lead, a_lead_tau)) for source, lead, a_lead, a_lead_tau in leads]
+      states = [
+        (source, *lead_state_at(lead, t + self._lead_age(lead, lead_age), x + v_ego * self._lead_age(lead, lead_age), a_lead, a_lead_tau))
+        for source, lead, a_lead, a_lead_tau in leads
+      ]
       a_cmd, _ = policy(
         v,
         states,
@@ -1186,6 +1261,11 @@ class MoonpilotLongitudinalPlanner:
       x += 0.5 * (v + v_next) * dt
       v, t_prev = v_next, t
     return speeds, accels
+
+  def _lead_age(self, lead, lead_age):
+    """How old a lead's `dRel` is at this tick: the message's age, and a radar lead's own sensor
+    latency on top where it is measured (`MOONPILOT_RADAR_LATENCY`)."""
+    return lead_age + (self.radar_latency if lead.radar else 0.0)
 
   def _t_follow(self, sm):
     personality = sm['selfdriveState'].personality.raw
