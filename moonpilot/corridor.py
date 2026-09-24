@@ -25,7 +25,6 @@ import numpy as np
 
 # Fork-owned. Tune against logs: plot corridor width vs. the path in PlotJuggler.
 MOONPILOT_CORRIDOR_MARGIN = 0.15  # m; path this close to an edge still counts as inside
-MOONPILOT_CORRIDOR_MIN_WIDTH = 2.8  # m; narrower than a lane is a squeeze, not a free corridor
 
 
 def _xy(edge):
