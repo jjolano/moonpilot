@@ -95,9 +95,13 @@ work in. Off (`MoonpilotSlam` unset or false) leaves `valid` false — the pass-
 ## Corridor occupancy (Phase 2)
 
 `moonpilot/corridor.py` is the on-road free-space strip from `modelV2.roadEdges` alone — pure
-numpy, no publisher, no toggle — so a future planner seam or a replay can call it the same way
+numpy, no publisher, no toggle of its own — so a planner seam or a replay can call it the same way
 `lead_in_path` is called. At each sample along a path it returns the free lateral bounds (ordered
 by y, never by edge index), the free width, and an in-corridor flag with a small margin; a sample
 the edges do not span is NaN, not free. Lane lines are the same shape and remain available if a
 consumer needs them; a persistent map across drives is out of scope (`slam-spike.md`).
+
+The first consumer is `MoonpilotSqueeze` (`squeeze_accel`): when the free width pinches under
+about two car widths over the next 40 m, a bounded ramp is fed into the fork planner's cruise-slot
+`min` the same way the curve terms are — see `moonpilot/docs/longitudinal.md`.
 

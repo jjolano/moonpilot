@@ -66,6 +66,13 @@ CURVE_SPEED = Feature(
   offroad_only=True,
 )
 
+SQUEEZE = Feature(
+  key="MoonpilotSqueeze",
+  title="narrow corridor braking",
+  description="Slow when free space ahead pinches under about two car widths. Braking is bounded, and only added. Immediate.",
+  offroad_only=True,
+)
+
 COAST_GRADE = Feature(
   key="MoonpilotCoastGrade",
   title="coast on grade",
@@ -139,7 +146,7 @@ SPEED = Group(
   description="What the car does with the pedals: whose planner sets the speed, and how it reads the road ahead.",
   # The lead's lateral prediction sits here rather than with the steering because the fork reaches
   # it through the planner's time gap, not through a steering request.
-  features=(LONGITUDINAL, MODEL_BRAKING, CURVE_SPEED, COAST_GRADE, LEAD_LATERAL, SLAM),
+  features=(LONGITUDINAL, MODEL_BRAKING, CURVE_SPEED, SQUEEZE, COAST_GRADE, LEAD_LATERAL, SLAM),
 )
 
 DEVICE = Group(

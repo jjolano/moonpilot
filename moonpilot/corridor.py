@@ -23,8 +23,19 @@ Three things that are not obvious:
 
 import numpy as np
 
+from opendbc.car.interfaces import ACCEL_MAX
+
 # Fork-owned. Tune against logs: plot corridor width vs. the path in PlotJuggler.
 MOONPILOT_CORRIDOR_MARGIN = 0.15  # m; path this close to an edge still counts as inside
+# Squeeze braking (`MoonpilotSqueeze`): free width under FULL over the next LOOKAHEAD metres of
+# known edge adds a bounded cruise-slot candidate. FULL is ~2 car widths (CarParams has no width
+# field, so this is a fixed stand-in for a typical ~2 m body); MIN is one body, where the floor
+# already applies. Lookahead is the model's near horizon, not the full 192 m edge span — far
+# samples are less certain and not worth slowing for. Floor matches the curve terms.
+MOONPILOT_SQUEEZE_LOOKAHEAD = 40.0  # m ahead of the car (after the path re-reference)
+MOONPILOT_SQUEEZE_FULL_WIDTH = 4.0  # m; below this the corridor is under ~2 car widths
+MOONPILOT_SQUEEZE_MIN_WIDTH = 2.0  # m; at or under one car body the floor is already applied
+MOONPILOT_SQUEEZE_ACCEL_MIN = -1.5  # m/s^2; same bound as the curve terms, well above ACCEL_MIN
 
 
 def _xy(edge):
@@ -91,3 +102,29 @@ def corridor_width(edge_a, edge_b, sample_x):
   left, right = corridor_bounds(edge_a, edge_b, sample_x)
   width = right - left
   return np.where(np.isfinite(width) & (width >= 0.0), width, np.nan)
+
+
+def squeeze_accel(edge_a, edge_b, sample_x, x_ego=0.0):
+  """Bounded braking for a corridor that pinches over the next `MOONPILOT_SQUEEZE_LOOKAHEAD` metres.
+
+  `sample_x` is the edges' own x frame (the model path's absolute distances); `x_ego` is how far
+  the car has already covered of that frame — the same re-reference the curve targets take, so the
+  window is metres *ahead of the car now*. Deepest known finite width in the window wins. Wide
+  enough, unknown, or empty → `ACCEL_MAX` (the inactive sentinel `policy` leaves the cruise term
+  alone for); otherwise a linear ramp from 0 at `FULL_WIDTH` down to `ACCEL_MIN` (this module's
+  squeeze floor) at `MIN_WIDTH` and no deeper. Pure geometry: no toggle, no messaging."""
+  sample_x = np.asarray(sample_x, dtype=float)
+  d = sample_x - float(x_ego)
+  window = (d >= 0.0) & (d <= MOONPILOT_SQUEEZE_LOOKAHEAD)
+  if not window.any():
+    return ACCEL_MAX
+  w = corridor_width(edge_a, edge_b, sample_x[window])
+  known = np.isfinite(w)
+  if not known.any():
+    return ACCEL_MAX
+  w_min = float(np.min(w[known]))
+  if w_min >= MOONPILOT_SQUEEZE_FULL_WIDTH:
+    return ACCEL_MAX
+  span = MOONPILOT_SQUEEZE_FULL_WIDTH - MOONPILOT_SQUEEZE_MIN_WIDTH
+  frac = float(np.clip((MOONPILOT_SQUEEZE_FULL_WIDTH - w_min) / span, 0.0, 1.0))
+  return MOONPILOT_SQUEEZE_ACCEL_MIN * frac

@@ -29,6 +29,8 @@ is:
 path's own curvature, and a proportional regulator on the lateral accel the car is actually pulling.
 ``moonpilot/curve.py`` is where the math and its constants live; both are inert without the model's
 path arrays and, for the in-curve term, ``vehicleParameters.valid``.
+``MoonpilotSqueeze`` adds one more: when the free corridor from ``modelV2.roadEdges`` pinches under
+~2 car widths over the next 40 m, a bounded ramp into the same slot — see ``moonpilot/corridor.py``.
 ``MoonpilotCoastGrade`` adds a grade-aware coast band inside the cruise slot: when the road pushes the
 car away from its set speed, the cruise candidate tapers toward upstream's fitted coast acceleration as
 the drift approaches 1.5 m/s, allowing a descent to run up and a climb to sag. It can only replace the
@@ -95,7 +97,8 @@ from moonpilot.curve import (
   lat_accel_hold,
   predicted_lat_accel,
 )
-from moonpilot.features import COAST_GRADE, CURVE_SPEED, LEAD_LATERAL, LONGITUDINAL, MODEL_BRAKING, enabled
+from moonpilot.corridor import squeeze_accel
+from moonpilot.features import COAST_GRADE, CURVE_SPEED, LEAD_LATERAL, LONGITUDINAL, MODEL_BRAKING, SQUEEZE, enabled
 from moonpilot.latency import (
   MOONPILOT_LAG_BLOCKS_KEY,
   MOONPILOT_LAG_KEY,
@@ -772,6 +775,7 @@ def policy(
   x_ego=0.0,
   v_hold=math.inf,
   coast_band: float = 0.0,
+  squeeze=ACCEL_MAX,
 ):
   """The smallest of the candidates, and which one it was.
 
@@ -784,7 +788,8 @@ def policy(
   the cruise slot as a minimum — so the reported source stays `cruise`, and the two curve terms are
   live in experimental mode too. That is the point of putting them there rather than beside the model
   candidate: `min` means they can only ever add braking to whatever the model asked for, never
-  substitute for it.
+  substitute for it. `squeeze` is `moonpilot.corridor.squeeze_accel`'s bounded ramp, same slot, same
+  rule; the `ACCEL_MAX` default is the no-candidate case.
 
   The cruise slot remains the set-speed authority. At or above `v_cruise` its ordinary speed-error
   output is non-positive even when a lead gap is oversized, so `min` cannot select positive
@@ -792,7 +797,7 @@ def policy(
   gap behind a lead holding the set speed; closing it waits for the lead to pull away or the ego to
   fall below set speed. That is deliberate: follow-distance recovery never buys overspeed.
   """
-  a_curve = min(curve_accel(v_ego, x_ego, curve), lat_accel_hold(v_ego, v_hold))
+  a_curve = min(curve_accel(v_ego, x_ego, curve), lat_accel_hold(v_ego, v_hold), squeeze)
   a_cruise_raw = cruise_accel(v_ego, v_cruise, e2e, steer_angle_deg, CP, accel_coast, allow_throttle, coast_band)
   a_cruise = min(a_cruise_raw, a_curve)
   lead_asks = []
@@ -1057,6 +1062,14 @@ class MoonpilotLongitudinalPlanner:
     # The path is re-referenced here, once, rather than folded into each caller's `x_ego`: both the
     # command and the published rollout then pass plain ego travel and share one target.
     curve = curve_targets(sm['modelV2'], curve_allowed, vp.roll, scale, ahead=x_path)
+    # The corridor squeeze: same re-reference as the curve (so the window is metres ahead of the
+    # car now), same cruise-slot min, gated on the toggle every frame like the other path consumers.
+    # Empty or unknown edges give the ACCEL_MAX sentinel and leave the cruise term alone.
+    squeeze = ACCEL_MAX
+    if enabled(SQUEEZE, self.params):
+      edges = sm['modelV2'].roadEdges
+      if len(edges) >= 2:
+        squeeze = squeeze_accel(edges[0], edges[1], ModelConstants.X_IDXS, x_ego=x_path)
 
     a_prev = float(self.output_a_target)
     if CS.standstill:
@@ -1085,6 +1098,7 @@ class MoonpilotLongitudinalPlanner:
       curve=curve,
       x_ego=x_pred,
       v_hold=v_hold,
+      squeeze=squeeze,
     )
 
     a_target = float(np.clip(jerk_limit(a_cmd, a_prev, self.dt, v_ego, jerk_scale), ACCEL_MIN, ACCEL_MAX))
@@ -1108,6 +1122,7 @@ class MoonpilotLongitudinalPlanner:
       v_hold,
       jerk_scale,
       coast_band=coast_band,
+      squeeze=squeeze,
     )
 
     self.j_desired_trajectory = np.gradient(self.a_desired_trajectory, MOONPILOT_CONTROL_T_IDX)
@@ -1217,6 +1232,7 @@ class MoonpilotLongitudinalPlanner:
     v_hold=math.inf,
     comfort_scale=1.0,
     coast_band: float = 0.0,
+    squeeze=ACCEL_MAX,
   ):
     """The same policy rolled forward over the published horizon, from (v_ego, a_target). The ego's
     own travel is carried in x, so the gap the leads are rolled against is the gap this plan
@@ -1224,10 +1240,11 @@ class MoonpilotLongitudinalPlanner:
     a gap recomputed from the initial speed and the loop's current accel: on a closing lead at
     25 m/s, its speeds sat up to 0.42 m/s away from the consistent rollout's. `lead_age` carries the
     same staleness correction `update` applies, so the published plan is the same prediction the
-    command was taken from rather than a fresher one. `curve` and `v_hold` ride along for the same
+    command was taken from rather than a fresher one.     `curve` and `v_hold` ride along for the same
     reason: the rollout is the policy the command came from, with the curve's own travel accumulated
     in `x` and the measured curvature held across the horizon — the curve target already carries the
-    path re-reference, so `x_ego` is plain ego travel here as it is in `update`."""
+    path re-reference, so `x_ego` is plain ego travel here as it is in `update`. `squeeze` rides the
+    same way: the corridor candidate is constant over the rollout (it was computed once for this tick)."""
     speeds = np.zeros(CONTROL_N)
     accels = np.zeros(CONTROL_N)
     v, a, x, t_prev = v_ego, a_target, 0.0, 0.0
@@ -1252,6 +1269,7 @@ class MoonpilotLongitudinalPlanner:
         curve=curve,
         x_ego=x,
         v_hold=v_hold,
+        squeeze=squeeze,
       )
       a = float(np.clip(jerk_limit(a_cmd, a, t - t_prev, v, comfort_scale), ACCEL_MIN, ACCEL_MAX))
       speeds[i] = v

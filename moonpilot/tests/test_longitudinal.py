@@ -29,6 +29,7 @@ from openpilot.selfdrive.car.cruise import V_CRUISE_MAX, V_CRUISE_UNSET
 import openpilot.selfdrive.test.longitudinal_maneuvers.plant as plant_mod
 from openpilot.selfdrive.test.longitudinal_maneuvers.test_longitudinal import create_maneuvers
 
+from moonpilot.corridor import MOONPILOT_SQUEEZE_ACCEL_MIN, MOONPILOT_SQUEEZE_FULL_WIDTH, MOONPILOT_SQUEEZE_MIN_WIDTH
 from moonpilot.curve import (
   MOONPILOT_CURVE_A_LAT,
   MOONPILOT_CURVE_ACCEL_MIN,
@@ -211,6 +212,7 @@ def _inputs(
   steer_ratio=0.0,
   stiffness_factor=0.0,
   roll=0.0,
+  road_edges=None,
 ):
   car_state = messaging.new_message("carState")
   car_state.carState.vEgo = float(v_ego)
@@ -250,6 +252,9 @@ def _inputs(
     model.modelV2.position = log.XYZTData.new_message(x=[float(v) for v in x], t=ModelConstants.T_IDXS)
     model.modelV2.velocity = log.XYZTData.new_message(x=[float(v) for v in v_path], t=ModelConstants.T_IDXS)
     model.modelV2.orientationRate = log.XYZTData.new_message(z=[float(v) for v in psi_rate], t=ModelConstants.T_IDXS)
+  if road_edges is not None:
+    # `road_edges` is a pair of `(x, y)` sequences, one per road edge, on the model's distance grid.
+    model.modelV2.roadEdges = [log.XYZTData.new_message(x=[float(v) for v in ex], y=[float(v) for v in ey]) for ex, ey in road_edges]
 
   radar = messaging.new_message("radarState")
   radar.radarState.leadOne = lead if lead is not None else _lead(200.0, float(v_ego), present=False)
@@ -2284,10 +2289,10 @@ class TestCurveSpeed(unittest.TestCase):
     self.assertNotIn(MOONPILOT_LONG_JERK_SCALE_KEY, measuring.params.puts)
 
   def test_the_feature_rows_match_the_params_defaults(self):
-    """Both behaviors ship off: each one is unvalidated on a car, and both are read with
+    """These behaviors ship off: each is unvalidated on a car, and each is read with
     `enabled()`, so the row and the param default have to agree."""
     text = (ROOT / "moonpilot" / "params_keys.h").read_text()
-    for key in ("MoonpilotCurveSpeed", "MoonpilotPathPreview"):
+    for key in ("MoonpilotCurveSpeed", "MoonpilotPathPreview", "MoonpilotSqueeze"):
       with self.subTest(key=key):
         feature = next(f for f in FEATURES if f.key == key)
         self.assertTrue(feature.offroad_only)
@@ -2297,6 +2302,56 @@ class TestCurveSpeed(unittest.TestCase):
     # to be the neutral ratio rather than the "unset" the lag param uses.
     self.assertTrue('{"MoonpilotCurveLatScale", {PERSISTENT, FLOAT, "1.0"}}' in text)
     self.assertTrue('{"MoonpilotLongJerkScale", {PERSISTENT, FLOAT, "1.0"}}' in text)
+
+
+class TestSqueeze(unittest.TestCase):
+  """`MoonpilotSqueeze`, through the planner's own seam (`test_corridor.py` holds the pure math).
+
+  The inertness statement is the same one curve rests on: no road edges (the default `_inputs`,
+  which is also what upstream's maneuver plant fills) is exactly the planner this fork had before
+  this existed, feature on or off — and a pinched corridor with the toggle off is too.
+  """
+
+  @staticmethod
+  def _edges(width, xs=None):
+    xs = list(np.asarray(xs if xs is not None else ModelConstants.X_IDXS, dtype=float))
+    half = float(width) / 2.0
+    return (xs, [-half] * len(xs)), (xs, [half] * len(xs))
+
+  def test_narrow_corridor_adds_bounded_braking(self):
+    edges = self._edges(MOONPILOT_SQUEEZE_FULL_WIDTH - 1.0)
+    on = _planner()
+    off = _planner(params_overrides={"MoonpilotSqueeze": False})
+    for _ in range(20):
+      on.update(_inputs(road_edges=edges))
+      off.update(_inputs(road_edges=edges))
+    self.assertLess(on.output_a_target, off.output_a_target)
+    self.assertGreaterEqual(on.output_a_target, MOONPILOT_SQUEEZE_ACCEL_MIN - 1e-9)
+    self.assertEqual(on.source, off.source)  # still the cruise slot
+
+  def test_wide_corridor_is_the_planner_without_the_feature(self):
+    edges = self._edges(MOONPILOT_SQUEEZE_FULL_WIDTH + 2.0)
+    on, off = _planner(), _planner(params_overrides={"MoonpilotSqueeze": False})
+    for _ in range(20):
+      on.update(_inputs(road_edges=edges))
+      off.update(_inputs(road_edges=edges))
+    self.assertAlmostEqual(on.output_a_target, off.output_a_target, delta=1e-12)
+
+  def test_no_road_edges_is_inert_even_when_on(self):
+    on, off = _planner(), _planner(params_overrides={"MoonpilotSqueeze": False})
+    for _ in range(20):
+      on.update(_inputs())
+      off.update(_inputs())
+    self.assertAlmostEqual(on.output_a_target, off.output_a_target, delta=1e-12)
+
+  def test_toggle_off_is_inert_on_a_pinch(self):
+    edges = self._edges(MOONPILOT_SQUEEZE_MIN_WIDTH)
+    off = _planner(params_overrides={"MoonpilotSqueeze": False})
+    baseline = _planner(params_overrides={"MoonpilotSqueeze": False})
+    for _ in range(20):
+      off.update(_inputs(road_edges=edges))
+      baseline.update(_inputs())
+    self.assertAlmostEqual(off.output_a_target, baseline.output_a_target, delta=1e-12)
 
 
 class TestUpstreamManeuvers(unittest.TestCase):
