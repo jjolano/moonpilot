@@ -4,9 +4,8 @@ Phase 1 of the true-SLAM path (`moonpilot/docs/slam-spike.md`). Short-horizon po
 `cameraOdometry` alone — excellent over ~60 s and useless over minutes — so this tracker
 dead-reckons the body at 20 Hz (wheel speed forward, VO lateral and yaw) and soft-corrects
 position against a GPS fix whenever one clears the gate. Nothing here is in the control path:
-the consumer that does not exist yet would read `moonpilotState.egoPose`; until it does, the
-tracker exists so a replay can score chained-pose RMSE against LLK the way `test_slam.py`
-scores speed.
+`moonpilot/leadd.py` fills `moonpilotState.egoPose` from this tracker when `MoonpilotSlam` is on,
+and a replay can score chained-pose RMSE against LLK the way `test_slam.py` scores speed.
 
 Four things that are not obvious:
 
@@ -76,6 +75,8 @@ class PoseTracker:
     self.n_gps = 0  # accepted fixes (first one rebases)
     self.n_rebase = 0  # streak rebases after the first (diagnostic for replays)
     self._reject_streak = 0
+    self.mono_time = 0.0  # s; last odom pose time, for the published message's stamp
+
 
   @property
   def has_origin(self) -> bool:
@@ -98,6 +99,7 @@ class PoseTracker:
     self.x += (c * v_forward - s * v_lateral) * dt
     self.y += (s * v_forward + c * v_lateral) * dt
     self.yaw += yaw_rate * dt
+    self.mono_time = mono_time
 
   def push_gps(self, mono_time: float, lat: float, lon: float, horizontal_accuracy: float | None = None,
                has_fix: bool = True, bearing_deg: float | None = None, speed: float | None = None) -> bool:
@@ -156,3 +158,19 @@ class PoseTracker:
     self.y += MOONPILOT_POSE_GPS_ALPHA * (gy - self.y)
     self.n_gps += 1
     return True
+
+
+def fill_ego_pose(message, tracker: PoseTracker) -> None:
+  """Write one pose onto a `moonpilotState` message. The publisher's half of the contract.
+
+  `valid` is false until the first accepted fix has set the origin: a consumer that has not seen a
+  rebase has no frame to read x/y in, and the pass-through case (off, no origin) is stock behavior.
+  """
+  field = message.moonpilotState.egoPose
+  field.valid = tracker.has_origin
+  if not tracker.has_origin:
+    return
+  field.monoTime = int(tracker.mono_time * 1e9)
+  field.x = tracker.x
+  field.y = tracker.y
+  field.yaw = tracker.yaw

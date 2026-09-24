@@ -579,6 +579,40 @@ class TestWiring(unittest.TestCase):
     self.assertEqual(writers[0].module, "moonpilot.leadd")
     self.assertNotIn("slamd", [p.name for p in procs.MOONPILOT_PROCS])
 
+  def test_the_gps_service_is_chosen_from_params(self):
+    from openpilot.common.gps import get_gps_location_service
+    from openpilot.common.params import Params
+
+    params = Params()
+    self.assertIn(get_gps_location_service(params), ("gpsLocation", "gpsLocationExternal"))
+
+  def test_pose_push_stamps_the_odometry_pose_time_and_reads_the_prior(self):
+    from moonpilot.leadd import _pose_push
+    from moonpilot.pose import PoseTracker
+
+    odometry = messaging.new_message("cameraOdometry")
+    odometry.cameraOdometry.trans = [20.0, 0.0, 0.0]
+    odometry.cameraOdometry.transStd = [0.02, 0.02, 0.02]
+    odometry.cameraOdometry.rot = [0.0, 0.0, 0.1]
+    car_state = messaging.new_message("carState")
+    sm = TestIngest._Sm(odometry.cameraOdometry, car_state.carState)
+
+    tracker = PoseTracker()
+    _pose_push(tracker, sm, TestIngest._prior(v_ego=19.5))
+    expected_t = ODOMETRY_MONO - MOONPILOT_SLAM_POSE_DELAY
+    self.assertEqual(tracker.t, expected_t)
+    self.assertEqual(tracker.mono_time, 0.0)  # first call only stamps; no dt yet
+
+    # A second frame 0.05 s later integrates one step at the prior's speed, with mid-point yaw.
+    odometry.cameraOdometry.timestampEof = int((ODOMETRY_MONO + 0.05) * 1e9)
+    sm.updated["cameraOdometry"] = True
+    _pose_push(tracker, sm, TestIngest._prior(v_ego=19.5))
+    dt = 0.05
+    yaw_mid = 0.5 * 0.1 * dt
+    self.assertAlmostEqual(tracker.x, 19.5 * math.cos(yaw_mid) * dt, delta=1e-6)
+    self.assertAlmostEqual(tracker.yaw, 0.1 * dt, delta=1e-6)
+    self.assertAlmostEqual(tracker.mono_time, expected_t + dt, delta=1e-9)
+
 
 if __name__ == "__main__":
   unittest.main()

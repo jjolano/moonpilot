@@ -83,3 +83,12 @@ without reshaping it. The on-device proof the plan calls for is a replay: logged
 `cameraOdometry` through the window, against `gpsLocationExternal` as truth, RMSE down or equal, and
 `egoCorrection.valid` duty ≥ 95 % onroad — met on this route at 100.00 % (14,955/14,955): PASS.
 
+## The ego pose
+
+The same toggle and the same publisher also fill `moonpilotState.egoPose` from `moonpilot/pose.py`:
+observation-only, dead-reckon + GPS gate, valid from the first accepted fix (the origin) onward.
+x/y are metres east/north of that fix, yaw is rad CCW from east, `monoTime` is the last odom pose
+time stamped the same way as the correction's window end. Nothing in the control path reads it yet;
+it is there so a replay can score chained-pose RMSE against LLK, and so Phase 2 has a frame to
+work in. Off (`MoonpilotSlam` unset or false) leaves `valid` false — the pass-through case.
+

@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
-"""Publish moonpilotState: the model's lead trajectories and the fork's ego-motion correction.
+"""Publish moonpilotState: lead trajectories, the ego-motion correction, and the ego pose.
 
 Observation only — nothing it publishes is in the control path, so no config_realtime_process.
 
 One publisher, by construction: msgq allows exactly one, and a second one kills the first with
 EADDRINUSE on its next send (msgq's own `test_multiple_publishers_exception`). So this process owns
-the service and fills both of its parts, and the ego correction is gated in-loop rather than by a
-second process — leads are published whether the correction is on or off, and a smoother that throws
-costs this frame's correction and nothing else.
+the service and fills all three of its parts, and each is gated in-loop rather than by a second
+process — leads are published whether the correction or the pose is on or off, and a smoother or
+tracker that throws costs that frame's field and nothing else.
 """
 
 import numpy as np
 
 from openpilot.cereal import messaging
 from openpilot.common.filter_simple import FirstOrderFilter
+from openpilot.common.gps import get_gps_location_service
 from openpilot.common.params import Params
 from openpilot.common.realtime import DT_MDL
 from openpilot.common.swaglog import cloudlog
@@ -23,6 +24,7 @@ from openpilot.selfdrive.locationd.locationd import CALIB_RPY_SANITY_CHECK
 
 from moonpilot import features
 from moonpilot.lead import MOONPILOT_INPATH_RC, MOONPILOT_LEAD_PROB_RC, normalize_lead
+from moonpilot.pose import PoseTracker, fill_ego_pose
 from moonpilot.slam import MOONPILOT_SLAM_POSE_DELAY, Node, PriorChannel, RotatingPoseWindow, fill_ego_correction, invalid
 
 N_LEADS = 3
@@ -81,13 +83,60 @@ def _slam_node(sm, prior: PriorChannel) -> Node | None:
   return Node(mono_time=mono_time, v_ego=v_ego, trans_x=float(trans[0]), trans_std_x=float(trans_std[0]))
 
 
+def _pose_push(tracker: PoseTracker, sm, prior: PriorChannel) -> None:
+  """One dead-reckon step at the odometry's pose time, or nothing when this frame has none.
+
+  Same stamp and prior read as `_slam_node`: the pose the odometry describes is
+  `timestampEof - MOONPILOT_SLAM_POSE_DELAY`. Wheel forward when the prior covers it (the plan
+  every other consumer trusts); the VO's own forward only as the bare-replay fallback `pose.py`
+  documents, so a prior gap still integrates rather than freezing. Calibration rotates the VO
+  lateral the same way the correction's ingest does.
+  """
+  if not (sm.updated['cameraOdometry'] and sm.valid['cameraOdometry']):
+    return
+  odometry = sm['cameraOdometry']
+  if len(odometry.trans) < 3 or len(odometry.rot) < 3:
+    return
+  mono_time = odometry.timestampEof * 1e-9 - MOONPILOT_SLAM_POSE_DELAY
+  trans = np.asarray(odometry.trans, dtype=float)
+  device_from_calib = _device_from_calib(sm)
+  if device_from_calib is not None:
+    trans = device_from_calib @ trans
+  v_forward = prior.at(mono_time)
+  if v_forward is None:
+    v_forward = float(trans[0])
+  tracker.push_odom(mono_time, v_forward=v_forward, yaw_rate=float(odometry.rot[2]), v_lateral=float(trans[1]))
+
+
+def _gps_push(tracker: PoseTracker, sm, gps_service: str) -> None:
+  """Gate and apply one GPS fix from whichever location service this build has."""
+  if not sm.updated[gps_service]:
+    return
+  g = sm[gps_service]
+  tracker.push_gps(
+    sm.logMonoTime[gps_service] * 1e-9,
+    float(g.latitude),
+    float(g.longitude),
+    horizontal_accuracy=float(g.horizontalAccuracy),
+    has_fix=bool(g.hasFix),
+    bearing_deg=float(g.bearingDeg),
+    speed=float(g.speed),
+  )
+
+
 def main() -> None:
-  sm = messaging.SubMaster(['modelV2', 'radarState', 'carState', 'cameraOdometry', 'extrinsicsCalibration'], poll='modelV2')
-  pm = messaging.PubMaster(['moonpilotState'])
   params = Params()
+  gps_service = get_gps_location_service(params)
+  sm = messaging.SubMaster(
+    ['modelV2', 'radarState', 'carState', 'cameraOdometry', 'extrinsicsCalibration', gps_service],
+    poll='modelV2',
+  )
+  pm = messaging.PubMaster(['moonpilotState'])
   window = RotatingPoseWindow()
   # The wheel-speed prior, fed with its own message times and read at the odometry's pose time.
   prior = PriorChannel()
+  # Fed whether or not MoonpilotSlam is on, same as the correction window: toggling is immediate.
+  pose = PoseTracker()
 
   # Owned here and created once: per-frame filters would silently drop the smoothing.
   in_path_filters = [FirstOrderFilter(1.0, MOONPILOT_INPATH_RC, DT_MDL) for _ in range(N_LEADS)]
@@ -102,6 +151,9 @@ def main() -> None:
     if sm.updated['carState']:
       prior.push(sm.logMonoTime['carState'] * 1e-9, float(sm['carState'].vEgo))
 
+    _gps_push(pose, sm, gps_service)
+    _pose_push(pose, sm, prior)
+
     if not sm.updated['modelV2']:
       continue
 
@@ -112,8 +164,9 @@ def main() -> None:
     if node is not None:
       window.push(node)
 
+    slam_on = features.enabled(features.SLAM, params)
     corr = invalid()
-    if features.enabled(features.SLAM, params):
+    if slam_on:
       try:
         corr = window.update()
       except Exception:
@@ -142,6 +195,10 @@ def main() -> None:
         setattr(slot, field, value)
 
     fill_ego_correction(msg, corr)
+    # Same toggle as the correction: one SLAM row, both observation fields. Off leaves egoPose at
+    # its default (valid false), which is the pass-through case.
+    if slam_on:
+      fill_ego_pose(msg, pose)
     pm.send('moonpilotState', msg)
 
 

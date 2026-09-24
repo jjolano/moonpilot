@@ -21,6 +21,7 @@ from moonpilot.pose import (
   MOONPILOT_POSE_MAX_HACC,
   MOONPILOT_POSE_REBASE_STREAK,
   PoseTracker,
+  fill_ego_pose,
   latlon_to_enu,
 )
 
@@ -34,6 +35,26 @@ ALIGN_MAX_S = 30.0  # s; cap on growing the fit window
 
 
 class TestPoseTracker(unittest.TestCase):
+  def test_fill_ego_pose_is_invalid_until_the_first_fix_rebases(self):
+    from openpilot.cereal import messaging
+
+    t = PoseTracker()
+    t.push_odom(1.0, v_forward=10.0, yaw_rate=0.0)
+    msg = messaging.new_message("moonpilotState")
+    fill_ego_pose(msg, t)
+    self.assertFalse(msg.moonpilotState.egoPose.valid)
+
+    self.assertTrue(t.push_gps(1.1, 43.7, -79.8, horizontal_accuracy=2.0))
+    # dt is from the last odom stamp (1.0), not from the GPS time: one 0.05 s step.
+    t.push_odom(1.05, v_forward=10.0, yaw_rate=0.0)
+    fill_ego_pose(msg, t)
+    pose = msg.moonpilotState.egoPose
+    self.assertTrue(pose.valid)
+    self.assertEqual(pose.monoTime, int(1.05 * 1e9))
+    self.assertAlmostEqual(pose.x, 10.0 * 0.05, delta=1e-6)
+    self.assertAlmostEqual(pose.y, 0.0, delta=1e-6)
+    self.assertAlmostEqual(pose.yaw, 0.0, delta=1e-6)
+
   def test_latlon_to_enu_is_local_and_linear(self):
     x, y = latlon_to_enu(43.7, -79.8, 43.7, -79.8)
     self.assertEqual((x, y), (0.0, 0.0))
