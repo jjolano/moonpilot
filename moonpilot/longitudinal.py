@@ -287,6 +287,17 @@ MOONPILOT_BRAKE_MEDIUM = -1.25  # m/s^2; also the cruise floor, and forceDecel's
 # Speed error (v_cruise - v_ego) at each cruise rung: medium brake, light brake, coasting, hold, slow
 # accel, fast accel.
 MOONPILOT_CRUISE_ERR_BP = [-5.0, -3.0, -1.5, 0.0, 2.0, 5.0]  # m/s
+# Personality scales this error axis rather than the rung magnitudes: one factor on every breakpoint
+# (0 stays 0, so the ladder keeps its shape), so aggressive binds the same measured rungs at less
+# speed error and relaxed at more. Keyed by the enum's raw value, like MOONPILOT_T_FOLLOW — a
+# _DynamicEnum read off a message does not hash as its int. Hand-picked: the manual corpus cannot
+# derive it, since during manual driving vCruise is valid on only 5 % of frames (stock ACC off), so
+# the driver's own error-to-rung response was never recorded.
+MOONPILOT_ERR_BP_SCALE = {
+  int(Personality.aggressive): 0.7,
+  int(Personality.standard): 1.0,
+  int(Personality.relaxed): 1.4,
+}
 # The crawl band. With no pedal the car settles at idle creep, a median 1.9 m/s on level road, and
 # climbs to it at +0.31 from 0.5-1 m/s (fast crawl), which caps the regulator's creep (`crawl_accel`).
 # The two braking-side crawl rungs are measured and deliberately not applied, because the regulator
@@ -411,8 +422,13 @@ def _climb_recovery_applies(v_ego, v_cruise, e2e, accel_coast, allow_throttle, c
   return coast_band > 0.0 and not e2e and grade < -MOONPILOT_COAST_GRADE_MIN and allow_throttle and coast_band <= error < 2.0 * coast_band
 
 
-def cruise_accel(v_ego, v_cruise, e2e, steer_angle_deg, CP, accel_coast, allow_throttle, coast_band: float = 0.0) -> float:
+def cruise_accel(v_ego, v_cruise, e2e, steer_angle_deg, CP, accel_coast, allow_throttle, coast_band: float = 0.0, err_bp=MOONPILOT_CRUISE_ERR_BP) -> float:
   """Return the speed-error cruise candidate, clipped to its normal cap.
+
+  ``err_bp`` is the speed-error breakpoint vector the rungs are interpolated over — the personality
+  dial's surface: a scaled copy of ``MOONPILOT_CRUISE_ERR_BP`` (see ``MOONPILOT_ERR_BP_SCALE``)
+  moves when each measured rung binds without touching any rung magnitude. The default is the
+  standard axis, which is the ladder as measured.
 
   With ``coast_band`` enabled, only inside the band and only when the grade pushes the car away from
   the set speed, the command is upstream's fitted coast acceleration for that grade, tapered linearly
@@ -439,7 +455,7 @@ def cruise_accel(v_ego, v_cruise, e2e, steer_angle_deg, CP, accel_coast, allow_t
     float(np.interp(v_ego, MOONPILOT_LADDER_V_BP, MOONPILOT_SLOW_ACCEL_V)),
     float(np.interp(v_ego, MOONPILOT_FAST_ACCEL_BP, MOONPILOT_FAST_ACCEL_V)),
   ]
-  a = min(float(np.interp(v_cruise - v_ego, MOONPILOT_CRUISE_ERR_BP, rungs)), cap)
+  a = min(float(np.interp(v_cruise - v_ego, err_bp, rungs)), cap)
   if _coast_applies(v_ego, v_cruise, e2e, accel_coast, allow_throttle, coast_band):
     coast, _ = _coast_grade(accel_coast)
     # Only where the hill is the thing moving the car — it pushes the car away from the set speed —
@@ -780,6 +796,7 @@ def policy(
   v_hold=math.inf,
   coast_band: float = 0.0,
   squeeze=ACCEL_MAX,
+  err_bp=MOONPILOT_CRUISE_ERR_BP,
 ):
   """The smallest of the candidates, and which one it was.
 
@@ -802,7 +819,7 @@ def policy(
   fall below set speed. That is deliberate: follow-distance recovery never buys overspeed.
   """
   a_curve = min(curve_accel(v_ego, x_ego, curve), lat_accel_hold(v_ego, v_hold), squeeze)
-  a_cruise_raw = cruise_accel(v_ego, v_cruise, e2e, steer_angle_deg, CP, accel_coast, allow_throttle, coast_band)
+  a_cruise_raw = cruise_accel(v_ego, v_cruise, e2e, steer_angle_deg, CP, accel_coast, allow_throttle, coast_band, err_bp)
   a_cruise = min(a_cruise_raw, a_curve)
   lead_asks = []
   for source, gap, v_lead, a_lead in leads:
@@ -966,6 +983,7 @@ class MoonpilotLongitudinalPlanner:
 
     steer_angle = CS.steeringAngleDeg - sm['vehicleParameters'].angleOffsetDeg
     t_follow = self._t_follow(sm)
+    err_bp = self._err_bp(sm)
     e2e = sm['selfdriveState'].experimentalMode
     threshold = model_release(v_ego) if self.model_braking else MOONPILOT_MODEL_BRAKE_THRESHOLD
     model_accel = model_candidate(sm['modelV2'], e2e, enabled(MODEL_BRAKING, self.params), threshold)
@@ -1125,6 +1143,7 @@ class MoonpilotLongitudinalPlanner:
       x_ego=x_pred,
       v_hold=v_hold,
       squeeze=squeeze,
+      err_bp=err_bp,
     )
 
     a_target = float(np.clip(jerk_limit(a_cmd, a_prev, self.dt, v_ego, jerk_scale), ACCEL_MIN, ACCEL_MAX))
@@ -1149,6 +1168,7 @@ class MoonpilotLongitudinalPlanner:
       jerk_scale,
       coast_band=coast_band,
       squeeze=squeeze,
+      err_bp=err_bp,
     )
 
     self.j_desired_trajectory = np.gradient(self.a_desired_trajectory, MOONPILOT_CONTROL_T_IDX)
@@ -1270,6 +1290,7 @@ class MoonpilotLongitudinalPlanner:
     comfort_scale=1.0,
     coast_band: float = 0.0,
     squeeze=ACCEL_MAX,
+    err_bp=MOONPILOT_CRUISE_ERR_BP,
   ):
     """The same policy rolled forward over the published horizon, from (v_ego, a_target). The ego's
     own travel is carried in x, so the gap the leads are rolled against is the gap this plan
@@ -1307,6 +1328,7 @@ class MoonpilotLongitudinalPlanner:
         x_ego=x,
         v_hold=v_hold,
         squeeze=squeeze,
+        err_bp=err_bp,
       )
       a = float(np.clip(jerk_limit(a_cmd, a, t - t_prev, v, comfort_scale), ACCEL_MIN, ACCEL_MAX))
       speeds[i] = v
@@ -1346,6 +1368,13 @@ class MoonpilotLongitudinalPlanner:
     if enabled(LEAD_LATERAL, self.params):
       base *= float(np.interp(nearest_lead_in_path(sm), [0.0, 1.0], [MOONPILOT_OUT_OF_PATH_T_FOLLOW, 1.0]))
     return base
+
+  def _err_bp(self, sm):
+    """The speed-error breakpoints for this frame's personality: the measured axis scaled by
+    `MOONPILOT_ERR_BP_SCALE`, raw-value keyed and standard-fallback like `_t_follow`."""
+    personality = sm['selfdriveState'].personality.raw
+    scale = MOONPILOT_ERR_BP_SCALE.get(personality, MOONPILOT_ERR_BP_SCALE[int(Personality.standard)])
+    return [e * scale for e in MOONPILOT_CRUISE_ERR_BP]
 
   def publish(self, sm, pm):
     plan_send = messaging.new_message('longitudinalPlan')

@@ -43,6 +43,8 @@ from moonpilot.longitudinal import (
   MOONPILOT_COASTING_V,
   MOONPILOT_CONTROL_T_IDX,
   MOONPILOT_CREEP_SPEED,
+  MOONPILOT_CRUISE_ERR_BP,
+  MOONPILOT_ERR_BP_SCALE,
   MOONPILOT_FAST_ACCEL_BP,
   MOONPILOT_FAST_ACCEL_V,
   MOONPILOT_FAST_CRAWL,
@@ -801,6 +803,22 @@ class TestPolicyFunctions(unittest.TestCase):
     # and it is what fires FCW where the late form stays silent: (30, 28, -6, 25 m) reads -5.00
     self.assertLess(required_decel(30.0, 25.0, 28.0, -6.0), MOONPILOT_FCW_DECEL)
 
+  def test_the_error_axis_reaches_cruise_but_never_the_lead_asks(self):
+    """The dial is cruise's own axis: with a governing lead the output is one number across all
+    three axes — the regulator, TTC and stopping floor never read it — while with no lead the
+    same three axes order the cruise ask."""
+    CP = _cp()
+    t_follow = MOONPILOT_T_FOLLOW[int(Personality.standard)]
+    axes = [[e * MOONPILOT_ERR_BP_SCALE[p] for e in MOONPILOT_CRUISE_ERR_BP] for p in (0, 1, 2)]
+    governed = [
+      policy(2.0, [(Source.lead0, 4.0, 0.0, 0.0)], 30.0, t_follow, False, None, 0.0, CP, -0.3, True, err_bp=axis)[0] for axis in axes
+    ]
+    self.assertEqual(governed, [governed[0]] * 3)
+    self.assertLess(governed[0], 0.0)  # it is the lead asking, not cruise
+    cruise = [policy(20.0, [], 22.0, t_follow, False, None, 0.0, CP, -0.3, True, err_bp=axis)[0] for axis in axes]
+    self.assertEqual(cruise, sorted(cruise, reverse=True))
+    self.assertGreater(cruise[0], cruise[2])
+
 
 class TestDriverLadder(unittest.TestCase):
   """The cruise candidate lands on the driver's measured rungs at each speed-error threshold and
@@ -822,6 +840,36 @@ class TestDriverLadder(unittest.TestCase):
     CP = _cp()
     self.assertEqual(cruise_accel(1.0, 0.0, False, 0.0, CP, -0.3, True), -1.0)
     self.assertEqual(cruise_accel(20.0, 0.0, False, 0.0, CP, -0.3, True), MOONPILOT_BRAKE_MEDIUM)
+
+  def test_the_error_axis_scales_with_personality(self):
+    """The personality dial moves the speed-error breakpoints, not the rung magnitudes: one factor
+    per breakpoint (0 stays 0, so the ladder keeps its shape), keyed by the enum's raw value like
+    MOONPILOT_T_FOLLOW — a _DynamicEnum off a message does not hash as its int."""
+    CP = _cp()
+    axis = lambda personality: _planner()._err_bp(_inputs(personality=personality))  # noqa: E731
+    for personality in (int(Personality.aggressive), int(Personality.standard), int(Personality.relaxed)):
+      scaled = axis(personality)
+      self.assertEqual(scaled, [e * MOONPILOT_ERR_BP_SCALE[personality] for e in MOONPILOT_CRUISE_ERR_BP])
+      self.assertEqual(scaled[3], 0.0)  # the hold rung never moves
+    agg, rel = axis(int(Personality.aggressive)), axis(int(Personality.relaxed))
+    # aggressive reaches the measured rungs at less speed error: err -3.5 lands the medium brake
+    self.assertAlmostEqual(cruise_accel(20.0, 16.5, False, 0.0, CP, -0.3, True, err_bp=agg), MOONPILOT_BRAKE_MEDIUM)
+    # relaxed at the same error sits between the light brake and coasting — softer on the pedal
+    relaxed = cruise_accel(20.0, 16.5, False, 0.0, CP, -0.3, True, err_bp=rel)
+    self.assertGreater(relaxed, MOONPILOT_BRAKE_LIGHT)
+    self.assertLess(relaxed, -0.33)
+    # ...and binds the fast rung at err +3.5 instead of +5
+    fast = min(float(np.interp(20.0, MOONPILOT_FAST_ACCEL_BP, MOONPILOT_FAST_ACCEL_V)), 1.7)  # the combined budget
+    self.assertAlmostEqual(cruise_accel(20.0, 23.5, False, 0.0, CP, -0.3, True, err_bp=agg), fast)
+    # at a shared positive error the ordering holds everywhere on the axis
+    for err in (1.0, 2.0, 3.5, 5.0):
+      asks = [cruise_accel(20.0, 20.0 + err, False, 0.0, CP, -0.3, True, err_bp=axis(p)) for p in (0, 1, 2)]
+      self.assertEqual(asks, sorted(asks, reverse=True))
+      self.assertGreater(asks[0], asks[2])
+    # forceDecel never sees the axis: v_cruise <= 0 short-circuits before the interpolation
+    for personality in (0, 1, 2):
+      self.assertEqual(cruise_accel(1.0, 0.0, False, 0.0, CP, -0.3, True, err_bp=axis(personality)), -1.0)
+      self.assertEqual(cruise_accel(20.0, 0.0, False, 0.0, CP, -0.3, True, err_bp=axis(personality)), MOONPILOT_BRAKE_MEDIUM)
 
   def test_the_crawl_cap_holds_a_creep_not_a_launch(self):
     self.assertEqual(crawl_accel(0.8, 0.5, 0.5, 0.0), MOONPILOT_FAST_CRAWL)  # creeping lead
@@ -1432,6 +1480,22 @@ class TestPlanner(unittest.TestCase):
     the standard gap for every personality."""
     for personality, t_follow in MOONPILOT_T_FOLLOW.items():
       self.assertAlmostEqual(_planner()._t_follow(_inputs(personality=personality)), t_follow, delta=1e-9)
+
+  def test_the_personality_dial_reaches_the_output(self):
+    """The dial end to end: update reads the personality off the message and threads the scaled
+    error axis into both the live policy and the trajectory solver. Without that threading the
+    axis tests still pass while every personality drives identically, so this is the plumbing
+    pin; at a shared positive error the steady output orders aggressive > standard > relaxed."""
+    steady = {}
+    for name, personality in (("aggressive", 0), ("standard", 1), ("relaxed", 2)):
+      planner = _planner()
+      a_ego = 0.0
+      for _ in range(60):  # the jerk limit needs frames to let the asks through
+        planner.update(_inputs(v_ego=20.0, v_cruise_kph=22.0 * 3.6, a_ego=a_ego, personality=personality))
+        a_ego = float(planner.output_a_target)
+      steady[name] = a_ego
+    self.assertGreater(steady["aggressive"], steady["standard"])
+    self.assertGreater(steady["standard"], steady["relaxed"])
 
   def test_the_handover_is_absorbed_by_the_jerk_limit_closed_loop(self):
     """Fly the planner at a stopped lead from outside the handover distance and integrate: the step
