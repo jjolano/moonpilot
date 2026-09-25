@@ -12,6 +12,7 @@ from openpilot.selfdrive.ui.onroad.cameraview import CameraView
 from openpilot.system.ui.lib.application import gui_app
 from openpilot.common.transformations.camera import DEVICE_CAMERAS, DeviceCameraConfig, view_frame_from_device_frame
 from openpilot.common.transformations.orientation import rot_from_euler
+from moonpilot.longitudinal import moonpilot_longitudinal_active  # moonpilot seam, see AGENTS.md
 from moonpilot.ui.onroad import moonpilot_status_color  # moonpilot seam, see AGENTS.md
 from moonpilot.ui.offroad_mode import long_press  # moonpilot seam, see AGENTS.md
 
@@ -115,7 +116,8 @@ class AugmentedRoadView(CameraView):
     rl.draw_rectangle_rounded_lines_ex(border_rect, border_roundness, 10, UI_BORDER_SIZE, border_color)
 
   def _switch_stream_if_needed(self, sm):
-    if sm['selfdriveState'].experimentalMode and WIDE_CAM in self.available_streams:
+    wide_cam_wanted = sm['selfdriveState'].experimentalMode or moonpilot_longitudinal_active(ui_state.CP, ui_state.params)  # moonpilot seam, see AGENTS.md
+    if wide_cam_wanted and WIDE_CAM in self.available_streams:
       v_ego = sm['carState'].vEgo
       if v_ego < WIDE_CAM_MAX_SPEED:
         target = WIDE_CAM

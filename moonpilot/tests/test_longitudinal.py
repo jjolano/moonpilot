@@ -87,6 +87,7 @@ from moonpilot.longitudinal import (
   lead_state_at,
   model_candidate,
   model_release,
+  moonpilot_longitudinal_active,
   moonpilot_longitudinal_planner,
   policy,
   required_decel,
@@ -1845,6 +1846,35 @@ class TestPlannerSeam(unittest.TestCase):
     self.assertIsInstance(moonpilot_longitudinal_planner(_cp(), _params(on=True)), MoonpilotLongitudinalPlanner)
     self.assertIsNone(moonpilot_longitudinal_planner(_cp(), _params(on=False)))
     self.assertIsNone(moonpilot_longitudinal_planner(_cp(openpilot_longitudinal=False), _params(on=True)))
+
+
+class TestPlannerActivePredicate(unittest.TestCase):
+  """`moonpilot_longitudinal_active`: the factory's own decision, readable without building a planner.
+
+  The UI asks it inside the render loop — the road view widens the displayed camera below its speed
+  threshold when the fork planner is the one in place — so the load-bearing property is that it can
+  never disagree with what plannerd actually constructed.
+  """
+
+  def test_it_agrees_with_the_factory_in_every_case(self):
+    for olc in (True, False):
+      for on in (True, False):
+        CP, params = _cp(openpilot_longitudinal=olc), _params(on=on)
+        self.assertEqual(moonpilot_longitudinal_active(CP, params),
+                         moonpilot_longitudinal_planner(CP, params) is not None,
+                         msg=f"openpilot_longitudinal={olc} param_on={on}")
+
+  def test_no_carp_params_yet_is_not_active(self):
+    """`ui_state.CP` stays None until `carParams` lands, and this runs on the render path"""
+    self.assertFalse(moonpilot_longitudinal_active(None, _params(on=True)))
+    self.assertIsNone(moonpilot_longitudinal_planner(None, _params(on=True)))
+
+  def test_both_ui_trees_widen_the_camera_on_it(self):
+    """Two files, one decision: tizi and mici are separate trees and either one alone would leave a
+    device showing a camera the fork's planner never asked for."""
+    for tree in ("ui/onroad", "ui/mici/onroad"):
+      text = (ROOT / "openpilot" / "selfdrive" / tree / "augmented_road_view.py").read_text()
+      self.assertTrue("moonpilot_longitudinal_active(ui_state.CP, ui_state.params)" in text, msg=tree)
 
 
 class TestModelBraking(unittest.TestCase):

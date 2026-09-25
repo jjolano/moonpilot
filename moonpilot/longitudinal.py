@@ -1402,9 +1402,22 @@ class MoonpilotLongitudinalPlanner:
     pm.send('longitudinalPlan', plan_send)
 
 
+def moonpilot_longitudinal_active(CP, params: Params | None = None) -> bool:
+  """Whether the fork's planner is the one in place on this car, without building one.
+
+  The same decision `moonpilot_longitudinal_planner` makes, so the two cannot disagree — the UI
+  asks this to widen the displayed road camera below its speed threshold when the fork planner is
+  driving, and a fork planner that is not in place must not have that say. `CP` is None until
+  `carParams` lands, which reads as "not yet" rather than as a verdict on the car.
+  """
+  if CP is None:
+    return False
+  return bool(enabled(LONGITUDINAL, params or Params()) and CP.openpilotLongitudinalControl)
+
+
 def moonpilot_longitudinal_planner(CP, params: Params | None = None) -> MoonpilotLongitudinalPlanner | None:
   """The seam's fork side: the fork planner when the driver wants it, None to leave upstream's in
   place. The param is read once, here, so the toggle takes a restart."""
-  if not (enabled(LONGITUDINAL, params or Params()) and CP.openpilotLongitudinalControl):
+  if not moonpilot_longitudinal_active(CP, params):
     return None
   return MoonpilotLongitudinalPlanner(CP)
