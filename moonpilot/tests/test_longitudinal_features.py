@@ -168,7 +168,7 @@ class TestCurveSpeed(unittest.TestCase):
     self.assertAlmostEqual(command(model_age_s=0.05, recv_age_s=0.5), command(model_age_s=0.0), delta=1e-12)
 
   def test_the_pre_brake_is_the_terms_own_floor_at_the_deepest_point(self):
-    """At 30 m/s even a 60 m approach to a 21.79 m/s target needs more than the term's authority, so
+    """At 30 m/s even a 60 m approach to the 250 m-radius curve's ~20.6 m/s target needs more than the term's authority, so
     what bounds this is `MOONPILOT_CURVE_ACCEL_MIN` and not the geometry — the actuator's own
     `ACCEL_MIN` is never reached, which is the point of the term's floor."""
     planner = _planner()
@@ -182,9 +182,9 @@ class TestCurveSpeed(unittest.TestCase):
     onset, and the floor is well below it — the term is a braking authority that converges on the
     target, not a speed limiter with its own dynamics.
 
-    `MOONPILOT_CURVE_PREVIEW_T` admits 4 s of path, ~100 m at 25 m/s, and slowing 25 to 21.79 at the
-    term's -1.5 m/s^2 floor needs 50 m, so the approach is inside the term's authority. At 30 m/s the
-    same arithmetic does not close — 142 m of braking against a 117 m preview — which is why this
+    `MOONPILOT_CURVE_PREVIEW_T` admits 4 s of path, ~100 m at 25 m/s, and slowing 25 to 20.62 at the
+    term's -1.5 m/s^2 floor needs about 67 m, so the approach is inside the term's authority. At 30 m/s the
+    same arithmetic does not close — 158 m of braking against a 117 m preview — which is why this
     flies at 25.
     """
     v_target = math.sqrt(MOONPILOT_CURVE_A_LAT / self.CLOSED_LOOP_KAPPA)

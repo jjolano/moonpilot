@@ -123,6 +123,12 @@ class TestCurveTargets(unittest.TestCase):
     expected = math.sqrt(MOONPILOT_CURVE_A_LAT / curv)
     self.assertTrue(np.allclose(target.v, expected, atol=1e-9))
 
+  def test_the_route_calibrated_budget_brakes_a_moderate_entry(self):
+    curv = 0.0045
+    target = curve_targets(_path(curv, v_path=20.0), True)
+    self.assertLess(curve_accel(20.0, float(target.x[0]) - 50.0, target), 0.0)
+    self.assertAlmostEqual(float(target.v[0]), math.sqrt(MOONPILOT_CURVE_A_LAT / curv), delta=1e-5)
+
   def test_a_spurious_curvature_cannot_ask_for_a_stop(self):
     target = curve_targets(_path(0.5), True)
     self.assertTrue(np.allclose(target.v, MOONPILOT_CURVE_V_MIN, atol=1e-9))
@@ -277,9 +283,9 @@ class TestHoldSpeed(unittest.TestCase):
 
 class TestLatAccelHold(unittest.TestCase):
   def test_it_is_proportional_on_the_speed_error(self):
-    curv = 0.008
+    curv = 0.005
     v_hold = hold_speed(curv, 20.0, MOONPILOT_CURVE_A_LAT, False, True)
-    self.assertAlmostEqual(lat_accel_hold(18.0, v_hold), 0.6 * (v_hold - 18.0), delta=1e-9)
+    self.assertAlmostEqual(lat_accel_hold(19.8, v_hold), 0.6 * (v_hold - 19.8), delta=1e-9)
 
   def test_it_clamps_at_the_terms_floor(self):
     v_hold = hold_speed(0.008, 20.0, MOONPILOT_CURVE_A_LAT, False, True)

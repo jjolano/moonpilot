@@ -52,6 +52,7 @@ from moonpilot.longitudinal import (
   MOONPILOT_FLOOR_ADMISSION_BP,
   MOONPILOT_FLOOR_ADMISSION_V,
   MOONPILOT_FOLLOW_CUSHION,
+  MOONPILOT_FOLLOW_TAPER_M,
   MOONPILOT_JERK_EMERGENCY,
   MOONPILOT_JERK_DOWN,
   MOONPILOT_JERK_LAUNCH,
@@ -75,6 +76,8 @@ from moonpilot.longitudinal import (
   MOONPILOT_STOP_REST,
   MOONPILOT_STOP_TAPER_T,
   MOONPILOT_T_FOLLOW,
+  MOONPILOT_T_FOLLOW_SLEW_DOWN,
+  MOONPILOT_T_FOLLOW_SLEW_UP,
   MOONPILOT_TTC_TARGET,
   MOONPILOT_TTC_TARGET_BP,
   MOONPILOT_TTC_TARGET_V,
@@ -364,6 +367,20 @@ class TestPolicyFunctions(unittest.TestCase):
     self.assertGreater(min(gap_errors), -MOONPILOT_FOLLOW_CUSHION)
     self.assertAlmostEqual(v_ego, v_lead, delta=1e-3)
     self.assertAlmostEqual(gap_errors[-1], 0.0, delta=1e-3)
+
+  def test_positive_follow_ask_tapers_before_a_slower_lead_reaches_the_target(self):
+    t_follow = MOONPILOT_T_FOLLOW[int(Personality.standard)]
+    v_ego, v_lead = 16.0, 15.99
+    target = _gap_target(v_ego, t_follow)
+    far = lead_accel(v_ego, target + MOONPILOT_FOLLOW_TAPER_M, v_lead, 0.0, t_follow)
+    mid = lead_accel(v_ego, target + 0.5 * MOONPILOT_FOLLOW_TAPER_M, v_lead, 0.0, t_follow)
+    near = lead_accel(v_ego, target + 0.05, v_lead, 0.0, t_follow)
+    self.assertGreater(far, mid)
+    self.assertGreater(mid, near)
+    self.assertGreater(near, 0.0)
+    self.assertLess(lead_accel(v_ego, target + 0.05, 15.0, 0.0, t_follow), near)
+    self.assertLess(lead_accel(v_ego, target - 1.0, v_lead, 0.0, t_follow), 0.0)
+    self.assertGreater(lead_accel(v_ego, target + 1.0, v_ego + 1.0, 0.0, t_follow), 0.0)
 
   def test_low_speed_lead_braking_coasts_then_yields_to_safety_and_recovery(self):
     CP = _cp()
@@ -1475,6 +1492,31 @@ class TestPlanner(unittest.TestCase):
       self.assertAlmostEqual(_planner(params_on=False)._t_follow(sm), base, delta=1e-9)
     self.assertAlmostEqual(_planner()._t_follow(_inputs(lead=_lead(35.0, 20.0))), base, delta=1e-9)
 
+  def test_time_gap_handoff_is_smooth_and_resets_without_a_lead(self):
+    out_of_path = custom.MoonpilotState.LeadTrajectory.new_message()
+    out_of_path.present = True
+    out_of_path.inPath = 0.0
+    in_path = custom.MoonpilotState.LeadTrajectory.new_message()
+    in_path.present = True
+    in_path.inPath = 1.0
+    lead = _lead(35.0, 20.0)
+    planner = _planner()
+    base = MOONPILOT_T_FOLLOW[Personality.standard]
+    target = base * MOONPILOT_OUT_OF_PATH_T_FOLLOW
+
+    self.assertAlmostEqual(planner._t_follow(_inputs(lead=lead, moonpilot_leads=[in_path])), base, delta=1e-9)
+    leaving = [planner._t_follow(_inputs(lead=lead, moonpilot_leads=[out_of_path])) for _ in range(100)]
+    self.assertGreater(leaving[0], target)
+    self.assertAlmostEqual(leaving[-1], target, delta=1e-9)
+    self.assertLessEqual(max(a - b for a, b in zip(leaving, leaving[1:], strict=False)), MOONPILOT_T_FOLLOW_SLEW_DOWN * DT_MDL + 1e-9)
+
+    returning = [planner._t_follow(_inputs(lead=lead, moonpilot_leads=[in_path])) for _ in range(100)]
+    self.assertLess(returning[0], base)
+    self.assertAlmostEqual(returning[-1], base, delta=1e-9)
+    self.assertLessEqual(max(b - a for a, b in zip(returning, returning[1:], strict=False)), MOONPILOT_T_FOLLOW_SLEW_UP * DT_MDL + 1e-9)
+
+    self.assertAlmostEqual(planner._t_follow(_inputs(moonpilot_leads=[in_path])), base, delta=1e-9)
+
   def test_time_gap_reads_the_personality_off_the_message(self):
     """The table is keyed by the enum's raw value because the enum read off a message is a capnp
     _DynamicEnum whose hash is not that value — keyed by the schema members this silently returned
@@ -1966,6 +2008,23 @@ class TestModelBraking(unittest.TestCase):
             candidate = model_candidate(model, False, True)
             braked, _ = policy(v_ego, leads, v_cruise, t_follow, False, candidate, 0.0, CP, -0.3, True)
             self.assertLessEqual(braked, deterministic + 1e-12)
+
+  def test_a_low_speed_leadless_model_stop_enters_the_stop_hold_early(self):
+    planner = _planner()
+    planner.update(_inputs(v_ego=20.0, v_cruise_kph=62.0, model_accel=-1.0))
+    for _ in range(20):
+      planner.update(_inputs(v_ego=1.0, v_cruise_kph=62.0, model_accel=-0.46))
+    self.assertTrue(planner.output_should_stop)
+    self.assertEqual(planner.source, Source.e2e)
+
+    with_lead = _planner()
+    with_lead.update(_inputs(v_ego=20.0, v_cruise_kph=62.0, model_accel=-1.0))
+    for _ in range(20):
+      with_lead.update(_inputs(v_ego=1.0, v_cruise_kph=62.0, model_accel=-0.46, lead=_lead(6.0, 0.2)))
+    self.assertFalse(with_lead.output_should_stop)
+
+    planner.update(_inputs(v_ego=1.0, v_cruise_kph=62.0, model_accel=0.15))
+    self.assertFalse(planner.output_should_stop)
 
   def test_a_stop_the_model_began_is_a_stop_the_model_finishes(self):
     """Route 000003d2's defect, closed-loop: the model braked a clear-road stop from 17 m/s and its

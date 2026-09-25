@@ -53,7 +53,7 @@ from opendbc.car.interfaces import ACCEL_MAX
 from moonpilot.lead import resample  # the fork's one interpolation entry point, shared rather than re-derived
 
 MOONPILOT_CURVE_T_IDX = np.array(ModelConstants.T_IDXS)  # the model path's own time grid
-MOONPILOT_CURVE_A_LAT = 1.9  # m/s^2; lateral accel a curve is worth taking at
+MOONPILOT_CURVE_A_LAT = 1.7  # m/s^2; lateral accel a curve is worth taking at
 MOONPILOT_CURVE_A_LAT_MIN = 1.0  # m/s^2; floor after the bank correction, so a large roll cannot zero the budget
 MOONPILOT_CURVE_J_LAT = 3.0  # m/s^3; lateral jerk the entry is shaped to, below upstream's 5.0 ISO command limit
 MOONPILOT_CURVE_JERK_STEP = 2.0  # m; the length the jerk ceiling's |dk/ds| is measured over, rather than

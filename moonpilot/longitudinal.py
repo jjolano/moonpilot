@@ -149,6 +149,8 @@ MOONPILOT_T_FOLLOW = {
   int(Personality.standard): 1.45,
   int(Personality.aggressive): 1.25,
 }
+MOONPILOT_T_FOLLOW_SLEW_DOWN = 0.5
+MOONPILOT_T_FOLLOW_SLEW_UP = 2.0
 MOONPILOT_K_GAP = 0.3  # 1/s^2 on the spacing error
 MOONPILOT_K_V = 0.6  # 1/s on the relative speed
 MOONPILOT_FOLLOW_CUSHION = 1.0  # m; a closing approach may spend this much of the nominal gap before
@@ -157,6 +159,7 @@ MOONPILOT_FOLLOW_CUSHION = 1.0  # m; a closing approach may spend this much of t
 # gap, then vanishes as ego becomes slower so the same regulator smoothly reopens the exact time gap.
 # It also tapers out before the time-gap target reaches the standstill floor. TTC and stopping-floor
 # terms never read it.
+MOONPILOT_FOLLOW_TAPER_M = 3.0
 MOONPILOT_APPROACH_DECEL = 1.0  # m/s^2; the spacing regulator's braking authority, and the
 # decel the approach term binds past — one number, so the
 # two terms meet at the same output
@@ -357,6 +360,7 @@ MOONPILOT_MODEL_BRAKE_THRESHOLD = -0.5  # m/s^2; outside experimental mode the m
 # exactly experimental mode's stop contract: held while the model's ask is under 0.1.
 MOONPILOT_MODEL_STOP_SPEED = 5.0  # m/s
 MOONPILOT_MODEL_STOP_RELEASE = 0.1  # m/s^2; `should_stop`'s threshold
+MOONPILOT_MODEL_STOP_ENTER_SPEED = 1.5  # m/s
 MOONPILOT_CRASH_DISTANCE = 0.25  # m; FCW contact margin
 MOONPILOT_FCW_DECEL = -4.0  # m/s^2 required decel that means it cannot be avoided
 MOONPILOT_FCW_COUNT = 2  # frames above threshold before FCW latches
@@ -636,6 +640,8 @@ def lead_accel(v_ego, gap, v_lead, a_lead, t_follow) -> float:
   )
   a_track = crawl_accel(a_track, v_ego, v_lead, a_lead)
   a_track = departure_crawl(a_track, v_ego, v_lead, a_lead)
+  if a_track > 0.0 and v_ego > v_lead_match and gap > gap_target:
+    a_track *= min(1.0, (gap - gap_target) / MOONPILOT_FOLLOW_TAPER_M)
   closing = v_ego - v_lead_eff
   if closing <= 0.0:
     return a_track  # not closing: nothing to brake for
@@ -901,6 +907,7 @@ class MoonpilotLongitudinalPlanner:
     self.allow_throttle = True
     self.source = LongitudinalPlanSource.cruise
     self.model_braking = False  # the model held a braking slot last frame: `model_release` applies
+    self.t_follow = None
     self.solve_time = 0.0
 
     self.v_desired_trajectory = np.zeros(CONTROL_N)
@@ -1217,7 +1224,14 @@ class MoonpilotLongitudinalPlanner:
     # to keep out of `LongControlState.stopping`, so admitting it here would undo that fix from the
     # other side.
     trailing = v_ego > MOONPILOT_SHOULD_STOP_SPEED and any(s == source and v_lead > MOONPILOT_SHOULD_STOP_SPEED for s, _, v_lead, _ in lead_states)
-    self.output_should_stop = (should_stop(v_ego, a_target) and not trailing) or (e2e and sm['modelV2'].action.shouldStop)
+    model_stop = (
+      not e2e
+      and self.model_braking
+      and not leads
+      and v_ego <= MOONPILOT_MODEL_STOP_ENTER_SPEED
+      and a_target < 0.0
+    )
+    self.output_should_stop = (should_stop(v_ego, a_target) and not trailing) or (e2e and sm['modelV2'].action.shouldStop) or model_stop
     self.output_a_target = a_target
     self.source = source
     # Persist the learned value *and its evidence* so the next boot continues from where this drive
@@ -1365,9 +1379,26 @@ class MoonpilotLongitudinalPlanner:
     # KeyError is not possible for the three current members; an upstream fourth would fall back to
     # the standard gap rather than raise in plannerd.
     base = MOONPILOT_T_FOLLOW.get(personality, MOONPILOT_T_FOLLOW[int(Personality.standard)])
-    if enabled(LEAD_LATERAL, self.params):
-      base *= float(np.interp(nearest_lead_in_path(sm), [0.0, 1.0], [MOONPILOT_OUT_OF_PATH_T_FOLLOW, 1.0]))
-    return base
+    lateral = enabled(LEAD_LATERAL, self.params)
+    target = base
+    if lateral:
+      target *= float(np.interp(nearest_lead_in_path(sm), [0.0, 1.0], [MOONPILOT_OUT_OF_PATH_T_FOLLOW, 1.0]))
+
+    lead = sm['radarState'].leadOne
+    if not lead.present:
+      self.t_follow = base
+      return base
+    if self.t_follow is None:
+      self.t_follow = target
+
+    if not lateral:
+      self.t_follow = base
+      return base
+    if target < self.t_follow:
+      self.t_follow = max(target, self.t_follow - MOONPILOT_T_FOLLOW_SLEW_DOWN * self.dt)
+    else:
+      self.t_follow = min(target, self.t_follow + MOONPILOT_T_FOLLOW_SLEW_UP * self.dt)
+    return self.t_follow
 
   def _err_bp(self, sm):
     """The speed-error breakpoints for this frame's personality: the measured axis scaled by
