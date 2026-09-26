@@ -27,7 +27,7 @@ from unittest import mock
 import numpy as np
 
 from moonpilot import models
-from moonpilot.tests.test_models import FakeParams
+from moonpilot.tests.test_models import FakeParams, profile_document
 
 ROOT = Path(__file__).resolve().parents[2]
 RECIPE = "a" * 64
@@ -167,6 +167,7 @@ class TestEntries(unittest.TestCase):
     os.makedirs(models.package_dir(recipe), exist_ok=True)
     with open(os.path.join(models.package_dir(recipe), "recipe.json"), "w", encoding="utf-8") as handle:
       handle.write(raw)
+    models.write_json(os.path.join(models.package_dir(recipe), "profile.json"), profile_document("comma/test/v1"))
     with open(os.path.join(models.package_dir(recipe), digest), "wb") as handle:
       handle.write(artifact_bytes)
     self.selection = recipe
@@ -326,6 +327,13 @@ class TestMonitoringParse(unittest.TestCase):
 class TestBuildAgreement(unittest.TestCase):
   """The two facts `moonpilot/modelbuild.py` and the device must agree on, which nothing else
   checks: the compile flags, and the pickle format the runtime loads."""
+
+  def setUp(self):
+    self.tmp = tempfile.TemporaryDirectory()
+    self.addCleanup(self.tmp.cleanup)
+    patcher = mock.patch.object(models.paths, "data_dir", lambda feature: os.path.join(self.tmp.name, feature))
+    patcher.start()
+    self.addCleanup(patcher.stop)
 
   def test_tg_flags_match_the_sconscript(self):
     # The device's string is a plain QCOM literal, so compare it directly rather than from

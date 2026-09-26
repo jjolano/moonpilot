@@ -6,6 +6,7 @@ import signal
 import subprocess
 import tarfile
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from typing import cast
@@ -115,7 +116,18 @@ class TestInstall(unittest.TestCase):
       shutil.copy(shell, target)
       running = subprocess.Popen([target, "-c", "while :; do :; done"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
       try:
-        self.assertEqual(os.readlink(f"/proc/{running.pid}/exe"), target, "not executing the installed path")
+        deadline = time.monotonic() + 1.0
+        while True:
+          try:
+            running_exe = os.readlink(f"/proc/{running.pid}/exe")
+            break
+          except FileNotFoundError:
+            if running.poll() is not None:
+              self.fail("test process exited before exec")
+            if time.monotonic() >= deadline:
+              self.skipTest("sandbox hides /proc/<pid>/exe")
+            time.sleep(0.01)
+        self.assertEqual(running_exe, target, "not executing the installed path")
         tailscale.install(_VERSION, _URL, _SHA)
       finally:
         running.kill()

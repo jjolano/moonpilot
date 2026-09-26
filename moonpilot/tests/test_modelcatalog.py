@@ -27,6 +27,7 @@ else:
 
 
 from moonpilot import modelcatalog, models
+from moonpilot.tests.test_models import profile_document
 from moonpilot.vendor.openmodels import client, contracts, metadata
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -326,6 +327,7 @@ class TestInterfaceVerification(TempStoreCase):
     os.makedirs(models.package_dir(recipe), exist_ok=True)
     with open(os.path.join(models.package_dir(recipe), "recipe.json"), "w", encoding="utf-8") as handle:
       handle.write(raw)
+    models.write_json(os.path.join(models.package_dir(recipe), "profile.json"), profile_document("comma/test/v1"))
     os.symlink(source, os.path.join(models.package_dir(recipe), "e" * 64))
     return recipe
 
