@@ -10,9 +10,19 @@ is:
     ``gap == max(STOP_DISTANCE, t_follow * v_ego)``, with a one-meter inward cushion while closing
     and relative-speed recovery after the cushion is spent;
     the standstill distance is a floor under the headway rather than an offset on top of it;
+    its *positive* side carries less authority above 20 m/s (``MOONPILOT_POS_AUTH_V``), because a
+    regulator stiff enough to be responsive up there saturates the cruise candidate's fast-accel
+    rung and hands the whole follow response to a constant — see that constant for the measurement;
+    and its *negative* side is not the gap target's to enforce while the ego is the slower car: the
+    1.45 s headway is unreachable at whatever speed the lead chooses, so following at a set speed
+    above the lead's would otherwise mean braking to the lead's pace and staying there
+    (``MOONPILOT_FOLLOW_SPEED_FLOOR_HEADWAY_T``);
   - the time gap itself, biased by ``MoonpilotLeadLateral`` when the lead is predicted to leave the
     path — the fork's lateral prediction reaches the longitudinal policy here, since there is no
-    MPC danger zone to scale;
+    MPC danger zone to scale. That prediction is a two-state, hysteretic claim rather than a
+    continuous scale, because ``inPath`` at highway speed is mostly the model's own lateral
+    uncertainty and a linear map from it put a moving target under the regulator
+    (``MOONPILOT_OUT_OF_PATH_ENTER``);
   - a time-to-collision approach term that takes over once the headway it wants passes the
     regulator's braking authority, and behind it a stopping floor — the old kinematic term kept as a
     bound, since a proportional TTC term ramps rather than stops and binds too late above ~34 m/s.
@@ -160,6 +170,52 @@ MOONPILOT_FOLLOW_CUSHION = 1.0  # m; a closing approach may spend this much of t
 # It also tapers out before the time-gap target reaches the standstill floor. TTC and stopping-floor
 # terms never read it.
 MOONPILOT_FOLLOW_TAPER_M = 3.0
+# The headway below which the gap is a safety argument rather than a comfort one, and so the only
+# thing that may enforce it is the brake. 1.0 s: the driver's own highway-speed follow on the manual
+# corpus rides a 2.56 s median headway with a p10 of 1.55 s (10,949 frames, 255 segments, routes
+# 000003c2/c6/c8 and 000003bc), so this sits a third below the driver's own worst decile and half
+# below `t_follow`. Its only consumer is the speed floor in `lead_accel`, and the direction it errs
+# in is the safe one: too high and the car holds a short headway, too low and it sheds speed to
+# satisfy a headway the lead itself set.
+MOONPILOT_FOLLOW_SPEED_FLOOR_HEADWAY_T = 1.0
+# How fast the lead may be slowing before the gap becomes a reason to brake again. -0.1 m/s^2, which
+# is `LeadAccelEstimator`'s own noise floor against a lead holding speed (its error against a centered
+# reference is 0.19 m/s^2 sd on the corpus, so this is a permissive bound, not a tight one) and well
+# under the -0.5 a real onset reads within 0.1 s. The direction it errs in is the safe one: too
+# permissive and the car coasts for a moment into a lead's brake, which the suite measured as 2.5 m
+# of lost end gap on a mid-approach brake.
+MOONPILOT_FOLLOW_SPEED_FLOOR_MIN_A_LEAD = -0.1
+# The positive side's authority: a multiplier on the regulator's output, and only on the output, and
+# only where it is already positive. 1.0 at and below 20 m/s, so the whole low-speed follow law — every
+# approach, every stop, every maneuver this fork has already been driven on — is bit-identical to what
+# it was; above it the spacing regulator can no longer reach the cruise ladder's saturated fast-accel
+# rung, which is what turned a proportional response into a step.
+#
+# Why the output and not the two terms: the terms carry opposite signs whenever the ego is both too
+# far back and too fast, and scaling them individually moves that *sum* toward zero — a state that
+# braked at the -1.0 approach clamp reads -0.84 under a 0.35 authority. `test_the_multipliers_move_
+# the_positive_side_and_nothing_else` is that measurement, and it is why this is one number.
+#
+# The measured fault, route 000003df segment 17, 53.5-55.5 s: a lead pulling away at ~0.8 m/s^2 with
+# the gap 1.5 m past its own target. The old regulator read +0.99 there, so `policy`'s `min` handed
+# the whole positive side to the cruise ladder's flat +0.87 for two seconds — the surge from the seat,
+# while the ego trailed by 0.4-0.95 m/s and the gap opened 3 m. Upstream's MPC, fed the identical
+# radarState at the identical tick, read +0.27..+0.41 and wanted *more* distance than this planner
+# does (33-40 m against 31 m): the difference is the response shape, not the spacing target. 0.35 is
+# what puts this regulator on upstream's number, and it moves the point at which the speed term alone
+# reaches the rung from 1.45 m/s of lag — which was exactly the rung — out to 4.4.
+#
+# The ramp is deliberately narrow (20 to 22 m/s, 72 to 79 kph). The rung it has to stay under is
+# already flat above 17.5 m/s, so this is the band where the ladder rather than the follow law was
+# setting the magnitude, and a gain that finished falling at 25 would still have been 0.68 at 22 —
+# back inside the range the drive complained about. Above 22 m/s it eases to 0.28 by 30.
+#
+# One cost, stated: the positive region is `[[0, -1], [f*K_GAP, -f*K_V]]`, so the damping ratio
+# scales as sqrt(f) — 0.33 here against 0.55, with the period stretching from 11 s to 19 s. That is
+# the price of a three-times gentler ask, the closed-loop suite still settles, and a slow drift of a
+# meter or two over twenty seconds is a better thing to feel than a two-second step.
+MOONPILOT_POS_AUTH_V_BP = [0.0, 20.0, 22.0, 30.0]  # m/s
+MOONPILOT_POS_AUTH_V = [1.0, 1.0, 0.35, 0.28]
 MOONPILOT_APPROACH_DECEL = 1.0  # m/s^2; the spacing regulator's braking authority, and the
 # decel the approach term binds past — one number, so the
 # two terms meet at the same output
@@ -260,6 +316,32 @@ MOONPILOT_LEAD_BRAKE_SUSTAIN_T = 2.0  # s; how long `stopping_decel` assumes a b
 MOONPILOT_A_LEAD_MIN = -10.0  # m/s^2; bounds on a lead's accel estimate, upstream's (long_mpc.process_lead)
 MOONPILOT_A_LEAD_MAX = 5.0
 MOONPILOT_OUT_OF_PATH_T_FOLLOW = 0.7  # time-gap scale for a lead predicted to leave the path
+# ...and the evidence that asks for it, as a two-state decision with hysteresis rather than a
+# continuous scale. `moonpilot.lead.inPath` is a probability that the lead's own lateral Gaussian
+# lies inside the ego path corridor, evaluated over a 4 s horizon and filtered with an instant rise
+# and a 1.0 s decay. Two things about it are measured, on route 000003df segments 5, 13, 17 and 18,
+# 689 samples where radard's yRel and the published inPath for the same slot agree within 0.25 s:
+#
+#   lead                 n     inPath median   p10    p90
+#   in lane (<1.8 m)   621        0.54        0.23   0.92
+#   adjacent (>3 m)     50        0.13        0.02   0.95
+#
+# So the number is a real signal but a weak one — corr(|yRel|, inPath) is -0.22, and the p90s nearly
+# touch — and mapping it linearly onto a time gap was the mistake. A lead the car was comfortably
+# following in lane read 0.54 at best and 0.23 at its p10, so the linear map delivered a permanent
+# 1.10-1.30 s headway where the personality asks 1.45: a 36 m target silently given as 28-33 m,
+# breathing with the estimate. That is a moving target under a proportional regulator, which is the
+# second half of the reported fault.
+#
+# These two thresholds are the fix, and 0.10 is where the separation is: it fires on 4.2 % of in-lane
+# leads and 46.9 % of adjacent-lane ones, the best ratio available (0.20 gives 7.6 % against 63.3 %,
+# 0.30 gives 15.6 % against 67.3 %, and above 0.40 the in-lane false-fires double). The reduction is
+# a claim about the lead *leaving*, it takes strong evidence for it, and it latches until the
+# evidence is clearly gone — the band between the two is the hysteresis, wide enough that inPath's own
+# jitter cannot cross it. The failure direction is the safe one: inPath that says nothing leaves the
+# car at the personality's own headway, and the only thing the feature can fail to do is close up.
+MOONPILOT_OUT_OF_PATH_ENTER = 0.10
+MOONPILOT_OUT_OF_PATH_LEAVE = 0.30
 # The driver's ladder: one accel per named driving state, measured from ~4 h of manual longitudinal
 # on the RAV4 (308 segments: `~/route-corpus` plus routes 000003c2/c6/c8 and 000003bc; stock ACC off,
 # gear drive). The planner interpolates between rungs instead of scaling a gain, so what it asks for
@@ -544,6 +626,16 @@ def crawl_accel(a_track, v_ego, v_lead, a_lead) -> float:
   return a_track + w * (MOONPILOT_FAST_CRAWL - a_track)
 
 
+def pos_authority(v_ego) -> float:
+  """The multiplier on the spacing regulator's output where that output is positive.
+
+  One reader, so nothing can apply it to the terms instead of the result — the terms carry opposite
+  signs whenever the ego is both too far back and too fast, and scaling them individually moves that
+  sum toward zero, i.e. weakens a brake. 1.0 at and below 20 m/s.
+  """
+  return float(np.interp(v_ego, MOONPILOT_POS_AUTH_V_BP, MOONPILOT_POS_AUTH_V))
+
+
 def departure_crawl(a_track, v_ego, v_lead, a_lead) -> float:
   """The spacing regulator's ask, floored at the crawl a lead pulling away is owed before the gap has
   reopened.
@@ -634,10 +726,57 @@ def lead_accel(v_ego, gap, v_lead, a_lead, t_follow) -> float:
     closing_match * MOONPILOT_K_V / MOONPILOT_K_GAP,
     max(t_follow * v_ego - MOONPILOT_STOP_DISTANCE, 0.0),
   )
+  a_track = MOONPILOT_K_GAP * (gap - gap_target + gap_cushion) + MOONPILOT_K_V * (v_lead_match - v_ego)
+  if a_track > 0.0:
+    a_track *= pos_authority(v_ego)
   a_track = max(
-    MOONPILOT_K_GAP * (gap - gap_target + gap_cushion) + MOONPILOT_K_V * (v_lead_match - v_ego),
+    a_track,
     -MOONPILOT_APPROACH_DECEL,
   )
+  # The time gap is not a reason to brake while the ego is the slower car. Every settled follow at a
+  # set speed above the lead's is in that state — the ego sits inside `gap_target` at whatever speed
+  # the lead chooses — and the gap term alone then asks for the full approach brake. Measured on
+  # route 000003df segments 17-18: 30 m behind a lead holding 24 m/s with the set speed at 111 kph,
+  # `a_track` reads -1.00 at 24, 25 and 26 m/s, i.e. at *exactly* the lead's speed too, and -1.00 at a
+  # 10 m gap with the ego 1 m/s slower, while `stopping_decel` reads -0.00 to -0.08 in the same states.
+  # Nothing there needs stopping for; the command is the headway the lead itself set, bought with the
+  # throttle shut. That is the ego decaying to below the lead's speed and staying there.
+  #
+  # So the response is to keep pace instead, and the floor is the speed the regulator matches. Four
+  # conditions, and each is a distinct way this could be wrong — all four found by the suite.
+  #
+  # `v_lead_match >= v_ego` — the floor's own value is the speed match, so it must be inert where the
+  # ego is the *faster* car: there the closing approach and its cushion are the whole mechanism, and
+  # holding the command at zero let a fly cross 7.5 m inside the target against a 1 m cushion. Equal
+  # counts, because "at the lead's speed" is exactly the state the floor exists for.
+  # `a_track < 0` — the floor raises a *negative* ask. Where the ask is already positive the scaled
+  # regulator owns it, and letting the unscaled floor raise that would undo the authority above (at
+  # the measured surge state it read +0.54 against the authority's +0.33).
+  # `a_lead > MOONPILOT_FOLLOW_SPEED_FLOOR_MIN_A_LEAD` — the lead is not slowing. Without this the
+  # floor is wrong in the most expensive direction, and quietly: holding the ego's speed against a
+  # lead braking at -3.5 makes the ego relatively *faster*, so the gap closes instead of opening —
+  # `test_mid_approach_lead_brake_stays_safe` lost 2.5 m of end gap. The 0.5 s braking credit inside
+  # `v_lead_eff` buys grace exactly where grace is not wanted. `LeadAccelEstimator` reads a real
+  # onset inside 0.1 s, so a bound at -0.1 keeps estimator noise out without keeping the brake.
+  # the headway — below `MOONPILOT_FOLLOW_SPEED_FLOOR_HEADWAY_T` the gap *is* the safety argument
+  # rather than a comfort one, and the full brake stands. This also keeps the hole this would
+  # otherwise open narrow and honest, because the fork has no other term that brakes a short headway
+  # when the ego is the slower car: TTC is skipped entirely, being a function of closing rate, and the
+  # stopping floor is shallow against a lead that is not itself slowing.
+  # `v_ego > MOONPILOT_CREEP_SPEED` — a moving follow, not a hold. At rest the headway test is
+  # vacuous and `v_lead_eff` clamps to zero, so the condition is trivially true and the car would
+  # accelerate away from a stopped lead inside the standstill gap.
+  #
+  # Unscaled, deliberately: this is not a comfort quantity, it is "do not lose the lead's speed".
+  # TTC and the stopping floor are `min`'d on top and still own every case that needs braking.
+  if (
+    a_track < 0.0
+    and v_lead_match >= v_ego
+    and a_lead > MOONPILOT_FOLLOW_SPEED_FLOOR_MIN_A_LEAD
+    and v_ego > MOONPILOT_CREEP_SPEED
+    and gap >= MOONPILOT_FOLLOW_SPEED_FLOOR_HEADWAY_T * v_ego
+  ):
+    a_track = max(a_track, MOONPILOT_K_V * (v_lead_match - v_ego))
   a_track = crawl_accel(a_track, v_ego, v_lead, a_lead)
   a_track = departure_crawl(a_track, v_ego, v_lead, a_lead)
   if a_track > 0.0 and v_ego > v_lead_match and gap > gap_target:
@@ -908,6 +1047,7 @@ class MoonpilotLongitudinalPlanner:
     self.source = LongitudinalPlanSource.cruise
     self.model_braking = False  # the model held a braking slot last frame: `model_release` applies
     self.t_follow = None
+    self.lead_leaving = False
     self.solve_time = 0.0
 
     self.v_desired_trajectory = np.zeros(CONTROL_N)
@@ -1382,11 +1522,18 @@ class MoonpilotLongitudinalPlanner:
     lateral = enabled(LEAD_LATERAL, self.params)
     target = base
     if lateral:
-      target *= float(np.interp(nearest_lead_in_path(sm), [0.0, 1.0], [MOONPILOT_OUT_OF_PATH_T_FOLLOW, 1.0]))
+      # Two-state, hysteretic: see MOONPILOT_OUT_OF_PATH_ENTER. The latch is the whole point — a
+      # continuous map put a moving target under the regulator, and inPath rises instantly.
+      in_path = nearest_lead_in_path(sm)
+      leaving = in_path < (MOONPILOT_OUT_OF_PATH_LEAVE if self.lead_leaving else MOONPILOT_OUT_OF_PATH_ENTER)
+      self.lead_leaving = leaving
+      if leaving:
+        target *= MOONPILOT_OUT_OF_PATH_T_FOLLOW
 
     lead = sm['radarState'].leadOne
     if not lead.present:
       self.t_follow = base
+      self.lead_leaving = False
       return base
     if self.t_follow is None:
       self.t_follow = target
