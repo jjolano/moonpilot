@@ -702,6 +702,7 @@ struct PeripheralState {
 
 struct UsbState {
   devices @0 :List(Device);
+  connected @1 :Bool;
 
   struct Device {
     busnum @0 :UInt8;
