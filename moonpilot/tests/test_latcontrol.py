@@ -12,6 +12,8 @@ from openpilot.common.constants import ACCELERATION_DUE_TO_GRAVITY
 from openpilot.common.realtime import DT_CTRL
 
 from moonpilot.latcontrol import (
+  MOONPILOT_FRICTION_HOLD,
+  MOONPILOT_FRICTION_RELEASE,
   MOONPILOT_JERK_LOOKAHEAD_T,
   MOONPILOT_KI,
   MOONPILOT_MEAS_CUTOFF_HZ,
@@ -200,6 +202,17 @@ class TestMoonpilotLatControlTorque(unittest.TestCase):
 
     self.assertIsNone(moonpilot_latcontrol(CP, CI, DT_CTRL, _params(on=False)))
     self.assertIsInstance(moonpilot_latcontrol(CP, CI, DT_CTRL, _params(on=True)), MoonpilotLatControlTorque)
+
+  def test_friction_holds_through_small_error_crossings(self):
+    lac, _, _ = _controller()
+    self.assertEqual(lac._friction(0.0, 0.0, 0.0), 0.0)
+    self.assertEqual(lac._friction(MOONPILOT_FRICTION_HOLD, 0.0, 0.0), 0.0)
+    self.assertEqual(lac._friction(0.5 * (MOONPILOT_FRICTION_HOLD + MOONPILOT_FRICTION_RELEASE), 0.0, 0.0), 0.0)
+    self.assertGreater(lac._friction(MOONPILOT_FRICTION_RELEASE, 0.0, 0.0), 0.0)
+    self.assertLess(lac._friction(-MOONPILOT_FRICTION_RELEASE, 0.0, 0.0), 0.0)
+    self.assertEqual(lac._friction(0.0, 0.0, 0.0), 0.0)
+    lac.reset()
+    self.assertFalse(lac.friction_hold)
 
   def test_measurement_filter_rejects_a_single_frame_angle_spike(self):
     """A road step on steeringAngleDeg must not land whole in feedback: friction tracks error

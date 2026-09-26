@@ -48,6 +48,8 @@ MOONPILOT_INTEGRATOR_MIN_SPEED = 5.0  # m/s; below it the angle measurement is t
 # Road steps kick steeringAngleDeg hard enough that the friction feedforward (corr ~0.9 with
 # output on a rough-highway route) chases them and weaves; a few Hz still tracks real cornering.
 MOONPILOT_MEAS_CUTOFF_HZ = 8.0
+MOONPILOT_FRICTION_HOLD = 0.05
+MOONPILOT_FRICTION_RELEASE = 0.10
 MOONPILOT_VERSION = 1000  # logged; a fork band upstream's counter will not reach
 
 
@@ -67,6 +69,7 @@ class MoonpilotLatControlTorque(LatControl):
     self.requests = deque([0.0] * self.buffer_len, maxlen=self.buffer_len)
     self.jerk_filter = FirstOrderFilter(0.0, 1 / (2 * np.pi * MOONPILOT_JERK_CUTOFF_HZ), self.dt)
     self.meas_filter = FirstOrderFilter(0.0, 1 / (2 * np.pi * MOONPILOT_MEAS_CUTOFF_HZ), self.dt)
+    self.friction_hold = False
 
   def update_torque_parameters(self, latAccelFactor, latAccelOffset, friction):
     # controlsd calls this whenever torqued publishes a new fit; the limits move with the factor.
@@ -86,6 +89,7 @@ class MoonpilotLatControlTorque(LatControl):
     super().reset()
     self.pid.reset()
     self.jerk_filter.x = 0.0
+    self.friction_hold = False
     # The measurement filter is not reset: it keeps tracking the wheel while inactive, the same
     # way the delay line does, so re-engaging does not start from a stale zero.
 
@@ -105,6 +109,15 @@ class MoonpilotLatControlTorque(LatControl):
     # at the lookahead on a car whose estimated delay is large (lagd publishes up to 0.65 s).
     delay = max(lat_delay - MOONPILOT_JERK_LOOKAHEAD_T, self.dt)
     return self.jerk_filter.update((self._setpoint(delay - self.dt) - self._setpoint(delay + self.dt)) / (2 * self.dt))
+
+  def _friction(self, error, desired_jerk, deadzone):
+    """Keep friction compensation from switching sign inside the near-zero error band."""
+    friction_input = error + MOONPILOT_JERK_GAIN * desired_jerk
+    if abs(friction_input) >= MOONPILOT_FRICTION_RELEASE:
+      self.friction_hold = False
+    elif abs(friction_input) <= MOONPILOT_FRICTION_HOLD:
+      self.friction_hold = True
+    return 0.0 if self.friction_hold else get_friction(friction_input, deadzone, FRICTION_THRESHOLD, self.torque_params)
 
   def update(self, active, CS, VM, params, steer_limited_by_safety, desired_curvature, curvature_limited, lat_delay):
     torque_log = log.ControlsState.LateralTorqueState.new_message()
@@ -139,7 +152,7 @@ class MoonpilotLatControlTorque(LatControl):
     # already supplies, less the learned bias in that roll estimate, plus enough to move the
     # steering against its friction.
     feedforward = desired_lat_accel - params.roll * ACCELERATION_DUE_TO_GRAVITY - self.torque_params.latAccelOffset
-    feedforward += get_friction(error + MOONPILOT_JERK_GAIN * desired_jerk, deadzone, FRICTION_THRESHOLD, self.torque_params)
+    feedforward += self._friction(error, desired_jerk, deadzone)
 
     if not active:
       output_torque = 0.0
