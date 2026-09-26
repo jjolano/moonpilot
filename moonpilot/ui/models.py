@@ -31,7 +31,6 @@ from openpilot.system.ui.widgets import MousePos
 BAR_TRACK = rl.Color(57, 57, 57, 255)
 BAR_FILL = rl.Color(51, 171, 76, 255)
 BAR_WIDTH = 620
-INSTALLED_ROWS = 8
 _CHEVRON_PATH = "icons/chevron_right.png"
 
 
@@ -208,6 +207,7 @@ class ModelsLayout(Page):
           lambda: models.catalog_text(self._status()["catalog"]),
           description=lambda: models.catalog_description(self._status()["catalog"]),
           callback=lambda: models.request(self._params, "refresh"),
+          enabled=lambda: not models.job_active(self._status()["job"]),
         ),
         job,
         cancel,
@@ -225,6 +225,8 @@ class ModelsLayout(Page):
     gui_app.push_widget(ModelTreeDialog(self._params, kind, lambda selection: self._choose(kind, selection), _offroad))
 
   def _choose(self, kind: str, selection: str) -> None:
+    if models.job_active(self._status()["job"]):
+      return
     if selection == models.desired(self._params, kind):
       return
     if not models.is_built(self._params, kind, selection):
@@ -247,8 +249,17 @@ class InstalledLayout(Page):
 
   def __init__(self, params: Params, back: Callable):
     self._params = params
-    rows: list = []
-    for index in range(INSTALLED_ROWS):
+    self._row_count = -1
+    super().__init__([], models.TITLE_INSTALLED, models.DESCRIPTION_INSTALLED, back)
+    self._sync_rows()
+
+  def _sync_rows(self) -> None:
+    count = len(models.status(self._params)["installed"])
+    if count == self._row_count:
+      return
+    self._items = self._items[:1]
+    self._row_count = count
+    for index in range(count):
       info = button_item(
         lambda index=index: self._name(index),
         lambda index=index: self._state(index),
@@ -256,23 +267,32 @@ class InstalledLayout(Page):
         callback=lambda: None,
       )
       remove = button_item(
-        models.LABEL_REMOVE, models.LABEL_REMOVE, description=models.REMOVE_TEXT, callback=lambda index=index: self._remove(index), enabled=_offroad
+        models.LABEL_REMOVE,
+        models.LABEL_REMOVE,
+        description=models.REMOVE_TEXT,
+        callback=lambda index=index: self._remove(index),
+        enabled=lambda: _offroad() and not models.job_active(models.status(self._params)["job"]),
       )
       rebuild = button_item(
         models.LABEL_REBUILD,
         models.LABEL_REBUILD,
         description=lambda index=index: models.installed_detail(self._entry(index) or {}),
         callback=lambda index=index: self._rebuild_action(index),
-        enabled=_offroad,
+        enabled=lambda: _offroad() and not models.job_active(models.status(self._params)["job"]),
       )
       for row in (info, remove, rebuild):
         row.set_visible(lambda index=index: self._entry(index) is not None)
       rebuild.set_visible(lambda index=index: (self._entry(index) or {}).get("state") != "built")
-      rows += [info, remove, rebuild]
-    super().__init__(rows, models.TITLE_INSTALLED, models.DESCRIPTION_INSTALLED, back)
+      for row in (info, remove, rebuild):
+        self.add_widget(row)
+
+  def _update_state(self) -> None:
+    super()._update_state()
+    self._sync_rows()
 
   def _entry(self, index: int) -> dict | None:
-    return models.page_item(models.status(self._params)["installed"], 0, INSTALLED_ROWS, index)
+    entries = models.status(self._params)["installed"]
+    return entries[index] if index < len(entries) else None
 
   def _name(self, index: int) -> str:
     entry = self._entry(index)

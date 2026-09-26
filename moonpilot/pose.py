@@ -160,11 +160,12 @@ class PoseTracker:
     return True
 
 
-def fill_ego_pose(message, tracker: PoseTracker) -> None:
+def fill_ego_pose(message, tracker: PoseTracker, now: float | None = None) -> None:
   """Write one pose onto a `moonpilotState` message. The publisher's half of the contract.
 
-  `valid` is false until the first accepted fix has set the origin: a consumer that has not seen a
-  rebase has no frame to read x/y in, and the pass-through case (off, no origin) is stock behavior.
+  `valid` is false until the first accepted fix has set the origin, and when `now` says the last
+  odometry sample is stale: a consumer that has not seen a rebase has no frame to read x/y in, and
+  a dead tracker must not keep a last pose alive.
   """
   field = message.moonpilotState.egoPose
   field.valid = tracker.has_origin
@@ -174,3 +175,6 @@ def fill_ego_pose(message, tracker: PoseTracker) -> None:
   field.x = tracker.x
   field.y = tracker.y
   field.yaw = tracker.yaw
+  if now is not None:
+    age = now - tracker.mono_time
+    field.valid = 0.0 <= age <= MOONPILOT_POSE_MAX_DT

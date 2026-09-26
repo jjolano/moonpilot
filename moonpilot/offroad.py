@@ -51,6 +51,14 @@ def can_enter(started: bool, v_ego: float, engaged: bool) -> bool:
   return started and not engaged and v_ego < MOONPILOT_OFFROAD_SPEED
 
 
+def set_requested(params, value: bool, started: bool, v_ego: float, engaged: bool) -> bool:
+  """Apply an entry or exit, rechecking the park gate when a delayed UI action fires."""
+  if value and not can_enter(started, v_ego, engaged):
+    return False
+  params.put_bool(MOONPILOT_OFFROAD_KEY, value, block=True)
+  return True
+
+
 def enabled(params, parked: bool) -> bool:
   """Whether the row and the gesture are live: entering is gated, leaving never is."""
   return requested(params) or parked

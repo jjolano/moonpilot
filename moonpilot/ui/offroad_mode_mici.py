@@ -33,7 +33,9 @@ def refresh(button: BigButton, params: Params) -> None:
 
 
 def toggle(params: Params) -> None:
-  params.put_bool(offroad.MOONPILOT_OFFROAD_KEY, not offroad.requested(params), block=True)
+  offroad.set_requested(
+    params, not offroad.requested(params), ui_state.started, ui_state.sm["carState"].vEgo, ui_state.engaged
+  )
 
 
 def long_press() -> None:
@@ -45,4 +47,4 @@ def long_press() -> None:
 
 
 def enter() -> None:
-  ui_state.params.put_bool(offroad.MOONPILOT_OFFROAD_KEY, True, block=True)
+  offroad.set_requested(ui_state.params, True, ui_state.started, ui_state.sm["carState"].vEgo, ui_state.engaged)

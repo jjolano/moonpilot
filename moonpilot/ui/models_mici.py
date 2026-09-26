@@ -19,7 +19,6 @@ from openpilot.system.ui.lib.application import gui_app
 from openpilot.system.ui.widgets import Widget
 from openpilot.system.ui.widgets.scroller import Scroller
 
-INSTALLED_ROWS = 8
 ICON_INSTALL = "icons_mici/settings/software.png"
 ICON_REMOVE = "icons_mici/settings/device/uninstall.png"
 ICON_REBUILD = "icons_mici/settings/device/update.png"
@@ -154,6 +153,7 @@ class ModelsPage(Page):
     self._installed.set_value(str(len(status["installed"])))
     self._refresh.set_value(models.catalog_text(status["catalog"]))
     self._refresh.set_long_press_callback(lambda: _describe(models.TITLE_REFRESH, models.catalog_description(status["catalog"])))
+    self._refresh.set_enabled(not models.job_active(status["job"]))
     self._reboot.set_visible(models.restart_needed(self._params))
     self._reboot.set_enabled(ui_state.is_offroad())
 
@@ -164,21 +164,13 @@ class InstalledPage(Page):
   def __init__(self, params: Params, back: Callable):
     self._params = params
     self._blocks: list[tuple[BigButton, BigButton, BigButton]] = []
-    widgets: list[Widget] = []
-    for index in range(INSTALLED_ROWS):
-      info = BigButton("")
-      info.set_click_callback(lambda index=index: self._describe(index))
-      remove = BigButton(models.LABEL_REMOVE, models.LABEL_REMOVE, description=models.REMOVE_TEXT)
-      remove.set_click_callback(lambda index=index: self._remove_action(index))
-      rebuild = BigButton(models.LABEL_REBUILD, models.LABEL_REBUILD, description=models.DESCRIPTION_STORAGE)
-      rebuild.set_click_callback(lambda index=index: self._rebuild_action(index))
-      self._blocks.append((info, remove, rebuild))
-      widgets.extend((info, remove, rebuild))
-    super().__init__(widgets, models.TITLE_INSTALLED, models.DESCRIPTION_INSTALLED, back)
+    self._row_count = -1
+    super().__init__([], models.TITLE_INSTALLED, models.DESCRIPTION_INSTALLED, back)
     self._update_rows()
 
   def _entry(self, index: int) -> dict | None:
-    return models.page_item(models.status(self._params)["installed"], 0, INSTALLED_ROWS, index)
+    entries = models.status(self._params)["installed"]
+    return entries[index] if index < len(entries) else None
 
   def show_event(self):
     super().show_event()
@@ -206,6 +198,23 @@ class InstalledPage(Page):
 
   def _update_rows(self):
     offroad = ui_state.is_offroad()
+    status = models.status(self._params)
+    entries = status["installed"]
+    if len(entries) != self._row_count:
+      self._row_count = len(entries)
+      self._blocks = []
+      widgets: list[Widget] = []
+      for index in range(self._row_count):
+        info = BigButton("")
+        info.set_click_callback(lambda index=index: self._describe(index))
+        remove = BigButton(models.LABEL_REMOVE, models.LABEL_REMOVE, description=models.REMOVE_TEXT)
+        remove.set_click_callback(lambda index=index: self._remove_action(index))
+        rebuild = BigButton(models.LABEL_REBUILD, models.LABEL_REBUILD, description=models.DESCRIPTION_STORAGE)
+        rebuild.set_click_callback(lambda index=index: self._rebuild_action(index))
+        self._blocks.append((info, remove, rebuild))
+        widgets.extend((info, remove, rebuild))
+      self.replace_rows(widgets)
+    active = models.job_active(status["job"])
     for index, (info, remove, rebuild) in enumerate(self._blocks):
       entry = self._entry(index)
       present = entry is not None
@@ -213,8 +222,8 @@ class InstalledPage(Page):
       remove.set_visible(present)
       rebuild.set_visible(present and entry.get("state") != "built" if entry else False)
       info.set_enabled(True)
-      remove.set_enabled(offroad)
-      rebuild.set_enabled(offroad)
+      remove.set_enabled(offroad and not active)
+      rebuild.set_enabled(offroad and not active)
       if entry is None:
         continue
       info.set_text(str(entry.get("name") or models.selection_of(entry)[:12]))
@@ -313,14 +322,15 @@ class GroupPage(Page):
     desired = models.desired(self._params, self._kind)
     starred = models.favorites(self._params)
     offroad = ui_state.is_offroad()
+    active = models.job_active(models.status(self._params)["job"])
     for button, entry in self._rows:
       selection = "" if entry is None else models.selection_of(entry)
       if entry is None or entry.get("state") == "built":
         action = models.REASON_SELECTED if selection == desired else models.LABEL_SELECT
-        button.set_enabled(offroad)
+        button.set_enabled(offroad and not active)
       else:
         action = models.LABEL_INSTALL
-        button.set_enabled(True)
+        button.set_enabled(not active)
       button.set_text(models.entry_display(entry, self._kind))
       button.set_value(f"{action} {FAVORITE_MARK}" if selection in starred else action)
 
@@ -335,6 +345,8 @@ class GroupPage(Page):
     self._rebuild()
 
   def _choose(self, entry: dict | None) -> None:
+    if models.job_active(models.status(self._params)["job"]):
+      return
     selection = "" if entry is None else models.selection_of(entry)
     if entry is not None and entry.get("state") != "built":
       _confirm(models.INSTALL_TEXT, ICON_INSTALL, lambda: _request(self._params, "install", selection))

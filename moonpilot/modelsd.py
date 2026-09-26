@@ -69,6 +69,8 @@ class Worker:
     self.job: models.Job | None = None
     self._published = ""
     self._completed = 0
+    self._progress_artifact: str | None = None
+    self._progress_finished = False
     self._last_progress = 0.0
     self._load_catalog()
 
@@ -126,6 +128,8 @@ class Worker:
     job.started_at = time.monotonic()  # published as `elapsed`, so the panels can show a clock
     self.job = job
     self._completed = 0
+    self._progress_artifact = None
+    self._progress_finished = False
     self.publish(force=True)
     try:
       if request["op"] == "refresh":
@@ -147,7 +151,7 @@ class Worker:
       job.error = "unexpected failure, see the log"
       cloudlog.exception("moonpilot models: job failed")
     self.publish(force=True)
-    models.clear_request(self.params)
+    models.clear_request(self.params, request["id"])
     self.job = None
     self.publish(force=True)
 
@@ -163,6 +167,9 @@ class Worker:
   def _network_usable(self) -> bool:
     state = self.sm["deviceState"]
     return state.networkType != log.DeviceState.NetworkType.none and not state.networkMetered
+
+  def _network_available(self) -> bool:
+    return self.sm["deviceState"].networkType != log.DeviceState.NetworkType.none
 
   # --- ops ---------------------------------------------------------------------------------------
   def _refresh(self, job: models.Job) -> None:
@@ -203,7 +210,13 @@ class Worker:
     selection = job.selection
     if self.catalog is None:
       raise _Refused("no catalog on this device yet; refresh it first")
-    if models.is_recipe(selection) and models.load_package(selection) is None:
+    if not models.is_recipe(selection):
+      raise _Refused("this model is not installed and could not be resolved")
+
+    resolved = models.selection_record(selection)
+    if resolved is None or models.verify_members(resolved["members"]) is not None:
+      if os.path.lexists(models.package_dir(selection)):
+        self._discard(selection)
       verdict = modelcatalog.admit(self.catalog, selection)
       if not verdict["admitted"]:
         raise _Refused(str(verdict["reason"]) or "this model cannot run here")
@@ -214,14 +227,16 @@ class Worker:
       if (reason := modelcatalog.verify_downloaded(self.catalog, selection)) is not None:
         self._discard(selection)
         raise _Refused(reason)
+      resolved = models.selection_record(selection)
+      if resolved is None:
+        self._discard(selection)
+        raise _Refused("downloaded package could not be resolved")
+      if (reason := models.verify_members(resolved["members"])) is not None:
+        self._discard(selection)
+        raise _Refused(reason)
 
-    resolved = models.selection_record(selection)
     if resolved is None:
       raise _Refused("this model is not installed and could not be resolved")
-    if (reason := models.verify_members(resolved["members"])) is not None:
-      # A truncated package must not be built from; a fresh install replaces it.
-      self._discard(selection)
-      raise _Refused(reason)
     proto = resolved["protocol"]
     # A build is a package again: the same copies in flight, and it is larger than its members, so
     # the estimate is their sum (the panel shows the store's own numbers, this only decides).
@@ -234,15 +249,27 @@ class Worker:
   def _fetch(self, job: models.Job, catalog, selection: str, declared: int) -> None:
     from moonpilot.vendor.openmodels.client import DownloadCancelled, ModelStore  # codespell:ignore cancelled
 
+    while not self._network_available():
+      job.phase = "waiting-network"
+      job.metered = False
+      self.publish(force=True)
+      time.sleep(NETWORK_INTERVAL)
+      self.sm.update(0)
+      if self._canceled(job):
+        raise _Canceled
     job.phase = "downloading"
     job.total = declared
     job.metered = bool(self.sm["deviceState"].networkMetered)
     self.publish(force=True)
 
     def on_progress(_sha256: str, received: int, total: int) -> None:
-      if received >= total:
+      if _sha256 != self._progress_artifact:
+        self._progress_artifact = _sha256
+        self._progress_finished = False
+      job.received = min(job.total, self._completed + received)
+      if received >= total and not self._progress_finished:
         self._completed += total
-      job.received = self._completed + received
+        self._progress_finished = True
       now = time.monotonic()
       if now - self._last_progress >= PROGRESS_INTERVAL:
         self._last_progress = now
@@ -255,13 +282,37 @@ class Worker:
       store.fetch(catalog.resolve(selection), on_progress=on_progress, cancelled=lambda: self._canceled(job))  # codespell:ignore cancelled
     except DownloadCancelled as exc:  # codespell:ignore cancelled
       raise _Canceled from exc
+    job.received = job.total
     job.phase = "verifying"
     self.publish(force=True)
 
   def _discard(self, selection: str) -> None:
     """A package that failed verification is worse than no package: the boot commit would fall back
     and the panel would show a model that cannot run. Remove it whole."""
-    shutil.rmtree(models.package_dir(selection), ignore_errors=True)
+    package = models.package_dir(selection)
+    if os.path.islink(package) or not os.path.isdir(package):
+      try:
+        os.unlink(package)
+      except OSError:
+        pass
+    else:
+      shutil.rmtree(package, ignore_errors=True)
+    self._prune_artifacts()
+
+  def _prune_artifacts(self) -> None:
+    """Drop digest-cache links left with no package owner; linked artifacts remain in use."""
+    cache = os.path.join(models.packages_dir(), ".artifacts")
+    try:
+      entries = os.scandir(cache)
+    except OSError:
+      return
+    with entries:
+      for entry in entries:
+        try:
+          if entry.is_file(follow_symlinks=False) and entry.stat(follow_symlinks=False).st_nlink == 1:
+            os.unlink(entry.path)
+        except OSError:
+          pass
 
   def _build(self, job: models.Job, modelbuild, selection: str, resolved: dict, proto) -> None:
     directory = models.build_dir(selection, proto.id)
@@ -314,7 +365,7 @@ class Worker:
     resolved = models.selection_record(selection)
     if resolved is not None:
       shutil.rmtree(models.build_dir(selection, resolved["protocol"].id), ignore_errors=True)
-    shutil.rmtree(models.package_dir(selection), ignore_errors=True)
+    self._discard(selection)
     job.phase = "done"
 
 

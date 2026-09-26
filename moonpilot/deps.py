@@ -21,6 +21,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 
@@ -37,6 +38,7 @@ UV_URL = f"https://github.com/astral-sh/uv/releases/download/{UV_VERSION}/{UV_AS
 _DEPS_NAME = "deps"
 STATUS_KEY = "MoonpilotDepsStatus"
 REQUEST_KEY = "MoonpilotDepsRequest"
+_RELEASE_MARKER = ".moonpilot-complete"
 
 READY = "ready"
 WAITING_NETWORK = "waiting-network"
@@ -186,30 +188,45 @@ def install() -> None:
   release = os.path.join(releases_dir, fingerprint)
   if os.path.lexists(release) and not os.path.isdir(release):
     raise OSError(f"dependency release path is not a directory: {release}")
+
+  def complete(path: str) -> bool:
+    try:
+      with open(os.path.join(path, _RELEASE_MARKER), encoding="ascii") as marker:
+        return marker.read() == fingerprint
+    except OSError:
+      return False
+
+  if not complete(release):
+    for entry in os.scandir(releases_dir):
+      if entry.is_dir(follow_symlinks=False) and entry.name.startswith(f"{fingerprint}-") and complete(entry.path):
+        release = entry.path
+        break
+
   staging: str | None = None
-  target: str | None = None
-  if not os.path.isdir(release):
-    # A release is immutable once its install succeeds. A failed install removes its staging
-    # directory in `finally`, so an existing directory is safe to reuse without touching the
-    # current release that another process may still import.
-    os.makedirs(release, mode=0o775)
-    staging = release
+  if not complete(release):
+    staging = tempfile.mkdtemp(prefix=f".{fingerprint}-", dir=releases_dir)
     target = release
+    if os.path.lexists(target):
+      target = os.path.join(releases_dir, f"{fingerprint}-{os.getpid()}-{time.monotonic_ns()}")
   current_tmp = None
 
   env = dict(os.environ)
   # uv's cache and /data are different filesystems, which is exactly the hardlink warning uv emits.
   env["UV_LINK_MODE"] = "copy"
   try:
-    if target is not None:
+    if staging is not None:
       subprocess.run(
-        [uv(), "pip", "install", "--target", target, "--require-hashes", "-r", lock_path()],
+        [uv(), "pip", "install", "--target", staging, "--require-hashes", "-r", lock_path()],
         env=env,
         check=True,
         capture_output=True,
         text=True,
       )
+      with open(os.path.join(staging, _RELEASE_MARKER), "w", encoding="ascii") as marker:
+        marker.write(fingerprint)
+      os.replace(staging, target)
       staging = None
+      release = target
 
     current = site_dir()
     current_tmp = f"{current}.tmp-{os.getpid()}-{time.monotonic_ns()}"
@@ -218,7 +235,7 @@ def install() -> None:
     current_tmp = None
 
     for entry in os.scandir(releases_dir):
-      if entry.name == fingerprint:
+      if entry.path == release:
         continue
       try:
         if entry.is_dir(follow_symlinks=False):

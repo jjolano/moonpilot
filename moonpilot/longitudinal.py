@@ -107,6 +107,7 @@ from moonpilot.curve import (
   lat_accel_hold,
   predicted_lat_accel,
 )
+from moonpilot.pose import MOONPILOT_POSE_MAX_DT
 from moonpilot.corridor import RollingCorridor, squeeze_accel
 from moonpilot.features import COAST_GRADE, CURVE_SPEED, LEAD_LATERAL, LONGITUDINAL, MODEL_BRAKING, SQUEEZE, enabled
 from moonpilot.latency import (
@@ -1509,6 +1510,9 @@ class MoonpilotLongitudinalPlanner:
       return None
     pose = sm["moonpilotState"].egoPose
     if not pose.valid:
+      return None
+    age = time.monotonic_ns() - pose.monoTime
+    if age < 0 or age > MOONPILOT_POSE_MAX_DT * 1e9:
       return None
     if not all(math.isfinite(v) for v in (pose.x, pose.y, pose.yaw)):
       return None

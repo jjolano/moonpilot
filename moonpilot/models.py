@@ -485,9 +485,11 @@ def job_active(job: dict | None) -> bool:
   return bool(job) and job.get("phase") in PHASES[:5]
 
 
-def request(params: Any, op: str, selection: str = "") -> str:
+def request(params: Any, op: str, selection: str = "") -> str | None:
   """Write a request and return its id. The id is what makes a request cancellable: the worker's
   `canceled()` re-reads the param and stops when it no longer holds this id."""
+  if op != "cancel" and read_request(params) is not None:
+    return None
   request_id = str(time.monotonic_ns())
   params.put(REQUEST_KEY, json.dumps({"schema": SCHEMA, "id": request_id, "op": op, "recipe": selection}), block=True)
   return request_id
@@ -511,8 +513,10 @@ def read_request(params: Any) -> dict | None:
   return {"schema": SCHEMA, "id": data["id"], "op": data["op"], "recipe": selection}
 
 
-def clear_request(params: Any) -> None:
-  params.remove(REQUEST_KEY)
+def clear_request(params: Any, request_id: str | None = None) -> None:
+  current = read_request(params)
+  if request_id is None or current is None or current["id"] == request_id:
+    params.remove(REQUEST_KEY)
 
 
 @dataclass
@@ -733,7 +737,9 @@ def load_package(recipe: str) -> dict | None:
   if hashlib.sha256(canonical.encode()).hexdigest() != recipe:
     return None
   profile = read_json(os.path.join(package_dir(recipe), "profile.json"))
-  return {"recipe": document, "profile": profile if isinstance(profile, dict) else None}
+  if not isinstance(profile, dict):
+    return None
+  return {"recipe": document, "profile": profile}
 
 
 def package_members(recipe: str, document: dict | None = None) -> dict[str, dict]:
@@ -1370,8 +1376,8 @@ def set_favorite(params: Any, selection: str, starred: bool) -> None:
 
 
 def chooser_groups(params: Any, kind: str) -> list[tuple[str, list[dict | None]]]:
-  """`[(group, rows)]` for one kind: the bundled model first with no header, then the starred
-  models, then the rest newest group first. Inside a group the chooser's own order stands, so an
+  """`[(group, rows)]` for one kind: the bundled model first, starred models duplicated into
+  Favorites, then the rest newest group first. Inside a group the chooser's own order stands, so an
   installed model leads its group and the catalog follows newest first.
 
   Group order is the order the rows were first seen in, which is `chooser_entries`' order -- and that
@@ -1381,13 +1387,19 @@ def chooser_groups(params: Any, kind: str) -> list[tuple[str, list[dict | None]]
   starred = favorites(params)
   order: list[str] = []
   buckets: dict[str, list[dict | None]] = {}
-  for entry in entries:
-    selection = "" if entry is None else selection_of(entry)
-    group = GROUP_FAVORITES if selection in starred else entry_group(entry)
+
+  def add(group: str, entry: dict | None) -> None:
     if group not in buckets:
       buckets[group] = []
       order.append(group)
     buckets[group].append(entry)
+
+  for entry in entries:
+    selection = "" if entry is None else selection_of(entry)
+    group = entry_group(entry)
+    add(group, entry)
+    if selection in starred and group != GROUP_FAVORITES:
+      add(GROUP_FAVORITES, entry)
   leading = [group for group in (GROUP_STOCK, GROUP_FAVORITES) if group in buckets]
   return [(group, buckets[group]) for group in leading + [group for group in order if group not in leading]]
 

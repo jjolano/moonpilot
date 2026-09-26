@@ -11,6 +11,7 @@ tracker that throws costs that frame's field and nothing else.
 """
 
 import numpy as np
+import time
 
 from openpilot.cereal import messaging
 from openpilot.common.filter_simple import FirstOrderFilter
@@ -198,7 +199,7 @@ def main() -> None:
     # Same toggle as the correction: one SLAM row, both observation fields. Off leaves egoPose at
     # its default (valid false), which is the pass-through case.
     if slam_on:
-      fill_ego_pose(msg, pose)
+      fill_ego_pose(msg, pose, time.monotonic())
     pm.send('moonpilotState', msg)
 
 

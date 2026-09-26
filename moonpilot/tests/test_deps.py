@@ -229,6 +229,8 @@ class TestInstall(unittest.TestCase):
       os.makedirs(release)
       with open(os.path.join(release, "marker"), "w") as marker:
         marker.write("complete")
+      with open(os.path.join(release, deps._RELEASE_MARKER), "w") as marker:
+        marker.write(self._fingerprint())
       with (
         mock.patch.object(deps, "uv", return_value="/usr/bin/uv"),
         mock.patch.object(deps.subprocess, "run") as run,

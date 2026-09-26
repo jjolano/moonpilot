@@ -92,7 +92,6 @@ class _FeatureRows:
     self._params: Params = ui_state.params
     self._rows: tuple[tuple[Feature, BigParamControl], ...] = tuple((feature, _feature_button(feature)) for feature in features)
     self._cp = ui_state.CP
-    ui_state.add_offroad_transition_callback(self._update_rows)
     self._update_rows()
 
   @property

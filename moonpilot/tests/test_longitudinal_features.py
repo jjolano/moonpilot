@@ -4,6 +4,7 @@ Split out of `test_longitudinal.py` for the 120 KB size gate; helpers live there
 """
 
 import math
+import time
 import unittest
 
 import numpy as np
@@ -466,6 +467,7 @@ class TestSqueeze(unittest.TestCase):
     pose_msg.egoPose.y = 0.0
     pose_msg.egoPose.yaw = 0.0
     for _ in range(20):
+      pose_msg.egoPose.monoTime = time.monotonic_ns()
       sm = _inputs(road_edges=edges)
       sm["moonpilotState"] = pose_msg
       sm.valid["moonpilotState"] = True

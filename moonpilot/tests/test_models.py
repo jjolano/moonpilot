@@ -379,8 +379,11 @@ class TestPicker(unittest.TestCase):
 
     self.assertEqual([label for label, _rows in groups], ["", "supercombo", "World Models", "Legacy Models"])
     self.assertEqual(groups[0][1], [None])
-    self.assertEqual([label for label, _rows in starred], ["", models.GROUP_FAVORITES, "supercombo", "World Models"])
+    self.assertEqual(
+      [label for label, _rows in starred], ["", models.GROUP_FAVORITES, "supercombo", "World Models", "Legacy Models"]
+    )
     self.assertEqual([models.selection_of(row) for row in starred[1][1] if row is not None], ["d" * 64])
+    self.assertEqual([models.selection_of(row) for row in starred[-1][1] if row is not None], ["d" * 64])
 
   def test_an_installed_model_keeps_the_group_the_catalog_gave_it(self):
     params = self._params()
@@ -394,7 +397,7 @@ class TestPicker(unittest.TestCase):
     self.assertEqual(models.entry_display(built, models.DRIVING), "built")
     self.assertEqual(built["short_name"], "BUILT")
 
-  def test_every_row_lands_in_exactly_one_group(self):
+  def test_starred_rows_stay_in_their_group_and_copy_into_favorites(self):
     params = self._params()
     entries = [
       {"recipe": "c" * 64, "name": "a", "kind": models.DRIVING, "admitted": True, "folder": "One"},
@@ -407,9 +410,14 @@ class TestPicker(unittest.TestCase):
       starred = models.chooser_groups(params, models.DRIVING)
     rows = [models.selection_of(row) for _label, group_rows in groups for row in group_rows if row]
     self.assertEqual(sorted(rows), sorted(set(rows)))
-    # The monitoring row is not in the driving picker, and the star moves a row rather than copying it.
+    # The monitoring row is not in the driving picker. The star adds one Favorites copy.
     self.assertNotIn("e" * 64, rows)
-    self.assertEqual(sum(len(group_rows) for _label, group_rows in starred), len(rows) + 1)
+    self.assertEqual(sum(len(group_rows) for _label, group_rows in starred), len(rows) + 2)
+    self.assertTrue(any(label == "One" for label, _rows in starred))
+    self.assertEqual(
+      [models.selection_of(row) for row in dict(starred)["One"] if row is not None], ["c" * 64]
+    )
+    self.assertEqual([models.selection_of(row) for row in starred[1][1] if row is not None], ["c" * 64])
 
   def test_a_generated_name_loses_the_kind_the_picker_already_says(self):
     generated = {"name": "Driving · split · standard · 2026-03-26 · bf430805", "name_kind": "generated"}
