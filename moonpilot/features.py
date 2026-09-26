@@ -35,6 +35,13 @@ PATH_PREVIEW = Feature(
   offroad_only=True,
 )
 
+PATH_SMOOTH = Feature(
+  key="MoonpilotPathSmooth",
+  title="smooth planner path",
+  description="Filter the model's curvature request before the controller, trading about 0.15 s of path lag for calmer steering steps. Restart to apply.",
+  offroad_only=True,
+)
+
 TURN_DESIRE = Feature(
   key="MoonpilotTurnDesire",
   title="turn desire",
@@ -145,7 +152,7 @@ class Group:
 STEERING = Group(
   title="steering",
   description="How openpilot moves the wheel: whose controller, when a curve is entered, and whether openpilot can steer at all.",
-  features=(LATERAL_ENGAGE, TORQUE_LATERAL, PATH_PREVIEW, TURN_DESIRE),
+  features=(LATERAL_ENGAGE, TORQUE_LATERAL, PATH_PREVIEW, PATH_SMOOTH, TURN_DESIRE),
 )
 
 SPEED = Group(

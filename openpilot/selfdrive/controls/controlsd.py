@@ -22,7 +22,7 @@ from openpilot.selfdrive.controls.lib.longcontrol import LongControl
 from openpilot.selfdrive.modeld.modeld import LAT_SMOOTH_SECONDS
 from openpilot.selfdrive.locationd.helpers import PoseCalibrator, Pose
 from moonpilot.latcontrol import moonpilot_latcontrol  # moonpilot seam, see AGENTS.md
-from moonpilot.curvature import moonpilot_curvature  # moonpilot seam, see AGENTS.md
+from moonpilot.curvature import moonpilot_curvature, moonpilot_path_smooth  # moonpilot seam, see AGENTS.md
 from moonpilot.longcontrol import moonpilot_longcontrol  # moonpilot seam, see AGENTS.md
 from moonpilot.engage import moonpilot_actuator_gate  # moonpilot seam, see AGENTS.md
 from moonpilot.models import boot_configuration  # moonpilot seam, see AGENTS.md
@@ -64,6 +64,8 @@ class Controls:
     # modeld's module default: a selection that declares one gets a model whose action horizon and
     # smoothing carry it, and both consumers below time their command against the same number.
     self.moonpilot_lat_smooth = boot_configuration(self.params, "LAT_SMOOTH_SECONDS", LAT_SMOOTH_SECONDS)  # moonpilot seam, see AGENTS.md
+    self.moonpilot_path_smooth = moonpilot_path_smooth()  # moonpilot seam, see AGENTS.md
+    self.moonpilot_smooth_lag = getattr(self.moonpilot_path_smooth, "tau", 0.0)  # moonpilot seam, see AGENTS.md
     self.VM = VehicleModel(self.CP)
     self.LaC: LatControl
     if self.CP.steerControlType == car.CarParams.SteerControlType.angle:
@@ -141,11 +143,14 @@ class Controls:
       new_desired_curvature = model_v2.action.desiredCurvature if CC.latActive else self.curvature
     if self.curvature_reference is not None and CC.latActive and not self.sm.valid['lateralManeuverPlan']:  # moonpilot seam, see AGENTS.md
       new_desired_curvature = self.curvature_reference(
-        model_v2, new_desired_curvature, v_ego=CS.vEgo, lat_delay=self.sm['lateralDelay'].lateralDelay + self.moonpilot_lat_smooth,
+        model_v2, new_desired_curvature, v_ego=CS.vEgo,
+        lat_delay=self.sm['lateralDelay'].lateralDelay + self.moonpilot_lat_smooth + self.moonpilot_smooth_lag,
         model_recv_time=self.sm.recv_time['modelV2'], now=self.sm.recv_time['selfdriveState'],
         model_valid=self.sm.valid['modelV2'] and self.sm.alive['modelV2'])
+    if self.moonpilot_path_smooth is not None:  # moonpilot seam, see AGENTS.md
+      new_desired_curvature = self.moonpilot_path_smooth.update(new_desired_curvature, CC.latActive)
     self.desired_curvature, curvature_limited = clip_curvature(CS.vEgo, self.desired_curvature, new_desired_curvature, lp.roll)
-    lat_delay = self.sm["lateralDelay"].lateralDelay + self.moonpilot_lat_smooth  # moonpilot seam, see AGENTS.md
+    lat_delay = self.sm["lateralDelay"].lateralDelay + self.moonpilot_lat_smooth + self.moonpilot_smooth_lag  # moonpilot seam, see AGENTS.md
 
     actuators.curvature = self.desired_curvature
     steer, lateral_output, lac_log = self.LaC.update(CC.latActive, CS, self.VM, lp,

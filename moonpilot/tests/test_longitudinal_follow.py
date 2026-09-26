@@ -12,10 +12,8 @@ from unittest import mock
 
 import numpy as np
 from openpilot.cereal import custom, log
-from openpilot.common.constants import CV
 
 from moonpilot.longitudinal import (
-  MOONPILOT_APPROACH_DECEL,
   MOONPILOT_FAST_ACCEL_BP,
   MOONPILOT_FAST_ACCEL_V,
   MOONPILOT_K_GAP,

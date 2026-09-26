@@ -1,7 +1,9 @@
-"""Response-aligned steering behavior and its restart-gated factory."""
+"""Response-aligned steering and the curvature request filter: behavior and their restart-gated factories."""
 
+import math
 import struct
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import numpy as np
@@ -17,11 +19,15 @@ from moonpilot.curvature import (
   MOONPILOT_PREVIEW_GAIN,
   MOONPILOT_PREVIEW_MAX_LAT_ACCEL,
   MOONPILOT_PREVIEW_MIN_SPEED,
+  MOONPILOT_SMOOTH_TAU,
+  PathSmooth,
   moonpilot_curvature,
+  moonpilot_path_smooth,
   response_aligned_curvature,
 )
 from moonpilot.tests.fakes import FakeParams, _params
 
+ROOT = Path(__file__).resolve().parents[2]
 T_IDXS = np.asarray(ModelConstants.T_IDXS)
 NOW = 10.0
 CAPTURE_AGE = 0.08
@@ -226,6 +232,84 @@ class TestExactFallback(unittest.TestCase):
     for base in (float("nan"), float("inf"), -float("inf")):
       with self.subTest(base=base):
         self.assert_pass_through(model, base=base)
+
+
+class TestSmoothFactory(unittest.TestCase):
+  def test_the_toggle_off_is_none(self):
+    self.assertIsNone(moonpilot_path_smooth(_params(False)))
+
+  def test_the_toggle_on_builds_the_filter_with_the_header_tau(self):
+    smooth = moonpilot_path_smooth(_params(True))
+    assert isinstance(smooth, PathSmooth)
+    self.assertEqual(smooth.tau, MOONPILOT_SMOOTH_TAU)
+
+  def test_it_is_chosen_once_so_the_toggle_takes_a_restart(self):
+    with mock.patch.object(curvature_mod, "Params", lambda: FakeParams(False)):
+      self.assertIsNone(moonpilot_path_smooth())
+    with mock.patch.object(curvature_mod, "Params", lambda: FakeParams(True)):
+      self.assertIsInstance(moonpilot_path_smooth(), PathSmooth)
+
+
+class TestPathSmooth(unittest.TestCase):
+  """The request filter: the exact step response, engage continuity, and the pass-through edges."""
+
+  ALPHA = 1.0 - math.exp(-0.01 / MOONPILOT_SMOOTH_TAU)
+
+  def test_a_step_follows_the_closed_form_response(self):
+    smooth = PathSmooth()
+    smooth.update(0.0, False)  # seed the state at rest, as controlsd does while not steering
+    outs = [smooth.update(1.0, True) for _ in range(15)]
+    self.assertAlmostEqual(outs[0], self.ALPHA, delta=1e-12)
+    # 15 control frames at dt=0.01 is tau: (1 - alpha)^n is exp(-n*dt/tau) exactly.
+    self.assertAlmostEqual(outs[-1], 1.0 - math.exp(-1.0), delta=1e-12)
+    self.assertTrue(all(b >= a for a, b in zip(outs, outs[1:], strict=False)))
+
+  def test_a_constant_input_is_reached_and_held(self):
+    smooth = PathSmooth()
+    out = 0.0
+    for _ in range(2000):
+      out = smooth.update(0.25, True)
+    self.assertAlmostEqual(out, 0.25, delta=1e-12)
+
+  def test_while_not_steering_the_input_passes_through_bit_exact(self):
+    smooth = PathSmooth()
+    smooth.update(1.0, True)  # a dirty state from before the disengage
+    for value in (0.0, -0.4, 1e-6):
+      with self.subTest(value=value):
+        self.assertEqual(smooth.update(value, False), value)
+
+  def test_a_disengage_resets_the_state_to_the_car_s_path(self):
+    smooth = PathSmooth()
+    smooth.update(1.0, True)
+    smooth.update(0.02, False)  # while not steering the state tracks the actual curvature
+    self.assertEqual(smooth.update(0.02, True), 0.02)  # re-engage never re-injects the 1.0
+
+  def test_the_first_call_on_a_fresh_filter_returns_the_input(self):
+    self.assertEqual(PathSmooth().update(0.3, True), 0.3)
+
+  def test_a_non_finite_request_passes_through_and_holds_the_state(self):
+    smooth = PathSmooth()
+    smooth.update(0.1, True)  # the first call passes through and lands the state on 0.1
+    for value in (float("nan"), float("inf"), -float("inf")):
+      with self.subTest(value=value):
+        out = smooth.update(value, True)
+        self.assertTrue(math.isnan(out) if math.isnan(value) else out == value)
+    # The next finite frame filters from the held 0.1: a poisoned state would come back nan.
+    self.assertAlmostEqual(smooth.update(0.2, True), 0.1 + self.ALPHA * 0.1, delta=1e-12)
+
+
+class TestSmoothWiring(unittest.TestCase):
+  """controlsd builds the filter once, applies it before clip_curvature, and folds its lag into
+  both delay consumers (the response-aligned reference's sampling horizon and the controller's)."""
+
+  def test_controlsd_builds_and_applies_the_filter_once(self):
+    text = (ROOT / "openpilot/selfdrive/controls/controlsd.py").read_text()
+    self.assertEqual(text.count("self.moonpilot_path_smooth = moonpilot_path_smooth()"), 1)
+    self.assertEqual(text.count("getattr(self.moonpilot_path_smooth, \"tau\", 0.0)"), 1)
+    self.assertEqual(text.count("if self.moonpilot_path_smooth is not None:"), 1)
+    self.assertEqual(text.count("self.moonpilot_path_smooth.update(new_desired_curvature, CC.latActive)"), 1)
+    self.assertLess(text.index("self.moonpilot_path_smooth.update"), text.index("clip_curvature(CS.vEgo"))
+    self.assertEqual(text.count("+ self.moonpilot_smooth_lag"), 2)
 
 
 if __name__ == "__main__":

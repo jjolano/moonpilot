@@ -18,15 +18,16 @@ from collections.abc import Callable
 import numpy as np
 
 from openpilot.common.params import Params
-from openpilot.common.realtime import DT_MDL
+from openpilot.common.realtime import DT_CTRL, DT_MDL
 from openpilot.selfdrive.controls.lib.drive_helpers import MIN_SPEED, get_curvature_from_plan
 
-from moonpilot.features import PATH_PREVIEW, enabled
+from moonpilot.features import PATH_PREVIEW, PATH_SMOOTH, enabled
 
 MOONPILOT_PREVIEW_GAIN = 0.3  # share of (response-aligned path - model request) added to the command
 MOONPILOT_PREVIEW_MAX_LAT_ACCEL = 0.8  # m/s^2; ceiling on what the delta itself may ask for
 MOONPILOT_PREVIEW_MIN_SPEED = 5.0  # m/s; below this the path curvature is noise
 MOONPILOT_MAX_MODEL_AGE = 2 * DT_MDL  # s; two missed 20 Hz model periods disable the correction
+MOONPILOT_SMOOTH_TAU = 0.15  # s; first-order time constant of the curvature request filter
 
 
 def response_aligned_curvature(model, desired_curvature: float, *, v_ego: float, lat_delay: float, model_recv_time: float, now: float,
@@ -73,3 +74,37 @@ def moonpilot_curvature(params: Params | None = None) -> Callable[..., float] | 
   if not enabled(PATH_PREVIEW, params or Params()):
     return None
   return response_aligned_curvature
+
+
+class PathSmooth:
+  """First-order lag on the curvature request: an IIR at the control rate, `x += alpha * (u - x)`.
+
+  While not steering it tracks the input, so a re-engage starts from the path the car is already
+  on — the same reset `clip_curvature`'s engage path makes, and what keeps the filter from
+  re-injecting its pre-disengage state. A non-finite request passes through untouched with the
+  state held: this stage must never be the thing that turns a good value bad.
+
+  The lag the filter adds is `tau` seconds, and controlsd folds it into the `lat_delay` both the
+  response-aligned reference and the controller time against, so enabling it does not silently
+  desynchronize the fork from its own delay bookkeeping."""
+
+  def __init__(self, tau: float = MOONPILOT_SMOOTH_TAU, dt: float = DT_CTRL):
+    self.tau = tau
+    self._alpha = 1.0 - math.exp(-dt / tau)
+    self._x: float | None = None
+
+  def update(self, curvature: float, active: bool) -> float:
+    if not math.isfinite(curvature):
+      return curvature
+    if not active or self._x is None:
+      self._x = curvature
+      return curvature
+    self._x += self._alpha * (curvature - self._x)
+    return self._x
+
+
+def moonpilot_path_smooth(params: Params | None = None) -> PathSmooth | None:
+  """Return the curvature request filter when enabled; the choice (and its tau) is fixed until restart."""
+  if not enabled(PATH_SMOOTH, params or Params()):
+    return None
+  return PathSmooth()

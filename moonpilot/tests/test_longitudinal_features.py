@@ -393,7 +393,7 @@ class TestCurveSpeed(unittest.TestCase):
     """These behaviors ship off: each is unvalidated on a car, and each is read with
     `enabled()`, so the row and the param default have to agree."""
     text = (ROOT / "moonpilot" / "params_keys.h").read_text()
-    for key in ("MoonpilotCurveSpeed", "MoonpilotPathPreview", "MoonpilotSqueeze", "MoonpilotPathOutside"):
+    for key in ("MoonpilotCurveSpeed", "MoonpilotPathPreview", "MoonpilotPathSmooth", "MoonpilotSqueeze", "MoonpilotPathOutside"):
       with self.subTest(key=key):
         feature = next(f for f in FEATURES if f.key == key)
         self.assertTrue(feature.offroad_only)

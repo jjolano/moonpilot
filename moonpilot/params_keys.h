@@ -37,6 +37,10 @@
     // Off by default: it aligns the model path to its capture age plus steering
     // delay; the response gain still needs on-device validation.
     {"MoonpilotPathPreview", {PERSISTENT, BOOL, "0"}},
+    // Off by default: it filters the model's curvature request before the controller, trading
+    // ~0.15 s of path lag for calmer torque steps; chosen at construction, so the row takes a
+    // restart.
+    {"MoonpilotPathSmooth", {PERSISTENT, BOOL, "0"}},
     // On by default: below the lane-change speed threshold a turn signal
     // feeds a turn desire into the model so it steers into the corner. The
     // model's own turn prediction picks the direction.
