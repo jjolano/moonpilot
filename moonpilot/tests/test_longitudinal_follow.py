@@ -18,20 +18,47 @@ from moonpilot.longitudinal import (
   MOONPILOT_FAST_ACCEL_V,
   MOONPILOT_K_GAP,
   MOONPILOT_K_V,
+  MOONPILOT_LADDER_V_BP,
   MOONPILOT_OUT_OF_PATH_ENTER,
   MOONPILOT_OUT_OF_PATH_LEAVE,
   MOONPILOT_FOLLOW_SPEED_FLOOR_HEADWAY_T,
   MOONPILOT_OUT_OF_PATH_T_FOLLOW,
+  MOONPILOT_SLOW_ACCEL_V,
   MOONPILOT_T_FOLLOW,
+  cruise_accel,
   lead_accel,
+  policy,
   pos_authority,
 )
-from moonpilot.tests.test_longitudinal import _gap_target, _inputs, _lead, _planner
+from moonpilot.tests.test_longitudinal import _cp, _gap_target, _inputs, _lead, _planner
 
 Personality = log.LongitudinalPersonality
 
 
 class TestFollowPolicy(unittest.TestCase):
+  def test_fast_cruise_ask_needs_room_to_accelerate_then_match_a_lead(self):
+    v_ego, v_cruise = 20.0, 25.0
+    t_follow = MOONPILOT_T_FOLLOW[int(Personality.standard)]
+    cp = _cp()
+    source = log.LongitudinalPlan.LongitudinalPlanSource
+    slow = float(np.interp(v_ego, MOONPILOT_LADDER_V_BP, MOONPILOT_SLOW_ACCEL_V))
+    fast = cruise_accel(v_ego, v_cruise, False, 0.0, cp, -0.3, True)
+
+    def ask(leads):
+      return policy(v_ego, leads, v_cruise, t_follow, False, None, 0.0, cp, -0.3, True)[0]
+
+    self.assertGreater(fast, slow)
+    self.assertEqual(ask([]), fast)
+    self.assertEqual(ask([(source.lead0, 200.0, v_ego, 0.0)]), fast)
+    self.assertEqual(ask([(source.lead0, 40.0, v_ego, 0.0)]), slow)
+    self.assertEqual(ask([(source.lead0, 40.0, v_ego, 1.0)]), fast)  # opening runway
+    self.assertTrue(slow < ask([(source.lead0, 65.0, v_ego, 0.0)]) < fast)
+    self.assertEqual(ask([(source.lead0, 65.0, v_ego - 2.0, 0.0)]), slow)  # same runway, more closing
+    self.assertEqual(ask([(source.lead0, 200.0, v_ego, 0.0), (source.lead1, 40.0, v_ego, 0.0)]), slow)
+
+    braking = (source.lead0, 20.0, 15.0, 0.0)
+    self.assertEqual(ask([braking]), lead_accel(v_ego, 20.0, 15.0, 0.0, t_follow))
+
   def test_the_positive_side_cannot_reach_the_cruise_rung_from_a_speed_deficit(self):
     """The reported fault, as an invariant rather than a number that will drift. The measurement and
     the A/B against upstream's MPC are on `MOONPILOT_POS_AUTH_V`; the shape is the claim: gentle

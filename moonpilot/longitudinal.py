@@ -962,11 +962,30 @@ def policy(
   output is non-positive even when a lead gap is oversized, so `min` cannot select positive
   acceleration merely to recover follow distance. A transient brake can therefore leave a larger
   gap behind a lead holding the set speed; closing it waits for the lead to pull away or the ego to
-  fall below set speed. That is deliberate: follow-distance recovery never buys overspeed.
+  fall below set speed. That is deliberate: follow-distance recovery never buys overspeed. A slower
+  lead that is not pulling away also caps the cruise slot's fast rung when there is too little
+  runway to reach set speed and then match the lead at the ordinary follow decel. The lead's own
+  braking candidate is unchanged.
   """
   a_curve = min(curve_accel(v_ego, x_ego, curve), lat_accel_hold(v_ego, v_hold), squeeze)
   a_cruise_raw = cruise_accel(v_ego, v_cruise, e2e, steer_angle_deg, CP, accel_coast, allow_throttle, coast_band, err_bp)
   a_cruise = min(a_cruise_raw, a_curve)
+  slow = float(np.interp(v_ego, MOONPILOT_LADDER_V_BP, MOONPILOT_SLOW_ACCEL_V))
+  if a_cruise > slow and v_cruise > v_ego:
+    a_open = a_cruise
+    for _, gap, v_lead, a_lead in leads:
+      if v_lead >= v_cruise or a_lead >= MOONPILOT_FAST_CRAWL:
+        continue
+      target = max(MOONPILOT_STOP_DISTANCE, t_follow * max(v_ego, v_lead))
+      runway = gap - target
+      closing_at_set = v_cruise - v_lead
+      closing_now = v_ego - v_lead
+      # Room to reach set speed, then match the lead at the ordinary follow decel. One extra
+      # follow gap fades the fast rung in; with less room, asking for it only buys a later brake.
+      # ponytail: assume constant lead speed; use its trajectory if this caps real pull-aways.
+      needed = (closing_at_set**2 - closing_now**2) / (2.0 * a_open) + closing_at_set**2 / (2.0 * MOONPILOT_APPROACH_DECEL)
+      if needed > 0.0:
+        a_cruise = min(a_cruise, float(np.interp(runway, [needed, needed + target], [slow, a_open])))
   lead_asks = []
   for source, gap, v_lead, a_lead in leads:
     ask = lead_accel(v_ego, gap, v_lead, a_lead, t_follow)

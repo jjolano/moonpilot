@@ -1246,15 +1246,15 @@ class TestPlanner(unittest.TestCase):
     contact. What moved is where the car *rests* once the lead has slowed to a crawl. Without the
     floor it settles 0.07 m/s below the lead at 9.31 m (1.45 s of headway) — the speed-decay state
     this floor exists to remove. With it, the car matches the lead's 6.50 m/s exactly and rests
-    6.82 m back, 1.05 s of headway, which is inside the floor's own 1.0 s bound by 5 cm and above
-    the 6.0 m standstill floor. Same braking, same margin through the approach, different resting
+    6.88 m back after the runway cap, 1.06 s of headway, clear of both the 1.0 s speed-floor bound
+    and the 6.0 m standstill floor. Same braking, same margin through the approach, different resting
     speed, and that difference is the whole change.
     """
     s = _fly(17.0, 61.2, 90.0, 17.0, lambda t: -3.5 if 2 <= t < 5 else 0.0, 25.0)
     self.assertTrue(any((v - vl) > 0.0 and 4.0 <= (g - MOONPILOT_STOP_DISTANCE) / (v - vl) <= 7.0 for v, vl, g in zip(s["v"], s["vl"], s["gap"], strict=False)))
     self.assertAlmostEqual(s["min_gap"], 6.74, delta=0.05)
     self.assertAlmostEqual(s["peak"], -1.78, delta=0.05)
-    self.assertAlmostEqual(s["end_gap"], 6.82, delta=0.05)
+    self.assertAlmostEqual(s["end_gap"], 6.88, delta=0.05)
     # the resting speed is the lead's, not a little under it: that is the invariant this replaces
     self.assertAlmostEqual(s["v"][-1], s["vl"][-1], delta=0.01)
     self.assertGreater(s["gap"][-1] / max(s["v"][-1], 0.01), MOONPILOT_FOLLOW_SPEED_FLOOR_HEADWAY_T)
