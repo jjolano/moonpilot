@@ -218,8 +218,14 @@ MOONPILOT_FOLLOW_SPEED_FLOOR_MIN_A_LEAD = -0.1
 MOONPILOT_POS_AUTH_V_BP = [0.0, 20.0, 22.0, 30.0]  # m/s
 MOONPILOT_POS_AUTH_V = [1.0, 1.0, 0.35, 0.28]
 MOONPILOT_APPROACH_DECEL = 1.0  # m/s^2; the spacing regulator's braking authority, and the
-# decel the approach term binds past — one number, so the
-# two terms meet at the same output
+# decel the approach terms bind past — one number, so the
+# candidates meet at the same output
+# How fast a lead may be *accelerating* before the arrival term retires. The arrival law assumes the
+# lead's speed holds, so a launching lead is the one state it is wrong in: it holds a brake on the ego
+# while the gap opens, and the ego falls behind a lead that is pulling away instead of following it.
+# +0.1 m/s^2 is `MOONPILOT_FOLLOW_SPEED_FLOOR_MIN_A_LEAD`'s own magnitude, i.e. the same estimator
+# noise floor stated positively — a lead holding speed reads inside it, so the term does not flicker.
+MOONPILOT_ARRIVAL_MAX_A_LEAD = 0.1  # m/s^2
 # The stopping floor's admission, scheduled on the ego's speed: it is also the approach plateau, because
 # the floor is a constant-decel stop that takes over once it needs this much. Measured on this driver's
 # 47 manual stops behind a stopped lead: a median plateau near -1.0 from 6-12 m/s and -1.5..-1.7 from
@@ -660,7 +666,7 @@ def departure_crawl(a_track, v_ego, v_lead, a_lead) -> float:
 
 
 def lead_accel(v_ego, gap, v_lead, a_lead, t_follow) -> float:
-  """Two terms, one number.
+  """Three terms, one number.
 
   The spacing regulator holds gap == max(STOP_DISTANCE, t_follow * v_ego) and matches the lead's
   speed; its braking authority is capped at the approach decel, so large speed errors do not turn
@@ -679,7 +685,7 @@ def lead_accel(v_ego, gap, v_lead, a_lead, t_follow) -> float:
   with the time-gap headroom so it can never move the target inside `STOP_DISTANCE`. This changes
   only the spacing regulator; the TTC and stopping-floor terms below still read the physical gap.
 
-  The approach is two terms, and the deeper one wins against the regulator's capped output.
+  The approach is three terms, and the deeper one wins against the regulator's capped output.
 
   The first is time-to-collision: it holds the closing rate inside what the slack affords at
   TTC_TARGET seconds of headway — ``closing <= slack / TTC_TARGET`` — and binds once honoring that
@@ -691,7 +697,26 @@ def lead_accel(v_ego, gap, v_lead, a_lead, t_follow) -> float:
   window it is what makes the approach respond to a lead that starts slowing, because it reads the
   closing rate, which the lead's own speed history drives.
 
-  The second is the stopping floor, the kinematic term kept as a bound rather than as the approach,
+  The second is the arrival term, and it is the only one aimed at the follow target rather than at
+  standstill: ``-closing**2 / (2 * slack)``, the constant decel that closes the remaining closing speed
+  exactly where ``slack = gap - t_follow * v_lead`` runs out, clamped to the
+  approach decel so it can never out-brake the regulator's own authority. The regulator's negative
+  window starts at ``gap < target - cushion + (K_V / K_GAP) * closing``, which is 31.5 m at 16 m/s
+  closing 4.5 against the 23.4 m standard-personality target, so without this term a closing approach
+  to a slower, non-braking lead holds set speed down to that gap and then brakes to catch up — arriving
+  hot. Measured on route 000003e4 segments 7-8: 18.8 s at 0.0 m/s^2 from a 119 m gap down to 34 m
+  against a 42 kph lead, then -1.09 m/s^2 actual with the car 1.1 m inside the target while still
+  closing at 0.4 m/s, then 2.5 s of -0.21 to -0.32 m/s^2 sitting at the settled gap — brake lights
+  while following. The law is self-consistent: at a constant command ``closing**2 / slack`` is itself
+  constant, so it holds one number the whole way in and arrives with ``closing == 0`` exactly at the
+  target, which is what the regulator would do if its negative window reached that far. Two gates keep
+  it inside its own regime. ``t_follow * v_lead > STOP_DISTANCE`` makes it a term for *moving* leads:
+  on a stopped lead the two targets coincide, and skipping it there leaves the floor's measured
+  approach plateau — the admission gate below — exactly as it was. ``a_lead <=
+  MOONPILOT_ARRIVAL_MAX_A_LEAD`` retires it on a lead that is pulling away, the one state the
+  constant-speed assumption is wrong in.
+
+  The third is the stopping floor, the kinematic term kept as a bound rather than as the approach,
   and it is measured in the frame the gap actually closes in. Outside `MOONPILOT_MIN_SLACK` it is
   the harder of two constant decels, `stopping_decel`: matching the lead's *braking-credited* speed
   before the slack is spent, and stopping short of where a lead that keeps braking comes to rest.
@@ -756,7 +781,9 @@ def lead_accel(v_ego, gap, v_lead, a_lead, t_follow) -> float:
   # `a_lead > MOONPILOT_FOLLOW_SPEED_FLOOR_MIN_A_LEAD` — the lead is not slowing. Without this the
   # floor is wrong in the most expensive direction, and quietly: holding the ego's speed against a
   # lead braking at -3.5 makes the ego relatively *faster*, so the gap closes instead of opening —
-  # `test_mid_approach_lead_brake_stays_safe` lost 2.5 m of end gap. The 0.5 s braking credit inside
+  # `test_mid_approach_lead_brake_stays_safe` used to lose 2.5 m of end gap to it, and with the
+  # arrival term now sharing the approach it loses 1 cm and 0.012 m/s of resting speed (the arrival
+  # term lands the car on the target, the floor holds it there). The 0.5 s braking credit inside
   # `v_lead_eff` buys grace exactly where grace is not wanted. `LeadAccelEstimator` reads a real
   # onset inside 0.1 s, so a bound at -0.1 keeps estimator noise out without keeping the brake.
   # the headway — below `MOONPILOT_FOLLOW_SPEED_FLOOR_HEADWAY_T` the gap *is* the safety argument
@@ -788,6 +815,15 @@ def lead_accel(v_ego, gap, v_lead, a_lead, t_follow) -> float:
   slack = max(gap - MOONPILOT_STOP_DISTANCE, 0.0)
   a_ttc = -MOONPILOT_K_TTC * (closing - slack / float(np.interp(v_ego, MOONPILOT_TTC_TARGET_BP, MOONPILOT_TTC_TARGET_V)))
   a = min(a_track, a_ttc) if a_ttc < -MOONPILOT_APPROACH_DECEL else a_track
+  # The arrival term: constant decel that spends the slack to the *follow* target, so the approach
+  # lands there at a speed match instead of braking into it. Skipped where the follow target is the
+  # standstill gap (a stopped lead — the floor below owns that approach unchanged) and where the lead
+  # is pulling away (the one state the constant-speed law is wrong in).
+  arrival_target = t_follow * v_lead_eff
+  if arrival_target > MOONPILOT_STOP_DISTANCE and a_lead <= MOONPILOT_ARRIVAL_MAX_A_LEAD:
+    slack_arrival = gap - arrival_target
+    if slack_arrival > 0.0:
+      a = min(a, max(-(closing**2) / (2.0 * slack_arrival), -MOONPILOT_APPROACH_DECEL))
   # The stopping floor makes this law safe outside the final soft meter rather than merely responsive.
   # A TTC term ramps on closing rate, and ramping is not stopping: at 36 m/s with TTC_TARGET = 5 it
   # binds 175 m out, where coming to rest behind a stopped lead needs 185 m. The kinematic term

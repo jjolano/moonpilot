@@ -13,7 +13,9 @@ from unittest import mock
 import numpy as np
 from openpilot.cereal import custom, log
 
+import moonpilot.longitudinal as longitudinal
 from moonpilot.longitudinal import (
+  MOONPILOT_APPROACH_DECEL,
   MOONPILOT_FAST_ACCEL_BP,
   MOONPILOT_FAST_ACCEL_V,
   MOONPILOT_K_GAP,
@@ -30,7 +32,7 @@ from moonpilot.longitudinal import (
   policy,
   pos_authority,
 )
-from moonpilot.tests.test_longitudinal import _cp, _gap_target, _inputs, _lead, _planner
+from moonpilot.tests.test_longitudinal import DT_MDL, _cp, _fly, _gap_target, _inputs, _lead, _planner
 
 Personality = log.LongitudinalPersonality
 
@@ -53,11 +55,68 @@ class TestFollowPolicy(unittest.TestCase):
     self.assertEqual(ask([(source.lead0, 40.0, v_ego, 0.0)]), slow)
     self.assertEqual(ask([(source.lead0, 40.0, v_ego, 1.0)]), fast)  # opening runway
     self.assertTrue(slow < ask([(source.lead0, 65.0, v_ego, 0.0)]) < fast)
-    self.assertEqual(ask([(source.lead0, 65.0, v_ego - 2.0, 0.0)]), slow)  # same runway, more closing
+    # Same runway, more closing: the arrival term is what caps it now, not the runway cap. Asking for
+    # speed while closing only buys a later brake — the runway cap's own words — and the closed form
+    # says bleed 2 m/s over the 38.9 m left to the follow target, i.e. a coast rather than the slow rung.
+    closing = ask([(source.lead0, 65.0, v_ego - 2.0, 0.0)])
+    self.assertEqual(closing, lead_accel(v_ego, 65.0, v_ego - 2.0, 0.0, t_follow))
+    self.assertLess(closing, slow)
     self.assertEqual(ask([(source.lead0, 200.0, v_ego, 0.0), (source.lead1, 40.0, v_ego, 0.0)]), slow)
 
     braking = (source.lead0, 20.0, 15.0, 0.0)
     self.assertEqual(ask([braking]), lead_accel(v_ego, 20.0, 15.0, 0.0, t_follow))
+
+  def test_a_closing_approach_coasts_to_the_target_instead_of_holding_set_speed(self):
+    """Route 000003e4 segments 7-8, flown closed loop: 16.1 m/s held at a 58 kph set speed for
+    18.8 s while the gap to a 42 kph lead closed from 119 m to 34 m, the plan asking 0.0 m/s² the
+    whole way, then -1.09 m/s² actual with the car 1.1 m inside the 17 m target while still closing,
+    and 2.5 s of braking at the settled gap — the brake lights while following. The regulator's
+    negative window does not open until 31.5 m there, TTC and the stopping floor are both past their
+    admission gates by less than they ask, so cruise held set speed and nothing else spoke.
+
+    The arrival term is what replaces it, and this is the before/after on the same harness: it coasts
+    from the first frame, never asks deeper than the driver's own no-pedal coast, and lands on the
+    target at a speed match instead of braking into it. The old numbers are the same law with the
+    arrival gate closed (`MOONPILOT_ARRIVAL_MAX_A_LEAD` set below any `a_lead`), which is how they
+    were produced, so this test fails if the term stops being what does the work.
+    """
+    s = _fly(16.0, 58.0, 119.0, 11.7, lambda t: 0.0, 60.0)
+    cmds, vs = s["cmd"], s["v"]
+    target = 1.45 * 11.7
+
+    self.assertLess(cmds[0], -0.05)  # coasting from the first frame, not from 32 m out
+    self.assertGreater(s["peak"], -0.15)  # a coast, not a brake: -0.0976 here, -0.8602 without the term
+    self.assertGreater(min(cmds), -0.1)  # no frame of the 60 s approach asks for a real brake
+    self.assertAlmostEqual(s["min_gap"], target, delta=0.5)  # lands on the target, 1.9 cm inside at worst
+    self.assertAlmostEqual(vs[-1], 11.7, delta=0.02)  # arrives at a speed match
+    self.assertAlmostEqual(s["end_gap"], target, delta=0.5)
+    self.assertFalse(s["contact"])
+    with mock.patch.object(longitudinal, "MOONPILOT_ARRIVAL_MAX_A_LEAD", -1e9):
+      old = _fly(16.0, 58.0, 119.0, 11.7, lambda t: 0.0, 60.0)
+    first_coast = next(i for i, c in enumerate(old["cmd"]) if c < -0.05)
+    self.assertGreater(first_coast * DT_MDL, 18.0)  # the old law waited 19.9 s to say anything
+    self.assertLess(old["gap"][first_coast], 35.0)  # ...and said it at 32 m, i.e. late
+    self.assertLess(old["peak"], -0.8)
+    self.assertGreater(sum(1 for c in old["cmd"] if c < -0.1), 100)  # 174 frames of real braking
+
+  def test_the_arrival_term_is_scoped_to_a_moving_lead_that_is_not_getting_away(self):
+    """The two gates, as behavior rather than as conditions. A stopped lead's follow target *is* the
+    standstill gap, so the term would read -1.00 against the floor's own unadmitted -1.55 at 135 m —
+    the floor's measured approach plateau is what owns that approach, and the regulator's positive
+    ask is what comes back when the term stays out of it. A launching lead is the one state the
+    constant-speed law is wrong in: retired, the command is bit-for-bit what it is with the term
+    forced off. Everything else the suite pins about stopped-lead approaches is unchanged for the
+    same reason.
+    """
+    self.assertGreater(lead_accel(20.0, 135.0, 0.0, 0.0, 1.45), 0.0)
+    steady = lead_accel(18.0, 90.0, 12.5, 0.0, 1.45)
+    launching = lead_accel(18.0, 90.0, 12.5, 1.0, 1.45)
+    self.assertAlmostEqual(steady, -0.210435, delta=1e-6)  # -closing^2 / (2 * (gap - t_follow * v_lead))
+    self.assertLess(steady, 0.0)
+    self.assertGreater(launching, 0.0)  # the constant-speed law does not brake into a launch
+    # and the clamp: at (18, 44, 10) the law wants -1.085 and the regulator asks +0.87, so the
+    # output is the approach decel — the term can never out-brake the authority every candidate shares.
+    self.assertAlmostEqual(lead_accel(18.0, 44.0, 10.0, 0.0, 1.45), -MOONPILOT_APPROACH_DECEL, delta=1e-9)
 
   def test_the_positive_side_cannot_reach_the_cruise_rung_from_a_speed_deficit(self):
     """The reported fault, as an invariant rather than a number that will drift. The measurement and

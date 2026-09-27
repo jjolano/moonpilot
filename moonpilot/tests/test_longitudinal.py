@@ -354,12 +354,15 @@ class TestPolicyFunctions(unittest.TestCase):
     opening speed until the exact target is recovered.
 
     The gap's equilibrium is now the target *or* wherever the speeds matched, whichever comes first:
-    the speed floor (`lead_accel`) holds the command at the speed match, so the last 0.19 m is not
-    bought with speed. Both speeds still converge exactly (`v_ego` to 20.0000 against a lead at
-    20.0), the overshoot bound is unchanged, and 0.19 m on a 29 m target is 0.7 % of the headway —
-    the whole point being that the headway is not enforced by shedding speed. A closing approach,
-    where the ego is the faster car, is untouched: the floor is inert there and the target remains
-    the only equilibrium."""
+    the speed floor (`lead_accel`) holds the command at the speed match, so the last fraction of a
+    meter is not bought with speed. Both speeds still converge exactly (`v_ego` to 20.0000 against a
+    lead at 20.0), the target is still crossed rather than held as a wall, and 0.09 m on a 29 m
+    target is 0.3 % of the headway — the whole point being that the headway is not enforced by
+    shedding speed. The crossing used to be 0.19 m and to settle 0.19 m inside the target; the
+    arrival term took both to -0.089 and 0.000, because it bleeds the closing speed while there is
+    still slack to spend, so the car arrives at the target already matched instead of crossing it
+    and recovering. A closing approach, where the ego is the faster car, is the regime both terms
+    live in: the floor is inert there and the target remains the only equilibrium."""
     t_follow = MOONPILOT_T_FOLLOW[int(Personality.standard)]
     v_lead = 20.0
     v_ego = v_lead + MOONPILOT_FOLLOW_CUSHION * MOONPILOT_K_GAP / (2 * MOONPILOT_K_V)
@@ -373,10 +376,10 @@ class TestPolicyFunctions(unittest.TestCase):
       gap += (v_lead - v_ego) * DT_MDL
       gap_errors.append(gap - _gap_target(v_ego, t_follow))
 
-    self.assertLess(min(gap_errors), -0.1 * MOONPILOT_FOLLOW_CUSHION)
+    self.assertAlmostEqual(min(gap_errors), -0.089, delta=0.005)  # the cushion is still spent
     self.assertGreater(min(gap_errors), -MOONPILOT_FOLLOW_CUSHION)
     self.assertAlmostEqual(v_ego, v_lead, delta=1e-3)
-    self.assertAlmostEqual(gap_errors[-1], -0.191, delta=0.005)
+    self.assertAlmostEqual(gap_errors[-1], 0.0, delta=0.005)
 
   def test_positive_follow_ask_tapers_before_a_slower_lead_reaches_the_target(self):
     t_follow = MOONPILOT_T_FOLLOW[int(Personality.standard)]
@@ -387,7 +390,10 @@ class TestPolicyFunctions(unittest.TestCase):
     near = lead_accel(v_ego, target + 0.05, v_lead, 0.0, t_follow)
     self.assertGreater(far, mid)
     self.assertGreater(mid, near)
-    self.assertGreater(near, 0.0)
+    # The arrival term owns this region, so the ask tapers to zero rather than to a positive creep:
+    # at matched speed with slack left to spend there is nothing to ask for, and what sits *inside*
+    # the target is a braking ask.
+    self.assertLess(abs(near), 0.01)
     self.assertLess(lead_accel(v_ego, target + 0.05, 15.0, 0.0, t_follow), near)
     self.assertLess(lead_accel(v_ego, target - 1.0, v_lead, 0.0, t_follow), 0.0)
     self.assertGreater(lead_accel(v_ego, target + 1.0, v_ego + 1.0, 0.0, t_follow), 0.0)
@@ -768,8 +774,11 @@ class TestPolicyFunctions(unittest.TestCase):
     """The complaint case: route 000003c8's engaged block (70-115 m, 4-7 m/s of closing, ego 17-19
     m/s behind a lead doing 11-14) sat flat at -1.0..-1.17 for ~8 s because the absolute-frame floor
     was the only admitted braking term. The relative frame asks ~5x less there, inside the approach
-    decel, so the floor is not admitted at all and the regulator — positive at those gaps — governs.
-    Each case computes the old value inline, so the test documents the delta it removes.
+    decel, so the floor is not admitted at all. What brakes instead is the arrival term — the same
+    relative-frame geometry aimed at the follow gap rather than the standstill gap — at -0.18..-0.25,
+    inside this driver's own no-pedal range (-0.33 at 15 m/s) and an order of magnitude under the
+    -1.0 that used to sit on those ticks. Each case computes the old value inline, so the test
+    documents the delta it removes.
     """
     for v_ego, gap, v_lead in ((18.0, 90.0, 12.5), (19.0, 70.0, 14.0), (17.0, 115.0, 11.0)):
       slack = gap - MOONPILOT_STOP_DISTANCE
@@ -777,7 +786,10 @@ class TestPolicyFunctions(unittest.TestCase):
       old = -(v_ego**2 - v_lead**2) / (2 * slack)
       self.assertGreater(new, -MOONPILOT_APPROACH_DECEL)  # not admitted: the floor cannot govern here
       self.assertGreater(old / new, 4.0)  # ~4.7-6.6x across these cases (-0.77..-1.29 vs -0.17..-0.20)
-      self.assertGreater(lead_accel(v_ego, gap, v_lead, 0.0, 1.45), 0.0)  # the regulator governs, positive
+      arrive = max(-(v_ego - v_lead) ** 2 / (2 * (gap - 1.45 * v_lead)), -MOONPILOT_APPROACH_DECEL)
+      ask = lead_accel(v_ego, gap, v_lead, 0.0, 1.45)
+      self.assertAlmostEqual(ask, arrive, delta=1e-9)  # the arrival term governs, not the regulator
+      self.assertGreater(ask, -0.3)  # a coast, not a brake
     # the first case sits exactly on the old admission edge (old -0.9985), which is the point: the old
     # floor governed by default at 70-115 m while the geometry asks for a ramp, and the route's 45/45
     # engaged braking ticks sat on it at -1.0..-1.17.
@@ -788,12 +800,15 @@ class TestPolicyFunctions(unittest.TestCase):
   def test_a_braking_lead_matched_at_speed_still_stops_without_contact(self):
     """The safety direction that forbids the naive relative form: from the 1.45 s follow gap at
     20 m/s behind a lead holding -5 m/s^2 to rest, the plain match reads -0.0 at matched speed and
-    contacts it. The sustain law holds 5.29 m of end gap (5.00 at -3.5), flown through the shared
+    contacts it. The sustain law holds 5.14 m of end gap (5.08 at -3.5), flown through the shared
     closed-loop harness with 1 s of steady following before the onset. The -5 stop ended at 5.70 until
     the floor's anchor tapered onto `MOONPILOT_STOP_REST` below 4 m/s: it now finishes at the rest
-    point every other stop uses instead of 0.5 m further back.
+    point every other stop uses instead of 0.5 m further back. The arrival term is what moved these
+    0.15 m closer — it starts bleeding the closing as soon as the lead's brake opens it, so the ego
+    arrives at the floor's own regime a little slower rather than a little later — and 5.14 m is
+    still 12.8x upstream's 0.4 m contact bar.
     """
-    for brake, end_gap in ((-3.5, 5.06), (-5.0, 5.29)):
+    for brake, end_gap in ((-3.5, 5.08), (-5.0, 5.14)):
       with self.subTest(brake=brake):
         s = _fly(20.0, 72.0, 29.0, 20.0, lambda t, b=brake: b if t > 1 else 0.0, 25.0)
         self.assertFalse(s["contact"])
@@ -808,12 +823,15 @@ class TestPolicyFunctions(unittest.TestCase):
     -1.00 m/s^2 of peak command, below the absolute-frame law's -1.89 and the unbounded sustain's
     -3.50, for an end gap of ~40 m either way. That tap peak is the same trade that capped
     `MOONPILOT_LEAD_PREVIEW_T` at 0.5 s (3.36 there on the same scenario), so this is the number the
-    2.0 s horizon was sized to hold under.
+    2.0 s horizon was sized to hold under. -0.43 was the scheduled floor admission (1.6 at 30 m/s:
+    the tap's -1.00 no longer admits it); the arrival term now supplies -0.80 as the ego starts
+    shedding the closing the tap opens, still inside that -1.00 budget and 0.7 m further back at rest.
     """
     s = _fly(30.0, 108.0, 60.0, 30.0, lambda t: -5.0 if 1 < t < 1.5 else 0.0, 20.0)
-    # -0.43 once the floor's admission is scheduled (1.6 at 30 m/s): the tap's -1.00 no longer admits it.
-    self.assertAlmostEqual(s["peak"], -0.43, delta=0.05)
+    self.assertAlmostEqual(s["peak"], -0.80, delta=0.05)
+    self.assertGreater(s["peak"], -MOONPILOT_APPROACH_DECEL)  # the arrival term's own ceiling
     self.assertFalse(s["contact"])
+    self.assertGreater(s["end_gap"], 40.0)
 
   def test_the_early_crossing_branch_is_exact_and_continuous(self):
     """Where the ego matches the lead's speed while the lead is still braking, the late form credits
@@ -1242,21 +1260,25 @@ class TestPlanner(unittest.TestCase):
     with the regulator capped at -1.0. Flown closed-loop with 1 s of steady following before the
     onset so the estimator has a real speed history.
 
-    The approach is untouched by the speed floor: peak -1.78, minimum gap 6.73 against 6.74, no
-    contact. What moved is where the car *rests* once the lead has slowed to a crawl. Without the
-    floor it settles 0.07 m/s below the lead at 9.31 m (1.45 s of headway) — the speed-decay state
-    this floor exists to remove. With it, the car matches the lead's 6.50 m/s exactly and rests
-    6.88 m back after the runway cap, 1.06 s of headway, clear of both the 1.0 s speed-floor bound
-    and the 6.0 m standstill floor. Same braking, same margin through the approach, different resting
-    speed, and that difference is the whole change.
+    The approach no longer arrives hot: the arrival term starts shedding the closing before the
+    lead's brake, so peak -1.61 against the old -1.78, minimum gap 9.36 against 6.74, no contact.
+    What the speed floor still owns is where the car *rests* once the lead has slowed to a crawl:
+    with the floor off the resting speed sits 0.012 m/s below the lead's 6.50 and the gap drifts
+    1 cm wide — the same defect the floor was added for (route 000003df: 0.07 m/s below the lead at
+    9.31 m), now a residual rather than the whole difference, because the arrival term shares the
+    approach and lands the car on the target. With it, the car matches the lead's 6.50 m/s and rests
+    9.36 m back at 1.44 s of headway, clear of both the 1.0 s speed-floor bound and the 6.0 m
+    standstill floor. The 0.005 delta below is what makes that a guard: it is the margin between
+    floor on (0.0006 m/s) and floor off (0.0118), and the floor's own positive test is
+    `test_the_gap_target_is_not_a_reason_to_brake_below_the_leads_speed`.
     """
     s = _fly(17.0, 61.2, 90.0, 17.0, lambda t: -3.5 if 2 <= t < 5 else 0.0, 25.0)
     self.assertTrue(any((v - vl) > 0.0 and 4.0 <= (g - MOONPILOT_STOP_DISTANCE) / (v - vl) <= 7.0 for v, vl, g in zip(s["v"], s["vl"], s["gap"], strict=False)))
-    self.assertAlmostEqual(s["min_gap"], 6.74, delta=0.05)
-    self.assertAlmostEqual(s["peak"], -1.78, delta=0.05)
-    self.assertAlmostEqual(s["end_gap"], 6.88, delta=0.05)
-    # the resting speed is the lead's, not a little under it: that is the invariant this replaces
-    self.assertAlmostEqual(s["v"][-1], s["vl"][-1], delta=0.01)
+    self.assertAlmostEqual(s["min_gap"], 9.36, delta=0.05)
+    self.assertAlmostEqual(s["peak"], -1.61, delta=0.05)
+    self.assertAlmostEqual(s["end_gap"], 9.36, delta=0.05)
+    # the resting speed is the lead's, not a little under it: that is the invariant this floor holds
+    self.assertAlmostEqual(s["v"][-1], s["vl"][-1], delta=0.005)
     self.assertGreater(s["gap"][-1] / max(s["v"][-1], 0.01), MOONPILOT_FOLLOW_SPEED_FLOOR_HEADWAY_T)
     self.assertFalse(s["contact"])
     self.assertGreater(s["peak"], ACCEL_MIN)

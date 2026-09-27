@@ -151,12 +151,15 @@ class TestLongLagEstimator(unittest.TestCase):
 
 
 class TestPlannerWiring(unittest.TestCase):
-  # The stopping floor's onset at 20 m/s against a 5 m/s lead, where the projection's extra meters
-  # decide whether the floor asks for anything at all: 0.45 s of lag is 0.30 s past the stock
-  # constant, which at this 15 m/s closing rate is 4.5 m of the approach. The floor is relative-frame
-  # (`stopping_decel`) with a speed-scheduled admission (1.6 m/s^2 here), so it only crosses it ahead
-  # of the regulator and the TTC term at a large closing rate.
-  ONSET = {"v_ego": 20.0, "v_cruise_kph": 72.0, "d_rel": 81.0, "v_lead": 5.0}
+  # The stopping floor's onset at 20 m/s, where the projection's extra meters decide whether the
+  # floor asks for anything at all: 0.45 s of lag is 0.30 s past the stock constant, which at this
+  # 20 m/s approach is 6 m of the approach. The lead is stopped so the arrival term is inert (its
+  # gate is `t_follow * v_lead > MOONPILOT_STOP_DISTANCE`), and the floor is relative-frame
+  # (`stopping_decel`) with a speed-scheduled admission (1.6 m/s^2 here), so it only crosses ahead
+  # of the regulator and the TTC term at a large closing rate. The original fixture's moving lead
+  # (81 m, 5 m/s) now saturates the arrival term's -APPROACH_DECEL clamp on both seeds, so it can
+  # no longer tell the two horizons apart.
+  ONSET = {"v_ego": 20.0, "v_cruise_kph": 72.0, "d_rel": 137.0, "v_lead": 0.0}
 
   @classmethod
   def _commands(cls, seed, frames=80):
@@ -177,8 +180,9 @@ class TestPlannerWiring(unittest.TestCase):
 
     A single frame cannot show it: from the planner's zero baseline the jerk limit allows 0.1 m/s^2,
     so two first-frame commands are the same clamped value whatever the delay. Held at one state for
-    80 frames the two planners separate qualitatively — on the stock constant the lead is still 4.5 m
-    further out and the floor asks for nothing (0.0), while through 0.45 s it has crossed its onset (-0.68).
+    80 frames the two planners separate qualitatively — on the stock constant the lead is still 6 m
+    further out and the floor asks for nothing (0.0), while through 0.45 s it has crossed its onset
+    (-0.73, against -0.68 before the arrival term took the moving-lead cases off this fixture).
     """
     unseeded_planner, unseeded = self._commands(None)
     seeded_planner, seeded = self._commands(0.45)
