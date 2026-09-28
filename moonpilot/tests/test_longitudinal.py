@@ -1619,12 +1619,10 @@ class TestPlanner(unittest.TestCase):
     self.assertGreater(gap, 5.0)  # and it did not run into the lead
 
   def test_the_reference_approach_holds_its_average_decel(self):
-    """The developer's stated objective as an observable property: on the 10 m/s reference approach
-    (stopped lead appearing at the 114 m first-present maximum, cruise at entry speed), average decel
-    from the -0.5 crossing to rest is 0.979 m/s^2 with peak -1.20 and rest 5.18 m. A raised admission
-    threshold shortens the distance used and raises the average (1.15 measured 1.137 with peak -1.41),
-    so this fails if anyone re-raises the gate without measuring. Pinned on the command, not the
-    constant — the law, not the dial.
+    """The 10 m/s / 114 m first-present stopped lead must use the available distance gently.
+    The time-shaped ask may never pass -0.5 m/s^2: a fixed braking threshold would mistake
+    a softer completed stop for a missing approach. Check the full slowdown, its peak and
+    the soft rest gap rather than one stopping-floor handover.
     """
     planner = _planner()
     v_ego, gap = 10.0, 114.0
@@ -1638,16 +1636,14 @@ class TestPlanner(unittest.TestCase):
       gap = max(0.0, gap - v_ego * DT_MDL)
       if v_ego < 0.05 and abs(commands[-1]) < 0.05:
         break
-    onset = next(i for i, c in enumerate(commands) if c < -0.5)
+    onset = next(i for i, c in enumerate(commands) if c < -0.05)
     rest = next((i for i in range(onset, len(speeds)) if speeds[i] < 0.05), len(speeds) - 1)
     distance = gaps[onset] - gaps[rest]
-    self.assertGreater(distance, 0.0, "the approach never reached the -0.5 command")
-    # Re-pinned on the driver's data: the floor's admission is scheduled (1.2 at 10 m/s) and the TTC
-    # headway shortens below 8 m/s, so the approach starts at 47 m instead of 55.5 m and averages
-    # 1.176 against 0.979 — the driver's own 6-12 m/s stops plateau near -1.0 with a -1.75 median peak.
-    self.assertLessEqual(speeds[onset] ** 2 / (2 * distance), 1.176 + 0.02)
-    self.assertGreaterEqual(min(commands[onset:]), -1.23 - 0.05)
-    self.assertAlmostEqual(gaps[-1], 5.12, delta=0.05)
+    self.assertLess(speeds[rest], 0.05, "the approach never reached rest")
+    self.assertGreater(distance, 0.0, "the approach never used the available distance")
+    self.assertLess(speeds[onset] ** 2 / (2 * distance), 0.7)
+    self.assertGreater(min(commands[onset : rest + 1]), -0.7)
+    self.assertAlmostEqual(gaps[rest], MOONPILOT_STOP_REST, delta=0.25)
 
   def test_a_fresh_matched_speed_radar_lead_stays_within_approach_decel(self):
     """A new radar slot with no reported lead acceleration must not turn matched-speed following into

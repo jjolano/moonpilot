@@ -53,29 +53,36 @@ MOONPILOT_LEAD_PROB_RC = 0.2  # s; radard's own gate-filter decay (radard.py:234
 # The lead accel estimator's window. radard's aLeadK is a KF1D with fixed gains (radard.py:29-48),
 # tau = 0.49 s at DT_MDL, so 90 % of a -3 m/s^2 step takes 1.20 s. A least-squares slope over this
 # window reaches the same step in the window's own length and averages noise instead of lagging it.
-MOONPILOT_LEAD_ACCEL_WINDOW = 7  # samples, 0.35 s at DT_MDL
+# 15 samples rather than 7, because the estimate is what the policy's continuous lead terms read and
+# its noise was the command's. Replayed open-loop over 340 local rlog segments (22.6 min of closing
+# approaches), the planner's jerk-limited command jitter (RMS about a 1 s mean) went 0.090 -> 0.082
+# m/s^2; smoothing the estimate after the fact instead delayed real brakes into contact (a 0.6 s
+# filter hit a lead braking -5 m/s^2 to rest). No closed-loop brake flown (-0.75 to -5 m/s^2, settled
+# and mid-approach, and a -5 tap) reaches a braking threshold more than 0.05 s later than on the
+# 7-sample window, and minimum gaps agree within 0.02 m. What caps the gain is radar track churn:
+# `radarTrackId` changes 3.1 times a second in those approaches, 98 % of them the same vehicle, and
+# each resets the window: it holds more than 7 samples on 42 % of those frames, and the whole cut is
+# there (0.096 -> 0.077 m/s^2; unchanged on the rest). Keeping it across those same-vehicle
+# changes lowers the estimate's error (0.307 -> 0.236 m/s^2 sd) but not the command's jitter, so
+# the reset stays.
+MOONPILOT_LEAD_ACCEL_WINDOW = 15  # samples, 0.75 s at DT_MDL
 MOONPILOT_LEAD_ACCEL_MIN_SAMPLES = 3  # below this the slope is noise, so radard's value stands
 MOONPILOT_LEAD_SPEED_JUMP = 2.5  # m/s in one frame: re-association, not motion (50 m/s^3)
 # The onset window. The full window's bias is what a braking lead costs us: at a step onto -3.5 m/s^2
-# the seven-sample slope needs 0.20 s to pass -2.0 and 0.25 s to pass -3.0, because that is how long
+# the fifteen-sample slope needs 0.40 s to pass -2.0 and 0.55 s to pass -3.0, because that is how long
 # the window is still half full of pre-onset samples — and a real brake ramps in over a few tenths, so
 # the lead's own onset is what the estimate is chasing. The newest three samples read the step in
 # 0.10 s. Reading both and believing the short one only when it is persistently deeper is one-sided by
 # construction (the policy only ever uses a_lead to add braking — `min(a_lead, 0.0)` against
 # `moonpilot/longitudinal.py`'s `MOONPILOT_LEAD_PREVIEW_T`), and the streak is what keeps radar noise
 # out of the command:
-# a single noisy frame cannot flip it, while an onset stays deep for many. Measured: on 51k settled
-# frames of the offline corpus (199 segments, the radar lead's own speed history) the estimate's error
-# against a centered reference is 0.188 -> 0.190 m/s^2 sd, and a spurious read past -1 m/s^2 goes
-# 0.19 % -> 0.21 % of frames — both inside a measurement whose radar vLead noise is 0.024-0.035 m/s,
-# so the design's own 0.05 m/s assumption is conservative. Closed loop
-# (`moonpilot/tests/test_longitudinal.py`), a lead braking at -3.5 m/s^2 from a settled follow: the
-# command reaches -1.0 m/s^2 at 0.30 s instead of 0.35 and -2.0 at 0.50 s either way — one frame at
-# the onset, where a full second of braking credit in `moonpilot/longitudinal.py` used to make it
-# 0.15 against 0.25 — and the arm carrying the lead's *true* accel instead of any estimate reaches
-# -1.0 at the same 0.30 s, so the sensing side of the onset is closed rather than chipped at. What
-# the arm still buys at this credit length is the published plan's tail and the FCW, both of which
-# read `a_lead` directly.
+# a single noisy frame cannot flip it, while an onset stays deep for many. Measured on 18,350
+# steady-lead frames of the 340 local segments (a +-1 s centered slope under 0.1 m/s^2 as the
+# reference), the onset window moves the estimate's error from 0.284 to 0.307 m/s^2 sd and a
+# spurious read past -1 m/s^2 from 0.68 % to 1.00 % of frames. Closed loop, a lead braking at
+# -3.5 m/s^2 from a settled 20 m/s follow draws -0.5 / -1.0 / -2.0 m/s^2 at 0.30 / 0.55 / 0.90 s with
+# or without it: the lead's falling speed reaches the command through the other terms as fast. What
+# the window buys is the published plan's tail and the FCW, both of which read `a_lead` directly.
 MOONPILOT_LEAD_ACCEL_FAST = 3  # samples in the onset window, 0.10 s at DT_MDL
 MOONPILOT_LEAD_ACCEL_FAST_MARGIN = 1.0  # m/s^2 the onset window must read deeper than the full one
 MOONPILOT_LEAD_ACCEL_FAST_STREAK = 2  # consecutive frames the margin must hold before it is used
@@ -114,11 +121,11 @@ class LeadAccelEstimator:
   braking lead gives us. The least-squares slope over MOONPILOT_LEAD_ACCEL_WINDOW samples has no lag
   of its own — a clean ramp reads exactly as soon as MOONPILOT_LEAD_ACCEL_MIN_SAMPLES are on it,
   0.10 s — so the only latency it carries is the ramp onto a window that already holds samples from
-  before the step: 0.30 s at the full window. The onset window is what shortens that: the newest
+  before the step: 0.70 s at the full window. The onset window is what shortens that: the newest
   MOONPILOT_LEAD_ACCEL_FAST samples are read beside the full window and believed only when they are
   persistently deeper, which reaches -2.0 m/s^2 in 0.10 s on a step where the full window needs
-  0.20 s, and -3.0 in 0.10 s where it needs 0.25. It averages measurement noise rather than lagging it:
-  0.19 m/s^2 of jitter over the window for 0.05 m/s of noise, against 1.41 m/s^2 for a one-frame
+  0.40 s, and -3.0 in 0.10 s where it needs 0.55. It averages measurement noise rather than lagging it:
+  0.06 m/s^2 of jitter over the full window for 0.05 m/s of noise, against 1.41 m/s^2 for a one-frame
   difference. The lead's *speed* is left alone — `vLead` has no filter lag to remove, and this
   fit's endpoint value would add a transient bias exactly at the onset of braking.
 
@@ -451,5 +458,5 @@ def lead_path_line(renderer, moonpilot_state, path_x, params):
       break
     points.append(pt)
 
-  widths = np.clip(s_d[:len(points)] * MOONPILOT_LEAD_PATH_PX_PER_M, *MOONPILOT_LEAD_PATH_WIDTH).astype(np.float32)
+  widths = np.clip(s_d[: len(points)] * MOONPILOT_LEAD_PATH_PX_PER_M, *MOONPILOT_LEAD_PATH_WIDTH).astype(np.float32)
   return np.array([x_d, y_d, z], dtype=np.float32).T, np.array(points, dtype=np.float32).reshape(-1, 2), widths, float(lead.inPath)

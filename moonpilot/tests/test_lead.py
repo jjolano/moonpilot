@@ -201,18 +201,19 @@ class TestLeadAccelEstimator(unittest.TestCase):
     return hit
 
   def test_the_onset_window_reads_a_brake_before_the_full_window_does(self):
-    """The bias the onset window exists for: after a step the seven-sample slope is still half
-    pre-onset samples, so it needs 0.20 s to pass -2.0 m/s^2 and 0.25 s to pass -3.0, where the
+    """The bias the onset window exists for: after a step the fifteen-sample slope is still half
+    pre-onset samples, so it needs 0.40 s to pass -2.0 m/s^2 and 0.55 s to pass -3.0, where the
     newest three samples have it in 0.10 s. Both arms are asserted, so a change that made the bare
-    window slower would fail here too — and the closed-loop consequence of this estimator difference
-    is pinned in test_longitudinal's braking-lead test."""
+    window slower would fail here too. The planner's command does not see the difference (a -3.5
+    brake from a settled follow draws the same 0.30 / 0.55 / 0.90 s either way); the published plan's
+    tail and the FCW, which read `a_lead` directly, do."""
     with_window = self._step_times()
     bare = self._step_times(bare_window=True)
 
     self.assertLessEqual(with_window[-2.0], 0.10)
     self.assertLessEqual(with_window[-3.0], 0.10)
-    self.assertLessEqual(bare[-2.0], 0.20)
-    self.assertLessEqual(bare[-3.0], 0.25)
+    self.assertLessEqual(bare[-2.0], 0.40)
+    self.assertLessEqual(bare[-3.0], 0.55)
     for threshold in (-2.0, -3.0):
       self.assertLess(with_window[threshold], bare[threshold], f"the onset window did not beat the bare window at {threshold}")
 
@@ -221,7 +222,7 @@ class TestLeadAccelEstimator(unittest.TestCase):
     braking (`min(a_lead, 0.0)` in the preview, and the floor/TTC terms key off the resulting closing
     rate), so a deeper estimate is more braking and a shallower one is less — which makes "may only
     deepen" the direction that cannot cost safety. It is also rare on a signal with no real onset:
-    11 of 600 frames of a 0.05 m/s random walk, the deepest of them 1.67 m/s^2.
+    22 of 600 frames of a 0.05 m/s random walk on the fifteen-sample window, the deepest of them 2.12 m/s^2.
     """
     rng = np.random.default_rng(0)
     v = 20.0 + np.cumsum(rng.normal(0.0, 0.05, 600))
@@ -663,7 +664,6 @@ class TestRendererLeadPath(unittest.TestCase):
         assert r._lead_path.projected_points.size == 0
         assert r._lead_path_widths.size == 0
         self.assertEqual(r._lead_in_path, 1.0)
-
 
   def test_invalid_or_dead_state_clears_and_redraws(self):
     for valid, alive in ((False, True), (True, False)):
