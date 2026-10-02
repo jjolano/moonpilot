@@ -580,6 +580,9 @@ struct PandaState @0xa7649e2575e4591e {
   # is @3, and the lateral grant this fork adds is @38.
   controlsAllowedLongitudinal @39 :Bool;
 
+  nmiReset @40 :Bool;
+  hardfaultReset @41 :Bool;
+
   enum FaultStatus {
     none @0;
     faultTemp @1;

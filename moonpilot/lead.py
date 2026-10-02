@@ -432,7 +432,7 @@ def lead_path_line(renderer, moonpilot_state, path_x, params):
   """The nearest lead's predicted path projected into a line, out to the planner's horizon.
 
   `renderer` is either tree's ModelRenderer, duck-typed so this module imports no UI: its ego path
-  gives the line its z and its own `_map_to_screen` projects it. `moonpilot_state` is None when the
+  gives the line its z and its own transform and clip region project it. `moonpilot_state` is None when
   message is invalid or its publisher dead. Returns (raw_points, projected_points, widths, in_path),
   with every array empty and in_path 1.0 when there is no line to draw.
   """
@@ -459,12 +459,21 @@ def lead_path_line(renderer, moonpilot_state, path_x, params):
   # Projected point by point rather than as a ribbon: the width is per sample, and the ribbon
   # helper returns the two chains interleaved with anything off screen silently dropped. Stop at
   # the first point that is not visible -- a polyline must not bridge a hole.
+  #
+  # The projection is this file's rather than the renderer's `_map_to_screen`: upstream deleted that
+  # method from the mici tree (lead bar, #39033) while tizi kept it, so calling it worked in exactly
+  # one of the two trees. Both still carry the transform and the clip region it was built from, and
+  # that is all this needs.
+  clip = renderer._clip_region
   points = []
   for x, y, zi in zip(x_d, y_d, z, strict=True):
-    pt = renderer._map_to_screen(float(x), float(y), float(zi) + renderer._path_offset_z)
-    if pt is None:
+    pt = renderer._car_space_transform @ np.array([x, y, zi + renderer._path_offset_z], dtype=np.float32)
+    if abs(pt[2]) < 1e-6:
       break
-    points.append(pt)
+    sx, sy = float(pt[0] / pt[2]), float(pt[1] / pt[2])
+    if not (clip.x <= sx <= clip.x + clip.width and clip.y <= sy <= clip.y + clip.height):
+      break
+    points.append((sx, sy))
 
   widths = np.clip(s_d[: len(points)] * MOONPILOT_LEAD_PATH_PX_PER_M, *MOONPILOT_LEAD_PATH_WIDTH).astype(np.float32)
   return np.array([x_d, y_d, z], dtype=np.float32).T, np.array(points, dtype=np.float32).reshape(-1, 2), widths, float(lead.inPath)
