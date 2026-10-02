@@ -35,9 +35,11 @@ from moonpilot.curve import (
   MOONPILOT_CURVE_J_LAT,
   MOONPILOT_CURVE_MIN_PATH_SPEED,
   MOONPILOT_CURVE_MIN_SLACK,
+  MOONPILOT_CURVE_MIN_T,
   MOONPILOT_CURVE_PREVIEW_T,
   MOONPILOT_CURVE_T_IDX,
   MOONPILOT_CURVE_V_MIN,
+  CurveTarget,
   LatAccelBiasEstimator,
   curve_accel,
   curve_targets,
@@ -176,7 +178,7 @@ class TestCurveTargets(unittest.TestCase):
     target = curve_targets(_path(curv), True)
     self.assertAlmostEqual(float(target.v[-1]), math.sqrt(MOONPILOT_CURVE_A_LAT / curv), delta=1e-5)
 
-  def test_a_ten_metre_ramp_still_governs(self):
+  def test_a_ten_meter_ramp_still_governs(self):
     """The window does not lose the entry this ceiling exists for. A 10 m ramp to a 250 m radius is
     `dk/ds = 4e-4`, i.e. `cbrt(3.0 / 4e-4)` = 19.6 m/s — and it is only two or three samples wide on
     the model's own grid at 20 m/s, so the interpolated curvature under-reads its slope by ~10 %
@@ -201,7 +203,7 @@ class TestCurveTargets(unittest.TestCase):
     while the 67 % it keeps are coherent ramps at 1.7 m spacing with |κ| at 1.7x.
 
     Here the step is 4e-4 across the 0.19 m between two of the model grid's first samples — the
-    sub-metre class — so every sample keeps the speed the *budget* gives it, where the sample-scale
+    sub-meter class — so every sample keeps the speed the *budget* gives it, where the sample-scale
     gradient reads that step as a ramp and caps three of them. The budget's own per-sample dip at the
     spike is untouched: it is a level rather than a derivative.
     """
@@ -252,6 +254,21 @@ class TestCurveAccel(unittest.TestCase):
     target = curve_targets(_path(0.004), True)
     self.assertEqual(curve_accel(30.0, float(target.x[0]) - 1e-9, target), MOONPILOT_CURVE_ACCEL_MIN)
     self.assertTrue(MOONPILOT_CURVE_MIN_SLACK > 0.0)
+
+  def test_a_near_binding_sample_asks_its_speed_error_over_the_travel_time_floor(self):
+    """A sample a few meters out and 0.6 m/s under the car is the model path's sample noise, not a
+    curve: unfloored its 4 m slack read the -1.5 floor on alternate frames (route 000003f8 segment 0).
+    Floored at `MOONPILOT_CURVE_MIN_T` of travel it asks the gentle `(v_t^2 - v^2) / (2 v T)`. A real
+    late curve — a large overspeed inside that same floored distance — still takes the whole floor."""
+    v = 20.0
+    near = CurveTarget(x=np.array([4.0]), v=np.array([v - 0.6]))
+    a = curve_accel(v, 0.0, near)
+    self.assertAlmostEqual(a, ((v - 0.6) ** 2 - v**2) / (2.0 * v * MOONPILOT_CURVE_MIN_T), delta=1e-9)
+    self.assertGreater(a, 0.5 * MOONPILOT_CURVE_ACCEL_MIN)
+    # the route's late sharp curve: 12.7 m/s, 10 m short of a 9 m/s sample
+    late = CurveTarget(x=np.array([10.0]), v=np.array([9.0]))
+    self.assertLess(10.0, 12.7 * MOONPILOT_CURVE_MIN_T)  # inside the floored distance
+    self.assertEqual(curve_accel(12.7, 0.0, late), MOONPILOT_CURVE_ACCEL_MIN)
 
   def test_the_inactive_sentinel_is_accel_max(self):
     target = curve_targets(_path(0.004), True)

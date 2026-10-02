@@ -203,15 +203,15 @@ class TestLeadAccelEstimator(unittest.TestCase):
   def test_the_onset_window_reads_a_brake_before_the_full_window_does(self):
     """The bias the onset window exists for: after a step the fifteen-sample slope is still half
     pre-onset samples, so it needs 0.40 s to pass -2.0 m/s^2 and 0.55 s to pass -3.0, where the
-    newest three samples have it in 0.10 s. Both arms are asserted, so a change that made the bare
-    window slower would fail here too. The planner's command does not see the difference (a -3.5
-    brake from a settled follow draws the same 0.30 / 0.55 / 0.90 s either way); the published plan's
-    tail and the FCW, which read `a_lead` directly, do."""
+    newest three samples have it once their streak is held — 0.20 s at four frames. Both arms are
+    asserted, so a change that made the bare window slower would fail here too. The planner's command
+    does not see the difference (a -3.5 brake from a settled follow draws the same 0.30 / 0.55 / 0.90 s
+    either way); the published plan's tail and the FCW, which read `a_lead` directly, do."""
     with_window = self._step_times()
     bare = self._step_times(bare_window=True)
 
-    self.assertLessEqual(with_window[-2.0], 0.10)
-    self.assertLessEqual(with_window[-3.0], 0.10)
+    self.assertLessEqual(with_window[-2.0], 0.20)
+    self.assertLessEqual(with_window[-3.0], 0.20)
     self.assertLessEqual(bare[-2.0], 0.40)
     self.assertLessEqual(bare[-3.0], 0.55)
     for threshold in (-2.0, -3.0):

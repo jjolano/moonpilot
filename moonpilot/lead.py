@@ -72,20 +72,28 @@ MOONPILOT_LEAD_SPEED_JUMP = 2.5  # m/s in one frame: re-association, not motion 
 # the fifteen-sample slope needs 0.40 s to pass -2.0 and 0.55 s to pass -3.0, because that is how long
 # the window is still half full of pre-onset samples — and a real brake ramps in over a few tenths, so
 # the lead's own onset is what the estimate is chasing. The newest three samples read the step in
-# 0.10 s. Reading both and believing the short one only when it is persistently deeper is one-sided by
+# 0.10 s, and the four-frame streak below believes them at 0.20 s. Reading both and believing the short
+# one only when it is persistently deeper is one-sided by
 # construction (the policy only ever uses a_lead to add braking — `min(a_lead, 0.0)` against
 # `moonpilot/longitudinal.py`'s `MOONPILOT_LEAD_PREVIEW_T`), and the streak is what keeps radar noise
 # out of the command:
 # a single noisy frame cannot flip it, while an onset stays deep for many. Measured on 18,350
 # steady-lead frames of the 340 local segments (a +-1 s centered slope under 0.1 m/s^2 as the
-# reference), the onset window moves the estimate's error from 0.284 to 0.307 m/s^2 sd and a
-# spurious read past -1 m/s^2 from 0.68 % to 1.00 % of frames. Closed loop, a lead braking at
+# reference), the onset window (at a two-frame streak) moves the estimate's error from 0.284 to
+# 0.307 m/s^2 sd and a spurious read past -1 m/s^2 from 0.68 % to 1.00 % of frames. Closed loop, a lead braking at
 # -3.5 m/s^2 from a settled 20 m/s follow draws -0.5 / -1.0 / -2.0 m/s^2 at 0.30 / 0.55 / 0.90 s with
 # or without it: the lead's falling speed reaches the command through the other terms as fast. What
 # the window buys is the published plan's tail and the FCW, both of which read `a_lead` directly.
 MOONPILOT_LEAD_ACCEL_FAST = 3  # samples in the onset window, 0.10 s at DT_MDL
 MOONPILOT_LEAD_ACCEL_FAST_MARGIN = 1.0  # m/s^2 the onset window must read deeper than the full one
-MOONPILOT_LEAD_ACCEL_FAST_STREAK = 2  # consecutive frames the margin must hold before it is used
+MOONPILOT_LEAD_ACCEL_FAST_STREAK = 4  # consecutive frames the margin must hold before it is used
+# Four, not two: a single `vLead` blip-and-return (a +0.2 m/s sample that is gone the next frame) sits
+# inside the three-sample window for three frames, and its falling edge read -1.0..-1.6 m/s^2 for two or
+# three of them. Those reads do reach the command — through `v_lead_eff` and the lead's projected
+# state — as single-frame brake taps while following. On route 000003f8 segments 42-45 (2.0 min of
+# engaged steady follow) streak 2 gave 69 frames past -0.8 m/s^2 and the command's high-frequency sd
+# 0.141; streak 4 gives 35 and 0.114, within 0.002 of having no onset window at all, for 0.10 s more
+# onset latency on the plan tail and FCW.
 # radard's accel-decay model, mirrored rather than imported: `radard.py` pulls messaging and opendbc,
 # and this module is on plannerd's and both renderers' import path. `MOONPILOT_LEAD_ACCEL_TAU` is
 # pinned to radard's own constant by test_lead; the two below copy inline literals there
@@ -123,8 +131,8 @@ class LeadAccelEstimator:
   0.10 s — so the only latency it carries is the ramp onto a window that already holds samples from
   before the step: 0.70 s at the full window. The onset window is what shortens that: the newest
   MOONPILOT_LEAD_ACCEL_FAST samples are read beside the full window and believed only when they are
-  persistently deeper, which reaches -2.0 m/s^2 in 0.10 s on a step where the full window needs
-  0.40 s, and -3.0 in 0.10 s where it needs 0.55. It averages measurement noise rather than lagging it:
+  persistently deeper, which reaches -2.0 m/s^2 in 0.20 s on a step where the full window needs
+  0.40 s, and -3.0 in 0.20 s where it needs 0.55. It averages measurement noise rather than lagging it:
   0.06 m/s^2 of jitter over the full window for 0.05 m/s of noise, against 1.41 m/s^2 for a one-frame
   difference. The lead's *speed* is left alone — `vLead` has no filter lag to remove, and this
   fit's endpoint value would add a transient bias exactly at the onset of braking.

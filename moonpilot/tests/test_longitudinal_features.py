@@ -6,6 +6,7 @@ Split out of `test_longitudinal.py` for the 120 KB size gate; helpers live there
 import math
 import time
 import unittest
+from unittest import mock
 
 import numpy as np
 
@@ -22,6 +23,7 @@ from moonpilot.curve import (
   MOONPILOT_CURVE_BIAS_KEY,
   MOONPILOT_CURVE_BIAS_MIN_SAMPLES,
   MOONPILOT_CURVE_BIAS_PERSIST_EVERY,
+  MOONPILOT_CURVE_EXIT_JERK,
   MOONPILOT_CURVE_HOLD_MARGIN,
   MOONPILOT_CURVE_K_HOLD,
   MOONPILOT_CURVE_PATH_MAX_AGE,
@@ -363,6 +365,39 @@ class TestCurveSpeed(unittest.TestCase):
       without.update(_inputs(v_ego=30.0))
     self.assertTrue(np.all(without.a_desired_trajectory >= 0.0))
     self.assertTrue(np.all(np.diff(without.v_desired_trajectory) >= -1e-9))
+
+  def test_the_exit_rebuilds_the_positive_ask_at_the_exit_jerk(self):
+    """Route 000003f8 segment 0: below set speed the command went -1.50 -> +1.17 within 2 s of a curve
+    letting go, the cruise rung behind the comfort jerk, and the car pulled +1.35 m/s^2 with 20 degrees
+    of wheel still in. Once the curve terms stop braking the positive ask now rebuilds from zero at
+    `MOONPILOT_CURVE_EXIT_JERK`: at k frames after the release it is at most `JERK * k * dt`, so +0.5
+    takes ~2 s where the comfort jerk alone gets there in ~0.35 s. The ramp only ever caps the
+    positive side and is armed only by braking, so a straight road that never braked is the planner
+    without it, frame for frame."""
+    v_ego, v_cruise_kph = 20.0, 108.0
+    straight = _path(v_ego, 0.0)
+    planner = _planner()
+    for _ in range(40):
+      planner.update(_inputs(v_ego=v_ego, v_cruise_kph=v_cruise_kph, path=self._ramp_curve(v_ego, 30.0, curvature=0.01)))
+    self.assertAlmostEqual(planner.output_a_target, MOONPILOT_CURVE_ACCEL_MIN, delta=1e-6)
+    exit_cmds = []
+    for k in range(1, 61):
+      planner.update(_inputs(v_ego=v_ego, v_cruise_kph=v_cruise_kph, path=straight))
+      exit_cmds.append(planner.output_a_target)
+      self.assertLessEqual(planner.output_a_target, MOONPILOT_CURVE_EXIT_JERK * k * DT_MDL + 1e-9, f"frame {k} after the release")
+    self.assertGreater(exit_cmds[-1], 0.5)  # it does rebuild, to the cruise rung's side of +0.5
+
+    def cruise(planner):
+      cmds = []
+      for _ in range(20):
+        planner.update(_inputs(v_ego=v_ego, v_cruise_kph=v_cruise_kph, path=straight))
+        cmds.append(planner.output_a_target)
+      return cmds
+
+    with mock.patch("moonpilot.longitudinal.MOONPILOT_CURVE_EXIT_JERK", math.inf):
+      uncapped = cruise(_planner())
+    self.assertEqual(cruise(_planner()), uncapped)
+    self.assertGreater(uncapped[7], 0.5)  # the comfort jerk's own ramp: past +0.5 inside 0.4 s
 
   def test_the_learned_scale_persists(self):
     """The value handed to the next drive, on the estimator's own cadence and gate: a trusted

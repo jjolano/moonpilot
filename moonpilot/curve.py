@@ -64,7 +64,7 @@ MOONPILOT_CURVE_JERK_STEP = 2.0  # m; the length the jerk ceiling's |dk/ds| is m
 # spacing with incoherent steps — net over summed |dk| 0.42, and |k| at 0.6x its own +/-5 m
 # neighbourhood — while the 67 % it keeps are coherent ramps at 1.7 m spacing with |k| at 1.7x its
 # neighbourhood, at full depth. 5 m dropped coherent ramps too (the dropped set's coherence median 1.0),
-# which is why this is sized to the sub-metre class rather than to the ramp the term exists for. The
+# which is why this is sized to the sub-meter class rather than to the ramp the term exists for. The
 # derivative is a centered +/-STEP/2 difference clamped to the path's own ends and divided by the span
 # it actually used, so a linear ramp reads its own slope exactly wherever the window fits inside it,
 # and the cost is one-way: only structure narrower than the window reads shallow.
@@ -86,11 +86,23 @@ MOONPILOT_CURVE_PATH_CLOCK_SANITY = 10.0  # s; an age past this is a clock that 
 MOONPILOT_CURVE_V_MIN = 5.0  # m/s; floor on any target speed, so a spurious curvature cannot ask for a stop
 MOONPILOT_CURVE_ACCEL_MIN = -1.5  # m/s^2; the terms' shared floor, well above ACCEL_MIN
 MOONPILOT_CURVE_MIN_SLACK = 1.0  # m; floor on the braking-distance denominator
+MOONPILOT_CURVE_MIN_T = 1.0  # s; floor on the pre-brake's distance, in travel time (see `curve_accel`).
+# Swept on route 000003f8 segment 0, against the late sharp curve there (a ~3 m/s^2 apex at 12.7 m/s,
+# which wants the whole -1.5 floor) and the near-speed flicker 17 s later: 0.5 s left the flicker at
+# -0.8..-1.2, 1.67 s (the in-curve gain's own time) halved the sharp curve's braking to -0.86, and 1.0 s
+# keeps that curve at -1.2..-1.43 while the flicker reads -0.15..-0.6.
 MOONPILOT_CURVE_MIN_PATH_SPEED = 1.0  # m/s; floor under the path speed the curvature is divided by
 MOONPILOT_CURVE_K_HOLD = 0.6  # 1/s on the in-curve speed error
 MOONPILOT_CURVE_HOLD_MARGIN = 1.1  # slack on the budget before the in-curve term engages at all
 MOONPILOT_CURVE_HOLD_MIN_SPEED = 5.0  # m/s; below it the steering angle implies curvatures no plan should chase
 MOONPILOT_CURVE_HOLD_MIN_CURVATURE = 1e-4  # 1/m (10 km radius); below it the measurement is noise
+MOONPILOT_CURVE_EXIT_JERK = 0.25  # m/s^3; how fast the positive ask may rebuild once the curve terms
+# stop braking. Without it the exit is the cruise ladder's rung behind the 1.5 m/s^3 comfort ramp: on
+# route 000003f8 segment 0 (12 m/s, ~3 m/s^2 of lateral at the apex) the command went -1.50 -> +1.17 in
+# 2.0 s and the car pulled +1.35 m/s^2 one second after the unwind, with 20 degrees of wheel still in.
+# The driver's own exits on that route, from comparable apexes at 11-14 m/s, sit near +0.1 at the
+# unwind, +0.25..0.45 one second later and +0.4..0.5 at two; 0.25 m/s^3 from zero at the release is
+# that ramp. It only caps the positive side, so it can never add braking.
 MOONPILOT_CURVE_BIAS_T = 1.0  # s between a prediction and the measurement it is scored against
 MOONPILOT_CURVE_BIAS_RC = 20.0  # s time constant of the ratio filter
 MOONPILOT_CURVE_BIAS_MIN_LAT_ACCEL = 1.0  # m/s^2; below this both signals are noise
@@ -213,14 +225,21 @@ def curve_targets(model, allowed, roll=0.0, scale=1.0, ahead=0.0) -> CurveTarget
 def curve_accel(v_ego, x_ego, curve) -> float:
   """The pre-brake: the decel that arrives at the deepest binding curve sample at its own target
   speed. `ACCEL_MAX` is the inactive sentinel — a straight path, a target above the current speed, or
-  every point already behind the car — so `min` leaves the cruise term exactly as it was."""
+  every point already behind the car — so `min` leaves the cruise term exactly as it was.
+
+  The distance is floored at `MOONPILOT_CURVE_MIN_T` of travel, so a sample the car is about to reach
+  asks `~(v_target - v_ego) / MOONPILOT_CURVE_MIN_T` instead of `(v_target**2 - v_ego**2) / 2d` with `d`
+  going to zero — a ratio that is the model path's sample noise once the car is within a few meters.
+  Unfloored, on route 000003f8 segment 0 a sample 0.6 m/s under the car's speed and a few meters out
+  asked the -1.5 floor on alternate frames for half a second. Beyond that distance the law is
+  unchanged, and a large overspeed still saturates at the floor."""
   if curve is None:
     return ACCEL_MAX
   d = curve.x - x_ego
   binding = (d > 0.0) & (curve.v < v_ego)
   if not binding.any():
     return ACCEL_MAX
-  slack = np.maximum(d[binding], MOONPILOT_CURVE_MIN_SLACK)
+  slack = np.maximum(d[binding], max(MOONPILOT_CURVE_MIN_SLACK, v_ego * MOONPILOT_CURVE_MIN_T))
   a = (curve.v[binding] ** 2 - v_ego**2) / (2.0 * slack)
   return float(max(a.min(), MOONPILOT_CURVE_ACCEL_MIN))
 
