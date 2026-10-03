@@ -3,8 +3,8 @@
 The controller must hold up its half of controlsd's contract — same `update` signature, the
 LongControlState that controlsState and both UIs read, a command inside the car's own accel limits —
 and the three things the fork owns on top of upstream's loop: the output rate limit (and the one
-place it is deliberately dropped, the handover out of the stopping state), the integrator freeze, and
-the stopping ramp.
+place it is deliberately dropped, a positive-plan handover out of the stopping state), the
+integrator freeze, and planned rolling braking before the stationary hold.
 """
 
 import unittest
@@ -16,8 +16,8 @@ from openpilot.common.realtime import DT_CTRL
 
 from moonpilot.longcontrol import (
   MOONPILOT_ACCEL_JERK,
+  MOONPILOT_MIN_ROLLING_STOP_DECEL,
   MOONPILOT_STANDSTILL_SPEED,
-  MOONPILOT_STOPPING_ROLL_JERK,
   MoonpilotLongControl,
   moonpilot_longcontrol,
 )
@@ -39,6 +39,7 @@ def _state(v_ego=20.0, a_ego=0.0, brake=False, gas=False, standstill=False):
   CS.aEgo = float(a_ego)
   CS.brakePressed = bool(brake)
   CS.gasPressed = bool(gas)
+  CS.standstill = bool(standstill)
   CS.cruiseState.standstill = bool(standstill)
   return CS
 
@@ -91,26 +92,47 @@ class TestMoonpilotLongControl(unittest.TestCase):
       self.assertLessEqual(abs(output - previous), MOONPILOT_ACCEL_JERK * DT_CTRL + 1e-9)
       previous = output
 
-  def test_stopping_eases_while_rolling_then_ramps_to_the_car_stop_accel(self):
-    """Rolling into the stop the hold deepens at the rolling rate — the lurch a driver eases the pedal
-    to avoid — and only once the car is parked does it ramp to the car's own stop accel."""
-    controller, CP = _controller()
-    rolling = _state(v_ego=0.2, a_ego=0.0)
-    outputs = [_step(controller, rolling, -1.0, should_stop=True) for _ in range(40)]
-    self.assertEqual(controller.long_control_state, LongCtrlState.stopping)
-    self.assertAlmostEqual(outputs[-1], -MOONPILOT_STOPPING_ROLL_JERK * DT_CTRL * 40, delta=1e-6)
+  def test_rolling_stop_tracks_the_easing_target(self):
+    controller, _ = _controller()
+    controller.long_control_state = LongCtrlState.stopping
+    controller.last_output_accel = -0.93
+    CS = _state(v_ego=0.28)
 
-    parked = _state(v_ego=0.0, a_ego=0.0, standstill=True)
-    outputs += [_step(controller, parked, -1.0, should_stop=True) for _ in range(300)]
-    self.assertAlmostEqual(outputs[-1], CP.stopAccel, delta=1e-6)
-    self.assertGreaterEqual(min(outputs), CP.stopAccel)
-    # monotone descent through both ramps
-    for earlier, later in zip(outputs, outputs[1:], strict=False):
-      self.assertLessEqual(later, earlier + 1e-12)
+    output = _step(controller, CS, -0.33, should_stop=True, frames=20)
+    self.assertAlmostEqual(output, -0.33, delta=1e-6)
+
+  def test_rolling_stop_preserves_stronger_emergency_braking(self):
+    controller, _ = _controller()
+    CS = _state(v_ego=0.28)
+
+    output = _step(controller, CS, -3.0, should_stop=True, frames=60)
+    self.assertAlmostEqual(output, -3.0, delta=1e-6)
+
+  def test_zero_target_still_finishes_a_rolling_stop(self):
+    controller, _ = _controller()
+    CS = _state(v_ego=0.28)
+
+    output = _step(controller, CS, 0.0, should_stop=True, frames=20)
+    self.assertAlmostEqual(output, -MOONPILOT_MIN_ROLLING_STOP_DECEL, delta=1e-6)
+
+  def test_rolling_stop_does_not_treat_cruise_standstill_as_physical_standstill(self):
+    controller, _ = _controller()
+    CS = _state(v_ego=0.28)
+    CS.cruiseState.standstill = True
+
+    output = _step(controller, CS, -0.33, should_stop=True, frames=20)
+    self.assertAlmostEqual(output, -0.33, delta=1e-6)
+
+  def test_physical_standstill_ramps_to_the_car_stop_accel(self):
+    controller, CP = _controller()
+    CS = _state(v_ego=0.0, standstill=True)
+
+    output = _step(controller, CS, -0.33, should_stop=True, frames=300)
+    self.assertAlmostEqual(output, CP.stopAccel, delta=1e-6)
 
   def test_stopping_never_brakes_past_the_limits(self):
     controller, _ = _controller()
-    CS = _state(v_ego=5.0, a_ego=0.0, standstill=True)
+    CS = _state(v_ego=0.0, a_ego=0.0, standstill=True)
     for _ in range(200):
       output = _step(controller, CS, -1.0, should_stop=True, limits=(-1.0, 2.0))
     self.assertGreaterEqual(output, -1.0)
@@ -181,26 +203,27 @@ class TestMoonpilotLongControl(unittest.TestCase):
     self.assertAlmostEqual(_step(controller, released, 0.5, frames=20), 0.5, delta=1e-6)
 
   def test_a_shallow_stop_hold_does_not_delay_the_release_either(self):
-    """The reset fires on every `stopping -> pid` edge, not only at the brake floor, and this is why.
-
-    Everything the stopping branch produces is a brake command, so a half-ramped hold carried into the
-    pid branch commands braking while the plan asks for motion — the same defect as the saturated hold,
-    just for less time. Measured from the edge at a 10 s dwell the pre-fix loop commands -0.76 and the
-    plan asks +0.15; at 11 s it commands -1.76. A reset makes the first frame land on the plan's side.
-
-    Asserted on the delivered accel: a -0.2 hold releasing into a +0.5 plan comes out at +0.08, one
-    rate-limit step from the reset baseline, and at -0.12 if the hold is carried over.
-    """
+    """A shallow held brake must release immediately when the plan asks to go, too."""
     controller, _ = _controller()
     creeping = _state(v_ego=0.2, standstill=False)
     for _ in range(80):
       _step(controller, creeping, -0.5, should_stop=True)
     self.assertEqual(controller.long_control_state, LongCtrlState.stopping)
-    self.assertAlmostEqual(controller.last_output_accel, -0.2, delta=1e-6)  # nowhere near the floor
+    self.assertTrue(-1.0 < controller.last_output_accel < 0.0)  # nowhere near the stationary floor
 
     output = _step(controller, creeping, 0.5, should_stop=False)
     self.assertGreater(output, 0.0)  # already on the plan's side, not still ramping through the brake
     self.assertAlmostEqual(output, MOONPILOT_ACCEL_JERK * DT_CTRL, delta=1e-6)
+
+  def test_negative_braking_request_survives_stopping_to_pid_transition(self):
+    controller, _ = _controller()
+    controller.long_control_state = LongCtrlState.stopping
+    controller.last_output_accel = -0.93
+    CS = _state(v_ego=0.28)
+
+    output = _step(controller, CS, -0.33, should_stop=False)
+    self.assertEqual(controller.long_control_state, LongCtrlState.pid)
+    self.assertLess(output, -0.3)
 
   def test_engaging_from_a_standstill_starts_stopping_not_driving(self):
     """long_control_state_trans' contract, which is why the fork reuses upstream's function."""
