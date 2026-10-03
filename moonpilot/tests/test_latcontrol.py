@@ -3,6 +3,7 @@ import unittest
 
 from opendbc.car.car_helpers import interfaces
 from opendbc.car.gm.values import CAR as GM
+from opendbc.car.lateral import FRICTION_THRESHOLD
 from opendbc.car.structs import car
 from opendbc.car.toyota.values import CAR as TOYOTA
 from opendbc.car.vehicle_model import VehicleModel
@@ -12,11 +13,9 @@ from openpilot.common.constants import ACCELERATION_DUE_TO_GRAVITY
 from openpilot.common.realtime import DT_CTRL
 
 from moonpilot.latcontrol import (
-  MOONPILOT_FRICTION_HOLD,
-  MOONPILOT_FRICTION_RELEASE,
+  MOONPILOT_FRICTION_DEADBAND,
   MOONPILOT_JERK_LOOKAHEAD_T,
   MOONPILOT_KI,
-  MOONPILOT_MEAS_CUTOFF_HZ,
   MoonpilotLatControlTorque,
   moonpilot_latcontrol,
 )
@@ -203,16 +202,27 @@ class TestMoonpilotLatControlTorque(unittest.TestCase):
     self.assertIsNone(moonpilot_latcontrol(CP, CI, DT_CTRL, _params(on=False)))
     self.assertIsInstance(moonpilot_latcontrol(CP, CI, DT_CTRL, _params(on=True)), MoonpilotLatControlTorque)
 
-  def test_friction_holds_through_small_error_crossings(self):
+  def test_friction_is_quiet_continuous_and_bounded_without_a_release_latch(self):
     lac, _, _ = _controller()
-    self.assertEqual(lac._friction(0.0, 0.0, 0.0), 0.0)
-    self.assertEqual(lac._friction(MOONPILOT_FRICTION_HOLD, 0.0, 0.0), 0.0)
-    self.assertEqual(lac._friction(0.5 * (MOONPILOT_FRICTION_HOLD + MOONPILOT_FRICTION_RELEASE), 0.0, 0.0), 0.0)
-    self.assertGreater(lac._friction(MOONPILOT_FRICTION_RELEASE, 0.0, 0.0), 0.0)
-    self.assertLess(lac._friction(-MOONPILOT_FRICTION_RELEASE, 0.0, 0.0), 0.0)
-    self.assertEqual(lac._friction(0.0, 0.0, 0.0), 0.0)
-    lac.reset()
-    self.assertFalse(lac.friction_hold)
+    limit = lac.torque_params.friction * lac.torque_params.latAccelFactor
+    ramp = FRICTION_THRESHOLD - MOONPILOT_FRICTION_DEADBAND
+    epsilon = 1e-6
+    for deadzone in (0.0, 0.08, 0.3):
+      quiet_band = max(deadzone, MOONPILOT_FRICTION_DEADBAND)
+      for sign in (-1.0, 1.0):
+        with self.subTest(deadzone=deadzone, sign=sign):
+          self.assertEqual(lac._friction(sign * quiet_band, 0.0, deadzone), 0.0)
+          midpoint = sign * (quiet_band + ramp / 2)
+          half = lac._friction(midpoint, 0.0, deadzone)
+          self.assertAlmostEqual(half, sign * limit / 2)
+          self.assertAlmostEqual(lac._friction(sign * (quiet_band + ramp), 0.0, deadzone), sign * limit)
+          self.assertAlmostEqual(lac._friction(sign * (quiet_band + 10 * ramp), 0.0, deadzone), sign * limit)
+          self.assertAlmostEqual(lac._friction(midpoint, 0.0, deadzone), half)
+          for boundary in (quiet_band, 0.10, quiet_band + ramp):
+            lac._friction(0.0, 0.0, deadzone)
+            before = lac._friction(sign * (boundary - epsilon), 0.0, deadzone)
+            after = lac._friction(sign * (boundary + epsilon), 0.0, deadzone)
+            self.assertLess(abs(after - before), 2e-5 * limit)
 
   def test_measurement_filter_rejects_a_single_frame_angle_spike(self):
     """A road step on steeringAngleDeg must not land whole in feedback: friction tracks error
@@ -239,7 +249,6 @@ class TestMoonpilotLatControlTorque(unittest.TestCase):
     lac.reset()
     lac_log = _run(lac, VM, CS, params, 1)
     self.assertAlmostEqual(lac_log.actualLateralAccel, 0.0, delta=0.05 * abs(raw))
-    self.assertEqual(MOONPILOT_MEAS_CUTOFF_HZ, 8.0)
 
   def test_angle_square_wave_does_not_flip_output_every_frame(self):
     """High-frequency angle noise (the bump signature) must not produce a torque sign-flip

@@ -10,3 +10,17 @@
 - The module remains `curvature.py`, not `path.py`, because `moonpilot/paths.py` owns storage roots. `moonpilot/tests/test_curvature.py` pins the 80 ms capture plus 200 ms delay as a 280 ms sample, live 10 ms advancement, action anchoring, the lateral-acceleration bound, immediate first-call behavior, and every freshness/shape pass-through.
 - **`MoonpilotPathSmooth` is an opt-in stage on the request, not on the correction above.** `moonpilot_path_smooth()` is the sibling factory (`self.moonpilot_path_smooth` in controlsd), off by default and chosen at construction, so its row takes a restart; when it returns `None` controlsd applies nothing and the frame is stock-exact. When on it is a first-order IIR at the control rate (`x += (1 - exp(-dt/tau)) * (u - x)`, `tau = 0.15 s`) between the fork's correction and `clip_curvature`, and it holds one piece of state: while not steering it tracks the input, so a re-engage starts from the curvature the car is already on and never re-injects pre-disengage state, and a non-finite request passes through with the state held. Its lag is folded into **both** `lat_delay` reads — the response horizon above and the torque controller's setpoint — so the filter never silently desynchronizes the delay bookkeeping it sits inside. The intended effect, from an offline replay of this route's engaged frames: about half the large controller-output steps and about 45% of total step energy, for ~0.15 s of added path lag (≈2 cm of lateral error at typical speeds), with sharp-cornering targets unchanged because geometry, not chatter, drives those. `TestSmoothFactory`, `TestPathSmooth` and `TestSmoothWiring` pin it.
 
+## Continuous torque friction compensation
+
+`moonpilot/latcontrol.py` logs controller version **1001** for the continuous friction map. Version 1000's compensation switched from zero to a nonzero value at 0.10 m/s² and dropped back to zero at 0.05 m/s². With the latest analyzed route's learned coefficient, those transitions added about 104 and removed about 52 CAN torque units.
+
+The replacement retains the near-zero quiet region without a release latch:
+
+- Input is still `error + MOONPILOT_JERK_GAIN * desired_jerk`, with the gain unchanged at 0.3.
+- The quiet band is `max(car_deadzone, MOONPILOT_FRICTION_DEADBAND)`, with the fork deadband at 0.05 m/s² and the car's steering-angle deadzone converted to acceleration as before.
+- Subtract that band from the input's magnitude, retaining its sign, then pass the result through the existing `get_friction` helper with a 0.15 m/s² ramp. Compensation is zero at the band's edge and reaches the unchanged learned maximum at `quiet_band + 0.15`; with a zero car deadzone it still reaches full compensation at 0.20 m/s².
+- There is no friction state to carry across an error reversal or reset, no new filter lag, and no change to the measurement filter, request delay, PI gains, Toyota torque/rate limits, or safety layer.
+
+An 84,708-frame replay of `000003fe--2ed5f82220`, using its original timestamps and recorded plant inputs, reduced the median friction-term step at the old release events from 0.0748 to 0.0225 normalized torque. The old controller's replay matched logged requests with a 99th-percentile absolute error of 0.0020. This is command-path evidence, not a closed-loop prediction: smaller corrections can occur more often, and physical steering stiction or EPS deadband may remain. A new drive must check notch size, tracking error, and rough-road weaving before changing jerk gain or shrinking the quiet band.
+
+
