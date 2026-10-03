@@ -29,6 +29,7 @@ from moonpilot.engage import moonpilot_engage  # moonpilot seam, see AGENTS.md
 from moonpilot.features import is_fork_build  # moonpilot seam, see AGENTS.md
 from moonpilot.turn_desire import turn_desire_alert  # moonpilot seam, see AGENTS.md
 from moonpilot.corridor import path_outside_alert  # moonpilot seam, see AGENTS.md
+from moonpilot.locationd import moonpilot_locationd_ok  # moonpilot seam, see AGENTS.md
 
 REPLAY = "REPLAY" in os.environ
 SIMULATION = "SIMULATION" in os.environ
@@ -424,7 +425,7 @@ class SelfdriveD:
       # the defaults of a message that was never received are not a localizer failure
       if self.sm.seen['deviceMotion'] and not self.sm['deviceMotion'].posenetOK:
         self.events.add(EventName.posenetInvalid)
-      if self.sm.seen['deviceMotion'] and not self.sm['deviceMotion'].inputsOK:
+      if self.sm.seen['deviceMotion'] and not moonpilot_locationd_ok(self.sm['deviceMotion'].inputsOK):  # moonpilot seam, see AGENTS.md
         self.events.add(EventName.locationdTemporaryError)
       if (self.sm.seen['vehicleParameters'] and not self.sm['vehicleParameters'].valid and cal_status == log.ExtrinsicsCalibration.Status.calibrated and
           not TESTING_CLOSET and (not SIMULATION or REPLAY)):

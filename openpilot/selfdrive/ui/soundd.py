@@ -13,12 +13,13 @@ from openpilot.common.swaglog import cloudlog
 
 from openpilot.system import micd
 from openpilot.common.hardware import HARDWARE
+from moonpilot.soundd import moonpilot_alert_volume  # moonpilot seam, see AGENTS.md
 
 SAMPLE_RATE = 48000
 SAMPLE_BUFFER = 4096 # (approx 100ms)
 MAX_VOLUME = 1.0
 MIN_VOLUME = 0.1
-ALERT_RAMP_TIME = 4 # seconds to ramp critical alerts to max volume
+# moonpilot holds warning volume at its alert-start level; the critical-sound switch remains.  # moonpilot seam, see AGENTS.md
 ALERT_MAX_TIME = 8 # seconds before critical alerts switch to the max sound
 SELFDRIVE_STATE_TIMEOUT = 5 # 5 seconds
 FILTER_DT = 1. / (micd.SAMPLE_RATE / micd.FFT_SAMPLES)
@@ -156,6 +157,14 @@ class Soundd:
       self.update_alert(AudibleAlert.none)
       self.selfdrive_timeout_alert = False
 
+  def update_alert_volume(self) -> None:  # moonpilot seam, see AGENTS.md
+    if self.current_alert in (AudibleAlert.warningSoft, AudibleAlert.warningImmediate):
+      elapsed = time.monotonic() - self.ramp_start_time
+      self.current_volume = moonpilot_alert_volume(self.ramp_start_volume)
+      if elapsed >= ALERT_MAX_TIME and self.current_sound != CRITICAL_MAX:
+        self.current_sound = CRITICAL_MAX
+        self.current_sound_frame = 0
+
   def calculate_volume(self, weighted_db):
     volume = ((weighted_db - AMBIENT_DB) / DB_SCALE) * (MAX_VOLUME - MIN_VOLUME) + MIN_VOLUME
     return math.pow(VOLUME_BASE, (np.clip(volume, MIN_VOLUME, MAX_VOLUME) - 1))
@@ -189,13 +198,7 @@ class Soundd:
 
         self.get_audible_alert(sm)
 
-        if self.current_alert in (AudibleAlert.warningSoft, AudibleAlert.warningImmediate):
-          elapsed = time.monotonic() - self.ramp_start_time
-          ramp_vol = float(np.interp(elapsed, [0, ALERT_RAMP_TIME], [self.ramp_start_volume, MAX_VOLUME]))
-          self.current_volume = max(self.current_volume, ramp_vol)
-          if elapsed >= ALERT_MAX_TIME and self.current_sound != CRITICAL_MAX:
-            self.current_sound = CRITICAL_MAX
-            self.current_sound_frame = 0
+        self.update_alert_volume()  # moonpilot seam, see AGENTS.md
 
         rk.keep_time()
 
