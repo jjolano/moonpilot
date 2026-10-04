@@ -387,8 +387,8 @@ MOONPILOT_OUT_OF_PATH_LEAVE = 0.30
 # short of the speed it ends at — the ladder's own fast-rung condition — so it carries the shape of a
 # launch rather than its average: ramping in to ~1.97 at 2.5-3.5 m/s and tapering after (a noisy
 # 5.5 m/s bin, 1.50 between 1.81 and 1.60, is dropped). `cruise_cap`'s combined budget
-# (`MOONPILOT_A_TOTAL_MAX_V`, 1.7 below 20 m/s) still bounds the peak. The corpus tops out at
-# 25 m/s; interp holds the last rung above it.
+# (`MOONPILOT_A_TOTAL_MAX_V`) is 2.0 through the launch band and 1.7 from 7 to 20 m/s, so the rungs'
+# launch peak is what binds there. The corpus tops out at 25 m/s; interp holds the last rung above it.
 MOONPILOT_LADDER_V_BP = [0.0, 2.5, 7.5, 12.5, 20.0]  # m/s
 MOONPILOT_SLOW_ACCEL_V = [0.77, 0.77, 0.67, 0.42, 0.31]  # m/s^2
 MOONPILOT_FAST_ACCEL_BP = [0.5, 1.5, 2.5, 3.5, 4.5, 7.0, 9.0, 11.0, 13.5, 17.5]  # m/s
@@ -405,14 +405,23 @@ MOONPILOT_LEAD_COAST_BRAKE_A = 0.3
 MOONPILOT_BRAKE_LIGHT = -0.75  # m/s^2
 MOONPILOT_BRAKE_MEDIUM = -1.25  # m/s^2; also the cruise floor, and forceDecel's
 # Speed error (v_cruise - v_ego) at each cruise rung: medium brake, light brake, coasting, hold, slow
-# accel, fast accel.
-MOONPILOT_CRUISE_ERR_BP = [-5.0, -3.0, -1.5, 0.0, 2.0, 5.0]  # m/s
+# accel, fast accel. The slow rung sits at +1 m/s, measured: taking the plateau a manual speed-up
+# settles on as the driver's target (117 speed-ups on cached routes 000002ac-00000405, no lead within
+# 80 m through the rise or the plateau), the driver still asks +0.19..+0.41 inside the last 0.5 m/s and
+# +0.25..+0.48 at 0.5-1 m/s, where a slow rung at +2 tapered to +0.04..+0.24. Flown from those
+# speed-ups with the plateau as set speed, +2 reached within 0.5 m/s of it in a median 9.8 s against
+# the driver's 4.9; +1 reaches it in 5.8 s (per flight a median 0.6 s and a p90 2.5 s behind the
+# driver), its median accel curve stays within 0.06 m/s^2 of the driver's median for the first 6 s
+# (single flights differ by a median 0.39 at their worst instant), and no flight overshoots the target.
+# It asks up to ~0.2 more than the driver at 1-2 m/s of error below 10 m/s.
+# The braking side is unchanged; grade is not removed from these samples.
+MOONPILOT_CRUISE_ERR_BP = [-5.0, -3.0, -1.5, 0.0, 1.0, 5.0]  # m/s
 # Personality scales this error axis rather than the rung magnitudes: one factor on every breakpoint
 # (0 stays 0, so the ladder keeps its shape), so aggressive binds the same measured rungs at less
 # speed error and relaxed at more. Keyed by the enum's raw value, like MOONPILOT_T_FOLLOW — a
 # _DynamicEnum read off a message does not hash as its int. Hand-picked: the manual corpus cannot
-# derive it, since during manual driving vCruise is valid on only 5 % of frames (stock ACC off), so
-# the driver's own error-to-rung response was never recorded.
+# derive it, since during manual driving vCruise is valid on only 5 % of frames (stock ACC off); the
+# plateau measurement above stands in for the standard axis only.
 MOONPILOT_ERR_BP_SCALE = {
   int(Personality.aggressive): 0.7,
   int(Personality.standard): 1.0,
@@ -429,8 +438,14 @@ MOONPILOT_ERR_BP_SCALE = {
 # rungs made that finish softer still (-0.28) and rested 4.63 m back.
 MOONPILOT_CREEP_SPEED = 1.9  # m/s
 MOONPILOT_FAST_CRAWL = 0.31  # m/s^2
-MOONPILOT_A_TOTAL_MAX_BP = [20.0, 40.0]  # m/s
-MOONPILOT_A_TOTAL_MAX_V = [1.7, 3.2]  # m/s^2 combined accel budget
+# Combined accel budget. 2.0 up to 4.5 m/s lets the measured launch rungs (1.96-1.97 at 2.5-3.5 m/s)
+# through: at a flat 1.7 the planner held a trapezoid at the clip where 20 of 31 manual launches behind
+# a departing lead (cached routes 000002ac-00000405) peaked above 1.7, median 1.92 at 2.8 s. Flown from
+# those same states the planner now peaks at a median 1.97 at 2.8 s, with a median 6 s speed of 8.36
+# against the driver's 8.24 m/s.
+# Lateral demand at launch speeds is small, so the cornering share of the budget does not bind there.
+MOONPILOT_A_TOTAL_MAX_BP = [4.5, 7.0, 20.0, 40.0]  # m/s
+MOONPILOT_A_TOTAL_MAX_V = [2.0, 1.7, 1.7, 3.2]  # m/s^2
 MOONPILOT_COAST_BAND = 1.5  # m/s; allowed set-speed drift on a grade, above on a descent and below on a climb
 # 3.4 mph / 5.4 km/h is large enough to let a hill spend itself without making the set speed meaningless.
 MOONPILOT_COAST_GRADE_MIN = 0.4  # m/s^2; minimum road term (`accel_coast - coast_accel(0.0)`) before this applies

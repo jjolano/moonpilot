@@ -789,12 +789,17 @@ class TestDriverLadder(unittest.TestCase):
     for v in (0.0, 10.0, 20.0):
       rung = lambda err, v=v: cruise_accel(v, v + err, False, 0.0, CP, -0.3, True)  # noqa: E731
       self.assertAlmostEqual(rung(5.0), min(float(np.interp(v, MOONPILOT_FAST_ACCEL_BP, MOONPILOT_FAST_ACCEL_V)), 1.7))  # the combined budget
-      self.assertAlmostEqual(rung(2.0), float(np.interp(v, MOONPILOT_LADDER_V_BP, MOONPILOT_SLOW_ACCEL_V)))
-      self.assertAlmostEqual(rung(1.0), 0.5 * rung(2.0))  # interpolated, not stepped
+      slow_err = MOONPILOT_CRUISE_ERR_BP[4]
+      self.assertAlmostEqual(rung(slow_err), float(np.interp(v, MOONPILOT_LADDER_V_BP, MOONPILOT_SLOW_ACCEL_V)))
+      self.assertAlmostEqual(rung(0.5 * slow_err), 0.5 * rung(slow_err))  # interpolated, not stepped
       self.assertEqual(rung(0.0), 0.0)
     self.assertAlmostEqual(cruise_accel(20.0, 18.5, False, 0.0, CP, -0.3, True), -0.33)  # coasting
     self.assertAlmostEqual(cruise_accel(20.0, 17.0, False, 0.0, CP, -0.3, True), MOONPILOT_BRAKE_LIGHT)
     self.assertAlmostEqual(cruise_accel(20.0, 10.0, False, 0.0, CP, -0.3, True), MOONPILOT_BRAKE_MEDIUM)
+    # The launch band's budget lets the measured launch peak through instead of clipping it at 1.7.
+    launch_rung = float(np.interp(3.0, MOONPILOT_FAST_ACCEL_BP, MOONPILOT_FAST_ACCEL_V))
+    self.assertGreater(launch_rung, 1.7)
+    self.assertAlmostEqual(cruise_accel(3.0, 8.0, False, 0.0, CP, -0.3, True), launch_rung)
 
   def test_force_decel_is_not_softened(self):
     CP = _cp()
