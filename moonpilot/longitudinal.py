@@ -129,7 +129,7 @@ from moonpilot.jerk import (
   LongitudinalComfortJerkEstimator,
 )
 
-from moonpilot.lead import MOONPILOT_LEAD_ACCEL_TAU_RESET, LeadAccelEstimator, nearest_lead_in_path
+from moonpilot.lead import MOONPILOT_LEAD_ACCEL_TAU_RESET, LeadAccelEstimator, nearest_lead_in_path, same_car
 from moonpilot.pitch import (
   MOONPILOT_PITCH_MIN_SAMPLES,
   MOONPILOT_PITCH_MIN_SPEED,
@@ -1299,6 +1299,16 @@ class MoonpilotLongitudinalPlanner:
       a_lead, a_lead_tau = estimator.update(lead)  # every frame, present or not: that is what resets the window
       if lead.present:
         leads.append((source, lead, a_lead, a_lead_tau))
+    # FCW keeps both slots: the dedupe below picks a candidate for the plan, and radard's two matches of
+    # one car can carry different `modelProb`, so dropping one could drop the only one over the FCW bar.
+    # A held track's `modelProb` is zero, so slots alone are every lead FCW could ever fire on.
+    fcw_leads = list(leads)
+    one, two = (lead for _, lead, _, _ in leads) if len(leads) == 2 else (None, None)
+    if one is not None and one.radar and two.radar and same_car(one.dRel, one.vLead, two.dRel, two.vLead):
+      # radard matches both model leads to the nearest radar track, so a stopped car often fills both
+      # slots, on two tracks of its own. One vehicle is one candidate: two noisy readings of it under
+      # `min` hand the winning slot back and forth and the command pulses (route 00000400 seg 4).
+      leads.pop()
     leads += self._radar_hold(sm['radarState'].leadOne, leads, v_ego)
     # Learn the radar's sensor latency from the same pair of slots, on every frame (present or not):
     # the gates inside `update` decide what teaches, so an absent lead is simply a no-op.
@@ -1447,7 +1457,8 @@ class MoonpilotLongitudinalPlanner:
     self.j_desired_trajectory = np.gradient(self.a_desired_trajectory, MOONPILOT_CONTROL_T_IDX)
 
     crash = any(
-      lead.modelProb > MOONPILOT_FCW_MODEL_PROB and required_decel(v_ego, lead.dRel, lead.vLead, a_lead) < MOONPILOT_FCW_DECEL for _, lead, a_lead, _ in leads
+      lead.modelProb > MOONPILOT_FCW_MODEL_PROB and required_decel(v_ego, lead.dRel, lead.vLead, a_lead) < MOONPILOT_FCW_DECEL
+      for _, lead, a_lead, _ in fcw_leads
     )
     self.crash_cnt = self.crash_cnt + 1 if crash else 0
     fcw = self.crash_cnt > MOONPILOT_FCW_COUNT and not CS.standstill

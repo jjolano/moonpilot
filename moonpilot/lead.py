@@ -63,11 +63,20 @@ MOONPILOT_LEAD_PROB_RC = 0.2  # s; radard's own gate-filter decay (radard.py:234
 # `radarTrackId` changes 3.1 times a second in those approaches, 98 % of them the same vehicle, and
 # each resets the window: it holds more than 7 samples on 42 % of those frames, and the whole cut is
 # there (0.096 -> 0.077 m/s^2; unchanged on the rest). Keeping it across those same-vehicle
-# changes lowers the estimate's error (0.307 -> 0.236 m/s^2 sd) but not the command's jitter, so
-# the reset stays.
+# changes lowers the estimate's error (0.307 -> 0.236 m/s^2 sd) but not the command's jitter while
+# following. Near a stop it does: route 00000400 seg 4 swapped tracks 517/541 on one stopped car
+# every 0.1-0.3 s, each swap refitted from three samples or fell back to the new track's `aLeadK`
+# (+-0.6 m/s^2 on a car at rest), and the decel pulsed -0.88 -> -1.26 -> -0.75 m/s^2 at 1.9 m/s.
+# So a new track at the same range and speed (`same_car`) keeps the window; replayed, together with
+# the planner's one-candidate-per-car, the last 4.5 s of that stop's command jitter went 0.090 ->
+# 0.056 m/s^2 and all engaged frames on hand (5.5k) 0.0430 -> 0.0410.
 MOONPILOT_LEAD_ACCEL_WINDOW = 15  # samples, 0.75 s at DT_MDL
 MOONPILOT_LEAD_ACCEL_MIN_SAMPLES = 3  # below this the slope is noise, so radard's value stands
 MOONPILOT_LEAD_SPEED_JUMP = 2.5  # m/s in one frame: re-association, not motion (50 m/s^3)
+# One vehicle under two radar tracks: the 517/541 pair above sat within 0.1 m and 0.25 m/s of each
+# other. A different car this close in range and speed asks the same thing of the policy anyway.
+MOONPILOT_LEAD_SAME_CAR_GAP = 1.0  # m of dRel
+MOONPILOT_LEAD_SAME_CAR_SPEED = 1.0  # m/s of vLead
 # The onset window. The full window's bias is what a braking lead costs us: at a step onto -3.5 m/s^2
 # the fifteen-sample slope needs 0.40 s to pass -2.0 and 0.55 s to pass -3.0, because that is how long
 # the window is still half full of pre-onset samples — and a real brake ramps in over a few tenths, so
@@ -121,6 +130,11 @@ def resample(t_src, values, t_dst) -> np.ndarray:
   return np.interp(np.asarray(t_dst, dtype=float), t_src, values)
 
 
+def same_car(d_a: float, v_a: float, d_b: float, v_b: float) -> bool:
+  """Whether two radar leads, by range and speed, are one vehicle under two radar tracks."""
+  return abs(d_a - d_b) < MOONPILOT_LEAD_SAME_CAR_GAP and abs(v_a - v_b) < MOONPILOT_LEAD_SAME_CAR_SPEED
+
+
 class LeadAccelEstimator:
   """A lead's acceleration from the slope of `vLead` over a short window.
 
@@ -139,7 +153,7 @@ class LeadAccelEstimator:
 
   Returns radard's own `aLeadK` and `aLeadTau` whenever the window cannot speak: a vision-only lead
   (there `aLeadK` is the model's own unfiltered accel, paired with its own 0.3 s decay), fewer than
-  MOONPILOT_LEAD_ACCEL_MIN_SAMPLES samples, a new `radarTrackId`, a source flip, or a `vLead` jump
+  MOONPILOT_LEAD_ACCEL_MIN_SAMPLES samples, a new vehicle (a new `radarTrackId` that is not `same_car`), a source flip, or a `vLead` jump
   past MOONPILOT_LEAD_SPEED_JUMP. Both are returned because they are one judgment: the decay says how
   long the accel is expected to hold, and it must describe the accel it travels with.
 
@@ -155,7 +169,8 @@ class LeadAccelEstimator:
   accel is a transient — and 2.5 s is where that assumption is wrong.
 
   One instance per radarState slot, updated every frame *including* the frames where the slot is
-  absent — the reset is what keeps a new lead from inheriting the previous one's samples. Sample
+  absent — the reset is what keeps a new lead from inheriting the previous one's samples, and
+  `same_car` is what keeps a new track on the same vehicle from being a new lead. Sample
   spacing is one model frame by construction: radard publishes `radarState` once per `modelV2`
   frame (`radard.py:263-272`), and plannerd is polled on the same message.
   """
@@ -163,6 +178,7 @@ class LeadAccelEstimator:
   def __init__(self, dt: float = DT_MDL, window: int = MOONPILOT_LEAD_ACCEL_WINDOW):
     self._samples: deque[float] = deque(maxlen=window)
     self._track: tuple[bool, bool, int] | None = None
+    self._last = (0.0, 0.0)  # the previous frame's (dRel, vLead), for `same_car` across a track change
     self._fast_streak = 0
     self._tau = FirstOrderFilter(MOONPILOT_LEAD_ACCEL_TAU, MOONPILOT_LEAD_ACCEL_TAU_RC, dt)
     self.a_lead_tau = MOONPILOT_LEAD_ACCEL_TAU
@@ -172,14 +188,17 @@ class LeadAccelEstimator:
   def update(self, lead) -> tuple[float, float]:
     track = (bool(lead.present), bool(lead.radar), int(lead.radarTrackId))
     v_lead = float(lead.vLead)
-    if track != self._track or (self._samples and abs(v_lead - self._samples[-1]) > MOONPILOT_LEAD_SPEED_JUMP):
+    same = track[:2] == (True, True) and self._track is not None and self._track[:2] == track[:2] and same_car(*self._last, float(lead.dRel), v_lead)
+    if (track != self._track and not same) or (self._samples and abs(v_lead - self._samples[-1]) > MOONPILOT_LEAD_SPEED_JUMP):
       self._samples.clear()
       self._fast_streak = 0
       # A new lead's decay is new too: radard builds a fresh `Track` — and a fresh filter — for a new
       # `radarTrackId`, so carrying the old track's value over would tell the rollout that this lead's
-      # accel holds for a length the previous lead earned.
+      # accel holds for a length the previous lead earned. A new track on the same vehicle is not a new
+      # lead, so it keeps both.
       self._tau.x = MOONPILOT_LEAD_ACCEL_TAU
     self._track = track
+    self._last = (float(lead.dRel), v_lead)
 
     # No window to read from: hand back radard's own pair, which is self-consistent by construction.
     if not (lead.present and lead.radar):

@@ -26,6 +26,7 @@ from moonpilot.lead import (
   MOONPILOT_LEAD_PATH_WIDTH,
   MOONPILOT_LEAD_PROB_GATE,
   MOONPILOT_LEAD_PROB_RC,
+  MOONPILOT_LEAD_SAME_CAR_GAP,
   MOONPILOT_LEAD_SPEED_JUMP,
   MOONPILOT_MIN_Y_STD,
   MOONPILOT_OUT_OF_PATH_DANGER,
@@ -164,11 +165,11 @@ class TestLeadAccelEstimator(unittest.TestCase):
   """
 
   @staticmethod
-  def _feed(estimator, v0=20.0, a=-3.0, frames=MOONPILOT_LEAD_ACCEL_WINDOW, a_lead=0.0, track_id=0, present=True, radar=True):
+  def _feed(estimator, v0=20.0, a=-3.0, frames=MOONPILOT_LEAD_ACCEL_WINDOW, a_lead=0.0, track_id=0, present=True, radar=True, d_rel=35.0):
     """Feed `frames` samples of v = v0 + a*i*DT_MDL, oldest first; returns the last (accel, tau)."""
     out = None
     for i in range(frames):
-      out = estimator.update(FusedLead(35.0, 0.0, v_lead=v0 + a * i * DT_MDL, a_lead=a_lead, present=present, radar=radar, track_id=track_id))
+      out = estimator.update(FusedLead(d_rel, 0.0, v_lead=v0 + a * i * DT_MDL, a_lead=a_lead, present=present, radar=radar, track_id=track_id))
     return out
 
   @classmethod
@@ -267,9 +268,22 @@ class TestLeadAccelEstimator(unittest.TestCase):
     estimator = LeadAccelEstimator()
     step = 3.0 * DT_MDL
     self.assertAlmostEqual(self._accel(estimator), -3.0, delta=0.01)
-    # a different radar track entirely: radard's value stands until this track's own window fills
-    self.assertEqual(self._accel(estimator, frames=1, v0=20.0 - step, a_lead=0.0, track_id=1), 0.0)
-    self.assertAlmostEqual(self._accel(estimator, frames=2, v0=20.0 - 2 * step, track_id=1), -3.0, delta=0.01)
+    # a different vehicle, 10 m further on: radard's value stands until this track's own window fills
+    self.assertEqual(self._accel(estimator, frames=1, v0=20.0 - step, a_lead=0.0, track_id=1, d_rel=45.0), 0.0)
+    self.assertAlmostEqual(self._accel(estimator, frames=2, v0=20.0 - 2 * step, track_id=1, d_rel=45.0), -3.0, delta=0.01)
+
+  def test_a_new_track_on_the_same_vehicle_keeps_its_window(self):
+    """radard tracks one car as several returns and hands the slot between them several times a
+    second near a stop (route 00000400 seg 4: tracks 517 and 541 on one stopped car). Same range, same
+    speed is the same car, so the estimate carries on instead of falling back to the new track's
+    `aLeadK` and refitting from three samples."""
+    estimator = LeadAccelEstimator()
+    step = 3.0 * DT_MDL
+    self.assertAlmostEqual(self._accel(estimator), -3.0, delta=0.01)
+    v0 = 20.0 - MOONPILOT_LEAD_ACCEL_WINDOW * step
+    self.assertAlmostEqual(self._accel(estimator, frames=1, v0=v0, a_lead=-9.9, track_id=1, d_rel=35.5), -3.0, delta=0.01)
+    # past the same-car bound it is another vehicle again
+    self.assertEqual(self._accel(estimator, frames=1, v0=v0 - step, a_lead=-9.9, track_id=2, d_rel=35.5 + MOONPILOT_LEAD_SAME_CAR_GAP), -9.9)
 
   def test_a_speed_jump_is_reassociation_not_braking(self):
     """A lead that re-associates 3.5 m/s away is a new object, not a 70 m/s^2 brake."""
@@ -344,7 +358,7 @@ class TestLeadAccelEstimator(unittest.TestCase):
     self.assertLess(estimator._tau.x, 0.1)
 
     for i in range(MOONPILOT_LEAD_ACCEL_MIN_SAMPLES):
-      _, a_lead_tau = estimator.update(FusedLead(35.0, 0.0, v_lead=13.0 - 3.5 * i * DT_MDL, radar=True, track_id=2))
+      _, a_lead_tau = estimator.update(FusedLead(50.0, 0.0, v_lead=13.0 - 3.5 * i * DT_MDL, radar=True, track_id=2))
     # the third frame's estimate is -3.5, so the decay has begun — from 1.5, not from the old track's
     self.assertEqual(a_lead_tau, MOONPILOT_LEAD_ACCEL_TAU * 0.9)
 

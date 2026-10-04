@@ -1303,6 +1303,29 @@ class TestPlanner(unittest.TestCase):
       self.assertEqual(jitter.source, Source.lead0)
       self.assertTrue(jitter.output_should_stop)
 
+  def test_one_car_in_both_slots_is_one_candidate(self):
+    """radard can match both model leads to one stopped car, on two of its radar tracks whose speeds
+    disagree by a few tenths (route 00000400 seg 4). Two readings of one car under `min` handed the
+    win back and forth and pulsed the command; one car is one candidate, so the plan is exactly the
+    plan for `leadOne` alone and `lead1` never governs."""
+    both, alone = _planner(), _planner()
+    for frame in range(60):
+      v_ego, gap = max(4.0 - 0.07 * frame, 0.0), 12.0 - 0.15 * frame
+      one, two = _lead(gap, 0.3 if frame % 3 else 0.0), _lead(gap + 0.1, 0.0 if frame % 3 else 0.3)
+      one.radarTrackId, two.radarTrackId = (517, 541) if frame % 2 else (541, 517)
+      both.update(_inputs(v_ego=v_ego, lead=one, lead_two=two))
+      alone.update(_inputs(v_ego=v_ego, lead=one))
+      self.assertNotEqual(both.source, Source.lead1)
+      self.assertEqual(both.output_a_target, alone.output_a_target)
+
+  def test_fcw_sees_both_slots_of_one_car(self):
+    """The dedupe is the plan's, not FCW's: radard's two matches of one car can carry different
+    `modelProb`, and dropping `leadTwo` would drop the only one over the FCW bar."""
+    planner = _planner()
+    for _ in range(4):
+      planner.update(_inputs(v_ego=20.0, lead=_lead(30.0, 0.0, model_prob=0.6), lead_two=_lead(30.0, 0.0, model_prob=0.95)))
+    self.assertTrue(planner.fcw)
+
   def test_a_nan_set_speed_holds_the_current_speed(self):
     planner = _planner()
     sm = _inputs(v_ego=15.0, v_cruise_kph=float("nan"))
