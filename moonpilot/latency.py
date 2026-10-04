@@ -73,7 +73,10 @@ best case 1. The gate is not mis-tuned, the evidence is thin. Carrying the count
 therefore the one lever the data supports: a drive that earns a block adds it to what earlier drives
 left, the mean is applied only once the blocks are there, and `MAX_LAG_STD` is what checks that the
 blocks agree. `MoonpilotLongLagBlocks` is that count; a value written before the key existed was only
-ever written when trusted, so a missing count reads as the needed one.
+ever written when trusted, so a missing count reads as the needed one. `MoonpilotLongLagHistory` holds
+the completed blocks themselves and is what a boot resumes (`persisted_blocks`, `restore_blocks`):
+`BlockAverage.__init__` would tile the mean into every slot, flattening the history each boot and
+zeroing the spread `MAX_LAG_STD` checks. The value and count stay beside it as `modeld`'s summary.
 
 Two more numbers from the same run, both worth knowing before reading a device result. Where the
 estimator did get to run it reported 0.33–0.40 s with NCC 0.965–0.986, and an independent high-pass
@@ -124,6 +127,7 @@ from openpilot.selfdrive.locationd.lagd import (
 
 MOONPILOT_LAG_KEY = "MoonpilotLongLag"  # the param the learned value persists in, as FLOAT
 MOONPILOT_LAG_BLOCKS_KEY = "MoonpilotLongLagBlocks"  # its evidence, in blocks, as INT
+MOONPILOT_LAG_HISTORY_KEY = "MoonpilotLongLagHistory"  # the completed blocks themselves, oldest first, as JSON
 MOONPILOT_LAG_LOG_DELTA = 0.05  # s of movement worth a log line, so the qlog can be read per drive
 MOONPILOT_LAG_MIN = 0.05  # s; ROI floor, one frame of the 20 Hz command
 MOONPILOT_LAG_MAX = 0.60  # s; ROI ceiling, mirrors lagd's MAX_LAG
@@ -169,11 +173,43 @@ def persisted_seed(params: Any) -> tuple[float, int] | None:
   return min(seeded, MOONPILOT_LAG_MAX), min(blocks, MOONPILOT_LAG_BLOCK_COUNT)
 
 
+def completed_blocks(avg: BlockAverage) -> list[float]:
+  """The finished blocks, oldest first: exactly the ones `BlockAverage.get` averages. Once the ring has
+  wrapped that is every slot but the one being written."""
+  if avg.valid_blocks < avg.num_blocks:
+    order = range(avg.valid_blocks)
+  else:
+    order = [(avg.block_idx + i) % avg.num_blocks for i in range(1, avg.num_blocks)]
+  return [float(avg.values[i, 0]) for i in order]
+
+
+def restore_blocks(avg: BlockAverage, blocks: list[float]) -> None:
+  """Resume `completed_blocks` exactly: the next block goes after the newest and, once the ring is full,
+  retires the oldest. `BlockAverage.__init__` would instead tile one value into every slot, which
+  flattens the history each boot and zeroes the spread `MAX_LAG_STD` checks."""
+  avg.values[:len(blocks), 0] = blocks
+  avg.valid_blocks = len(blocks)
+  avg.block_idx = len(blocks) % avg.num_blocks
+  avg.idx = 0
+
+
+def persisted_blocks(params: Any) -> list[float]:
+  """The blocks the planner resumes: the persisted history when it is well-formed, else the value and
+  count as written before the history existed, as that many equal blocks — the one boot that reads the
+  old format, since the next persist writes the history."""
+  history = params.get(MOONPILOT_LAG_HISTORY_KEY, return_default=True)
+  if isinstance(history, list) and 0 < len(history) < MOONPILOT_LAG_BLOCK_COUNT and \
+     all(isinstance(b, float) and MOONPILOT_LAG_MIN <= b <= MOONPILOT_LAG_MAX for b in history):
+    return history
+  seed = persisted_seed(params)
+  return [] if seed is None else [seed[0]] * min(seed[1], MOONPILOT_LAG_BLOCK_COUNT - 1)
+
+
 def applied_long_delay(CP, params: Any, smoothing: float = 0.0) -> float:
   """The delay the model's longitudinal ask is decoded at: what the planner projects through, plus the
   model's own smoothing constant. `action_t` is this number plus one model period, so the ask and the
   plan it is arbitrated against are computed for the same horizon; the car's own constant is the floor
-  and a value without enough evidence behind it is not applied at all, exactly as `seed` rules."""
+  and a value without enough evidence behind it is not applied at all, as the planner's own status rules."""
   seed = persisted_seed(params)
   if seed is None or seed[1] < MOONPILOT_LAG_BLOCKS_NEEDED:
     return float(CP.longitudinalActuatorDelay) + float(smoothing)
@@ -191,16 +227,13 @@ class LongLagEstimator:
     self.frame = 0
     self.last_invalid_t = -math.inf
     self.last_estimate_t = 0.0
-    self.reset(0.0, 0)
-
-  def reset(self, delay: float, valid_blocks: int) -> None:
     self.points = Points(int(MOONPILOT_LAG_WINDOW_SEC / self.dt))
-    self.block_avg = BlockAverage(MOONPILOT_LAG_BLOCK_COUNT, MOONPILOT_LAG_BLOCK_SIZE, valid_blocks, float(delay))
+    self.block_avg = BlockAverage(MOONPILOT_LAG_BLOCK_COUNT, MOONPILOT_LAG_BLOCK_SIZE, 0, 0.0)
 
-  def seed(self, delay: float, valid_blocks: int) -> None:
-    """Resume a persisted estimate, the `lagd.reset` pattern: the block average starts at the value
-    with enough blocks behind it, so `applied_delay` uses it on the first frame."""
-    self.reset(delay, valid_blocks)
+  def restore(self, blocks: list[float]) -> None:
+    """Resume persisted blocks (`persisted_blocks`) exactly, so `applied_delay` uses them on the first
+    frame and their spread is still the spread `status` checks."""
+    restore_blocks(self.block_avg, blocks)
 
   def update(self, cmd: float, a_ego: float, valid: bool) -> None:
     """One frame. `valid` is the caller's judgment that the command is what is moving the car;

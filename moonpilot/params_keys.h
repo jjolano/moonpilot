@@ -62,6 +62,10 @@
     // stands. 0 is "no evidence", which is what a value written before this
     // key existed reads as.
     {"MoonpilotLongLagBlocks", {PERSISTENT, INT, "0"}},
+    // The completed blocks behind MoonpilotLongLag, oldest first, so a boot
+    // resumes the history itself rather than that many copies of its mean.
+    // Written beside the value and count, which stay what modeld reads.
+    {"MoonpilotLongLagHistory", {PERSISTENT, JSON}},
     // Learned onroad from positive command ramps versus `carState.aEgo`.
     // Tightens only the longitudinal comfort-side jerk; the braking and
     // emergency ramps stay validated constants.

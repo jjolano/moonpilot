@@ -30,10 +30,10 @@ def _models_wanted(started: bool, params, CP) -> bool:
   return params.get(models.REQUEST_KEY) is not None or params.get(models.STATUS_KEY) is None
 
 
-# moonpilot processes, appended to upstream's procs in openpilot/system/manager/process_config.py.
+# moonpilot processes, merged into upstream's procs by moonpilot_procs in openpilot/system/manager/process_config.py.
 # Constructors: NativeProcess(name, cwd, cmdline, should_run, enabled=True) /
 #               PythonProcess(name, module, should_run, enabled=True) / DaemonProcess(name, module, param_name)
-# Typed as the same union upstream's literal list infers, so `procs += MOONPILOT_PROCS` stays well-typed.
+# Typed as the same union upstream's literal list infers, so the merged list stays well-typed.
 MOONPILOT_PROCS: list[DaemonProcess | NativeProcess | PythonProcess] = [
   # Normalizes the model's lead trajectories onto moonpilotState, and the fork's rolling-window ego
   # correction with them: msgq allows one publisher per service, so the correction rides this
@@ -51,3 +51,11 @@ MOONPILOT_PROCS: list[DaemonProcess | NativeProcess | PythonProcess] = [
   # published a status at all, then the manager reaps it; see moonpilot/modelsd.py.
   PythonProcess("modelsd", "moonpilot.modelsd", _models_wanted),
 ]
+
+
+def moonpilot_procs(procs: list[DaemonProcess | NativeProcess | PythonProcess]) -> list[DaemonProcess | NativeProcess | PythonProcess]:
+  """Upstream's process table with the fork's: lagd's row runs the fork's estimator under upstream's name and
+  predicate, so lateralDelay keeps one publisher and every consumer reads it unchanged (moonpilot/lagd.py);
+  MOONPILOT_PROCS is appended."""
+  return [PythonProcess("lagd", "moonpilot.lagd", p.should_run) if p.name == "lagd" and isinstance(p, PythonProcess) else p
+          for p in procs] + MOONPILOT_PROCS

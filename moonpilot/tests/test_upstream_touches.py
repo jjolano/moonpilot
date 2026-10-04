@@ -67,7 +67,7 @@ ALLOWED = {
   "openpilot/system/manager/manager.py": "the model store's boot selection commit",
   "openpilot/selfdrive/modeld/modeld.py": "the fork's driving model runtime; low-speed turn-desire hook after DesireHelper.update()",
   "openpilot/selfdrive/modeld/dmonitoringmodeld.py": "the fork's monitoring model runtime",
-  "openpilot/system/manager/process_config.py": "MOONPILOT_PROCS",
+  "openpilot/system/manager/process_config.py": "moonpilot_procs: the fork's lagd row and MOONPILOT_PROCS",
   # The fork's own opendbc/panda: recorded as submodule pointer moves, so the paths of the
   # submodules themselves are the upstream paths here.
   "opendbc_repo": "forked safety layer, on jjolano/moonpilot-opendbc",

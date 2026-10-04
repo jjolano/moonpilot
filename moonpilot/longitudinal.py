@@ -116,12 +116,14 @@ from moonpilot.corridor import RollingCorridor, squeeze_accel
 from moonpilot.features import COAST_GRADE, CURVE_SPEED, LEAD_LATERAL, LONGITUDINAL, MODEL_BRAKING, SQUEEZE, enabled
 from moonpilot.latency import (
   MOONPILOT_LAG_BLOCKS_KEY,
+  MOONPILOT_LAG_HISTORY_KEY,
   MOONPILOT_LAG_KEY,
   MOONPILOT_LAG_LOG_DELTA,
   MOONPILOT_LAG_MIN_SPEED,
   MOONPILOT_LAG_PERSIST_EVERY,
   LongLagEstimator,
-  persisted_seed,
+  completed_blocks,
+  persisted_blocks,
 )
 from moonpilot.jerk import (
   MOONPILOT_LONG_JERK_MIN_SAMPLES,
@@ -1139,13 +1141,10 @@ class MoonpilotLongitudinalPlanner:
     # lengthen the projection, so an unset param, a stale one and a measurement below the stock
     # constant are all exactly the planner this fork had before.
     self.long_lag = LongLagEstimator(CP, dt)
+    # The persisted blocks, restored exactly (`moonpilot.latency.persisted_blocks`); the value and count
+    # persisted beside them are what `modeld` reads to decode the model's longitudinal ask.
+    self.long_lag.restore(persisted_blocks(self.params))
     self.long_lag_logged = self.long_lag.applied_delay()
-    # The persisted value and its evidence, validated in one place (`moonpilot.latency.persisted_seed`)
-    # because `modeld` acts on the same number to decode the model's longitudinal ask.
-    seed = persisted_seed(self.params)
-    if seed is not None:
-      self.long_lag.seed(*seed)
-      self.long_lag_logged = self.long_lag.applied_delay()
     self.long_jerk = LongitudinalComfortJerkEstimator(dt)
     seeded_jerk = self.params.get(MOONPILOT_LONG_JERK_SCALE_KEY, return_default=True)
     if isinstance(seeded_jerk, float) and seeded_jerk < 1.0:
@@ -1573,6 +1572,7 @@ class MoonpilotLongitudinalPlanner:
     value = round(self.long_lag.estimate, 3)
     self.params.put(MOONPILOT_LAG_KEY, value)
     self.params.put(MOONPILOT_LAG_BLOCKS_KEY, self.long_lag.valid_blocks)
+    self.params.put(MOONPILOT_LAG_HISTORY_KEY, [round(b, 4) for b in completed_blocks(self.long_lag.block_avg)])
     if abs(value - self.long_lag_logged) > MOONPILOT_LAG_LOG_DELTA:
       cloudlog.info(f"moonpilot longitudinal lag {value:.3f} s over {self.long_lag.valid_blocks} blocks, action_t {self.action_t:.3f} s")
       self.long_lag_logged = value
