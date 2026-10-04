@@ -12,6 +12,7 @@ class Feature:
   description: str
   offroad_only: bool = False  # changes driving behavior, so only flip it while parked
   requires: tuple[str, ...] = ()  # modules that must be importable for this feature to run
+  choices: tuple[str, ...] = ()  # a choice row instead of a toggle: the param is an INT index here, 0 = off
 
 
 LEAD_LATERAL = Feature(
@@ -38,8 +39,12 @@ PATH_PREVIEW = Feature(
 PATH_SMOOTH = Feature(
   key="MoonpilotPathSmooth",
   title="smooth planner path",
-  description="Filter the model's curvature request before the controller, trading about 0.15 s of path lag for calmer steering steps. Restart to apply.",
+  description=(
+    "Filter the model's curvature request before the controller. The time constant is the steering lag added for calmer "
+    "torque steps: 0.05 s takes about half the steps out, 0.10 s most of the rest, 0.15 s little more. Restart to apply."
+  ),
   offroad_only=True,
+  choices=("off", "0.05 s", "0.10 s", "0.15 s"),
 )
 
 TURN_DESIRE = Feature(
@@ -194,6 +199,12 @@ def enabled(feature: Feature, params: Params) -> bool:
   # The seam-facing "is this behavior on" predicate: a feature the driver asked for but
   # whose dependencies are not installed yet is off, so seams never import what is missing.
   return available(feature) and wanted(feature, params)
+
+
+def choice(feature: Feature, params: Params) -> int:
+  # A choice row's selected index; anything out of range reads as 0, its "off".
+  index = params.get(feature.key, return_default=True)
+  return index if isinstance(index, int) and 0 <= index < len(feature.choices) else 0
 
 
 def brand() -> str:

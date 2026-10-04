@@ -8,7 +8,7 @@ from collections.abc import Callable
 
 from moonpilot import tailscale
 from moonpilot.engage import car_unavailable_reason
-from moonpilot.features import FEATURES, Group, GROUPS, Feature, missing_modules, version, wanted
+from moonpilot.features import FEATURES, Group, GROUPS, Feature, choice, missing_modules, version, wanted
 from moonpilot.ui import models as models_ui
 from moonpilot.ui import offroad_mode
 from moonpilot.ui.tailscale_qr import TailscaleSignInDialog
@@ -16,7 +16,7 @@ from openpilot.common.params import Params
 from openpilot.selfdrive.ui.ui_state import ui_state
 from openpilot.system.ui.lib.application import gui_app
 from openpilot.system.ui.widgets import Widget
-from openpilot.system.ui.widgets.list_view import button_item, text_item, toggle_item
+from openpilot.system.ui.widgets.list_view import button_item, multiple_button_item, text_item, toggle_item
 from openpilot.system.ui.widgets.scroller_tici import Scroller
 
 
@@ -33,13 +33,27 @@ def _description(feature: Feature) -> str:
   return feature.description if reason is None else "<b>" + reason + "</b><br><br>" + feature.description
 
 
-def _feature_toggle(feature: Feature, params: Params):
+def _feature_row(feature: Feature, params: Params):
+  def enabled(f=feature):
+    return _unavailable_reason(f) is None and (not f.offroad_only or ui_state.is_offroad())
+
+  if feature.choices:
+    row = multiple_button_item(
+      feature.title,
+      lambda f=feature: _description(f),
+      buttons=list(feature.choices),
+      selected_index=choice(feature, params),
+      button_width=200,
+      callback=lambda index, key=feature.key: params.put(key, index, block=True),
+    )
+    row.action_item.set_enabled(enabled)
+    return row
   return toggle_item(
     feature.title,
     description=lambda f=feature: _description(f),
     initial_state=wanted(feature, params),
     callback=lambda state, key=feature.key: params.put_bool(key, state, block=True),
-    enabled=lambda f=feature: _unavailable_reason(f) is None and (not f.offroad_only or ui_state.is_offroad()),
+    enabled=enabled,
   )
 
 
@@ -122,7 +136,7 @@ class GroupLayout(Widget):
     self._scroller = Scroller(
       [
         button_item(group.title, "BACK", description=group.description, callback=back),
-        *(_feature_toggle(feature, params) for feature in group.features),
+        *(_feature_row(feature, params) for feature in group.features),
       ],
       line_separator=True,
       spacing=0,

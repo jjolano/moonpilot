@@ -19,12 +19,13 @@ from moonpilot.curvature import (
   MOONPILOT_PREVIEW_GAIN,
   MOONPILOT_PREVIEW_MAX_LAT_ACCEL,
   MOONPILOT_PREVIEW_MIN_SPEED,
-  MOONPILOT_SMOOTH_TAU,
+  MOONPILOT_SMOOTH_TAUS,
   PathSmooth,
   moonpilot_curvature,
   moonpilot_path_smooth,
   response_aligned_curvature,
 )
+from moonpilot.features import PATH_SMOOTH
 from moonpilot.tests.fakes import FakeParams, _params
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -235,28 +236,38 @@ class TestExactFallback(unittest.TestCase):
 
 
 class TestSmoothFactory(unittest.TestCase):
-  def test_the_toggle_off_is_none(self):
-    self.assertIsNone(moonpilot_path_smooth(_params(False)))
+  def test_the_choice_off_is_none(self):
+    self.assertIsNone(moonpilot_path_smooth(_params(0)))
 
-  def test_the_toggle_on_builds_the_filter_with_the_header_tau(self):
-    smooth = moonpilot_path_smooth(_params(True))
-    assert isinstance(smooth, PathSmooth)
-    self.assertEqual(smooth.tau, MOONPILOT_SMOOTH_TAU)
+  def test_each_choice_builds_the_filter_its_label_names(self):
+    self.assertEqual(len(MOONPILOT_SMOOTH_TAUS), len(PATH_SMOOTH.choices))
+    for index, label in enumerate(PATH_SMOOTH.choices[1:], start=1):
+      with self.subTest(label=label):
+        smooth = moonpilot_path_smooth(_params(index))
+        assert isinstance(smooth, PathSmooth)
+        self.assertEqual(smooth.tau, MOONPILOT_SMOOTH_TAUS[index])
+        self.assertEqual(label, f"{smooth.tau:.2f} s")
 
-  def test_it_is_chosen_once_so_the_toggle_takes_a_restart(self):
-    with mock.patch.object(curvature_mod, "Params", lambda: FakeParams(False)):
+  def test_an_out_of_range_choice_reads_as_off(self):
+    for value in (-1, len(PATH_SMOOTH.choices), None):
+      with self.subTest(value=value):
+        self.assertIsNone(moonpilot_path_smooth(_params(value)))
+
+  def test_it_is_chosen_once_so_the_choice_takes_a_restart(self):
+    with mock.patch.object(curvature_mod, "Params", lambda: FakeParams(0)):
       self.assertIsNone(moonpilot_path_smooth())
-    with mock.patch.object(curvature_mod, "Params", lambda: FakeParams(True)):
-      self.assertIsInstance(moonpilot_path_smooth(), PathSmooth)
+    with mock.patch.object(curvature_mod, "Params", lambda: FakeParams(2)):
+      self.assertEqual(getattr(moonpilot_path_smooth(), "tau", None), 0.10)
 
 
 class TestPathSmooth(unittest.TestCase):
   """The request filter: the exact step response, engage continuity, and the pass-through edges."""
 
-  ALPHA = 1.0 - math.exp(-0.01 / MOONPILOT_SMOOTH_TAU)
+  TAU = 0.15  # the step response below counts 15 frames to one tau
+  ALPHA = 1.0 - math.exp(-0.01 / TAU)
 
   def test_a_step_follows_the_closed_form_response(self):
-    smooth = PathSmooth()
+    smooth = PathSmooth(self.TAU)
     smooth.update(0.0, False)  # seed the state at rest, as controlsd does while not steering
     outs = [smooth.update(1.0, True) for _ in range(15)]
     self.assertAlmostEqual(outs[0], self.ALPHA, delta=1e-12)
@@ -265,30 +276,30 @@ class TestPathSmooth(unittest.TestCase):
     self.assertTrue(all(b >= a for a, b in zip(outs, outs[1:], strict=False)))
 
   def test_a_constant_input_is_reached_and_held(self):
-    smooth = PathSmooth()
+    smooth = PathSmooth(self.TAU)
     out = 0.0
     for _ in range(2000):
       out = smooth.update(0.25, True)
     self.assertAlmostEqual(out, 0.25, delta=1e-12)
 
   def test_while_not_steering_the_input_passes_through_bit_exact(self):
-    smooth = PathSmooth()
+    smooth = PathSmooth(self.TAU)
     smooth.update(1.0, True)  # a dirty state from before the disengage
     for value in (0.0, -0.4, 1e-6):
       with self.subTest(value=value):
         self.assertEqual(smooth.update(value, False), value)
 
   def test_a_disengage_resets_the_state_to_the_car_s_path(self):
-    smooth = PathSmooth()
+    smooth = PathSmooth(self.TAU)
     smooth.update(1.0, True)
     smooth.update(0.02, False)  # while not steering the state tracks the actual curvature
     self.assertEqual(smooth.update(0.02, True), 0.02)  # re-engage never re-injects the 1.0
 
   def test_the_first_call_on_a_fresh_filter_returns_the_input(self):
-    self.assertEqual(PathSmooth().update(0.3, True), 0.3)
+    self.assertEqual(PathSmooth(self.TAU).update(0.3, True), 0.3)
 
   def test_a_non_finite_request_passes_through_and_holds_the_state(self):
-    smooth = PathSmooth()
+    smooth = PathSmooth(self.TAU)
     smooth.update(0.1, True)  # the first call passes through and lands the state on 0.1
     for value in (float("nan"), float("inf"), -float("inf")):
       with self.subTest(value=value):

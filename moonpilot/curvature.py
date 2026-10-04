@@ -21,13 +21,13 @@ from openpilot.common.params import Params
 from openpilot.common.realtime import DT_CTRL, DT_MDL
 from openpilot.selfdrive.controls.lib.drive_helpers import MIN_SPEED, get_curvature_from_plan
 
-from moonpilot.features import PATH_PREVIEW, PATH_SMOOTH, enabled
+from moonpilot.features import PATH_PREVIEW, PATH_SMOOTH, choice, enabled
 
 MOONPILOT_PREVIEW_GAIN = 0.3  # share of (response-aligned path - model request) added to the command
 MOONPILOT_PREVIEW_MAX_LAT_ACCEL = 0.8  # m/s^2; ceiling on what the delta itself may ask for
 MOONPILOT_PREVIEW_MIN_SPEED = 5.0  # m/s; below this the path curvature is noise
 MOONPILOT_MAX_MODEL_AGE = 2 * DT_MDL  # s; two missed 20 Hz model periods disable the correction
-MOONPILOT_SMOOTH_TAU = 0.15  # s; first-order time constant of the curvature request filter
+MOONPILOT_SMOOTH_TAUS = (0.0, 0.05, 0.10, 0.15)  # s; first-order time constant per MoonpilotPathSmooth choice, 0 = off
 
 
 def response_aligned_curvature(model, desired_curvature: float, *, v_ego: float, lat_delay: float, model_recv_time: float, now: float,
@@ -88,7 +88,7 @@ class PathSmooth:
   response-aligned reference and the controller time against, so enabling it does not silently
   desynchronize the fork from its own delay bookkeeping."""
 
-  def __init__(self, tau: float = MOONPILOT_SMOOTH_TAU, dt: float = DT_CTRL):
+  def __init__(self, tau: float, dt: float = DT_CTRL):
     self.tau = tau
     self._alpha = 1.0 - math.exp(-dt / tau)
     self._x: float | None = None
@@ -104,7 +104,7 @@ class PathSmooth:
 
 
 def moonpilot_path_smooth(params: Params | None = None) -> PathSmooth | None:
-  """Return the curvature request filter when enabled; the choice (and its tau) is fixed until restart."""
-  if not enabled(PATH_SMOOTH, params or Params()):
-    return None
-  return PathSmooth()
+  """Return the curvature request filter at the chosen tau, or None when off; fixed until restart."""
+  params = params or Params()
+  tau = MOONPILOT_SMOOTH_TAUS[choice(PATH_SMOOTH, params)] if enabled(PATH_SMOOTH, params) else 0.0
+  return PathSmooth(tau) if tau > 0.0 else None

@@ -471,7 +471,8 @@ class TestCurveSpeed(unittest.TestCase):
         feature = next(f for f in FEATURES if f.key == key)
         self.assertTrue(feature.offroad_only)
         self.assertFalse(feature.requires)
-        self.assertTrue(f'{{"{key}", {{PERSISTENT, BOOL, "0"}}}}' in text)
+        kind = "INT" if feature.choices else "BOOL"  # a choice row's 0 is its "off"
+        self.assertTrue(f'{{"{key}", {{PERSISTENT, {kind}, "0"}}}}' in text)
     # The learned scale is a value, not a toggle: nothing may gate on it, and its neutral default has
     # to be the neutral ratio rather than the "unset" the lag param uses.
     self.assertTrue('{"MoonpilotCurveLatScale", {PERSISTENT, FLOAT, "1.0"}}' in text)

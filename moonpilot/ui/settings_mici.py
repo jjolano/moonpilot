@@ -4,11 +4,11 @@ from collections.abc import Callable
 
 from moonpilot import models, tailscale
 from moonpilot.engage import car_unavailable_reason
-from moonpilot.features import GROUPS, Group, Feature, available, wanted
+from moonpilot.features import GROUPS, Group, Feature, available, choice, wanted
 from moonpilot.ui import models_mici, offroad_mode_mici
 from moonpilot.ui.tailscale_qr_mici import TailscaleSignInDialogMici
 from openpilot.common.params import Params
-from openpilot.selfdrive.ui.mici.widgets.button import BigButton, BigParamControl
+from openpilot.selfdrive.ui.mici.widgets.button import BigButton, BigMultiParamToggle, BigParamControl
 from openpilot.selfdrive.ui.mici.widgets.dialog import BigDialog
 from openpilot.selfdrive.ui.ui_state import ui_state
 from openpilot.system.ui.lib.application import gui_app
@@ -17,7 +17,10 @@ from openpilot.system.ui.widgets.scroller import Scroller
 
 
 def _feature_button(feature: Feature):
-  button = BigParamControl(feature.title, feature.key, description=feature.description)
+  if feature.choices:
+    button: BigParamControl | BigMultiParamToggle = BigMultiParamToggle(feature.title, feature.key, list(feature.choices), description=feature.description)
+  else:
+    button = BigParamControl(feature.title, feature.key, description=feature.description)
   button.set_enabled(lambda f=feature: available(f) and car_unavailable_reason(f, ui_state.CP) is None and (not f.offroad_only or ui_state.is_offroad()))
   return button
 
@@ -90,7 +93,7 @@ class _PageStack(Widget):
 class _FeatureRows:
   def __init__(self, features: tuple[Feature, ...]):
     self._params: Params = ui_state.params
-    self._rows: tuple[tuple[Feature, BigParamControl], ...] = tuple((feature, _feature_button(feature)) for feature in features)
+    self._rows = tuple((feature, _feature_button(feature)) for feature in features)
     self._cp = ui_state.CP
     self._update_rows()
 
@@ -108,6 +111,11 @@ class _FeatureRows:
 
   def _update_rows(self):
     for feature, button in self._rows:
+      if feature.choices:
+        # ponytail: a choice row's value line is its option, so it has no room for an unavailable
+        # reason; no choice feature has a dependency or car gate yet.
+        button.set_value(feature.choices[choice(feature, self._params)])
+        continue
       button.set_value(_unavailable_value(feature))
       button.set_checked(wanted(feature, self._params))
 
