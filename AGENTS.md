@@ -352,6 +352,7 @@ Last 2000 upstream commits, per seam file: `pyproject.toml` (391) moves almost w
 ## Working here
 
 - `tools/op.sh build | lint | test [target]` — build, lint, test. `tools/op.sh --help` lists the rest.
+- A dev PC without AVX2 (e.g. Celeron N5105) dies with `SIGILL` in the longitudinal MPC: comma's x86 `comma-deps-acados` wheel ships a Haswell-only `libblasfeo.so`. `moonpilot/blasfeo_portable.sh` rebuilds it as portable C from the blasfeo revision the wheel pins and swaps it into the venv and `c_generated_code/`; rerun after any reinstall of that wheel. Device builds (aarch64) are unaffected.
 - UI is Python + raylib; tizi (`openpilot/selfdrive/ui/layouts/`) and mici (`openpilot/selfdrive/ui/mici/layouts/`) are separate trees — a fork panel is registered in both.
 - Tests run through a unittest loader (`tools/test_runner.py`), so fork tests subclass `unittest.TestCase`.
 - Style is enforced by `scripts/lint/lint.sh` and `pyproject.toml` (ruff, ty, codespell); fork code mirrors the conventions of the upstream file it hooks into.
