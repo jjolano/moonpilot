@@ -1665,7 +1665,7 @@ class MoonpilotLongitudinalPlanner:
         squeeze=squeeze,
         exit_cap=min(exit_cap + exit_jerk * t, ACCEL_MAX),
         err_bp=err_bp,
-        model_weight=model_weight,
+        model_weight=max(model_weight, min(self.model_fade + t / MOONPILOT_MODEL_BRAKE_FADE_T, 1.0)),
       )
       a = float(np.clip(jerk_limit(a_cmd, a, t - t_prev, v, comfort_scale), ACCEL_MIN, ACCEL_MAX))
       speeds[i] = v

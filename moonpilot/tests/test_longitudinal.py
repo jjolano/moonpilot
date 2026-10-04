@@ -1962,6 +1962,17 @@ class TestModelBraking(unittest.TestCase):
     self.assertGreater(faded[4] - stepped[4], 0.15)  # held back over the first quarter second
     self.assertAlmostEqual(faded[-1], -0.6)  # and whole once the fade has run
 
+  def test_the_published_plan_projects_the_fade(self):
+    """On the admission frame the live weight is one tenth, but the command reaches the whole ask within
+    `MOONPILOT_MODEL_BRAKE_FADE_T`; the published plan has to forecast that, not one tenth of it forever."""
+    planner = _planner()
+    for _ in range(40):
+      planner.update(_inputs(v_cruise_kph=72.0, model_accel=0.0))
+    planner.update(_inputs(v_cruise_kph=72.0, model_accel=-0.6))
+    self.assertGreater(planner.output_a_target, -0.1)  # the command itself is still at the start of the fade
+    self.assertAlmostEqual(float(planner.a_desired_trajectory[0]), planner.output_a_target, delta=1e-12)
+    self.assertAlmostEqual(float(planner.a_desired_trajectory.min()), -0.6, delta=1e-6)
+
   def test_a_deep_ask_reaches_the_actuator_floor_not_a_fork_floor(self):
     """Past the deadband the ask goes in whole. What bounds it is `ACCEL_MIN`, and only that — a
     fork-owned floor above it was measured and removed, because the corpus showed it withholding
