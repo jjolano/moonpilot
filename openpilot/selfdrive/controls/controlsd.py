@@ -114,7 +114,7 @@ class Controls:
     standstill = abs(CS.vEgo) <= max(self.CP.minSteerSpeed, 0.3) or CS.standstill
     CC.latActive = self.sm['selfdriveState'].active and not CS.steerFaultTemporary and not CS.steerFaultPermanent and \
                    (not standstill or self.CP.steerAtStandstill) and \
-                   self.moonpilot_gate.lateral(self.sm['pandaStates'])  # moonpilot seam, see AGENTS.md
+                   self.moonpilot_gate.lateral(self.sm['pandaStates'], CS)  # moonpilot seam, see AGENTS.md
     CC.longActive = CC.enabled and not any(e.overrideLongitudinal for e in self.sm['onroadEvents']) and \
                     self.CP.openpilotLongitudinalControl and self.moonpilot_gate.longitudinal(self.sm['pandaStates'])  # moonpilot seam, see AGENTS.md
 

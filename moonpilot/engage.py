@@ -246,6 +246,10 @@ def moonpilot_engage_safety_param(CP, params: Params | None = None) -> None:
   CP.safetyConfigs[0].safetyParam |= int(LATERAL_ENGAGE_FLAGS[CP.brand])
 
 
+MOONPILOT_TOYOTA_STEER_RATE = 100  # deg/s; Toyota's existing EPS rate threshold
+MOONPILOT_TOYOTA_STEER_QUIET_FRAMES = 10  # 100 ms at controlsd's 100 Hz
+
+
 class ActuatorGate:
   """The panda's own grants, read back by the client that produced them.
 
@@ -259,15 +263,31 @@ class ActuatorGate:
 
   True — upstream's behavior — on every car the feature is not enabled for, which is what keeps a
   stock config unchanged. Built once, at construction, like the fork's other behavior toggles.
+
+  Supported Toyota torque cars also pause steering at the EPS rate threshold until ten permitted
+  control cycles are quiet. This releases the request, not the fault checks or their alerts.
   """
 
   def __init__(self, CP, params: Params | None = None) -> None:
     params = params if params is not None else Params()
     self._gated = enabled(LATERAL_ENGAGE, params) and _available(CP)
+    self._toyota_torque = self._gated and CP.brand == 'toyota' and CP.steerControlType == car.CarParams.SteerControlType.torque
+    self._steer_quiet_frames = 0
 
-  def lateral(self, panda_states) -> bool:
-    """Whether openpilot may command steering: the panda's lateral grant, once armed."""
-    return (not self._gated) or any(ps.controlsAllowedLateral for ps in panda_states)
+  def lateral(self, panda_states, CS) -> bool:
+    """The panda's lateral grant, with Toyota torque requests paused during rapid wheel motion."""
+    if not self._gated:
+      return True
+    if not any(ps.controlsAllowedLateral for ps in panda_states):
+      return False
+    if self._toyota_torque:
+      if abs(CS.steeringRateDeg) >= MOONPILOT_TOYOTA_STEER_RATE:
+        self._steer_quiet_frames = MOONPILOT_TOYOTA_STEER_QUIET_FRAMES
+      elif self._steer_quiet_frames:
+        self._steer_quiet_frames -= 1
+      if self._steer_quiet_frames:
+        return False
+    return True
 
   def longitudinal(self, panda_states) -> bool:
     """Whether openpilot may command acceleration: the panda's own longitudinal grant.
