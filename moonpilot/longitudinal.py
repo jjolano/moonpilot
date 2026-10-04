@@ -1304,7 +1304,7 @@ class MoonpilotLongitudinalPlanner:
     # A held track's `modelProb` is zero, so slots alone are every lead FCW could ever fire on.
     fcw_leads = list(leads)
     one, two = (lead for _, lead, _, _ in leads) if len(leads) == 2 else (None, None)
-    if one is not None and one.radar and two.radar and same_car(one.dRel, one.vLead, two.dRel, two.vLead):
+    if one is not None and one.radar and two.radar and same_car(one, two):
       # radard matches both model leads to the nearest radar track, so a stopped car often fills both
       # slots, on two tracks of its own. One vehicle is one candidate: two noisy readings of it under
       # `min` hand the winning slot back and forth and the command pulses (route 00000400 seg 4).

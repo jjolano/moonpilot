@@ -165,11 +165,11 @@ class TestLeadAccelEstimator(unittest.TestCase):
   """
 
   @staticmethod
-  def _feed(estimator, v0=20.0, a=-3.0, frames=MOONPILOT_LEAD_ACCEL_WINDOW, a_lead=0.0, track_id=0, present=True, radar=True, d_rel=35.0):
+  def _feed(estimator, v0=20.0, a=-3.0, frames=MOONPILOT_LEAD_ACCEL_WINDOW, a_lead=0.0, track_id=0, present=True, radar=True, d_rel=35.0, y_rel=0.0):
     """Feed `frames` samples of v = v0 + a*i*DT_MDL, oldest first; returns the last (accel, tau)."""
     out = None
     for i in range(frames):
-      out = estimator.update(FusedLead(d_rel, 0.0, v_lead=v0 + a * i * DT_MDL, a_lead=a_lead, present=present, radar=radar, track_id=track_id))
+      out = estimator.update(FusedLead(d_rel, y_rel, v_lead=v0 + a * i * DT_MDL, a_lead=a_lead, present=present, radar=radar, track_id=track_id))
     return out
 
   @classmethod
@@ -284,6 +284,15 @@ class TestLeadAccelEstimator(unittest.TestCase):
     self.assertAlmostEqual(self._accel(estimator, frames=1, v0=v0, a_lead=-9.9, track_id=1, d_rel=35.5), -3.0, delta=0.01)
     # past the same-car bound it is another vehicle again
     self.assertEqual(self._accel(estimator, frames=1, v0=v0 - step, a_lead=-9.9, track_id=2, d_rel=35.5 + MOONPILOT_LEAD_SAME_CAR_GAP), -9.9)
+
+  def test_a_car_alongside_at_the_same_range_and_speed_is_another_vehicle(self):
+    """Equal range and speed is what an adjacent-lane car pacing the lead has; its history is not
+    this lead's accel. A track change a lane over starts fresh, on radard's own value."""
+    estimator = LeadAccelEstimator()
+    step = 3.0 * DT_MDL
+    self.assertAlmostEqual(self._accel(estimator), -3.0, delta=0.01)
+    v0 = 20.0 - MOONPILOT_LEAD_ACCEL_WINDOW * step
+    self.assertEqual(self._accel(estimator, frames=1, v0=v0, a_lead=-9.9, track_id=1, y_rel=3.5), -9.9)
 
   def test_a_speed_jump_is_reassociation_not_braking(self):
     """A lead that re-associates 3.5 m/s away is a new object, not a 70 m/s^2 brake."""

@@ -10,6 +10,7 @@ right-positive, so `y` is negated on the way out.
 
 import math
 from collections import deque
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -73,9 +74,14 @@ MOONPILOT_LEAD_PROB_RC = 0.2  # s; radard's own gate-filter decay (radard.py:234
 MOONPILOT_LEAD_ACCEL_WINDOW = 15  # samples, 0.75 s at DT_MDL
 MOONPILOT_LEAD_ACCEL_MIN_SAMPLES = 3  # below this the slope is noise, so radard's value stands
 MOONPILOT_LEAD_SPEED_JUMP = 2.5  # m/s in one frame: re-association, not motion (50 m/s^3)
-# One vehicle under two radar tracks: the 517/541 pair above sat within 0.1 m and 0.25 m/s of each
-# other. A different car this close in range and speed asks the same thing of the policy anyway.
+# One vehicle under two radar tracks: the 517/541 pair above sat within 0.1 m of range, 0.25 m/s of
+# speed and 0.5 m of lateral offset. Lateral is what tells two cars side by side apart — equal range
+# and speed is exactly what an adjacent-lane car pacing the lead has, and its accel is not the lead's.
+# Over 3.1k same-range, same-speed track pairs on hand (slot pairs and swaps), |dyRel| ran median 0.1 m,
+# p99 0.8 m; cars in adjacent lanes sit a lane apart (~3.5 m), and anything outside the bound stays
+# two leads.
 MOONPILOT_LEAD_SAME_CAR_GAP = 1.0  # m of dRel
+MOONPILOT_LEAD_SAME_CAR_LATERAL = 1.0  # m of yRel
 MOONPILOT_LEAD_SAME_CAR_SPEED = 1.0  # m/s of vLead
 # The onset window. The full window's bias is what a braking lead costs us: at a step onto -3.5 m/s^2
 # the fifteen-sample slope needs 0.40 s to pass -2.0 and 0.55 s to pass -3.0, because that is how long
@@ -130,9 +136,14 @@ def resample(t_src, values, t_dst) -> np.ndarray:
   return np.interp(np.asarray(t_dst, dtype=float), t_src, values)
 
 
-def same_car(d_a: float, v_a: float, d_b: float, v_b: float) -> bool:
-  """Whether two radar leads, by range and speed, are one vehicle under two radar tracks."""
-  return abs(d_a - d_b) < MOONPILOT_LEAD_SAME_CAR_GAP and abs(v_a - v_b) < MOONPILOT_LEAD_SAME_CAR_SPEED
+def same_car(a, b) -> bool:
+  """Whether two radar leads (anything with `dRel`, `yRel`, `vLead`) are one vehicle under two radar
+  tracks: close in range, lateral offset and speed at once. Ambiguous is two vehicles."""
+  return (
+    abs(a.dRel - b.dRel) < MOONPILOT_LEAD_SAME_CAR_GAP
+    and abs(a.yRel - b.yRel) < MOONPILOT_LEAD_SAME_CAR_LATERAL
+    and abs(a.vLead - b.vLead) < MOONPILOT_LEAD_SAME_CAR_SPEED
+  )
 
 
 class LeadAccelEstimator:
@@ -178,7 +189,7 @@ class LeadAccelEstimator:
   def __init__(self, dt: float = DT_MDL, window: int = MOONPILOT_LEAD_ACCEL_WINDOW):
     self._samples: deque[float] = deque(maxlen=window)
     self._track: tuple[bool, bool, int] | None = None
-    self._last = (0.0, 0.0)  # the previous frame's (dRel, vLead), for `same_car` across a track change
+    self._last = None  # the previous frame's lead, snapshotted, for `same_car` across a track change
     self._fast_streak = 0
     self._tau = FirstOrderFilter(MOONPILOT_LEAD_ACCEL_TAU, MOONPILOT_LEAD_ACCEL_TAU_RC, dt)
     self.a_lead_tau = MOONPILOT_LEAD_ACCEL_TAU
@@ -188,7 +199,7 @@ class LeadAccelEstimator:
   def update(self, lead) -> tuple[float, float]:
     track = (bool(lead.present), bool(lead.radar), int(lead.radarTrackId))
     v_lead = float(lead.vLead)
-    same = track[:2] == (True, True) and self._track is not None and self._track[:2] == track[:2] and same_car(*self._last, float(lead.dRel), v_lead)
+    same = track[:2] == (True, True) and self._track is not None and self._track[:2] == track[:2] and self._last is not None and same_car(self._last, lead)
     if (track != self._track and not same) or (self._samples and abs(v_lead - self._samples[-1]) > MOONPILOT_LEAD_SPEED_JUMP):
       self._samples.clear()
       self._fast_streak = 0
@@ -198,7 +209,7 @@ class LeadAccelEstimator:
       # lead, so it keeps both.
       self._tau.x = MOONPILOT_LEAD_ACCEL_TAU
     self._track = track
-    self._last = (float(lead.dRel), v_lead)
+    self._last = SimpleNamespace(dRel=float(lead.dRel), yRel=float(lead.yRel), vLead=v_lead)
 
     # No window to read from: hand back radard's own pair, which is self-consistent by construction.
     if not (lead.present and lead.radar):

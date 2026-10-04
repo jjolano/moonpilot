@@ -1326,6 +1326,20 @@ class TestPlanner(unittest.TestCase):
       planner.update(_inputs(v_ego=20.0, lead=_lead(30.0, 0.0, model_prob=0.6), lead_two=_lead(30.0, 0.0, model_prob=0.95)))
     self.assertTrue(planner.fcw)
 
+  def test_a_car_alongside_stays_a_separate_candidate(self):
+    """Equal range and speed is what an adjacent-lane car pacing the lead has. `leadOne` here is that
+    car, a lane over and holding speed; `leadTwo` is the in-path car beside it, starting to brake. They
+    are two vehicles, so the braking one stays a candidate and governs exactly as it would alone."""
+    both, alone = _planner(), _planner()
+    for frame in range(30):
+      v_lead = 15.0 - 3.0 * max(frame - 24, 0) * DT_MDL
+      beside, ahead = _lead(30.0, 15.0), _lead(30.0, v_lead)
+      beside.yRel, beside.radarTrackId, ahead.radarTrackId = 3.5, 1, 2
+      both.update(_inputs(v_ego=15.0, v_cruise_kph=60.0, lead=beside, lead_two=ahead))
+      alone.update(_inputs(v_ego=15.0, v_cruise_kph=60.0, lead=ahead))
+    self.assertEqual(both.source, Source.lead1)
+    self.assertEqual(both.output_a_target, alone.output_a_target)
+
   def test_a_nan_set_speed_holds_the_current_speed(self):
     planner = _planner()
     sm = _inputs(v_ego=15.0, v_cruise_kph=float("nan"))
