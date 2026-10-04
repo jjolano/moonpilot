@@ -1938,6 +1938,30 @@ class TestModelBraking(unittest.TestCase):
     self.assertAlmostEqual(planner.output_a_target, -1.5)
     self.assertEqual(planner.source, Source.e2e)
 
+  def test_a_shallow_admitted_ask_blends_in_from_the_plan(self):
+    """Route 00000408 at 15 m/s: an ask admitted at -0.50 stepped the plan from -0.23 to -0.52 in 0.15 s
+    and the car answered -0.84. Admitted, a shallow ask now blends in from the other candidates over
+    `MOONPILOT_MODEL_BRAKE_FADE_T`, never shallower than the step-in would have been relieved by, and
+    still arrives whole. At the set speed the cruise term is ~0, so the jerk limit does not hide it."""
+
+    def commands():
+      planner = _planner()
+      for _ in range(40):
+        planner.update(_inputs(v_cruise_kph=72.0, model_accel=0.0))
+      sm = _inputs(v_cruise_kph=72.0, model_accel=-0.6)
+      out = []
+      for _ in range(30):
+        planner.update(sm)
+        out.append(planner.output_a_target)
+      return out
+
+    faded = commands()
+    with mock.patch("moonpilot.longitudinal.MOONPILOT_MODEL_BRAKE_FADE_T", 1e-9):
+      stepped = commands()
+    self.assertTrue(all(f >= s - 1e-12 for f, s in zip(faded, stepped, strict=True)))
+    self.assertGreater(faded[4] - stepped[4], 0.15)  # held back over the first quarter second
+    self.assertAlmostEqual(faded[-1], -0.6)  # and whole once the fade has run
+
   def test_a_deep_ask_reaches_the_actuator_floor_not_a_fork_floor(self):
     """Past the deadband the ask goes in whole. What bounds it is `ACCEL_MIN`, and only that — a
     fork-owned floor above it was measured and removed, because the corpus showed it withholding

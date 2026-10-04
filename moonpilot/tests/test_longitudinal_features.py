@@ -24,9 +24,11 @@ from moonpilot.curve import (
   MOONPILOT_CURVE_BIAS_MIN_SAMPLES,
   MOONPILOT_CURVE_BIAS_PERSIST_EVERY,
   MOONPILOT_CURVE_EXIT_JERK,
+  MOONPILOT_CURVE_EXIT_LAT_ACCEL,
   MOONPILOT_CURVE_HOLD_MARGIN,
   MOONPILOT_CURVE_K_HOLD,
   MOONPILOT_CURVE_PATH_MAX_AGE,
+  curve_accel,
   curve_targets,
   lat_accel_hold,
 )
@@ -369,20 +371,25 @@ class TestCurveSpeed(unittest.TestCase):
   def test_the_exit_rebuilds_the_positive_ask_at_the_exit_jerk(self):
     """Route 000003f8 segment 0: below set speed the command went -1.50 -> +1.17 within 2 s of a curve
     letting go, the cruise rung behind the comfort jerk, and the car pulled +1.35 m/s^2 with 20 degrees
-    of wheel still in. Once the curve terms stop braking the positive ask now rebuilds from zero at
-    `MOONPILOT_CURVE_EXIT_JERK`: at k frames after the release it is at most `JERK * k * dt`, so +0.5
-    takes ~2 s where the comfort jerk alone gets there in ~0.35 s. The ramp only ever caps the
-    positive side and is armed only by braking, so a straight road that never braked is the planner
-    without it, frame for frame."""
+    of wheel still in. Once the curve terms stop braking with the car still cornering, the positive ask
+    rebuilds from zero at `MOONPILOT_CURVE_EXIT_JERK`: at k frames after the release it is at most
+    `JERK * k * dt`, so +0.5 takes ~2 s where the comfort jerk alone gets there in ~0.35 s. The ramp only
+    ever caps the positive side and is armed only by braking, so a straight road that never braked is
+    the planner without it, frame for frame."""
     v_ego, v_cruise_kph = 20.0, 108.0
     straight = _path(v_ego, 0.0)
+    # 0.003 1/m at 20 m/s is 1.2 m/s^2 of measured lateral: the wheel is still in, inside the cruise
+    # term's own turn budget. `vp_valid` stays false so the in-curve hold term is off and only the exit
+    # ramp shapes the command.
+    cornering = {"steer_angle_deg": self._steer_angle_for(0.003, v_ego), "steer_ratio": 15.0, "stiffness_factor": 1.0}
+    self.assertGreater(0.003 * v_ego**2, MOONPILOT_CURVE_EXIT_LAT_ACCEL)
     planner = _planner()
     for _ in range(40):
       planner.update(_inputs(v_ego=v_ego, v_cruise_kph=v_cruise_kph, path=self._ramp_curve(v_ego, 30.0, curvature=0.01)))
     self.assertAlmostEqual(planner.output_a_target, MOONPILOT_CURVE_ACCEL_MIN, delta=1e-6)
     exit_cmds = []
     for k in range(1, 61):
-      planner.update(_inputs(v_ego=v_ego, v_cruise_kph=v_cruise_kph, path=straight))
+      planner.update(_inputs(v_ego=v_ego, v_cruise_kph=v_cruise_kph, path=straight, **cornering))
       exit_cmds.append(planner.output_a_target)
       self.assertLessEqual(planner.output_a_target, MOONPILOT_CURVE_EXIT_JERK * k * DT_MDL + 1e-9, f"frame {k} after the release")
     self.assertGreater(exit_cmds[-1], 0.5)  # it does rebuild, to the cruise rung's side of +0.5
@@ -398,6 +405,36 @@ class TestCurveSpeed(unittest.TestCase):
       uncapped = cruise(_planner())
     self.assertEqual(cruise(_planner()), uncapped)
     self.assertGreater(uncapped[7], 0.5)  # the comfort jerk's own ramp: past +0.5 inside 0.4 s
+
+  def test_a_straight_wheel_with_no_curve_ahead_rebuilds_at_the_comfort_jerk(self):
+    """Route 00000408: a predicted intersection turn the car never took asked -0.04..-0.32 m/s^2 with the
+    wheel at 3 degrees, and the slow exit ramp then held a pull-away near zero for 5 s while the cruise
+    term asked +1.5. With the wheel straight and nothing on the path that would brake at the set speed,
+    the ramp rebuilds at the comfort up-jerk; a curve still ahead keeps the slow ramp, so a pre-brake
+    that has met its target cannot re-accelerate into the curve."""
+    v_ego, v_cruise_kph = 20.0, 108.0
+    ahead = self._ramp_curve(v_ego, 20.0, curvature=0.0027)  # inside the 4 s preview at 20 m/s
+    target = curve_targets(_inputs(path=ahead)['modelV2'], True)
+    self.assertGreaterEqual(curve_accel(v_ego, 0.0, target), 0.0)  # not braking at the current speed
+    self.assertLess(curve_accel(v_cruise_kph / 3.6, 0.0, target), 0.0)  # but it would at the set speed
+
+    def exit_after_brake(path):
+      planner = _planner()
+      for _ in range(40):
+        planner.update(_inputs(v_ego=v_ego, v_cruise_kph=v_cruise_kph, path=self._ramp_curve(v_ego, 30.0, curvature=0.01)))
+      cmds = []
+      for _ in range(40):
+        planner.update(_inputs(v_ego=v_ego, v_cruise_kph=v_cruise_kph, path=path))
+        cmds.append(planner.output_a_target)
+      return cmds
+
+    # Out of -1.5 the up-jerk governs either way until the command crosses zero; past it the slow ramp
+    # would hold +0.5 at 2 s, and the comfort rebuild is already back on the cruise rung.
+    clear = exit_after_brake(_path(v_ego, 0.0))
+    self.assertGreater(clear[-1], MOONPILOT_CURVE_EXIT_JERK * 40 * DT_MDL + 0.25)
+    curve_still_ahead = exit_after_brake(ahead)
+    for k, cmd in enumerate(curve_still_ahead, start=1):
+      self.assertLessEqual(cmd, MOONPILOT_CURVE_EXIT_JERK * k * DT_MDL + 1e-9, f"frame {k} after the release")
 
   def test_the_learned_scale_persists(self):
     """The value handed to the next drive, on the estimator's own cadence and gate: a trusted

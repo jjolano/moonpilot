@@ -100,6 +100,7 @@ from moonpilot.curve import (
   MOONPILOT_CURVE_BIAS_PERSIST_EVERY,
   MOONPILOT_CURVE_BIAS_TRACKING_TOLERANCE,
   MOONPILOT_CURVE_EXIT_JERK,
+  MOONPILOT_CURVE_EXIT_LAT_ACCEL,
   MOONPILOT_CURVE_PATH_MAX_AGE,
   MOONPILOT_CURVE_PATH_CLOCK_SANITY,
   LatAccelBiasEstimator,
@@ -501,9 +502,9 @@ MOONPILOT_RADAR_HOLD_T = 2.0  # s
 MOONPILOT_RADAR_HOLD_MIN_V = 5.0  # m/s of ego speed
 MOONPILOT_RADAR_HOLD_MIN_GAP = 40.0  # m
 MOONPILOT_MODEL_BRAKE_THRESHOLD = -0.5  # m/s^2; outside experimental mode the model is ignored
-# until it asks for at least this much braking, and past that its ask goes in whole: the floor under
-# it is the actuator's own ACCEL_MIN, not a fork value. See `model_candidate` for why a fork-owned
-# floor above that was measured and removed.
+# until it asks for at least this much braking, and past that its ask blends in over
+# `MOONPILOT_MODEL_BRAKE_FADE_T` and then goes in whole: the floor under it is the actuator's own
+# ACCEL_MIN, not a fork value. See `model_candidate` for why a fork-owned floor above that was removed.
 # Once admitted, the model keeps its slot until its ask rises past this release, which climbs from the
 # entry threshold at `MOONPILOT_MODEL_STOP_SPEED` to upstream `should_stop`'s own 0.1 at creep speed.
 # The model tapers its ask as it finishes a stop — on route 000003d2 it braked from 17 m/s and crossed
@@ -512,6 +513,8 @@ MOONPILOT_MODEL_BRAKE_THRESHOLD = -0.5  # m/s^2; outside experimental mode the m
 # exactly experimental mode's stop contract: held while the model's ask is under 0.1.
 MOONPILOT_MODEL_STOP_SPEED = 5.0  # m/s
 MOONPILOT_MODEL_STOP_RELEASE = 0.1  # m/s^2; `should_stop`'s threshold
+MOONPILOT_MODEL_BRAKE_FADE_T = 0.5  # s; an admitted model ask blends in from the other candidates over this
+MOONPILOT_MODEL_BRAKE_FULL = -2.0  # m/s^2; an ask this deep goes in whole at once, and shallower ones in proportion
 MOONPILOT_MODEL_STOP_ENTER_SPEED = 1.5  # m/s
 MOONPILOT_CRASH_DISTANCE = 0.25  # m; FCW contact margin
 MOONPILOT_FCW_DECEL = -4.0  # m/s^2 required decel that means it cannot be avoided
@@ -997,7 +1000,9 @@ def model_candidate(model, e2e, allowed, threshold=MOONPILOT_MODEL_BRAKE_THRESHO
   would be a one-way ratchet against the cruise term, and the car would settle below the set speed
   on a clear road. Below the threshold the model is not asking for anything a driver would feel.
 
-  Past it the ask goes in whole. What bounds it is `ACCEL_MIN`, and that bound is unconditional:
+  Past it the ask blends in from the other candidates over `MOONPILOT_MODEL_BRAKE_FADE_T` (faster the
+  deeper it is, at once from `MOONPILOT_MODEL_BRAKE_FULL`) and then goes in whole — a timed entry, not
+  a floor. What bounds it is `ACCEL_MIN`, and that bound is unconditional:
   enforced by the clip every command passes through in `update`, by the identical clip in the
   published rollout, and again by the controller from the car's own `accel_limits` — so a deep ask
   still reaches full authority in an emergency, at `MOONPILOT_JERK_EMERGENCY`.
@@ -1045,6 +1050,7 @@ def policy(
   squeeze=ACCEL_MAX,
   exit_cap=ACCEL_MAX,
   err_bp=MOONPILOT_CRUISE_ERR_BP,
+  model_weight=1.0,
 ):
   """The smallest of the candidates, and which one it was.
 
@@ -1069,6 +1075,10 @@ def policy(
   runway to reach set speed and then match the lead at the ordinary follow decel. Below set speed,
   the moving-lead arrival term may use the slow rung only while arrival by coasting still fits. TTC,
   regulator braking and the stopping floor are unchanged.
+
+  `model_weight` is how much of an admitted model ask below the other candidates goes in: the
+  candidate is blended from their minimum toward the model by it, so admission past the deadband
+  starts where the plan already is instead of stepping onto the model. 1.0 is the raw ask.
   """
   a_curve = min(curve_accel(v_ego, x_ego, curve), lat_accel_hold(v_ego, v_hold), squeeze, exit_cap)
   a_cruise_raw = cruise_accel(v_ego, v_cruise, e2e, steer_angle_deg, CP, accel_coast, allow_throttle, coast_band, err_bp)
@@ -1104,7 +1114,12 @@ def policy(
   candidates = [(a_cruise, LongitudinalPlanSource.cruise)]
   candidates += lead_asks
   if model_accel is not None:
-    candidates.append((float(model_accel), LongitudinalPlanSource.e2e))
+    # Blended from where the other candidates are, so admission is not a step (see `model_weight`).
+    rest = min(c[0] for c in candidates)
+    model = float(model_accel)
+    if model < rest:
+      model = rest + model_weight * (model - rest)
+    candidates.append((model, LongitudinalPlanSource.e2e))
   accel, source = min(candidates, key=lambda c: c[0])
   return float(accel), source
 
@@ -1172,6 +1187,7 @@ class MoonpilotLongitudinalPlanner:
     self.radar_hold = None  # (last radar leadOne snapshot, a_lead, a_lead_tau, seconds held, ego travel since)
     self.source = LongitudinalPlanSource.cruise
     self.model_braking = False  # the model held a braking slot last frame: `model_release` applies
+    self.model_fade = 0.0  # seconds-scaled weight an admitted model ask has earned (`MOONPILOT_MODEL_BRAKE_FADE_T`)
     self.t_follow = None
     self.lead_leaving = False
     # The curve exit ramp's ceiling on the positive ask: zero while a curve term brakes, rebuilt at
@@ -1214,6 +1230,7 @@ class MoonpilotLongitudinalPlanner:
     if reset_state:
       self.output_a_target = a_ego
       self.model_braking = False
+      self.model_fade = 0.0
       self.curve_exit_cap = ACCEL_MAX
 
     # Learn the chain's lag from the command that was in effect last frame (`output_a_target` is
@@ -1266,6 +1283,11 @@ class MoonpilotLongitudinalPlanner:
     threshold = model_release(v_ego) if self.model_braking else MOONPILOT_MODEL_BRAKE_THRESHOLD
     model_accel = model_candidate(sm['modelV2'], e2e, enabled(MODEL_BRAKING, self.params), threshold)
     self.model_braking = model_accel is not None and not e2e
+    self.model_fade = min(self.model_fade + self.dt / MOONPILOT_MODEL_BRAKE_FADE_T, 1.0) if self.model_braking else 0.0
+    model_weight = 1.0
+    if model_accel is not None and not e2e:
+      # A deep ask is not held back by the fade: proportionally more of it goes in at once.
+      model_weight = max(self.model_fade, float(np.interp(model_accel, [MOONPILOT_MODEL_BRAKE_FULL, threshold], [1.0, 0.0])))
 
     # The curve speed control. The measured curvature is the car's own — `-VM.calc_curvature` of the
     # steer angle, the same idiom controlsd and `moonpilot/latcontrol.py` use — and the model's path
@@ -1414,11 +1436,18 @@ class MoonpilotLongitudinalPlanner:
     x_pred = 0.5 * (v_ego + v_pred) * self.action_t
     # The curve exit: while any curve term brakes, the positive ask is held to where the command already
     # is (zero once it is braking), and after it lets go it rebuilds from there at a ramp instead of
-    # jumping to the cruise rung behind the comfort jerk (MOONPILOT_CURVE_EXIT_JERK).
+    # jumping to the cruise rung behind the comfort jerk (MOONPILOT_CURVE_EXIT_JERK). The slow ramp is
+    # for a car still cornering or a curve still ahead; with the wheel straight and nothing on the path
+    # that would brake at the set speed, it rebuilds at the comfort up-jerk (MOONPILOT_CURVE_EXIT_LAT_ACCEL).
+    exit_jerk = MOONPILOT_CURVE_EXIT_JERK
     if min(curve_accel(v_pred, x_pred, curve), lat_accel_hold(v_pred, v_hold), squeeze) < 0.0:
       self.curve_exit_cap = max(a_prev, 0.0)
     else:
-      self.curve_exit_cap = min(self.curve_exit_cap + MOONPILOT_CURVE_EXIT_JERK * self.dt, ACCEL_MAX)
+      cornering = abs(measured_curvature) * CS.vEgo**2 >= MOONPILOT_CURVE_EXIT_LAT_ACCEL
+      curve_ahead = curve_accel(max(v_cruise, v_pred), x_pred, curve) < 0.0
+      if not (cornering or curve_ahead):
+        exit_jerk = MOONPILOT_JERK_UP
+      self.curve_exit_cap = min(self.curve_exit_cap + exit_jerk * self.dt, ACCEL_MAX)
     lead_states = []
     for source, lead, a_lead, a_lead_tau in leads:
       age = self._lead_age(lead, lead_age)
@@ -1441,6 +1470,7 @@ class MoonpilotLongitudinalPlanner:
       squeeze=squeeze,
       exit_cap=self.curve_exit_cap,
       err_bp=err_bp,
+      model_weight=model_weight,
     )
 
     a_target = float(np.clip(jerk_limit(a_cmd, a_prev, self.dt, v_ego, jerk_scale), ACCEL_MIN, ACCEL_MAX))
@@ -1466,7 +1496,9 @@ class MoonpilotLongitudinalPlanner:
       coast_band=coast_band,
       squeeze=squeeze,
       exit_cap=self.curve_exit_cap,
+      exit_jerk=exit_jerk,
       err_bp=err_bp,
+      model_weight=model_weight,
     )
 
     self.j_desired_trajectory = np.gradient(self.a_desired_trajectory, MOONPILOT_CONTROL_T_IDX)
@@ -1591,7 +1623,9 @@ class MoonpilotLongitudinalPlanner:
     coast_band: float = 0.0,
     squeeze=ACCEL_MAX,
     exit_cap=ACCEL_MAX,
+    exit_jerk=MOONPILOT_CURVE_EXIT_JERK,
     err_bp=MOONPILOT_CRUISE_ERR_BP,
+    model_weight=1.0,
   ):
     """The same policy rolled forward over the published horizon, from (v_ego, a_target). The ego's
     own travel is carried in x, so the gap the leads are rolled against is the gap this plan
@@ -1629,8 +1663,9 @@ class MoonpilotLongitudinalPlanner:
         x_ego=x,
         v_hold=v_hold,
         squeeze=squeeze,
-        exit_cap=min(exit_cap + MOONPILOT_CURVE_EXIT_JERK * t, ACCEL_MAX),
+        exit_cap=min(exit_cap + exit_jerk * t, ACCEL_MAX),
         err_bp=err_bp,
+        model_weight=model_weight,
       )
       a = float(np.clip(jerk_limit(a_cmd, a, t - t_prev, v, comfort_scale), ACCEL_MIN, ACCEL_MAX))
       speeds[i] = v
