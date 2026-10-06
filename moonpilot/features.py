@@ -47,6 +47,18 @@ PATH_SMOOTH = Feature(
   choices=("off", "0.05 s", "0.10 s", "0.15 s"),
 )
 
+STEER_HYSTERESIS = Feature(
+  key="MoonpilotSteerHysteresis",
+  title="steady steering torque",
+  description=(
+    "moonpilot steering only. Holds the steering torque until the controller's own torque moves past a small band "
+    + "(percent of maximum), so tiny back-and-forth corrections never reach the wheel. Wider is calmer and less precise. "
+    + "Restart to apply."
+  ),
+  offroad_only=True,
+  choices=("off", "0.3%", "0.7%", "1.3%"),
+)
+
 TURN_DESIRE = Feature(
   key="MoonpilotTurnDesire",
   title="turn desire",
@@ -157,7 +169,7 @@ class Group:
 STEERING = Group(
   title="steering",
   description="How openpilot moves the wheel: whose controller, when a curve is entered, and whether openpilot can steer at all.",
-  features=(LATERAL_ENGAGE, TORQUE_LATERAL, PATH_PREVIEW, PATH_SMOOTH, TURN_DESIRE),
+  features=(LATERAL_ENGAGE, TORQUE_LATERAL, PATH_PREVIEW, PATH_SMOOTH, STEER_HYSTERESIS, TURN_DESIRE),
 )
 
 SPEED = Group(

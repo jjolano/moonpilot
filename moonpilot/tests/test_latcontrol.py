@@ -16,9 +16,13 @@ from moonpilot.latcontrol import (
   MOONPILOT_FRICTION_DEADBAND,
   MOONPILOT_JERK_LOOKAHEAD_T,
   MOONPILOT_KI,
+  MOONPILOT_TORQUE_HYSTERESIS,
+  MOONPILOT_VERSION,
+  MOONPILOT_VERSION_HYSTERESIS,
   MoonpilotLatControlTorque,
   moonpilot_latcontrol,
 )
+from moonpilot.features import STEER_HYSTERESIS
 from moonpilot.tests.fakes import _params
 
 # A request small enough that the controller runs inside its own limits, so the integrator
@@ -26,10 +30,10 @@ from moonpilot.tests.fakes import _params
 LINEAR_REQUEST = 0.3 / 625
 
 
-def _controller(car_name=TOYOTA.TOYOTA_RAV4):
+def _controller(car_name=TOYOTA.TOYOTA_RAV4, hysteresis=0.0):
   CP = interfaces[car_name].get_non_essential_params(car_name)
   CI = interfaces[car_name](CP)
-  return MoonpilotLatControlTorque(CP.as_reader(), CI, DT_CTRL), VehicleModel(CP), CI
+  return MoonpilotLatControlTorque(CP.as_reader(), CI, DT_CTRL, hysteresis), VehicleModel(CP), CI
 
 
 def _state(VEgo=25.0):
@@ -269,6 +273,61 @@ class TestMoonpilotLatControlTorque(unittest.TestCase):
     # Unfiltered, each 2-frame half-cycle of ±1.5° at 25 m/s is a multi-m/s² measurement step
     # and would flip every cycle (up to 50). The LPF must keep that well under half.
     self.assertLess(flips, 25)
+
+
+class TestTorqueHysteresis(unittest.TestCase):
+  H = MOONPILOT_TORQUE_HYSTERESIS[2]
+
+  def _noisy_run(self, lac, VM):
+    CS, params = _state(8.0), log.VehicleParameters.new_message()
+    torques: list[float] = []
+    for i in range(400):
+      CS.steeringAngleDeg = 0.3 * ((i * 7919) % 11 - 5) / 5  # deterministic sensor-scale jitter
+      _run(lac, VM, CS, params, 1, desired_curvature=LINEAR_REQUEST * (1 + 0.5 * math.sin(i / 40)), torques=torques)
+    return torques
+
+  def test_the_command_stays_within_the_band_and_reverses_less(self):
+    plain, VM, _ = _controller()
+    held, VM2, _ = _controller(hysteresis=self.H)
+    a, b = self._noisy_run(plain, VM), self._noisy_run(held, VM2)
+    self.assertLessEqual(max(abs(x - y) for x, y in zip(a, b, strict=True)), self.H + 1e-9)
+
+    def reversals(xs):
+      d = [y - x for x, y in zip(xs, xs[1:], strict=False) if abs(y - x) > 1e-9]
+      return sum((p > 0) != (q > 0) for p, q in zip(d, d[1:], strict=False))
+    self.assertGreater(reversals(a), 20)  # the plain controller does chatter on this input
+    self.assertLess(reversals(b), reversals(a) / 2)
+
+  def test_large_moves_pass_and_a_reset_drops_the_hold(self):
+    lac, _, _ = _controller(hysteresis=self.H)
+    self.assertEqual(lac._hold(0.1), 0.1)
+    self.assertEqual(lac._hold(0.1 + self.H / 2), 0.1)  # inside the band: held
+    self.assertEqual(lac._hold(0.1 - self.H / 2), 0.1)
+    self.assertAlmostEqual(lac._hold(0.3), 0.3 - self.H)  # a real move follows, trailing by the band
+    lac.reset()
+    self.assertEqual(lac._hold(-0.2), -0.2)  # a re-engage starts from the controller's own output
+
+  def test_the_logged_version_says_which_law_ran(self):
+    CS, params = _state(), log.VehicleParameters.new_message()
+    for h, version in ((0.0, MOONPILOT_VERSION), (self.H, MOONPILOT_VERSION_HYSTERESIS)):
+      lac, VM, _ = _controller(hysteresis=h)
+      self.assertEqual(_run(lac, VM, CS, params, 1).version, version)
+
+  def test_the_factory_maps_each_choice_to_its_labelled_band(self):
+    CP = interfaces[TOYOTA.TOYOTA_RAV4].get_non_essential_params(TOYOTA.TOYOTA_RAV4)
+    CI = interfaces[TOYOTA.TOYOTA_RAV4](CP)
+    self.assertEqual(len(MOONPILOT_TORQUE_HYSTERESIS), len(STEER_HYSTERESIS.choices))
+    for index, label in enumerate(STEER_HYSTERESIS.choices):
+      with self.subTest(label=label):
+        lac = moonpilot_latcontrol(CP.as_reader(), CI, DT_CTRL, _params(True, {STEER_HYSTERESIS.key: index}))
+        assert isinstance(lac, MoonpilotLatControlTorque)
+        self.assertEqual(lac.hysteresis, MOONPILOT_TORQUE_HYSTERESIS[index])
+        self.assertEqual(label, "off" if index == 0 else f"{lac.hysteresis * 100:.1f}%")
+    # out of range reads as off; and no fork controller at all means nothing to hold
+    lac = moonpilot_latcontrol(CP.as_reader(), CI, DT_CTRL, _params(True, {STEER_HYSTERESIS.key: 9}))
+    assert isinstance(lac, MoonpilotLatControlTorque)
+    self.assertEqual(lac.hysteresis, 0.0)
+    self.assertIsNone(moonpilot_latcontrol(CP.as_reader(), CI, DT_CTRL, _params(False, {STEER_HYSTERESIS.key: 2})))
 
 
 if __name__ == "__main__":

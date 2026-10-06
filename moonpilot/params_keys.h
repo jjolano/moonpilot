@@ -42,6 +42,10 @@
     // that much path lag for calmer torque steps; chosen at construction, so the row takes a
     // restart.
     {"MoonpilotPathSmooth", {PERSISTENT, INT, "0"}},
+    // Off by default: an index into STEER_HYSTERESIS.choices (0 off, then 0.3 / 0.7 / 1.3 % of
+    // max torque), the half-width of a backlash on the fork torque controller's output; chosen at
+    // construction, so the row takes a restart.
+    {"MoonpilotSteerHysteresis", {PERSISTENT, INT, "0"}},
     // On by default: below the lane-change speed threshold a turn signal
     // feeds a turn desire into the model so it steers into the corner. The
     // model's own turn prediction picks the direction.
