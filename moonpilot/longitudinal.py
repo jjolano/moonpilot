@@ -489,7 +489,29 @@ MOONPILOT_ALLOW_THROTTLE_THRESHOLD = 0.4
 # that route's manual driving the driver was on the gas on 3 % of frames under 0.4 and 78 % above it —
 # so the fix is hysteresis on it, not a different threshold.
 MOONPILOT_ALLOW_THROTTLE_RELEASE = 0.5
+MOONPILOT_ALLOW_THROTTLE_RETURN_T = 0.5  # s the probability must stay over the release before throttle returns.
+# The 0.1 hysteresis is narrower than the signal's own frame-to-frame swing: on route 0000040e it read
+# 0.31 -> 0.53 -> 0.38 -> 0.66 inside 0.2 s, and the cruise term stepped +0.08 <-> -0.30 three times in a
+# second ahead of a stop (338.4-339.3 s). Losing throttle stays immediate, so the coast starts as early.
 MOONPILOT_MIN_ALLOW_THROTTLE_SPEED = 2.5  # m/s
+# Soft landing behind a stopped lead. The spacing regulator is the only term braking inside the standstill
+# gap at a crawl (TTC and the stopping floor are gated on ~1.0 m/s^2 there), and its gap-deficit brake held
+# -0.54..-0.77 m/s^2 down to 0.3 m/s on route 0000040e (126-138 s): the car came to rest from -0.7, a
+# 0.61 m/s^2 step in 0.1 s on the IMU against 0.17 for the model-led stop that tapered to -0.2. Below
+# `MOONPILOT_SOFT_STOP_V` and behind a lead slower than `MOONPILOT_SOFT_STOP_LEAD_V`, the regulator's brake
+# is replaced by the kinematic stop to a rest point that moves in as the car slows,
+# `MOONPILOT_STOP_REST + SOFT_STOP_REST_PER_V * v`: at the band edge it is the approach's own constant-decel
+# plateau, so the handover has no step, and the shrinking `v^2` tapers it out toward rest. A decel tapering
+# linearly with speed was tried first: it asked ~2 m/s^2 at 3.7 m/s against a 1.2 plateau, so the band edge
+# stepped deeper before easing. Flown against stopped leads from 5-12 m/s the car rests 4.93-5.16 m behind
+# (5.0-5.26 before) and late detections or braking leads 4.63-4.71 (4.80-4.86), at -0.11..-0.15 m/s^2 as
+# it stops against -0.25..-0.38, with every peak unchanged.
+MOONPILOT_SOFT_STOP_REST_PER_V = 0.15  # s; the rest point's extra distance per m/s of speed
+MOONPILOT_SOFT_STOP_V = [3.0, 5.0]  # m/s: fully in below, out above
+MOONPILOT_SOFT_STOP_LEAD_V = [0.5, 1.5]  # m/s of braking-credited lead speed: fully in below, out above
+MOONPILOT_SOFT_STOP_MIN_T = 0.5  # s; the slack floor, in travel time, once the rest point is crossed while
+# still moving: -v / (2 * MIN_T) instead of a near-zero denominator (-4.6 m/s^2 at 0.68 m/s past it).
+MOONPILOT_SOFT_STOP_HANDOFF_V = 0.1  # m/s of closing over which the law hands standstill back to the regulator
 # A far radar lead outlives a lapse in radard's association. Toyota's radar and the model disagree on a
 # far lead's range by ~14 m (median) and the model's speed by +-6-7 m/s (p10/p90) there, so beyond ~60 m
 # radard keeps losing the match and handing leadOne to the vision-only lead: 84 % of vision-only leads on
@@ -701,6 +723,23 @@ def crawl_accel(a_track, v_ego, v_lead, a_lead) -> float:
   return a_track + w * (MOONPILOT_FAST_CRAWL - a_track)
 
 
+def soft_stop(a_track, v_ego, gap, v_lead_eff) -> float:
+  """The spacing regulator's brake near rest behind a (near-)stopped lead, replaced by the kinematic stop
+  to a rest point that moves in as the car slows (see `MOONPILOT_SOFT_STOP_REST_PER_V`). Only a brake while still
+  closing: a positive ask (a creep, a launch) is untouched, and the law hands back over the last
+  `MOONPILOT_SOFT_STOP_HANDOFF_V` of closing so the stop hold and the launch logic own standstill exactly
+  as before. Fades out above `MOONPILOT_SOFT_STOP_V` and for a lead above `MOONPILOT_SOFT_STOP_LEAD_V`."""
+  if a_track >= 0.0:
+    return a_track
+  w = float(np.interp(v_ego, MOONPILOT_SOFT_STOP_V, [1.0, 0.0])) * float(np.interp(v_lead_eff, MOONPILOT_SOFT_STOP_LEAD_V, [1.0, 0.0]))
+  w *= float(np.interp(v_ego - v_lead_eff, [0.0, MOONPILOT_SOFT_STOP_HANDOFF_V], [0.0, 1.0]))
+  if w <= 0.0:
+    return a_track
+  rest = MOONPILOT_STOP_REST + MOONPILOT_SOFT_STOP_REST_PER_V * v_ego
+  a_soft = -(v_ego**2) / (2.0 * max(gap - rest, MOONPILOT_SOFT_STOP_MIN_T * v_ego, 0.05))
+  return a_track + w * (a_soft - a_track)
+
+
 def pos_authority(v_ego) -> float:
   """The multiplier on the spacing regulator's output where that output is positive.
 
@@ -880,6 +919,7 @@ def lead_accel(v_ego, gap, v_lead, a_lead, t_follow, catch_up_accel=0.0, catch_u
     a_track += w * max(MOONPILOT_K_V * (v_lead_match - v_ego) - a_track, 0.0)
   a_track = crawl_accel(a_track, v_ego, v_lead, a_lead)
   a_track = departure_crawl(a_track, v_ego, v_lead, a_lead)
+  a_track = soft_stop(a_track, v_ego, gap, v_lead_eff)
   if a_track > 0.0 and v_ego > v_lead_match and gap > gap_target:
     a_track *= min(1.0, (gap - gap_target) / MOONPILOT_FOLLOW_TAPER_M)
   closing = v_ego - v_lead_eff
@@ -1183,6 +1223,7 @@ class MoonpilotLongitudinalPlanner:
     self.fcw = False
     self.crash_cnt = 0
     self.allow_throttle = True
+    self.throttle_return_t = 0.0  # seconds the gas-press probability has held over the release while coasting
     self.radar_hold = None  # (last radar leadOne snapshot, a_lead, a_lead_tau, seconds held, ego travel since)
     self.source = LongitudinalPlanSource.cruise
     self.model_braking = False  # the model held a braking slot last frame: `model_release` applies
@@ -1272,8 +1313,13 @@ class MoonpilotLongitudinalPlanner:
     coast_band = MOONPILOT_COAST_BAND if pose_valid and coast_enabled else 0.0
     throttle_probs = sm['modelV2'].meta.disengagePredictions.gasPressProbs
     throttle_prob = throttle_probs[1] if len(throttle_probs) > 1 else 1.0
-    throttle_threshold = MOONPILOT_ALLOW_THROTTLE_THRESHOLD if self.allow_throttle else MOONPILOT_ALLOW_THROTTLE_RELEASE
-    self.allow_throttle = throttle_prob > throttle_threshold or v_ego <= MOONPILOT_MIN_ALLOW_THROTTLE_SPEED
+    if self.allow_throttle:
+      self.throttle_return_t = 0.0
+      self.allow_throttle = throttle_prob > MOONPILOT_ALLOW_THROTTLE_THRESHOLD
+    else:
+      self.throttle_return_t = self.throttle_return_t + self.dt if throttle_prob > MOONPILOT_ALLOW_THROTTLE_RELEASE else 0.0
+      self.allow_throttle = self.throttle_return_t >= MOONPILOT_ALLOW_THROTTLE_RETURN_T - 1e-9
+    self.allow_throttle = self.allow_throttle or v_ego <= MOONPILOT_MIN_ALLOW_THROTTLE_SPEED
 
     steer_angle = CS.steeringAngleDeg - sm['vehicleParameters'].angleOffsetDeg
     t_follow = self._t_follow(sm)

@@ -1715,7 +1715,7 @@ class TestPlanner(unittest.TestCase):
       return fly(age, 0.0)
 
     fresh = corrected(0.0)
-    self.assertGreater(fresh, 5.0)  # it stops
+    self.assertGreater(fresh, MOONPILOT_STOP_REST - 0.5)  # it stops, at the soft rest point
     # realistic staleness: the stop is the fresh one to within 3 cm, up to 0.2 s — four times the
     # 46 ms measured on the corpus. The tight bound is calibrated to that range on purpose: past it
     # the correction loses accuracy because the lead's own acceleration over the stale interval is not
@@ -1732,7 +1732,7 @@ class TestPlanner(unittest.TestCase):
         c, u = corrected(age), uncorrected(age)
         self.assertGreaterEqual(c, u, f"{age} s of staleness made the correction stop closer than no correction")
         if age <= 0.2:
-          self.assertGreater(c, 5.0)  # still a real stop, not a degraded one
+          self.assertGreater(c, MOONPILOT_STOP_REST - 0.5)  # still a real stop, not a degraded one
 
   def test_a_lead_with_no_stamp_gets_no_correction(self):
     """The zero case, which is what keeps this out of the maneuver plant's way: a SubMaster with no

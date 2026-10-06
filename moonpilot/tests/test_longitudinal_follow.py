@@ -148,6 +148,24 @@ class TestFollowPolicy(unittest.TestCase):
     self.assertTrue(all(-0.8 < ask < 0.0 for ask in asks))
     self.assertLess(max(abs(a - b) for a, b in zip(asks, asks[1:], strict=False)), 0.05)
 
+  def test_a_stop_behind_a_stopped_lead_lands_softly_near_the_rest_gap(self):
+    """Route 0000040e (126-138 s): a stopped lead first seen ~83 m out from 17 m/s, and the regulator's
+    gap-deficit brake held -0.54..-0.77 m/s^2 to 0.3 m/s, so the car came to rest from -0.7. The soft
+    landing ends the stop gently, near the rest gap, and once the brake eases it never deepens again —
+    the handover from the approach plateau is not a second brake."""
+    for v0, gap0 in ((12.0, 70.0), (17.0, 85.0)):
+      with self.subTest(v0=v0, gap0=gap0):
+        s = _fly(v0, v0 * 3.6 + 5, gap0, 0.0, lambda t: 0.0, 40.0)
+        v, c = np.array(s["v"]), np.array(s["cmd"])
+        last = int(np.flatnonzero(v > 0.1)[-1])
+        self.assertGreater(c[last], -0.2)
+        self.assertFalse(s["contact"])
+        self.assertTrue(MOONPILOT_STOP_REST - 0.6 < s["end_gap"] < MOONPILOT_STOP_DISTANCE, s["end_gap"])
+        braking = c[: last + 1]
+        eased = np.flatnonzero(braking - np.minimum.accumulate(braking) > 0.05)
+        tail = braking[eased[0] :]
+        self.assertLess(float(np.max(np.maximum.accumulate(tail) - tail)), 0.06)
+
   def test_an_accelerating_lead_retires_the_approach_brake(self):
     self.assertLess(lead_accel(18.0, 90.0, 12.5, 0.0, 1.45), 0.0)
     self.assertGreater(lead_accel(18.0, 90.0, 12.5, 1.0, 1.45), 0.0)
@@ -395,8 +413,22 @@ class TestFollowPolicy(unittest.TestCase):
 
   def test_throttle_returns_only_past_the_release_probability(self):
     """Route 000003f8 segment 43: the gas-press probability hovered on 0.4 and the coast cap flipped
-    on and off a frame at a time. Throttle is lost under 0.4 and only returns over 0.5."""
+    on and off a frame at a time. Throttle is lost under 0.4 at once and returns only once the
+    probability has held over 0.5 for `MOONPILOT_ALLOW_THROTTLE_RETURN_T` — route 0000040e's swings
+    (0.31 -> 0.53 -> 0.38 -> 0.66 inside 0.2 s) crossed both thresholds a frame at a time."""
     planner = _planner()
-    for prob, allowed in ((0.45, True), (0.35, False), (0.45, False), (0.55, True), (0.45, True)):
+    hold = round(longitudinal.MOONPILOT_ALLOW_THROTTLE_RETURN_T / DT_MDL)
+    for prob, allowed in ((0.45, True), (0.35, False), (0.45, False)):
       planner.update(_inputs(v_ego=20.0, throttle_prob=prob))
       self.assertEqual(planner.allow_throttle, allowed, prob)
+    for _ in range(hold - 1):
+      planner.update(_inputs(v_ego=20.0, throttle_prob=0.55))
+      self.assertFalse(planner.allow_throttle)
+    planner.update(_inputs(v_ego=20.0, throttle_prob=0.38))  # one dip restarts the hold
+    for _ in range(hold - 1):
+      planner.update(_inputs(v_ego=20.0, throttle_prob=0.66))
+      self.assertFalse(planner.allow_throttle)
+    planner.update(_inputs(v_ego=20.0, throttle_prob=0.66))
+    self.assertTrue(planner.allow_throttle)
+    planner.update(_inputs(v_ego=20.0, throttle_prob=0.45))
+    self.assertTrue(planner.allow_throttle)
