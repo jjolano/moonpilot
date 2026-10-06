@@ -102,10 +102,21 @@ class TestLookahead(unittest.TestCase):
 
   HORIZON = CAPTURE_AGE + LAT_DELAY
 
-  def _out(self, model, level, desired=0.0):
+  def _out(self, model, level, desired=0.0, v_ego=V_EGO):
     reference = moonpilot_curvature(_params(True, {PATH_LOOKAHEAD.key: level}))
     assert reference is not None
-    return reference(model, desired, v_ego=V_EGO, lat_delay=LAT_DELAY, model_recv_time=NOW - RECEIVE_AGE, now=NOW, model_valid=True)
+    return reference(model, desired, v_ego=v_ego, lat_delay=LAT_DELAY, model_recv_time=NOW - RECEIVE_AGE, now=NOW, model_valid=True)
+
+  def test_the_lead_in_fades_out_below_corner_speeds(self):
+    model = _corner(0.002, t_start=self.HORIZON + 0.5)
+    for v in (6.0, 7.9):
+      with self.subTest(v=v):
+        self.assertEqual(_bits(self._out(model, 3, v_ego=v)), _bits(self._out(model, 0, v_ego=v)))
+    today, faded = self._out(model, 0, v_ego=10.0), self._out(model, 3, v_ego=10.0)
+    with mock.patch.object(curvature_mod, "MOONPILOT_LOOKAHEAD_SPEEDS", ([0.0, 1.0], [1.0, 1.0])):
+      full = self._out(model, 3, v_ego=10.0)
+    self.assertGreater(full, today)
+    self.assertAlmostEqual(faded - today, 0.5 * (full - today), delta=1e-15)
 
   def test_a_turn_beyond_the_single_sample_is_entered_early_and_more_with_each_level(self):
     model = _corner(0.002, t_start=self.HORIZON + 0.5)  # 0.5 s after the point today's sample reads

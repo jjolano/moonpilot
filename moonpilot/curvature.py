@@ -38,6 +38,10 @@ MOONPILOT_SMOOTH_TAUS = (0.0, 0.05, 0.10, 0.15)  # s; first-order time constant 
 # wide. The cost is a turn-in that begins inside the lane: 0.5-1.1 / 1.0-2.2 / 1.1-3.1 m median open-loop,
 # before the model's own re-planning. None makes highway builds lighter: the controller adds that abruptness.
 MOONPILOT_LOOKAHEAD: tuple[tuple[float, float, float] | None, ...] = (None, (1.0, 0.3, 0.8), (1.0, 0.6, 1.5), (1.5, 0.6, 1.5))
+# Below about 36 km/h, residential corners and intersections, an early turn-in is a cut toward the inside -- the curb
+# on a right turn -- for little lead (0.05-0.30 s at 5-10 m/s). Faded out there: at 5-10 m/s the lead-in's median
+# open-loop inside drift fell from 0.8-2.0 m to 0.07-0.15 m, and the 10-17 and >17 m/s leads were unchanged.
+MOONPILOT_LOOKAHEAD_SPEEDS = ([8.0, 12.0], [0.0, 1.0])  # m/s: none below 8, full from 12
 
 
 def _toward(desired_curvature: float, target: float, v_ego: float, gain: float, cap: float) -> float:
@@ -88,6 +92,7 @@ def response_aligned_curvature(model, desired_curvature: float, *, v_ego: float,
   # pulls the request in early and gradually.
   samples = np.interp(np.arange(response_horizon, response_horizon + window + 1e-9, 0.05), t_idxs, yaw_rates)
   ahead = _toward(desired_curvature, float(np.mean(samples)) / max(v_ego, MIN_SPEED), v_ego, gain, cap)
+  ahead = today + float(np.interp(v_ego, *MOONPILOT_LOOKAHEAD_SPEEDS)) * (ahead - today)
   # Never less turn than today's request: averaging in a turn's easing would cut its apex and let it out
   # early, and both run wide.
   return today if (ahead - today) * today < 0.0 else ahead
