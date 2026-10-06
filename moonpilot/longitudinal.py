@@ -396,6 +396,17 @@ MOONPILOT_LADDER_V_BP = [0.0, 2.5, 7.5, 12.5, 20.0]  # m/s
 MOONPILOT_SLOW_ACCEL_V = [0.77, 0.77, 0.67, 0.42, 0.31]  # m/s^2
 MOONPILOT_FAST_ACCEL_BP = [0.5, 1.5, 2.5, 3.5, 4.5, 7.0, 9.0, 11.0, 13.5, 17.5]  # m/s
 MOONPILOT_FAST_ACCEL_V = [0.83, 1.70, 1.96, 1.97, 1.81, 1.60, 1.47, 1.27, 1.13, 0.87]  # m/s^2
+# The fast rung above is what the driver's feet did, which is not what the car delivers for it. Swept
+# across 434 cached segments (29 engaged events commanding >= 1.0 m/s^2 for >= 0.4 s at >= 2 m/s, the
+# peak `aEgo` searched 2 s past the run for the vehicle's own lag): the car lands 1.27x the ask below
+# 3 m/s, 1.00x at 3-6, 1.07x at 6-10 and 1.13x at 10-15, so it overshoots nearly everywhere and does
+# so worst at the launch peak where the ask is largest. Four separate routes show the same shape at
+# 2 m/s (cmd 1.97 -> a 2.43..2.51). The ladder value stays the measurement; this is the factor that
+# turns it into a setpoint the plant can hold, applied only to the fast rung and only where the
+# overshoot was measured, so a merge at speed keeps the authority the driver measured. 0.786 is the
+# inverse of the 0-3 m/s median ratio; it reaches 1.0 by 6 m/s, where the sweep found none.
+MOONPILOT_FAST_ACCEL_TRACK_BP = [0.0, 6.0]  # m/s
+MOONPILOT_FAST_ACCEL_TRACK_V = [0.786, 1.0]  # dimensionless; 1.0 above the last breakpoint
 # Coasting: no pedals, level road, median by speed (2-5, 5-10, 10-25 m/s). Agrees with `coast_accel`'s -0.3.
 MOONPILOT_COASTING_BP = [3.5, 7.5, 15.0]  # m/s
 MOONPILOT_COASTING_V = [-0.10, -0.30, -0.33]  # m/s^2
@@ -636,7 +647,8 @@ def cruise_accel(v_ego, v_cruise, e2e, steer_angle_deg, CP, accel_coast, allow_t
     float(np.interp(v_ego, MOONPILOT_COASTING_BP, MOONPILOT_COASTING_V)),
     0.0,
     float(np.interp(v_ego, MOONPILOT_LADDER_V_BP, MOONPILOT_SLOW_ACCEL_V)),
-    float(np.interp(v_ego, MOONPILOT_FAST_ACCEL_BP, MOONPILOT_FAST_ACCEL_V)),
+    float(np.interp(v_ego, MOONPILOT_FAST_ACCEL_BP, MOONPILOT_FAST_ACCEL_V))
+    * float(np.interp(v_ego, MOONPILOT_FAST_ACCEL_TRACK_BP, MOONPILOT_FAST_ACCEL_TRACK_V)),
   ]
   a = min(float(np.interp(v_cruise - v_ego, err_bp, rungs)), cap)
   if _coast_applies(v_ego, v_cruise, e2e, accel_coast, allow_throttle, coast_band):

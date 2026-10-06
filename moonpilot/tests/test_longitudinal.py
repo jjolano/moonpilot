@@ -47,6 +47,8 @@ from moonpilot.longitudinal import (
   MOONPILOT_ERR_BP_SCALE,
   MOONPILOT_FAST_ACCEL_BP,
   MOONPILOT_FAST_ACCEL_V,
+  MOONPILOT_FAST_ACCEL_TRACK_BP,
+  MOONPILOT_FAST_ACCEL_TRACK_V,
   MOONPILOT_FAST_CRAWL,
   MOONPILOT_FCW_DECEL,
   MOONPILOT_FLOOR_ADMISSION_BP,
@@ -330,6 +332,12 @@ def _gap_target(v_ego, t_follow):
   A floor and not an offset — `STOP_DISTANCE + t_follow * v_ego` made the effective headway
   `t_follow + STOP_DISTANCE / v_ego`, so the car hung back further the slower it went."""
   return max(MOONPILOT_STOP_DISTANCE, t_follow * v_ego)
+
+
+def _fast_rung(v_ego):
+  """The ladder's fast rung as asked for: the measured driver value times the plant's tracking factor."""
+  return float(np.interp(v_ego, MOONPILOT_FAST_ACCEL_BP, MOONPILOT_FAST_ACCEL_V)) * float(
+    np.interp(v_ego, MOONPILOT_FAST_ACCEL_TRACK_BP, MOONPILOT_FAST_ACCEL_TRACK_V))
 
 
 class TestPolicyFunctions(unittest.TestCase):
@@ -788,7 +796,7 @@ class TestDriverLadder(unittest.TestCase):
     CP = _cp()
     for v in (0.0, 10.0, 20.0):
       rung = lambda err, v=v: cruise_accel(v, v + err, False, 0.0, CP, -0.3, True)  # noqa: E731
-      self.assertAlmostEqual(rung(5.0), min(float(np.interp(v, MOONPILOT_FAST_ACCEL_BP, MOONPILOT_FAST_ACCEL_V)), 1.7))  # the combined budget
+      self.assertAlmostEqual(rung(5.0), min(_fast_rung(v), 1.7))  # the combined budget
       slow_err = MOONPILOT_CRUISE_ERR_BP[4]
       self.assertAlmostEqual(rung(slow_err), float(np.interp(v, MOONPILOT_LADDER_V_BP, MOONPILOT_SLOW_ACCEL_V)))
       self.assertAlmostEqual(rung(0.5 * slow_err), 0.5 * rung(slow_err))  # interpolated, not stepped
@@ -796,10 +804,13 @@ class TestDriverLadder(unittest.TestCase):
     self.assertAlmostEqual(cruise_accel(20.0, 18.5, False, 0.0, CP, -0.3, True), -0.33)  # coasting
     self.assertAlmostEqual(cruise_accel(20.0, 17.0, False, 0.0, CP, -0.3, True), MOONPILOT_BRAKE_LIGHT)
     self.assertAlmostEqual(cruise_accel(20.0, 10.0, False, 0.0, CP, -0.3, True), MOONPILOT_BRAKE_MEDIUM)
-    # The launch band's budget lets the measured launch peak through instead of clipping it at 1.7.
-    launch_rung = float(np.interp(3.0, MOONPILOT_FAST_ACCEL_BP, MOONPILOT_FAST_ACCEL_V))
+    # The launch band's budget lets the measured launch peak through instead of clipping it at 1.7, and
+    # the plant's tracking factor takes it back down to what the car actually delivers.
+    launch_rung = _fast_rung(3.0)
     self.assertGreater(launch_rung, 1.7)
+    self.assertLess(launch_rung, float(np.interp(3.0, MOONPILOT_FAST_ACCEL_BP, MOONPILOT_FAST_ACCEL_V)))
     self.assertAlmostEqual(cruise_accel(3.0, 8.0, False, 0.0, CP, -0.3, True), launch_rung)
+    self.assertAlmostEqual(_fast_rung(6.0), float(np.interp(6.0, MOONPILOT_FAST_ACCEL_BP, MOONPILOT_FAST_ACCEL_V)))
 
   def test_force_decel_is_not_softened(self):
     CP = _cp()
@@ -824,7 +835,7 @@ class TestDriverLadder(unittest.TestCase):
     self.assertGreater(relaxed, MOONPILOT_BRAKE_LIGHT)
     self.assertLess(relaxed, -0.33)
     # ...and binds the fast rung at err +3.5 instead of +5
-    fast = min(float(np.interp(20.0, MOONPILOT_FAST_ACCEL_BP, MOONPILOT_FAST_ACCEL_V)), 1.7)  # the combined budget
+    fast = min(_fast_rung(20.0), 1.7)  # the combined budget; the tracking factor is 1.0 out here
     self.assertAlmostEqual(cruise_accel(20.0, 23.5, False, 0.0, CP, -0.3, True, err_bp=agg), fast)
     # at a shared positive error the ordering holds everywhere on the axis
     for err in (1.0, 2.0, 3.5, 5.0):
@@ -1148,10 +1159,12 @@ class TestPlanner(unittest.TestCase):
 
   def test_accelerating_lead_launch_stays_near_the_live_target(self):
     """Measured stop-and-go launches from the 6 m standstill target do not need a positive-side
-    taper: over 5 s at 1/2/3 m/s^2 the minimum target error is 0/0/0 m, and the commands at 0.25 s
-    are 0.478/0.83/0.83 m/s^2 — the two faster leads capped by the driver's fast-accel rung at rest
-    (0.998/1.075 before it). The launch jerk answers the lead without crossing inward."""
-    for a_lead, expected_cmd in ((1.0, 0.478), (2.0, 0.83), (3.0, 0.83)):
+    taper: over 5 s at 1/2/3 m/s^2 the minimum target error is 0/0/0 m. At 0.25 s the 1 m/s^2 lead is
+    still the binding term at 0.478, while the two faster leads are capped by the driver's fast-accel
+    rung at rest — the tracked rung now, 0.65 rather than the raw 0.83, because at rest the car
+    delivers 1.27x what it is asked for (see `MOONPILOT_FAST_ACCEL_TRACK_V`). The launch jerk answers
+    the lead without crossing inward."""
+    for a_lead, expected_cmd in ((1.0, 0.478), (2.0, None), (3.0, None)):
       planner = _planner()
       v_ego = v_lead = gap = 0.0
       gap = MOONPILOT_STOP_DISTANCE
@@ -1161,7 +1174,8 @@ class TestPlanner(unittest.TestCase):
         lead = _lead(gap, v_lead, a_lead=a_lead if t < 5.0 else 0.0)
         planner.update(_inputs(v_ego=v_ego, v_cruise_kph=108.0, lead=lead, standstill=v_ego < 0.01))
         if frame == round(0.25 / DT_MDL):
-          self.assertAlmostEqual(planner.output_a_target, expected_cmd, delta=0.02)
+          expected = _fast_rung(v_ego) if expected_cmd is None else expected_cmd
+          self.assertAlmostEqual(planner.output_a_target, expected, delta=0.02)
         errors.append(gap - max(MOONPILOT_STOP_DISTANCE, MOONPILOT_T_FOLLOW[int(Personality.standard)] * v_ego))
         v_ego = max(0.0, v_ego + planner.output_a_target * DT_MDL)
         v_lead = max(0.0, v_lead + a_lead * DT_MDL)

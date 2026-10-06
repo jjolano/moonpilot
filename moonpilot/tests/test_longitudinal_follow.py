@@ -175,6 +175,25 @@ class TestFollowPolicy(unittest.TestCase):
         self.assertGreater(s["min_gap"], min_gap)
         self.assertEqual(s["v"][-1], 0.0)
 
+  def test_a_launch_asks_for_what_the_car_delivers_not_what_the_feet_did(self):
+    """Sweep of 434 cached segments: below 3 m/s the car lands 1.27x the fast-rung ask, and four
+    separate routes show cmd 1.97 -> a 2.43..2.51. The tracking factor is what turns the measured
+    rung into a setpoint the plant holds, and it must be the ask that shrinks — never the ladder.
+    Exact factors only at the factor's own breakpoints; in between it interpolates."""
+    for v0, expected_factor in ((0.0, 0.786), (8.0, 1.0), (20.0, 1.0)):
+      with self.subTest(v0=v0):
+        measured = float(np.interp(v0, MOONPILOT_FAST_ACCEL_BP, MOONPILOT_FAST_ACCEL_V))
+        asked = cruise_accel(v0, v0 + 5.0, False, 0.0, _cp(), -0.3, True)
+        self.assertAlmostEqual(asked, measured * expected_factor, places=6)
+    for v0 in (1.0, 3.0, 4.5, 12.0):
+      measured = float(np.interp(v0, MOONPILOT_FAST_ACCEL_BP, MOONPILOT_FAST_ACCEL_V))
+      self.assertLessEqual(cruise_accel(v0, v0 + 5.0, False, 0.0, _cp(), -0.3, True), measured)
+    # Above the band the ask *is* the measured rung, so a merge at speed keeps the authority the driver
+    # measured; the taper after 3.5 m/s is the ladder's own, not the factor's.
+    for v0 in (6.0, 9.0, 13.0):
+      measured = float(np.interp(v0, MOONPILOT_FAST_ACCEL_BP, MOONPILOT_FAST_ACCEL_V))
+      self.assertAlmostEqual(cruise_accel(v0, v0 + 5.0, False, 0.0, _cp(), -0.3, True), measured, places=6)
+
   def test_an_accelerating_lead_retires_the_approach_brake(self):
     self.assertLess(lead_accel(18.0, 90.0, 12.5, 0.0, 1.45), 0.0)
     self.assertGreater(lead_accel(18.0, 90.0, 12.5, 1.0, 1.45), 0.0)
