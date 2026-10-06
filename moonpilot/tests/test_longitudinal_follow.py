@@ -166,6 +166,15 @@ class TestFollowPolicy(unittest.TestCase):
         tail = braking[eased[0] :]
         self.assertLess(float(np.max(np.maximum.accumulate(tail) - tail)), 0.06)
 
+  def test_crawl_softening_does_not_spend_a_close_stopped_leads_remaining_gap(self):
+    # The time-only comfort floor drove a 0.68 m/s crawl through a lead initially 0.5 m away,
+    # even on this instantaneous point-mass plant. Short-gap braking must retain its authority.
+    for gap0, min_gap in ((0.5, 0.1), (0.8, 0.4)):
+      with self.subTest(gap0=gap0):
+        s = _fly(0.68, 108.0, gap0, 0.0, lambda t: 0.0, 10.0)
+        self.assertGreater(s["min_gap"], min_gap)
+        self.assertEqual(s["v"][-1], 0.0)
+
   def test_an_accelerating_lead_retires_the_approach_brake(self):
     self.assertLess(lead_accel(18.0, 90.0, 12.5, 0.0, 1.45), 0.0)
     self.assertGreater(lead_accel(18.0, 90.0, 12.5, 1.0, 1.45), 0.0)

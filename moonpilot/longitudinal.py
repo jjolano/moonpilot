@@ -728,11 +728,16 @@ def soft_stop(a_track, v_ego, gap, v_lead_eff) -> float:
   to a rest point that moves in as the car slows (see `MOONPILOT_SOFT_STOP_REST_PER_V`). Only a brake while still
   closing: a positive ask (a creep, a launch) is untouched, and the law hands back over the last
   `MOONPILOT_SOFT_STOP_HANDOFF_V` of closing so the stop hold and the launch logic own standstill exactly
-  as before. Fades out above `MOONPILOT_SOFT_STOP_V` and for a lead above `MOONPILOT_SOFT_STOP_LEAD_V`."""
+  as before. Fades out above `MOONPILOT_SOFT_STOP_V`, for a lead above `MOONPILOT_SOFT_STOP_LEAD_V`,
+  and over physical gaps from twice `MOONPILOT_MIN_SLACK` to that minimum, where the regulator owns braking."""
   if a_track >= 0.0:
     return a_track
   w = float(np.interp(v_ego, MOONPILOT_SOFT_STOP_V, [1.0, 0.0])) * float(np.interp(v_lead_eff, MOONPILOT_SOFT_STOP_LEAD_V, [1.0, 0.0]))
   w *= float(np.interp(v_ego - v_lead_eff, [0.0, MOONPILOT_SOFT_STOP_HANDOFF_V], [0.0, 1.0]))
+  # Comfort never replaces the short-gap brake: retain the regulator inside its existing one-meter
+  # minimum slack, fading the taper in over the next meter. A time-only floor can otherwise crawl
+  # through a close stopped lead because neither TTC nor the stopping floor is admitted at this speed.
+  w *= min(max(gap / MOONPILOT_MIN_SLACK - 1.0, 0.0), 1.0)
   if w <= 0.0:
     return a_track
   rest = MOONPILOT_STOP_REST + MOONPILOT_SOFT_STOP_REST_PER_V * v_ego
