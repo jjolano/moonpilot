@@ -46,6 +46,10 @@
     // max torque), the half-width of a backlash on the fork torque controller's output; chosen at
     // construction, so the row takes a restart.
     {"MoonpilotSteerHysteresis", {PERSISTENT, INT, "0"}},
+    // Off by default: Toyota torque cars drop the steering request for one frame when the wheel is
+    // unwinding and the controller no longer asks for the torque the car still holds; built with the
+    // actuator gate at construction, so the row takes a restart.
+    {"MoonpilotSteerRelease", {PERSISTENT, BOOL, "0"}},
     // On by default: below the lane-change speed threshold a turn signal
     // feeds a turn desire into the model so it steers into the corner. The
     // model's own turn prediction picks the direction.

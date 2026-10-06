@@ -59,6 +59,16 @@ STEER_HYSTERESIS = Feature(
   choices=("off", "0.3%", "0.7%", "1.3%"),
 )
 
+STEER_RELEASE = Feature(
+  key="MoonpilotSteerRelease",
+  title="let go on unwind",
+  description=(
+    "Toyota torque steering. When the wheel is coming back out of a turn and the steering no longer asks for torque, "
+    + "let go at once, the way a driver lets the wheel unwind, instead of ramping the leftover torque down. Restart to apply."
+  ),
+  offroad_only=True,
+)
+
 TURN_DESIRE = Feature(
   key="MoonpilotTurnDesire",
   title="turn desire",
@@ -169,7 +179,7 @@ class Group:
 STEERING = Group(
   title="steering",
   description="How openpilot moves the wheel: whose controller, when a curve is entered, and whether openpilot can steer at all.",
-  features=(LATERAL_ENGAGE, TORQUE_LATERAL, PATH_PREVIEW, PATH_SMOOTH, STEER_HYSTERESIS, TURN_DESIRE),
+  features=(LATERAL_ENGAGE, TORQUE_LATERAL, PATH_PREVIEW, PATH_SMOOTH, STEER_HYSTERESIS, STEER_RELEASE, TURN_DESIRE),
 )
 
 SPEED = Group(

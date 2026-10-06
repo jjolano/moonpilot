@@ -157,6 +157,7 @@ class Controls:
                                                      self.steer_limited_by_safety, self.desired_curvature,
                                                      curvature_limited, lat_delay)
     actuators.torque = float(steer)
+    CC.latActive = CC.latActive and not self.moonpilot_gate.release(CS, actuators.torque, self.sm['carOutput'])  # moonpilot seam, see AGENTS.md
     if self.CP.steerControlType == car.CarParams.SteerControlType.curvature:
       actuators.curvature = float(lateral_output)
     else:

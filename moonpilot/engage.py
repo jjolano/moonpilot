@@ -105,7 +105,7 @@ from openpilot.cereal import log
 from openpilot.common.params import Params
 from openpilot.selfdrive.selfdrived.events import ET
 
-from moonpilot.features import LATERAL_ENGAGE, LONGITUDINAL, TORQUE_LATERAL, Feature, enabled
+from moonpilot.features import LATERAL_ENGAGE, LONGITUDINAL, STEER_RELEASE, TORQUE_LATERAL, Feature, enabled
 
 ButtonType = car.CarState.ButtonEvent.Type
 GearShifter = car.CarState.GearShifter
@@ -206,6 +206,11 @@ def _torque_steered(CP) -> bool:
   return CP.steerControlType not in (car.CarParams.SteerControlType.angle, car.CarParams.SteerControlType.curvature) and CP.lateralTuning.which() == 'torque'
 
 
+def _toyota_torque_steered(CP) -> bool:
+  """Toyota torque steering, where carcontroller's per-frame torque ramp and request bit live."""
+  return CP.brand == 'toyota' and CP.steerControlType == car.CarParams.SteerControlType.torque
+
+
 def car_unavailable_reason(feature: Feature, CP) -> str | None:
   """Why a driver cannot use this feature on this car, or `None`. What the settings panels ask.
 
@@ -214,11 +219,11 @@ def car_unavailable_reason(feature: Feature, CP) -> str | None:
   than as a per-feature branch inside both panel files. `ui_state.CP` is None until carParams
   arrives offroad, which reads as "say nothing".
 
-  Three features have a reason, and only the first of them is a safety gate. `LATERAL_ENGAGE`'s is
+  Four features have a reason, and only the first of them is a safety gate. `LATERAL_ENGAGE`'s is
   the same `_unsupported_reason(CP)` `_available` reads, so the row and the behavior cannot
-  disagree. `TORQUE_LATERAL`'s and `LONGITUDINAL`'s are panel-facing only — nothing gates behavior
-  on them — because a car outside their seam's dispatch is a car the seam never runs on: the
-  feature is inert there, not gated.
+  disagree. `TORQUE_LATERAL`'s, `LONGITUDINAL`'s and `STEER_RELEASE`'s are panel-facing only —
+  nothing gates behavior on them — because a car outside their dispatch is a car the code never
+  runs on: the feature is inert there, not gated.
   """
   if CP is None:
     return None
@@ -228,6 +233,8 @@ def car_unavailable_reason(feature: Feature, CP) -> str | None:
     return "torque-steered cars only"
   if feature is LONGITUDINAL and not CP.openpilotLongitudinalControl:
     return "openpilot-longitudinal cars only"
+  if feature is STEER_RELEASE and not _toyota_torque_steered(CP):
+    return "Toyota torque-steered cars only"
   return None
 
 
@@ -249,6 +256,16 @@ def moonpilot_engage_safety_param(CP, params: Params | None = None) -> None:
 MOONPILOT_TOYOTA_STEER_RATE = 100  # deg/s; Toyota's existing EPS rate threshold
 MOONPILOT_TOYOTA_STEER_HOT_FRAMES = 17  # stock MAX_STEER_RATE_FRAMES: the exposure Toyota's own request cut allows
 MOONPILOT_TOYOTA_STEER_QUIET_FRAMES = 10  # 100 ms at controlsd's 100 Hz
+# Steering release (STEER_RELEASE). Toyota's carcontroller lowers torque by STEER_DELTA_DOWN (25 of 1500)
+# per frame while the request is up, so torque the controller has already dropped keeps holding the wheel
+# in the turn. On routes 408-410 hands-off unwinds started holding a median 508 units the controller no
+# longer asked for, and the ramp kept it there a median 0.16 s and up to 0.4 s. A frame with latActive
+# off sends zero torque with STEER_REQUEST=0, which the panda accepts outright, so one such frame clears
+# it and the car's own last torque is zero from then on.
+MOONPILOT_RELEASE_MIN_TORQUE = 0.1  # of max: below it the ramp is gone within 60 ms anyway
+MOONPILOT_RELEASE_ASK = 0.05  # of max: the controller is asking for nothing in the held direction
+MOONPILOT_RELEASE_RETURN_RATE = 10.0  # deg/s toward center: the wheel is already coming back
+MOONPILOT_RELEASE_MIN_ANGLE = 30.0  # deg: a turn unwinding, not a correction near center
 
 
 class ActuatorGate:
@@ -268,12 +285,16 @@ class ActuatorGate:
   Supported Toyota torque cars also pause steering once the wheel has stayed at the EPS rate threshold
   for more than 17 consecutive permitted cycles — the frame stock would cut the request for one frame —
   and resume after ten quiet ones. This releases the request, not the fault checks or their alerts.
+
+  Toyota torque cars with STEER_RELEASE on — lateral-only engagement or not — also let go of torque
+  the controller has already dropped: `release()`, asked after the controller runs.
   """
 
   def __init__(self, CP, params: Params | None = None) -> None:
     params = params if params is not None else Params()
     self._gated = enabled(LATERAL_ENGAGE, params) and _available(CP)
-    self._toyota_torque = self._gated and CP.brand == 'toyota' and CP.steerControlType == car.CarParams.SteerControlType.torque
+    self._toyota_torque = self._gated and _toyota_torque_steered(CP)
+    self._release = _toyota_torque_steered(CP) and enabled(STEER_RELEASE, params)
     self._steer_hot_frames = 0
     self._steer_quiet_frames = 0
 
@@ -295,6 +316,18 @@ class ActuatorGate:
       if self._steer_quiet_frames:
         return False
     return True
+
+  def release(self, CS, ask: float, CO) -> bool:
+    """Whether to drop this one frame's request: the wheel is coming back out of a turn, the car is
+    still applying torque from last frame (`CO`, carOutput) and the controller's new `ask` is near
+    zero or opposite to it. Dropping the request is a human letting go of the wheel; the controller
+    keeps running, so the next frame steers from its own ask instead of from the car's ramp."""
+    applied = CO.actuatorsOutput.torque
+    if not self._release or abs(CS.steeringAngleDeg) < MOONPILOT_RELEASE_MIN_ANGLE or abs(applied) < MOONPILOT_RELEASE_MIN_TORQUE:
+      return False
+    turn = 1.0 if CS.steeringAngleDeg > 0 else -1.0
+    held = 1.0 if applied > 0 else -1.0
+    return turn * CS.steeringRateDeg <= -MOONPILOT_RELEASE_RETURN_RATE and ask * held <= MOONPILOT_RELEASE_ASK
 
   def longitudinal(self, panda_states) -> bool:
     """Whether openpilot may command acceleration: the panda's own longitudinal grant.
