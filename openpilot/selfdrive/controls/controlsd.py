@@ -150,7 +150,7 @@ class Controls:
     if self.moonpilot_path_smooth is not None:  # moonpilot seam, see AGENTS.md
       new_desired_curvature = self.moonpilot_path_smooth.update(new_desired_curvature, CC.latActive)
     self.desired_curvature, curvature_limited = clip_curvature(CS.vEgo, self.desired_curvature, new_desired_curvature, lp.roll)
-    lat_delay = self.sm["lateralDelay"].lateralDelay + self.moonpilot_lat_smooth + self.moonpilot_smooth_lag  # moonpilot seam, see AGENTS.md
+    lat_delay = self.sm["lateralDelay"].lateralDelay + self.moonpilot_lat_smooth  # moonpilot seam, see AGENTS.md
 
     actuators.curvature = self.desired_curvature
     steer, lateral_output, lac_log = self.LaC.update(CC.latActive, CS, self.VM, lp,

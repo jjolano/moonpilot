@@ -247,6 +247,7 @@ def moonpilot_engage_safety_param(CP, params: Params | None = None) -> None:
 
 
 MOONPILOT_TOYOTA_STEER_RATE = 100  # deg/s; Toyota's existing EPS rate threshold
+MOONPILOT_TOYOTA_STEER_HOT_FRAMES = 17  # stock MAX_STEER_RATE_FRAMES: the exposure Toyota's own request cut allows
 MOONPILOT_TOYOTA_STEER_QUIET_FRAMES = 10  # 100 ms at controlsd's 100 Hz
 
 
@@ -264,14 +265,16 @@ class ActuatorGate:
   True — upstream's behavior — on every car the feature is not enabled for, which is what keeps a
   stock config unchanged. Built once, at construction, like the fork's other behavior toggles.
 
-  Supported Toyota torque cars also pause steering at the EPS rate threshold until ten permitted
-  control cycles are quiet. This releases the request, not the fault checks or their alerts.
+  Supported Toyota torque cars also pause steering once the wheel has stayed at the EPS rate threshold
+  for more than 17 consecutive permitted cycles — the frame stock would cut the request for one frame —
+  and resume after ten quiet ones. This releases the request, not the fault checks or their alerts.
   """
 
   def __init__(self, CP, params: Params | None = None) -> None:
     params = params if params is not None else Params()
     self._gated = enabled(LATERAL_ENGAGE, params) and _available(CP)
     self._toyota_torque = self._gated and CP.brand == 'toyota' and CP.steerControlType == car.CarParams.SteerControlType.torque
+    self._steer_hot_frames = 0
     self._steer_quiet_frames = 0
 
   def lateral(self, panda_states, CS) -> bool:
@@ -282,9 +285,13 @@ class ActuatorGate:
       return False
     if self._toyota_torque:
       if abs(CS.steeringRateDeg) >= MOONPILOT_TOYOTA_STEER_RATE:
-        self._steer_quiet_frames = MOONPILOT_TOYOTA_STEER_QUIET_FRAMES
-      elif self._steer_quiet_frames:
-        self._steer_quiet_frames -= 1
+        self._steer_hot_frames += 1
+        if self._steer_hot_frames > MOONPILOT_TOYOTA_STEER_HOT_FRAMES:
+          self._steer_quiet_frames = MOONPILOT_TOYOTA_STEER_QUIET_FRAMES
+      else:
+        self._steer_hot_frames = 0
+        if self._steer_quiet_frames:
+          self._steer_quiet_frames -= 1
       if self._steer_quiet_frames:
         return False
     return True

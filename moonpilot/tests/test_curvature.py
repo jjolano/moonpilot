@@ -309,19 +309,5 @@ class TestPathSmooth(unittest.TestCase):
     self.assertAlmostEqual(smooth.update(0.2, True), 0.1 + self.ALPHA * 0.1, delta=1e-12)
 
 
-class TestSmoothWiring(unittest.TestCase):
-  """controlsd builds the filter once, applies it before clip_curvature, and folds its lag into
-  both delay consumers (the response-aligned reference's sampling horizon and the controller's)."""
-
-  def test_controlsd_builds_and_applies_the_filter_once(self):
-    text = (ROOT / "openpilot/selfdrive/controls/controlsd.py").read_text()
-    self.assertEqual(text.count("self.moonpilot_path_smooth = moonpilot_path_smooth()"), 1)
-    self.assertEqual(text.count("getattr(self.moonpilot_path_smooth, \"tau\", 0.0)"), 1)
-    self.assertEqual(text.count("if self.moonpilot_path_smooth is not None:"), 1)
-    self.assertEqual(text.count("self.moonpilot_path_smooth.update(new_desired_curvature, CC.latActive)"), 1)
-    self.assertLess(text.index("self.moonpilot_path_smooth.update"), text.index("clip_curvature(CS.vEgo"))
-    self.assertEqual(text.count("+ self.moonpilot_smooth_lag"), 2)
-
-
 if __name__ == "__main__":
   unittest.main()

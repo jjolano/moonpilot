@@ -258,25 +258,38 @@ class TestActuatorGate(unittest.TestCase):
       self.assertFalse(gate.lateral(states, cs), states)
       self.assertFalse(gate.longitudinal(states), states)
 
-  def test_toyota_rate_pause_waits_for_ten_quiet_frames(self):
+  def test_toyota_rate_pause_after_stock_exposure_then_ten_quiet_frames(self):
     gate = moonpilot_actuator_gate(_cp(), _params(on=True))
     states = [_ps(controls_allowed=True, controls_allowed_lateral=True)]
     cs = _cs()
     cs.steeringRateDeg = 99
     self.assertTrue(gate.lateral(states, cs))
+    # Seventeen consecutive frames at the threshold keep steering, as stock's request does.
     cs.steeringRateDeg = 100
-    self.assertFalse(gate.lateral(states, cs))
+    for _ in range(17):
+      self.assertTrue(gate.lateral(states, cs))
+    self.assertFalse(gate.lateral(states, cs))  # the 18th: where stock would cut, the pause starts
     self.assertTrue(gate.longitudinal(states))
+    cs.steeringRateDeg = -150
+    for _ in range(50):
+      self.assertFalse(gate.lateral(states, cs))  # either direction holds the pause while it lasts
     cs.steeringRateDeg = -99
     for _ in range(3):
       self.assertFalse(gate.lateral(states, cs))
     cs.steeringRateDeg = -100
-    self.assertFalse(gate.lateral(states, cs))  # A new excursion restarts the quiet interval.
+    self.assertFalse(gate.lateral(states, cs))  # one frame back above threshold neither resumes nor restarts the tail
     cs.steeringRateDeg = 99
-    for _ in range(9):
+    for _ in range(6):
       self.assertFalse(gate.lateral(states, cs))
-    self.assertTrue(gate.lateral(states, cs))
+    self.assertTrue(gate.lateral(states, cs))  # ten quiet frames counted across the one hot frame
     self.assertFalse(gate.lateral([], cs))  # Recovery never invents panda permission.
+
+    # A dip below the threshold restarts the exposure count, so short excursions never pause.
+    fresh = moonpilot_actuator_gate(_cp(), _params(on=True))
+    for _ in range(5):
+      for rate in [120] * 17 + [99]:
+        cs.steeringRateDeg = rate
+        self.assertTrue(fresh.lateral(states, cs), rate)
 
     # The extra pause is Toyota torque-only; other enabled cars still obey the panda.
     cs.steeringRateDeg = 100

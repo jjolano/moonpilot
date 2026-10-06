@@ -9,6 +9,7 @@ from openpilot.selfdrive.locationd.lagd import BLOCK_NUM_NEEDED, BLOCK_SIZE, MIN
 from moonpilot.lagd import (
   MOONPILOT_LAT_LAG_BLOCK_COUNT,
   MOONPILOT_LAT_LAG_KEY,
+  MOONPILOT_LAT_LAG_MAX_APPLIED,
   MoonpilotLagEstimator,
   persisted_blocks,
 )
@@ -62,7 +63,8 @@ class TestLagd(unittest.TestCase):
       _feed(est, v_ego=15.0)
     fork_msg, stock_msg = fork.get_msg(True).lateralDelay, stock.get_msg(True).lateralDelay
     self.assertEqual(fork_msg.status, "estimated")
-    self.assertAlmostEqual(fork_msg.lateralDelay, 7 * DT, delta=0.01)
+    self.assertAlmostEqual(np.mean(fork_msg.points), 7 * DT, delta=0.01)  # the learner sees the true 0.35 s
+    self.assertEqual(fork_msg.lateralDelay, MOONPILOT_LAT_LAG_MAX_APPLIED)  # what consumers apply is capped
     self.assertEqual(stock_msg.status, "unestimated")
 
   def test_below_the_speed_gate_nothing_is_learned(self):
@@ -70,10 +72,10 @@ class TestLagd(unittest.TestCase):
     _feed(est, v_ego=9.0)
     msg = est.get_msg(True).lateralDelay
     self.assertEqual(msg.status, "unestimated")
-    self.assertAlmostEqual(msg.lateralDelay, 0.12 + 0.2, delta=1e-6)
+    self.assertAlmostEqual(msg.lateralDelay, min(0.12 + 0.2, MOONPILOT_LAT_LAG_MAX_APPLIED), delta=1e-6)
 
   def test_the_cache_restores_the_blocks_not_their_mean(self):
-    blocks = [0.30, 0.32, 0.40, 0.36, 0.34]
+    blocks = [0.20, 0.22, 0.24, 0.21, 0.23]  # under the applied cap, so the mean is what is published
     est = MoonpilotLagEstimator(_cp(), DT)
     est.restore(blocks)
     est.block_avg.update(0.6)  # a partial block: published in the estimate, never cached
@@ -88,6 +90,15 @@ class TestLagd(unittest.TestCase):
     ld = again.get_msg(True).lateralDelay
     self.assertAlmostEqual(ld.lateralDelay, np.mean(blocks), delta=1e-6)
     self.assertAlmostEqual(ld.lateralDelayEstimateStd, np.std(blocks), delta=1e-6)  # the spread survives a boot
+
+  def test_the_applied_delay_never_exceeds_the_cap_but_the_blocks_do(self):
+    blocks = [0.40, 0.42, 0.44, 0.41, 0.43]
+    est = MoonpilotLagEstimator(_cp(), DT)
+    est.restore(blocks)
+    ld = est.get_msg(True).lateralDelay
+    self.assertEqual(ld.status, "estimated")
+    self.assertEqual(ld.lateralDelay, MOONPILOT_LAT_LAG_MAX_APPLIED)
+    np.testing.assert_allclose(list(ld.points), blocks, atol=1e-6)
 
   def test_a_full_ring_retires_its_oldest_block(self):
     old = [0.20 + 0.01 * i for i in range(MOONPILOT_LAT_LAG_BLOCK_COUNT - 1)]

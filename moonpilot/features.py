@@ -41,7 +41,7 @@ PATH_SMOOTH = Feature(
   title="smooth planner path",
   description=(
     "Filter the model's curvature request before the controller. The time constant is the steering lag added for calmer "
-    "torque steps: 0.05 s takes about half the steps out, 0.10 s most of the rest, 0.15 s little more. Restart to apply."
+    + "torque steps: 0.05 s takes about half the steps out, 0.10 s most of the rest, 0.15 s little more. Restart to apply."
   ),
   offroad_only=True,
   choices=("off", "0.05 s", "0.10 s", "0.15 s"),

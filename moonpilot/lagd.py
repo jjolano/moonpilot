@@ -23,8 +23,10 @@ measured defect of the stock learner on this car:
   in the fork band, so a stock cache (version 1) is discarded rather than seeded — the stale value this
   replaces — and stock `lagd` would discard this one in turn.
 
-Unestimated (fewer than 5 blocks) or invalid (block spread over `MAX_LAG_STD`) still publishes stock's
-`steerActuatorDelay + 0.2`. The loop below mirrors upstream's `main()` line for line; a change there
+Unestimated (fewer than 5 blocks) or invalid (block spread over `MAX_LAG_STD`) starts from stock's
+`steerActuatorDelay + 0.2`. Whatever the source, the *applied* `lateralDelay` is capped at
+`MOONPILOT_LAT_LAG_MAX_APPLIED`; `lateralDelayEstimate` and the blocks stay uncapped, so the learner's
+view is still logged. The loop below mirrors upstream's `main()` line for line; a change there
 does not reach this copy by itself.
 """
 import math
@@ -42,6 +44,12 @@ from moonpilot.latency import completed_blocks, restore_blocks
 MOONPILOT_LAT_LAG_MIN_SPEED = 10.0  # m/s
 MOONPILOT_LAT_LAG_BLOCK_COUNT = 10
 MOONPILOT_LAT_LAG_VERSION = 1000  # fork band; stock lagd's VERSION is 1
+# ponytail: a fixed ceiling, because the estimate is measured in closed loop. The torque controller holds
+# the wheel to the request from lat_delay ago, so desiredCurvature -> yaw lag reads about the applied delay
+# plus the vehicle's response: 408 applied 0.228 and measured ~0.31; 40e applied 0.32 (+0.05 smoothing) and its
+# first partial block read 0.469. Left alone the applied value ratchets toward MAX_LAG. Lift the cap once the
+# estimate is taken against something the controller's delay does not shape (open-loop torque -> yaw).
+MOONPILOT_LAT_LAG_MAX_APPLIED = 0.25  # s
 MOONPILOT_LAT_LAG_KEY = "LiveDelay"  # upstream's cache, so both reset-calibration buttons clear it
 
 
@@ -70,6 +78,7 @@ class MoonpilotLagEstimator(LateralLagEstimator):
 
   def get_msg(self, valid: bool, debug: bool = False):
     msg = super().get_msg(valid)
+    msg.lateralDelay.lateralDelay = min(msg.lateralDelay.lateralDelay, MOONPILOT_LAT_LAG_MAX_APPLIED)
     msg.lateralDelay.points = completed_blocks(self.block_avg)
     msg.lateralDelay.version = MOONPILOT_LAT_LAG_VERSION
     return msg
