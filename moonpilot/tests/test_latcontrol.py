@@ -1,6 +1,8 @@
 import math
 import unittest
 
+import numpy as np
+
 from opendbc.car.car_helpers import interfaces
 from opendbc.car.gm.values import CAR as GM
 from opendbc.car.lateral import FRICTION_THRESHOLD
@@ -13,16 +15,19 @@ from openpilot.common.constants import ACCELERATION_DUE_TO_GRAVITY
 from openpilot.common.realtime import DT_CTRL
 
 from moonpilot.latcontrol import (
+  MOONPILOT_DAMPING_T,
   MOONPILOT_FRICTION_DEADBAND,
   MOONPILOT_JERK_LOOKAHEAD_T,
   MOONPILOT_KI,
+  MOONPILOT_KP_BP,
+  MOONPILOT_KP_V,
   MOONPILOT_TORQUE_HYSTERESIS,
   MOONPILOT_VERSION,
   MOONPILOT_VERSION_HYSTERESIS,
   MoonpilotLatControlTorque,
   moonpilot_latcontrol,
 )
-from moonpilot.features import STEER_HYSTERESIS
+from moonpilot.features import STEER_DAMPING, STEER_HYSTERESIS
 from moonpilot.tests.fakes import _params
 
 # A request small enough that the controller runs inside its own limits, so the integrator
@@ -328,6 +333,59 @@ class TestTorqueHysteresis(unittest.TestCase):
     assert isinstance(lac, MoonpilotLatControlTorque)
     self.assertEqual(lac.hysteresis, 0.0)
     self.assertIsNone(moonpilot_latcontrol(CP.as_reader(), CI, DT_CTRL, _params(False, {STEER_HYSTERESIS.key: 2})))
+
+
+class TestCurveDamping(unittest.TestCase):
+  T = MOONPILOT_DAMPING_T[2]
+
+  def _d(self, v, wheel_rate, request_jerk=0.0, damping_t=None):
+    """The D term once the jerk filter has settled: the wheel turning at wheel_rate deg/s while the plan's
+    lateral acceleration changes at request_jerk m/s^3."""
+    CP = interfaces[TOYOTA.TOYOTA_RAV4].get_non_essential_params(TOYOTA.TOYOTA_RAV4)
+    lac = MoonpilotLatControlTorque(CP.as_reader(), interfaces[TOYOTA.TOYOTA_RAV4](CP), DT_CTRL, damping_t=self.T if damping_t is None else damping_t)
+    VM = VehicleModel(CP)
+    CS, params = _state(v), log.VehicleParameters.new_message()
+    CS.steeringRateDeg = wheel_rate
+    request, lac_log = 0.0, None
+    for _ in range(300):
+      request += request_jerk * DT_CTRL / v**2
+      lac_log = _run(lac, VM, CS, params, 1, desired_curvature=request)
+    measured_jerk = -VM.calc_curvature(math.radians(wheel_rate), v, 0.0) * v**2
+    return lac_log.d, measured_jerk, VM
+
+  def test_a_weave_is_resisted_by_kp_times_the_derivative_time(self):
+    d, measured_jerk, _ = self._d(10.0, 20.0)
+    self.assertLess(d * measured_jerk, 0.0)  # opposes the wheel's motion
+    self.assertAlmostEqual(d, float(np.interp(10.0, MOONPILOT_KP_BP, MOONPILOT_KP_V)) * self.T * -measured_jerk, delta=1e-6)
+    mirror, _, _ = self._d(10.0, -20.0)
+    self.assertAlmostEqual(mirror, -d, delta=1e-9)
+
+  def test_a_turn_the_plan_asks_for_is_not_damped(self):
+    v, jerk = 10.0, 1.0
+    _, _, VM = self._d(v, 0.0)
+    wheel_rate = math.degrees(-VM.get_steer_from_curvature(jerk / v**2, v, 0.0))  # the wheel turning exactly as planned
+    turn, _, _ = self._d(v, wheel_rate, request_jerk=jerk)
+    weave, _, _ = self._d(v, wheel_rate)
+    self.assertLess(abs(turn), 0.05 * abs(weave))
+
+  def test_damping_only_where_the_weave_was_measured(self):
+    for v, on in ((2.0, False), (10.0, True), (16.0, True), (25.0, False)):
+      with self.subTest(v=v):
+        d, _, _ = self._d(v, 20.0)
+        self.assertEqual(abs(d) > 1e-6, on)
+    self.assertEqual(self._d(10.0, 20.0, damping_t=0.0)[0], 0.0)  # off is upstream's law: no D at all
+
+  def test_the_factory_maps_each_choice_to_its_derivative_time(self):
+    CP = interfaces[TOYOTA.TOYOTA_RAV4].get_non_essential_params(TOYOTA.TOYOTA_RAV4)
+    CI = interfaces[TOYOTA.TOYOTA_RAV4](CP)
+    self.assertEqual(len(MOONPILOT_DAMPING_T), len(STEER_DAMPING.choices))
+    for index in (*range(len(STEER_DAMPING.choices)), 9):  # 9: out of range reads as off
+      with self.subTest(index=index):
+        lac = moonpilot_latcontrol(CP.as_reader(), CI, DT_CTRL, _params(True, {STEER_DAMPING.key: index}))
+        assert isinstance(lac, MoonpilotLatControlTorque)
+        expected = MOONPILOT_DAMPING_T[index] if index < len(MOONPILOT_DAMPING_T) else 0.0
+        lac.pid.update(0.0, error_rate=1.0, speed=10.0)
+        self.assertAlmostEqual(lac.pid.d, float(np.interp(10.0, MOONPILOT_KP_BP, MOONPILOT_KP_V)) * expected, delta=1e-9)
 
 
 if __name__ == "__main__":

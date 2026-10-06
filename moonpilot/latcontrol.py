@@ -5,7 +5,7 @@ PI on the delay-matched error, friction compensation — because that is the par
 for. What the fork owns is the code and every number in it, so tuning happens here instead of in
 an upstream file.
 
-Four mechanisms are deliberately not upstream's:
+Five mechanisms are deliberately not upstream's:
 
   - the setpoint is read out of the request buffer at a fractional frame, so a lateralDelay that
     is not a whole number of frames (it moves continuously) does not step the setpoint by a whole
@@ -18,7 +18,9 @@ Four mechanisms are deliberately not upstream's:
     at a nonzero torque, so small corrections do not acquire a release-threshold kick;
   - an optional hysteresis (backlash) on the output: the command only moves once the controller's
     torque has left a band of ±h around it, so frame-to-frame reversals smaller than 2h never reach
-    the car, and the command never differs from the controller's by more than h.
+    the car, and the command never differs from the controller's by more than h;
+  - optional damping (a D term) on how fast the wheel departs from the plan's own rate, so a weave in
+    a curve is resisted while a turn the plan asks for is not.
 
 The controller is picked once, at construction, so the toggle needs a restart, and it only runs
 on a car whose lateralTuning is torque — angle and curvature cars never reach the seam.
@@ -37,7 +39,7 @@ from openpilot.common.params import Params
 from openpilot.common.pid import PIDController
 from openpilot.selfdrive.controls.lib.latcontrol import LatControl
 
-from moonpilot.features import STEER_HYSTERESIS, TORQUE_LATERAL, choice, enabled
+from moonpilot.features import STEER_DAMPING, STEER_HYSTERESIS, TORQUE_LATERAL, choice, enabled
 
 # Error correction runs in lateral-acceleration space, where the same curvature error means less
 # lateral acceleration the slower the car goes; the speed schedule is what puts that back. These
@@ -59,17 +61,29 @@ MOONPILOT_VERSION_HYSTERESIS = 1002  # the same law with output hysteresis on
 # Half-widths in normalized steer torque per MoonpilotSteerHysteresis choice. On a RAV4 (STEER_MAX 1500)
 # these are ~4.5 / 10.5 / 19.5 CAN units; route 40d/40e replays cut torque reversals 2-4x at 5-10 units.
 MOONPILOT_TORQUE_HYSTERESIS = (0.0, 0.003, 0.007, 0.013)
+# Derivative time per MoonpilotSteerDamping choice: P + D = KP * (error + T * error_rate), a lead of T
+# seconds on the feedback. In hands-off curves at 3-17 m/s (routes 3f8-410, matched by speed and turn
+# size against the same driver's manual curves) 22-24% of the wheel's motion was above 1 Hz against the
+# driver's 4-11%, and P carried it: P's 1-5 Hz content equalled its turn-scale correction and moved with
+# the wheel at r = 0.9, 82% of it at 1-2 Hz. At 1.2 Hz these are 21 / 37 / 48 degrees of lead.
+MOONPILOT_DAMPING_T = (0.0, 0.05, 0.10, 0.15)  # s
+# Where the weave was measured, and where the angle and rate sensors are fine enough to damp: off below
+# 3 m/s (KP 30 and up), full from 5 to 15 m/s, faded out by 20 m/s, where the wheel already matched the driver.
+MOONPILOT_DAMPING_SPEEDS = ([3.0, 5.0, 15.0, 20.0], [0.0, 1.0, 1.0, 0.0])
 
 
 class MoonpilotLatControlTorque(LatControl):
-  def __init__(self, CP, CI, dt, hysteresis: float = 0.0):
+  def __init__(self, CP, CI, dt, hysteresis: float = 0.0, damping_t: float = 0.0):
     super().__init__(CP, CI, dt)
     self.torque_params = CP.lateralTuning.torque.as_builder()
     self.torque_from_lateral_accel = CI.torque_from_lateral_accel()
     self.lateral_accel_from_torque = CI.lateral_accel_from_torque()
     self.steering_angle_deadzone_deg = self.torque_params.steeringAngleDeadzoneDeg
 
-    self.pid = PIDController([MOONPILOT_KP_BP, MOONPILOT_KP_V], MOONPILOT_KI, rate=1 / self.dt)
+    # D's gain is KP times the derivative time, at every breakpoint of either schedule.
+    kd_bp = sorted(set(MOONPILOT_KP_BP + MOONPILOT_DAMPING_SPEEDS[0]))
+    kd_v = [float(np.interp(v, MOONPILOT_KP_BP, MOONPILOT_KP_V) * damping_t * np.interp(v, *MOONPILOT_DAMPING_SPEEDS)) for v in kd_bp]
+    self.pid = PIDController([MOONPILOT_KP_BP, MOONPILOT_KP_V], MOONPILOT_KI, k_d=[kd_bp, kd_v], rate=1 / self.dt)
     self.update_limits()
 
     # Lateral acceleration requests, newest last: the delay line the setpoint is read out of.
@@ -160,6 +174,11 @@ class MoonpilotLatControlTorque(LatControl):
       setpoint = delayed_setpoint
     error = setpoint - measured_lat_accel
     desired_jerk = self._desired_jerk(lat_delay)
+    # The wheel's own rate from the rate sensor (it trails the angle's derivative by ~20 ms on this car and
+    # does not differentiate the angle's 0.1 deg steps), against the plan's rate: zero while the wheel
+    # follows a turn the plan asks for, so only a departure from it is damped.
+    measured_jerk = -VM.calc_curvature(math.radians(CS.steeringRateDeg), CS.vEgo, 0.0) * CS.vEgo**2
+    error_rate = desired_jerk - measured_jerk
 
     # Friction only applies outside the steering's own deadzone, in lateral acceleration units.
     curvature_deadzone = abs(VM.calc_curvature(math.radians(self.steering_angle_deadzone_deg), CS.vEgo, 0.0))
@@ -177,7 +196,7 @@ class MoonpilotLatControlTorque(LatControl):
     else:
       # Integrating is only honest while the output is ours and the measurement is usable.
       freeze_integrator = steer_limited_by_safety or CS.steeringPressed or CS.vEgo < MOONPILOT_INTEGRATOR_MIN_SPEED
-      command = self.pid.update(error, speed=CS.vEgo, feedforward=feedforward, freeze_integrator=freeze_integrator)
+      command = self.pid.update(error, error_rate=error_rate, speed=CS.vEgo, feedforward=feedforward, freeze_integrator=freeze_integrator)
       # Clipped here as well as by the PID's limits: a car's torque map need not be monotonic.
       output_torque = float(np.clip(self.torque_from_lateral_accel(command, self.torque_params), -self.steer_max, self.steer_max))
 
@@ -204,9 +223,10 @@ class MoonpilotLatControlTorque(LatControl):
 
 def moonpilot_latcontrol(CP, CI, dt, params: Params | None = None) -> LatControl | None:
   """The seam's fork side: the fork controller when the driver wants it, None to leave upstream's
-  in place. The params are read once, here, so the toggle and the hysteresis choice take a restart."""
+  in place. The params are read once, here, so the toggle and the hysteresis and damping choices take a restart."""
   params = params or Params()
   if not enabled(TORQUE_LATERAL, params):
     return None
   hysteresis = MOONPILOT_TORQUE_HYSTERESIS[choice(STEER_HYSTERESIS, params)] if enabled(STEER_HYSTERESIS, params) else 0.0
-  return MoonpilotLatControlTorque(CP, CI, dt, hysteresis)
+  damping_t = MOONPILOT_DAMPING_T[choice(STEER_DAMPING, params)] if enabled(STEER_DAMPING, params) else 0.0
+  return MoonpilotLatControlTorque(CP, CI, dt, hysteresis, damping_t)

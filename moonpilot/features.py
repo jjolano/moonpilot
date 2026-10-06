@@ -59,6 +59,18 @@ STEER_HYSTERESIS = Feature(
   choices=("off", "0.3%", "0.7%", "1.3%"),
 )
 
+STEER_DAMPING = Feature(
+  key="MoonpilotSteerDamping",
+  title="curve damping",
+  description=(
+    "moonpilot steering only. Resists the wheel weaving back and forth in curves between about 10 and 70 km/h, "
+    + "without slowing turns the path asks for. Stronger is steadier, but passes more sensor noise to the wheel. "
+    + "Restart to apply."
+  ),
+  offroad_only=True,
+  choices=("off", "light", "medium", "strong"),
+)
+
 TURN_DESIRE = Feature(
   key="MoonpilotTurnDesire",
   title="turn desire",
@@ -169,7 +181,7 @@ class Group:
 STEERING = Group(
   title="steering",
   description="How openpilot moves the wheel: whose controller, when a curve is entered, and whether openpilot can steer at all.",
-  features=(LATERAL_ENGAGE, TORQUE_LATERAL, PATH_PREVIEW, PATH_SMOOTH, STEER_HYSTERESIS, TURN_DESIRE),
+  features=(LATERAL_ENGAGE, TORQUE_LATERAL, PATH_PREVIEW, PATH_SMOOTH, STEER_HYSTERESIS, STEER_DAMPING, TURN_DESIRE),
 )
 
 SPEED = Group(

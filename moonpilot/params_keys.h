@@ -46,6 +46,10 @@
     // max torque), the half-width of a backlash on the fork torque controller's output; chosen at
     // construction, so the row takes a restart.
     {"MoonpilotSteerHysteresis", {PERSISTENT, INT, "0"}},
+    // Off by default: an index into STEER_DAMPING.choices (0 off, then 0.05 / 0.10 / 0.15 s of
+    // derivative time on the fork torque controller's feedback, 5-15 m/s); chosen at construction,
+    // so the row takes a restart.
+    {"MoonpilotSteerDamping", {PERSISTENT, INT, "0"}},
     // On by default: below the lane-change speed threshold a turn signal
     // feeds a turn desire into the model so it steers into the corner. The
     // model's own turn prediction picks the direction.
