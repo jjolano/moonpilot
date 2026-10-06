@@ -18,7 +18,7 @@ from openpilot.selfdrive.selfdrived.events import ET, EVENTS, Events
 from openpilot.selfdrive.selfdrived.alertmanager import AlertManager
 from openpilot.selfdrive.selfdrived.state import SOFT_DISABLE_TIME, StateMachine
 
-from moonpilot.features import LATERAL_ENGAGE, LONGITUDINAL, SLAM, STEER_RELEASE, TORQUE_LATERAL
+from moonpilot.features import LATERAL_ENGAGE, LONGITUDINAL, SLAM, TORQUE_LATERAL
 from moonpilot.engage import (
   LATERAL_ENGAGE_FLAGS,
   LateralEngage,
@@ -298,35 +298,6 @@ class TestActuatorGate(unittest.TestCase):
         other = moonpilot_actuator_gate(cp, _params(on=True))
         self.assertTrue(other.lateral(states, cs))
         self.assertFalse(other.lateral([], cs))
-
-  def test_toyota_release_lets_go_of_torque_the_controller_dropped_as_the_wheel_unwinds(self):
-    def co(torque):
-      out = car.CarOutput.new_message()
-      out.actuatorsOutput.torque = torque
-      return out
-
-    gate = moonpilot_actuator_gate(_cp(), _params(on=True))
-    cs = _cs()
-    cs.steeringAngleDeg, cs.steeringRateDeg = 90.0, -40.0  # a left turn coming back toward center
-    self.assertTrue(gate.release(cs, 0.0, co(0.4)))  # the car still holds 600 units nobody asks for
-    self.assertTrue(gate.release(cs, -0.2, co(0.4)))  # the ask has crossed over: let go as well
-    self.assertFalse(gate.release(cs, 0.3, co(0.4)))  # the controller still holds the turn
-    self.assertFalse(gate.release(cs, 0.0, co(0.08)))  # residue the car's ramp clears within 60 ms
-    for angle, rate in ((90.0, 40.0), (90.0, -5.0), (20.0, -40.0)):  # tightening, barely moving, near center
-      with self.subTest(angle=angle, rate=rate):
-        cs.steeringAngleDeg, cs.steeringRateDeg = angle, rate
-        self.assertFalse(gate.release(cs, 0.0, co(0.4)))
-    cs.steeringAngleDeg, cs.steeringRateDeg = -90.0, 40.0  # the mirror turn
-    self.assertTrue(gate.release(cs, 0.0, co(-0.4)))
-    self.assertFalse(gate.release(cs, -0.3, co(-0.4)))
-
-    # Its own toggle, not lateral-only engagement's; Toyota torque only; off is upstream exactly.
-    cs.steeringAngleDeg, cs.steeringRateDeg = 90.0, -40.0
-    self.assertTrue(moonpilot_actuator_gate(_cp(), _params(True, {LATERAL_ENGAGE.key: False})).release(cs, 0.0, co(0.4)))
-    for cp, params in ((_cp(), _params(True, {STEER_RELEASE.key: False})), (_cp(brand='honda'), _params(on=True)),
-                       (_cp(steer_control_type=car.CarParams.SteerControlType.angle), _params(on=True))):
-      with self.subTest(brand=cp.brand, steer_control_type=cp.steerControlType):
-        self.assertFalse(moonpilot_actuator_gate(cp, params).release(cs, 0.0, co(0.4)))
 
 
 class TestEngagePolicy(unittest.TestCase):
@@ -863,18 +834,12 @@ class TestCarGate(unittest.TestCase):
     self.assertIsNone(car_unavailable_reason(LONGITUDINAL, _cp(openpilot_longitudinal=True)))
     self.assertEqual(car_unavailable_reason(LONGITUDINAL, _cp(openpilot_longitudinal=False)), "openpilot-longitudinal cars only")
 
-  def test_release_is_toyota_torque_only(self):
-    self.assertIsNone(car_unavailable_reason(STEER_RELEASE, _cp()))
-    for cp in (_cp(brand='honda'), _cp(steer_control_type=car.CarParams.SteerControlType.angle)):
-      with self.subTest(brand=cp.brand, steer_control_type=cp.steerControlType):
-        self.assertEqual(car_unavailable_reason(STEER_RELEASE, cp), "Toyota torque-steered cars only")
-
   def test_features_without_a_car_requirement_are_unaffected(self):
     self.assertIsNone(car_unavailable_reason(SLAM, _cp(brand='hyundai')))
 
   def test_no_carparams_yet_is_not_a_reason(self):
     """The panel renders before carParams lands, and an unloaded CP is not a verdict on the car."""
-    for feature in (LATERAL_ENGAGE, TORQUE_LATERAL, LONGITUDINAL, STEER_RELEASE):
+    for feature in (LATERAL_ENGAGE, TORQUE_LATERAL, LONGITUDINAL):
       with self.subTest(feature=feature.key):
         self.assertIsNone(car_unavailable_reason(feature, None))
 
