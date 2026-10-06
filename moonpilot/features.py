@@ -36,6 +36,17 @@ PATH_PREVIEW = Feature(
   offroad_only=True,
 )
 
+PATH_LOOKAHEAD = Feature(
+  key="MoonpilotPathLookahead",
+  title="turn in early",
+  description=(
+    "Response-aligned steering only. Starts turns earlier and lets them out earlier by looking further along the "
+    + "planned path. Stronger starts earlier but cuts more toward the inside of the curve. Restart to apply."
+  ),
+  offroad_only=True,
+  choices=("off", "light", "medium", "strong"),
+)
+
 PATH_SMOOTH = Feature(
   key="MoonpilotPathSmooth",
   title="smooth planner path",
@@ -181,7 +192,7 @@ class Group:
 STEERING = Group(
   title="steering",
   description="How openpilot moves the wheel: whose controller, when a curve is entered, and whether openpilot can steer at all.",
-  features=(LATERAL_ENGAGE, TORQUE_LATERAL, PATH_PREVIEW, PATH_SMOOTH, STEER_HYSTERESIS, STEER_DAMPING, TURN_DESIRE),
+  features=(LATERAL_ENGAGE, TORQUE_LATERAL, PATH_PREVIEW, PATH_LOOKAHEAD, PATH_SMOOTH, STEER_HYSTERESIS, STEER_DAMPING, TURN_DESIRE),
 )
 
 SPEED = Group(

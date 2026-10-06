@@ -12,6 +12,7 @@ out-of-grid input returns the decoded action exactly; no previous correction is 
 keeps this module off modeld's import graph (modeld imports its constants).
 """
 
+import functools
 import math
 from collections.abc import Callable
 
@@ -21,17 +22,25 @@ from openpilot.common.params import Params
 from openpilot.common.realtime import DT_CTRL, DT_MDL
 from openpilot.selfdrive.controls.lib.drive_helpers import MIN_SPEED, get_curvature_from_plan
 
-from moonpilot.features import PATH_PREVIEW, PATH_SMOOTH, choice, enabled
+from moonpilot.features import PATH_LOOKAHEAD, PATH_PREVIEW, PATH_SMOOTH, choice, enabled
 
 MOONPILOT_PREVIEW_GAIN = 0.3  # share of (response-aligned path - model request) added to the command
 MOONPILOT_PREVIEW_MAX_LAT_ACCEL = 0.8  # m/s^2; ceiling on what the delta itself may ask for
 MOONPILOT_PREVIEW_MIN_SPEED = 5.0  # m/s; below this the path curvature is noise
 MOONPILOT_MAX_MODEL_AGE = 2 * DT_MDL  # s; two missed 20 Hz model periods disable the correction
 MOONPILOT_SMOOTH_TAUS = (0.0, 0.05, 0.10, 0.15)  # s; first-order time constant per MoonpilotPathSmooth choice, 0 = off
+# Look-ahead per MoonpilotPathLookahead choice: (window s, gain, cap m/s^2). Off is the single sample above.
+# On openpilot's recorded turns (routes 3f8-410), replacing the sample with the mean planned curvature over
+# [horizon, horizon + window] started the request 0.05/0.21/0.05 s (light), 0.15/0.39/0.19 s (medium) and
+# 0.35/0.66/0.26 s (strong) earlier at 5-10/10-17/>17 m/s, without making highway builds lighter, at the cost
+# of a turn-in that begins inside the lane (0.3-1.2 m median before the model's own re-planning) and up to
+# 16% less peak in tight low-speed turns. The driver's own highway lead (~0.8 s) needed (1.5, 1.0, 1.5), whose
+# drift was meters, so it is not offered.
+MOONPILOT_LOOKAHEAD = ((0.0, MOONPILOT_PREVIEW_GAIN, MOONPILOT_PREVIEW_MAX_LAT_ACCEL), (1.0, 0.3, 0.8), (1.0, 0.6, 1.5), (1.5, 0.6, 1.5))
 
 
 def response_aligned_curvature(model, desired_curvature: float, *, v_ego: float, lat_delay: float, model_recv_time: float, now: float,
-                               model_valid: bool) -> float:
+                               model_valid: bool, lookahead: tuple[float, float, float] = MOONPILOT_LOOKAHEAD[0]) -> float:
   """Return the decoded request plus a bounded path correction, or the request unchanged. Called once per control frame."""
   if not model_valid:
     return desired_curvature
@@ -58,22 +67,32 @@ def response_aligned_curvature(model, desired_curvature: float, *, v_ego: float,
     return desired_curvature
   if not all(np.isfinite(values).all() for values in (yaws, yaw_rates, t_idxs, rate_t_idxs)):
     return desired_curvature
-  if response_horizon <= 0.0 or response_horizon > t_idxs[-1]:
+  window, gain, cap = lookahead
+  if response_horizon <= 0.0 or response_horizon + window > t_idxs[-1]:
     return desired_curvature
 
-  response_curvature = float(get_curvature_from_plan(yaws, yaw_rates, t_idxs, v_ego, response_horizon))
+  if window > 0.0:
+    # The planned curvature (yaw rate / speed) averaged over the window ahead of the response: a turn
+    # coming up pulls the request in early and gradually, and its exit lets go the same way.
+    samples = np.interp(np.arange(response_horizon, response_horizon + window + 1e-9, 0.05), t_idxs, yaw_rates)
+    response_curvature = float(np.mean(samples)) / max(v_ego, MIN_SPEED)
+  else:
+    response_curvature = float(get_curvature_from_plan(yaws, yaw_rates, t_idxs, v_ego, response_horizon))
   if not math.isfinite(response_curvature):
     return desired_curvature
-  limit = MOONPILOT_PREVIEW_MAX_LAT_ACCEL / max(v_ego, MIN_SPEED) ** 2
-  delta = float(np.clip(MOONPILOT_PREVIEW_GAIN * (response_curvature - desired_curvature), -limit, limit))
+  limit = cap / max(v_ego, MIN_SPEED) ** 2
+  delta = float(np.clip(gain * (response_curvature - desired_curvature), -limit, limit))
   return desired_curvature + delta
 
 
 def moonpilot_curvature(params: Params | None = None) -> Callable[..., float] | None:
-  """Return the response-aligned reference when enabled; the choice is fixed until restart."""
-  if not enabled(PATH_PREVIEW, params or Params()):
+  """Return the response-aligned reference when enabled, with the look-ahead chosen at the same time;
+  both are fixed until restart."""
+  params = params or Params()
+  if not enabled(PATH_PREVIEW, params):
     return None
-  return response_aligned_curvature
+  level = choice(PATH_LOOKAHEAD, params) if enabled(PATH_LOOKAHEAD, params) else 0
+  return functools.partial(response_aligned_curvature, lookahead=MOONPILOT_LOOKAHEAD[level]) if level else response_aligned_curvature
 
 
 class PathSmooth:

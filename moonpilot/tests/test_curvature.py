@@ -4,6 +4,7 @@ import math
 import struct
 import unittest
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
 import numpy as np
@@ -15,6 +16,7 @@ from openpilot.selfdrive.controls.lib.drive_helpers import get_curvature_from_pl
 from openpilot.selfdrive.modeld.constants import ModelConstants
 
 from moonpilot.curvature import (
+  MOONPILOT_LOOKAHEAD,
   MOONPILOT_MAX_MODEL_AGE,
   MOONPILOT_PREVIEW_GAIN,
   MOONPILOT_PREVIEW_MAX_LAT_ACCEL,
@@ -25,8 +27,10 @@ from moonpilot.curvature import (
   moonpilot_path_smooth,
   response_aligned_curvature,
 )
-from moonpilot.features import PATH_SMOOTH
+from moonpilot.features import PATH_LOOKAHEAD, PATH_SMOOTH
 from moonpilot.tests.fakes import FakeParams, _params
+
+NO_LOOKAHEAD = {PATH_LOOKAHEAD.key: 0}
 
 ROOT = Path(__file__).resolve().parents[2]
 T_IDXS = np.asarray(ModelConstants.T_IDXS)
@@ -64,7 +68,7 @@ def _response(model, *, v_ego=V_EGO, now=NOW, lat_delay=LAT_DELAY):
 
 
 def _update(model, desired_curvature=0.0, **overrides):
-  arguments = {
+  arguments: dict[str, Any] = {
     "v_ego": V_EGO,
     "lat_delay": LAT_DELAY,
     "model_recv_time": NOW - RECEIVE_AGE,
@@ -84,13 +88,56 @@ class TestFactory(unittest.TestCase):
     self.assertIsNone(moonpilot_curvature(_params(False)))
 
   def test_the_toggle_on_builds_the_reference(self):
-    self.assertIs(moonpilot_curvature(_params(True)), response_aligned_curvature)
+    self.assertIs(moonpilot_curvature(_params(True, NO_LOOKAHEAD)), response_aligned_curvature)
 
   def test_it_is_chosen_once_so_the_toggle_takes_a_restart(self):
     with mock.patch.object(curvature_mod, "Params", lambda: FakeParams(False)):
       self.assertIsNone(moonpilot_curvature())
-    with mock.patch.object(curvature_mod, "Params", lambda: FakeParams(True)):
+    with mock.patch.object(curvature_mod, "Params", lambda: FakeParams(True, NO_LOOKAHEAD)):
       self.assertIs(moonpilot_curvature(), response_aligned_curvature)
+
+
+class TestLookahead(unittest.TestCase):
+  """The look-ahead window: a coming turn pulls the request in early, an ending one lets it out early."""
+
+  HORIZON = CAPTURE_AGE + LAT_DELAY
+
+  def _out(self, model, level, desired=0.0):
+    reference = moonpilot_curvature(_params(True, {PATH_LOOKAHEAD.key: level}))
+    assert reference is not None
+    return reference(model, desired, v_ego=V_EGO, lat_delay=LAT_DELAY, model_recv_time=NOW - RECEIVE_AGE, now=NOW, model_valid=True)
+
+  def test_a_turn_beyond_the_single_sample_is_entered_early_and_more_with_each_level(self):
+    model = _corner(0.002, t_start=self.HORIZON + 0.5)  # 0.5 s after the point today's sample reads
+    self.assertEqual(_bits(self._out(model, 0)), _bits(0.0))  # off: nothing yet, exactly today's request
+    light, medium, strong = (self._out(model, level) for level in (1, 2, 3))
+    self.assertGreater(light, 0.0)
+    self.assertLess(light, medium)
+    self.assertLess(medium, strong)
+    self.assertLess(strong, 0.002)  # a lead-in, never the turn itself
+
+  def test_an_ending_turn_is_let_out_early(self):
+    model = _corner(0.002, t_end=self.HORIZON + 0.5)
+    for level in (1, 2, 3):
+      with self.subTest(level=level):
+        self.assertLess(self._out(model, level, desired=0.002), 0.002)
+
+  def test_the_lead_in_is_capped_per_level(self):
+    model = _corner(0.05, t_start=self.HORIZON + 0.1)
+    for level in (1, 2, 3):
+      with self.subTest(level=level):
+        cap = MOONPILOT_LOOKAHEAD[level][2] / V_EGO ** 2
+        self.assertAlmostEqual(self._out(model, level), cap, delta=1e-12)
+
+  def test_a_window_past_the_published_path_returns_the_request(self):
+    model = _corner(0.002)
+    late = T_IDXS[-1] - CAPTURE_AGE - MOONPILOT_LOOKAHEAD[3][0] + 0.01
+    out = response_aligned_curvature(model, 0.03125, v_ego=V_EGO, lat_delay=late, model_recv_time=NOW - RECEIVE_AGE, now=NOW,
+                                     model_valid=True, lookahead=MOONPILOT_LOOKAHEAD[3])
+    self.assertEqual(_bits(out), _bits(0.03125))
+
+  def test_without_response_aligned_steering_there_is_no_look_ahead(self):
+    self.assertIsNone(moonpilot_curvature(_params(False, {PATH_LOOKAHEAD.key: 3})))
 
 
 class TestResponseReference(unittest.TestCase):

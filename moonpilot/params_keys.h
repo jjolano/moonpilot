@@ -37,6 +37,10 @@
     // Off by default: it aligns the model path to its capture age plus steering
     // delay; the response gain still needs on-device validation.
     {"MoonpilotPathPreview", {PERSISTENT, BOOL, "0"}},
+    // Off by default: an index into PATH_LOOKAHEAD.choices (0 off, then light / medium / strong):
+    // the response-aligned reference averages the planned curvature over a window ahead instead of
+    // one sample; inert unless MoonpilotPathPreview is on; chosen at construction, so a restart.
+    {"MoonpilotPathLookahead", {PERSISTENT, INT, "0"}},
     // Off by default: an index into PATH_SMOOTH.choices (0 off, then 0.05 / 0.10 / 0.15 s),
     // the time constant of a filter on the model's curvature request before the controller —
     // that much path lag for calmer torque steps; chosen at construction, so the row takes a
