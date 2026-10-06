@@ -29,18 +29,27 @@ MOONPILOT_PREVIEW_MAX_LAT_ACCEL = 0.8  # m/s^2; ceiling on what the delta itself
 MOONPILOT_PREVIEW_MIN_SPEED = 5.0  # m/s; below this the path curvature is noise
 MOONPILOT_MAX_MODEL_AGE = 2 * DT_MDL  # s; two missed 20 Hz model periods disable the correction
 MOONPILOT_SMOOTH_TAUS = (0.0, 0.05, 0.10, 0.15)  # s; first-order time constant per MoonpilotPathSmooth choice, 0 = off
-# Look-ahead per MoonpilotPathLookahead choice: (window s, gain, cap m/s^2). Off is the single sample above.
-# On openpilot's recorded turns (routes 3f8-410), replacing the sample with the mean planned curvature over
-# [horizon, horizon + window] started the request 0.05/0.21/0.05 s (light), 0.15/0.39/0.19 s (medium) and
-# 0.35/0.66/0.26 s (strong) earlier at 5-10/10-17/>17 m/s, without making highway builds lighter, at the cost
-# of a turn-in that begins inside the lane (0.3-1.2 m median before the model's own re-planning) and up to
-# 16% less peak in tight low-speed turns. The driver's own highway lead (~0.8 s) needed (1.5, 1.0, 1.5), whose
-# drift was meters, so it is not offered.
-MOONPILOT_LOOKAHEAD = ((0.0, MOONPILOT_PREVIEW_GAIN, MOONPILOT_PREVIEW_MAX_LAT_ACCEL), (1.0, 0.3, 0.8), (1.0, 0.6, 1.5), (1.5, 0.6, 1.5))
+# Look-ahead per MoonpilotPathLookahead choice: (window s, gain, cap m/s^2); None = off, the single sample above.
+# The mean planned curvature over [horizon, horizon + window] may only add turn to today's request, never take
+# any away, so a turn-in starts early while the apex and the exit stay as today's: on openpilot's recorded turns
+# (routes 3f8-410) the request started 0.05/0.21/0.05 s (light), 0.15/0.39/0.19 s (medium) and 0.30/0.62/0.26 s
+# (strong) earlier at 5-10/10-17/>17 m/s with every turn's apex at 100% of today's (p10 included) and no outward
+# drift at the median. Unrestricted, the same averages cut the apex to 82-96% and let turns out early -- running
+# wide. The cost is a turn-in that begins inside the lane: 0.5-1.1 / 1.0-2.2 / 1.1-3.1 m median open-loop,
+# before the model's own re-planning. None makes highway builds lighter: the controller adds that abruptness.
+MOONPILOT_LOOKAHEAD: tuple[tuple[float, float, float] | None, ...] = (None, (1.0, 0.3, 0.8), (1.0, 0.6, 1.5), (1.5, 0.6, 1.5))
+
+
+def _toward(desired_curvature: float, target: float, v_ego: float, gain: float, cap: float) -> float:
+  """The request plus `gain` of the way to `target`, the step capped at `cap` m/s^2; the request if `target` is not finite."""
+  if not math.isfinite(target):
+    return desired_curvature
+  limit = cap / max(v_ego, MIN_SPEED) ** 2
+  return desired_curvature + float(np.clip(gain * (target - desired_curvature), -limit, limit))
 
 
 def response_aligned_curvature(model, desired_curvature: float, *, v_ego: float, lat_delay: float, model_recv_time: float, now: float,
-                               model_valid: bool, lookahead: tuple[float, float, float] = MOONPILOT_LOOKAHEAD[0]) -> float:
+                               model_valid: bool, lookahead: tuple[float, float, float] | None = None) -> float:
   """Return the decoded request plus a bounded path correction, or the request unchanged. Called once per control frame."""
   if not model_valid:
     return desired_curvature
@@ -67,22 +76,21 @@ def response_aligned_curvature(model, desired_curvature: float, *, v_ego: float,
     return desired_curvature
   if not all(np.isfinite(values).all() for values in (yaws, yaw_rates, t_idxs, rate_t_idxs)):
     return desired_curvature
-  window, gain, cap = lookahead
-  if response_horizon <= 0.0 or response_horizon + window > t_idxs[-1]:
+  if response_horizon <= 0.0 or response_horizon > t_idxs[-1]:
     return desired_curvature
 
-  if window > 0.0:
-    # The planned curvature (yaw rate / speed) averaged over the window ahead of the response: a turn
-    # coming up pulls the request in early and gradually, and its exit lets go the same way.
-    samples = np.interp(np.arange(response_horizon, response_horizon + window + 1e-9, 0.05), t_idxs, yaw_rates)
-    response_curvature = float(np.mean(samples)) / max(v_ego, MIN_SPEED)
-  else:
-    response_curvature = float(get_curvature_from_plan(yaws, yaw_rates, t_idxs, v_ego, response_horizon))
-  if not math.isfinite(response_curvature):
-    return desired_curvature
-  limit = cap / max(v_ego, MIN_SPEED) ** 2
-  delta = float(np.clip(gain * (response_curvature - desired_curvature), -limit, limit))
-  return desired_curvature + delta
+  today = _toward(desired_curvature, float(get_curvature_from_plan(yaws, yaw_rates, t_idxs, v_ego, response_horizon)), v_ego,
+                  MOONPILOT_PREVIEW_GAIN, MOONPILOT_PREVIEW_MAX_LAT_ACCEL)
+  if lookahead is None or response_horizon + lookahead[0] > t_idxs[-1]:
+    return today
+  window, gain, cap = lookahead
+  # The planned curvature (yaw rate / speed) averaged over the window ahead of the response: a turn coming up
+  # pulls the request in early and gradually.
+  samples = np.interp(np.arange(response_horizon, response_horizon + window + 1e-9, 0.05), t_idxs, yaw_rates)
+  ahead = _toward(desired_curvature, float(np.mean(samples)) / max(v_ego, MIN_SPEED), v_ego, gain, cap)
+  # Never less turn than today's request: averaging in a turn's easing would cut its apex and let it out
+  # early, and both run wide.
+  return today if (ahead - today) * today < 0.0 else ahead
 
 
 def moonpilot_curvature(params: Params | None = None) -> Callable[..., float] | None:
@@ -92,7 +100,8 @@ def moonpilot_curvature(params: Params | None = None) -> Callable[..., float] | 
   if not enabled(PATH_PREVIEW, params):
     return None
   level = choice(PATH_LOOKAHEAD, params) if enabled(PATH_LOOKAHEAD, params) else 0
-  return functools.partial(response_aligned_curvature, lookahead=MOONPILOT_LOOKAHEAD[level]) if level else response_aligned_curvature
+  lookahead = MOONPILOT_LOOKAHEAD[level]
+  return functools.partial(response_aligned_curvature, lookahead=lookahead) if lookahead else response_aligned_curvature
 
 
 class PathSmooth:

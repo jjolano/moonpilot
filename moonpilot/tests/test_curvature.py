@@ -98,7 +98,7 @@ class TestFactory(unittest.TestCase):
 
 
 class TestLookahead(unittest.TestCase):
-  """The look-ahead window: a coming turn pulls the request in early, an ending one lets it out early."""
+  """The look-ahead window: a coming turn pulls the request in early; it never takes turn away from today's request."""
 
   HORIZON = CAPTURE_AGE + LAT_DELAY
 
@@ -116,25 +116,29 @@ class TestLookahead(unittest.TestCase):
     self.assertLess(medium, strong)
     self.assertLess(strong, 0.002)  # a lead-in, never the turn itself
 
-  def test_an_ending_turn_is_let_out_early(self):
-    model = _corner(0.002, t_end=self.HORIZON + 0.5)
-    for level in (1, 2, 3):
-      with self.subTest(level=level):
-        self.assertLess(self._out(model, level, desired=0.002), 0.002)
+  def test_an_easing_or_ending_turn_keeps_todays_request_so_it_never_runs_wide(self):
+    for model in (_corner(0.002, t_end=self.HORIZON + 0.5), _model(np.interp(T_IDXS, [0.0, 1.0], [0.002 * V_EGO, 0.0005 * V_EGO]))):
+      today = self._out(model, 0, desired=0.002)
+      for level in (1, 2, 3):
+        with self.subTest(level=level):
+          self.assertEqual(_bits(self._out(model, level, desired=0.002)), _bits(today))
 
   def test_the_lead_in_is_capped_per_level(self):
     model = _corner(0.05, t_start=self.HORIZON + 0.1)
     for level in (1, 2, 3):
+      lookahead = MOONPILOT_LOOKAHEAD[level]
+      assert lookahead is not None
       with self.subTest(level=level):
-        cap = MOONPILOT_LOOKAHEAD[level][2] / V_EGO ** 2
-        self.assertAlmostEqual(self._out(model, level), cap, delta=1e-12)
+        self.assertAlmostEqual(self._out(model, level), lookahead[2] / V_EGO ** 2, delta=1e-12)
 
-  def test_a_window_past_the_published_path_returns_the_request(self):
+  def test_a_window_past_the_published_path_keeps_todays_request(self):
     model = _corner(0.002)
-    late = T_IDXS[-1] - CAPTURE_AGE - MOONPILOT_LOOKAHEAD[3][0] + 0.01
-    out = response_aligned_curvature(model, 0.03125, v_ego=V_EGO, lat_delay=late, model_recv_time=NOW - RECEIVE_AGE, now=NOW,
-                                     model_valid=True, lookahead=MOONPILOT_LOOKAHEAD[3])
-    self.assertEqual(_bits(out), _bits(0.03125))
+    lookahead = MOONPILOT_LOOKAHEAD[3]
+    assert lookahead is not None
+    late = T_IDXS[-1] - CAPTURE_AGE - lookahead[0] + 0.01
+    today = _update(model, 0.03125, lat_delay=late)
+    out = _update(model, 0.03125, lat_delay=late, lookahead=lookahead)
+    self.assertEqual(_bits(out), _bits(today))
 
   def test_without_response_aligned_steering_there_is_no_look_ahead(self):
     self.assertIsNone(moonpilot_curvature(_params(False, {PATH_LOOKAHEAD.key: 3})))

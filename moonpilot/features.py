@@ -40,8 +40,8 @@ PATH_LOOKAHEAD = Feature(
   key="MoonpilotPathLookahead",
   title="turn in early",
   description=(
-    "Response-aligned steering only. Starts turns earlier and lets them out earlier by looking further along the "
-    + "planned path. Stronger starts earlier but cuts more toward the inside of the curve. Restart to apply."
+    "Response-aligned steering only. Starts turns earlier by looking further along the planned path, and never steers "
+    + "less than without it, so it does not run wide. Stronger starts earlier and cuts more toward the inside. Restart to apply."
   ),
   offroad_only=True,
   choices=("off", "light", "medium", "strong"),
