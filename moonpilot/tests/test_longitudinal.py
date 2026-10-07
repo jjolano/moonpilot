@@ -42,6 +42,7 @@ from moonpilot.longitudinal import (
   MOONPILOT_COASTING_BP,
   MOONPILOT_COASTING_V,
   MOONPILOT_CONTROL_T_IDX,
+  MOONPILOT_CRAWL_REST,
   MOONPILOT_CREEP_SPEED,
   MOONPILOT_CRUISE_ERR_BP,
   MOONPILOT_ERR_BP_SCALE,
@@ -58,6 +59,7 @@ from moonpilot.longitudinal import (
   MOONPILOT_FOLLOW_TAPER_M,
   MOONPILOT_JERK_EMERGENCY,
   MOONPILOT_JERK_DOWN,
+  MOONPILOT_JERK_ONSET,
   MOONPILOT_JERK_LAUNCH,
   MOONPILOT_JERK_LAUNCH_SPEED,
   MOONPILOT_JERK_UP,
@@ -514,8 +516,9 @@ class TestPolicyFunctions(unittest.TestCase):
     """The up limit is `MOONPILOT_JERK_LAUNCH` at and below `MOONPILOT_JERK_LAUNCH_SPEED`, tapering
     back to `MOONPILOT_JERK_UP` by twice it — a launch is the one place the plan's own ask outruns the
     comfort limit, and the car's answer to a lead pulling away is the most visible thing this planner
-    does. The down side reads the *command* and never the speed: every braking number in the file was
-    measured against it, and the emergency ramp it interpolates into is untouched.
+    does. The down side reads the *command*: a shallow ask onsets at `MOONPILOT_JERK_ONSET` above the
+    creep band, and keeps `MOONPILOT_JERK_DOWN` at a crawl, while a lead brakes, and from -2.0 on,
+    where it interpolates into the untouched emergency ramp.
     """
     for v_ego, expected in (
       (0.0, MOONPILOT_JERK_LAUNCH),
@@ -530,8 +533,11 @@ class TestPolicyFunctions(unittest.TestCase):
       self.assertAlmostEqual(jerk_limit(10.0, 0.05, DT_MDL, v_ego), 0.05 + expected * DT_MDL, places=9)
     for v_ego in (0.0, MOONPILOT_JERK_LAUNCH_SPEED, 25.0):
       self.assertAlmostEqual(jerk_limit(10.0, 0.0, DT_MDL, v_ego), MOONPILOT_JERK_UP * DT_MDL, places=9)
-    for v_ego in (0.0, MOONPILOT_JERK_LAUNCH_SPEED, 25.0):
+    for v_ego in (0.0, MOONPILOT_JERK_LAUNCH_SPEED):
       self.assertAlmostEqual(jerk_limit(-1.0, 0.0, DT_MDL, v_ego), -MOONPILOT_JERK_DOWN * DT_MDL, places=9)
+    self.assertAlmostEqual(jerk_limit(-1.0, 0.0, DT_MDL, 25.0), -MOONPILOT_JERK_ONSET * DT_MDL, places=9)
+    self.assertAlmostEqual(jerk_limit(-1.0, 0.0, DT_MDL, 25.0, lead_braking=True), -MOONPILOT_JERK_DOWN * DT_MDL, places=9)
+    self.assertAlmostEqual(jerk_limit(-2.0, 0.0, DT_MDL, 25.0), -MOONPILOT_JERK_DOWN * DT_MDL, places=9)
 
   def test_the_approach_stops_behind_a_stopped_lead_at_every_reachable_speed(self):
     """The safety property, and the one the TTC term alone does not have: the fork's car can reach
@@ -732,7 +738,8 @@ class TestPolicyFunctions(unittest.TestCase):
       with self.subTest(brake=brake):
         s = _fly(20.0, 72.0, 29.0, 20.0, lambda t, b=brake: b if t > 1 else 0.0, 25.0)
         self.assertFalse(s["contact"])
-        self.assertGreater(s["min_gap"], MOONPILOT_STOP_REST - MOONPILOT_MIN_SLACK)
+        # The crawl cap may spend the rest gap down toward MOONPILOT_CRAWL_REST at the end (3.91 m at -5.0).
+        self.assertGreater(s["min_gap"], MOONPILOT_CRAWL_REST - 0.2)
         self.assertLess(s["v"][-1], 0.05)
     # and the direct assertion: at matched speed the prediction branch, not the match, is what binds
     self.assertAlmostEqual(stopping_decel(20.0, 20.0, -5.0, 23.0), -1.5151515151515151, delta=1e-9)
@@ -1131,8 +1138,9 @@ class TestPlanner(unittest.TestCase):
     s = _fly(12.0, 43.2, 70.0, 0.0, lambda t: 0.0, 30.0)
     tail = [a for v, a in zip(s["v"], s["cmd"], strict=True) if 0.3 < v < 4.0]
     self.assertLess(max(earlier - later for earlier, later in zip(tail, tail[1:], strict=False)), 0.02)
-    # A soft rest target, not a requirement to recover the last few centimeters by braking harder.
-    self.assertTrue(MOONPILOT_STOP_REST - 0.3 < s["end_gap"] < MOONPILOT_STOP_DISTANCE)
+    # A soft rest target, not a requirement to recover the last few centimeters by braking harder. The
+    # gentle onset of the shallow arrival ask lands it 4.90 m behind (4.91 at the 2.0 onset).
+    self.assertTrue(MOONPILOT_STOP_REST - 0.35 < s["end_gap"] < MOONPILOT_STOP_DISTANCE)
     self.assertLess(s["v"][-1], 0.01)
     self.assertFalse(s["contact"])
 
@@ -1616,7 +1624,7 @@ class TestPlanner(unittest.TestCase):
     planner = _planner()
     planner.update(_inputs(v_ego=20.0, v_cruise_kph=108.0, lead=_lead(15.0, 20.0)))
     self.assertEqual(planner.source, Source.lead0)
-    self.assertAlmostEqual(planner.output_a_target, -MOONPILOT_JERK_DOWN * DT_MDL, delta=1e-9)
+    self.assertAlmostEqual(planner.output_a_target, -MOONPILOT_JERK_ONSET * DT_MDL, delta=1e-9)
     self.assertGreaterEqual(planner.output_a_target, -MOONPILOT_APPROACH_DECEL)
 
   def test_a_vision_lead_accel_uses_the_half_second_preview(self):
@@ -1956,7 +1964,8 @@ class TestModelBraking(unittest.TestCase):
     """Route 00000408 at 15 m/s: an ask admitted at -0.50 stepped the plan from -0.23 to -0.52 in 0.15 s
     and the car answered -0.84. Admitted, a shallow ask now blends in from the other candidates over
     `MOONPILOT_MODEL_BRAKE_FADE_T`, never shallower than the step-in would have been relieved by, and
-    still arrives whole. At the set speed the cruise term is ~0, so the jerk limit does not hide it."""
+    still arrives whole. At the set speed the cruise term is ~0; the onset jerk is held at
+    `MOONPILOT_JERK_DOWN` so the fade is what is measured."""
 
     def commands():
       planner = _planner()
@@ -1969,9 +1978,10 @@ class TestModelBraking(unittest.TestCase):
         out.append(planner.output_a_target)
       return out
 
-    faded = commands()
-    with mock.patch("moonpilot.longitudinal.MOONPILOT_MODEL_BRAKE_FADE_T", 1e-9):
-      stepped = commands()
+    with mock.patch("moonpilot.longitudinal.MOONPILOT_JERK_ONSET", MOONPILOT_JERK_DOWN):
+      faded = commands()
+      with mock.patch("moonpilot.longitudinal.MOONPILOT_MODEL_BRAKE_FADE_T", 1e-9):
+        stepped = commands()
     self.assertTrue(all(f >= s - 1e-12 for f, s in zip(faded, stepped, strict=True)))
     self.assertGreater(faded[4] - stepped[4], 0.15)  # held back over the first quarter second
     self.assertAlmostEqual(faded[-1], -0.6)  # and whole once the fade has run
