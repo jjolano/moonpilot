@@ -17,6 +17,7 @@ import moonpilot.longitudinal as longitudinal
 from moonpilot.longitudinal import (
   MOONPILOT_APPROACH_DECEL,
   MOONPILOT_ARRIVAL_MIN_T,
+  MOONPILOT_BRAKE_EXIT_JERK,
   MOONPILOT_FAST_ACCEL_BP,
   MOONPILOT_FAST_ACCEL_V,
   MOONPILOT_K_GAP,
@@ -191,6 +192,45 @@ class TestFollowPolicy(unittest.TestCase):
         self.assertGreater(s["peak"], -1.9)
         self.assertGreater(s["end_gap"], MOONPILOT_CRAWL_REST - 0.2)
         self.assertFalse(s["contact"])
+
+  def test_a_departing_lead_lifts_the_models_stop_hold_once_the_model_asks_to_go(self):
+    """Route 00000414 at 472 s: the model's stop hold, latched on the approach, kept the plan at
+    +0.04..+0.09 — under `should_stop`'s 0.1 — for 1.8 s while the lead pulled away, until the driver
+    pressed the gas. A positive model ask with leadOne moving now hands the slot back to the lead; a
+    model still asking to hold (a light the lead drove through) keeps it."""
+    for model_go, held in ((0.05, False), (0.0, True)):
+      with self.subTest(model_go=model_go):
+        planner = _planner()
+        planner.update(_inputs(v_ego=8.0, v_cruise_kph=62.0, model_accel=-1.5, lead=_lead(30.0, 0.0)))
+        for _ in range(40):
+          planner.update(_inputs(v_ego=0.0, v_cruise_kph=62.0, model_accel=-0.05, lead=_lead(5.2, 0.0), standstill=True))
+        self.assertTrue(planner.output_should_stop)
+        for _ in range(4):
+          planner.update(_inputs(v_ego=0.0, v_cruise_kph=62.0, model_accel=model_go, lead=_lead(5.4, 0.4), standstill=True))
+        self.assertEqual(planner.output_should_stop, held)
+        self.assertEqual(planner.output_a_target > 0.1, not held)
+
+  def test_speeding_up_after_a_brake_rebuilds_at_the_drivers_pace(self):
+    """Rolling out of a brake (routes 00000410 at 7.6 m/s, 00000414 at 11.5 m/s) the cruise rung came back
+    at the 1.5 m/s^3 comfort jerk and peaked 1.5 / 1.21 m/s^2; over 210 manual brake-then-gas episodes
+    on 31 routes the driver rose at a median 0.50 at 5-10 m/s and 0.30 at 10-15. Above the launch band
+    the positive ask now rebuilds at `MOONPILOT_BRAKE_EXIT_JERK`; inside it, a launch keeps its jerk."""
+    for v_ego, exit_ramp in ((10.0, True), (2.0, False)):
+      with self.subTest(v_ego=v_ego):
+        planner = _planner()
+        for _ in range(20):
+          planner.update(_inputs(v_ego=v_ego, v_cruise_kph=62.0, model_accel=-1.5))
+        cmds = []
+        for _ in range(60):
+          planner.update(_inputs(v_ego=v_ego, v_cruise_kph=62.0, model_accel=0.3))  # the model asks to go
+          cmds.append(planner.output_a_target)
+        release = next(i for i, c in enumerate(cmds) if c >= -0.5)
+        ramp = [MOONPILOT_BRAKE_EXIT_JERK * (k - release) * DT_MDL for k in range(len(cmds))]
+        if exit_ramp:
+          self.assertTrue(all(c <= r + 1e-9 for c, r in zip(cmds[release:], ramp[release:], strict=True)))
+          self.assertGreater(cmds[-1], 0.5)  # it does come back
+        else:
+          self.assertGreater(max(c - r for c, r in zip(cmds[release:], ramp[release:], strict=True)), 0.2)
 
   def test_a_launch_asks_for_what_the_car_delivers_not_what_the_feet_did(self):
     """Sweep of 434 cached segments: below 3 m/s the car lands 1.27x the fast-rung ask, and four

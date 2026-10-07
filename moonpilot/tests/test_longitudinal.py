@@ -2099,7 +2099,8 @@ class TestModelBraking(unittest.TestCase):
     self.assertEqual(model_release(MOONPILOT_MODEL_STOP_SPEED), MOONPILOT_MODEL_BRAKE_THRESHOLD)
     self.assertEqual(model_release(0.0), MOONPILOT_MODEL_STOP_RELEASE)
     braked = _planner()
-    for ask, frames in ((-1.5, 20), (-0.4, 40)):
+    # 80 frames: the brake-exit ramp (`MOONPILOT_BRAKE_EXIT_JERK`) has to finish before the two meet.
+    for ask, frames in ((-1.5, 20), (-0.4, 80)):
       for _ in range(frames):
         braked.update(_inputs(v_ego=20.0, v_cruise_kph=108.0, model_accel=ask))
     self.assertEqual(braked.source, Source.cruise)

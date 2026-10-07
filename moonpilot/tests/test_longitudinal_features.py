@@ -38,6 +38,7 @@ from moonpilot.jerk import (
   MOONPILOT_LONG_JERK_SCALE_KEY,
 )
 from moonpilot.features import FEATURES
+from moonpilot.longitudinal import MOONPILOT_BRAKE_EXIT_JERK
 from moonpilot.tests.test_longitudinal import ROOT, Source, _cp, _inputs, _path, _planner
 
 
@@ -406,12 +407,12 @@ class TestCurveSpeed(unittest.TestCase):
     self.assertEqual(cruise(_planner()), uncapped)
     self.assertGreater(uncapped[7], 0.5)  # the comfort jerk's own ramp: past +0.5 inside 0.4 s
 
-  def test_a_straight_wheel_with_no_curve_ahead_rebuilds_at_the_comfort_jerk(self):
+  def test_a_straight_wheel_with_no_curve_ahead_rebuilds_at_the_brake_exit_jerk(self):
     """Route 00000408: a predicted intersection turn the car never took asked -0.04..-0.32 m/s^2 with the
     wheel at 3 degrees, and the slow exit ramp then held a pull-away near zero for 5 s while the cruise
     term asked +1.5. With the wheel straight and nothing on the path that would brake at the set speed,
-    the ramp rebuilds at the comfort up-jerk; a curve still ahead keeps the slow ramp, so a pre-brake
-    that has met its target cannot re-accelerate into the curve."""
+    the ramp rebuilds at `MOONPILOT_BRAKE_EXIT_JERK`, the driver's own post-brake pace; a curve still
+    ahead keeps the slow ramp, so a pre-brake that has met its target cannot re-accelerate into the curve."""
     v_ego, v_cruise_kph = 20.0, 108.0
     ahead = self._ramp_curve(v_ego, 20.0, curvature=0.0027)  # inside the 4 s preview at 20 m/s
     target = curve_targets(_inputs(path=ahead)['modelV2'], True)
@@ -429,10 +430,12 @@ class TestCurveSpeed(unittest.TestCase):
       return cmds
 
     # Out of -1.5 the up-jerk governs either way until the command crosses zero; past it the slow ramp
-    # would hold +0.5 at 2 s, and the comfort rebuild is already back on the cruise rung.
+    # holds +0.5 at 2 s and the straight wheel's rebuild is clearly ahead of it, inside its own ramp.
     clear = exit_after_brake(_path(v_ego, 0.0))
-    self.assertGreater(clear[-1], MOONPILOT_CURVE_EXIT_JERK * 40 * DT_MDL + 0.25)
     curve_still_ahead = exit_after_brake(ahead)
+    self.assertGreater(clear[-1], curve_still_ahead[-1] + 0.1)
+    for k, cmd in enumerate(clear, start=1):
+      self.assertLessEqual(cmd, MOONPILOT_BRAKE_EXIT_JERK * k * DT_MDL + 1e-9, f"frame {k} after the release")
     for k, cmd in enumerate(curve_still_ahead, start=1):
       self.assertLessEqual(cmd, MOONPILOT_CURVE_EXIT_JERK * k * DT_MDL + 1e-9, f"frame {k} after the release")
 

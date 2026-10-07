@@ -441,15 +441,7 @@ MOONPILOT_ERR_BP_SCALE = {
   int(Personality.standard): 1.0,
   int(Personality.relaxed): 1.4,
 }
-# The crawl band. With no pedal the car settles at idle creep, a median 1.9 m/s on level road, and
-# climbs to it at +0.31 from 0.5-1 m/s (fast crawl), which caps the regulator's creep (`crawl_accel`).
-# The two braking-side crawl rungs are measured and deliberately not applied, because the regulator
-# already stops at the driver's rate: below creep speed the driver brakes (83 % of frames) at a median
-# -0.08 around 0.5 m/s (slow crawl), and over 212 stops averages -0.47 in the last second (p25 -0.81,
-# p75 -0.26) and -0.37 in the two before (stopped). The unshaped regulator, from 5-25 m/s at a
-# stopped lead, reads -0.31 and -0.47 over the same windows and rests 5.19 m back — inside the
-# driver's spread, with a softer finish rather than a firmer one. Compressing its braking toward the
-# rungs made that finish softer still (-0.28) and rested 4.63 m back.
+# The crawl band: idle creep and the fast-crawl climb to it (docs/longitudinal.md, "The crawl band").
 MOONPILOT_CREEP_SPEED = 1.9  # m/s
 MOONPILOT_FAST_CRAWL = 0.31  # m/s^2
 # Combined accel budget. 2.0 up to 4.5 m/s lets the measured launch rungs (1.96-1.97 at 2.5-3.5 m/s)
@@ -474,20 +466,17 @@ MOONPILOT_JERK_UP = 1.5  # m/s^3
 MOONPILOT_JERK_LAUNCH = 4.0  # m/s^3; the up-limit at and below MOONPILOT_JERK_LAUNCH_SPEED, tapering
 # back to `MOONPILOT_JERK_UP` at twice it, and only from the second frame of a ramp — `jerk_limit`
 # keeps the first step at the comfort value, which is what holds a parked car's brake hold out of one
-# frame of a lead's reported speed. What it buys, measured closed-loop from rest behind a lead pulling
-# away at 2 m/s^2: 0.5 m/s^2 at 0.15 s against the comfort ramp's 0.30 s, and 0.14 m of the gap by 2 s
-# (8.863 -> 8.721). In that case the regulator's anticipation credit is worth 0.005 m on its own,
-# because this ramp is what binds there, and the two together are worth 0.56 m (8.863 -> 8.299) with
-# the ask at 1.075 m/s^2 by 0.25 s. Only the up side moves, so every braking number below is untouched.
+# frame of a lead's reported speed. Measured gains: docs/longitudinal.md, "The up-jerk is scheduled".
 MOONPILOT_JERK_LAUNCH_SPEED = 2.5  # m/s
-MOONPILOT_JERK_DOWN = 2.0  # m/s^3 at a -2.0 ask; `jerk_limit` rises from it to JERK_EMERGENCY at ACCEL_MIN.
-# Measured: 6.05 m of end gap, no contact at 90-144 kph against stopped and braking leads.
+MOONPILOT_JERK_DOWN = 2.0  # m/s^3 at a -2.0 ask; 6.05 m end gap, no contact at 90-144 kph
 MOONPILOT_JERK_EMERGENCY = 10.0  # m/s^3, reached at ACCEL_MIN
-MOONPILOT_JERK_ONSET = 1.0  # m/s^3 above MOONPILOT_JERK_ONSET_A: docs/longitudinal.md, "A shallow brake"
+MOONPILOT_JERK_ONSET = 1.0  # m/s^3 above JERK_ONSET_A; this and below: docs/longitudinal.md
 MOONPILOT_JERK_ONSET_A = -1.0  # m/s^2
 MOONPILOT_JERK_ONSET_LEAD_A = -0.2  # m/s^2; a lead slowing past this keeps JERK_DOWN
-MOONPILOT_CRAWL_REST = 4.0  # m; docs/longitudinal.md, "A crawl stop"
-MOONPILOT_CRAWL_STOP_DECEL = 1.5  # m/s^2; the driver's crawl-stop peak (median 1.47)
+MOONPILOT_CRAWL_REST = 4.0  # m
+MOONPILOT_CRAWL_STOP_DECEL = 1.5  # m/s^2; the driver's crawl-stop peak
+MOONPILOT_BRAKE_EXIT_A = -0.5  # m/s^2; braking past this holds the positive ask, as curve braking does
+MOONPILOT_BRAKE_EXIT_JERK = 0.5  # m/s^3; its rebuild with the wheel straight, above the launch band
 MOONPILOT_ALLOW_THROTTLE_THRESHOLD = 0.4
 # Throttle comes back only once the model's gas-press probability clears this, not the 0.4 that took it
 # away. On route 000003f8 the probability hovered on 0.4 while following a slowing lead and the cruise
@@ -961,8 +950,7 @@ def lead_accel(v_ego, gap, v_lead, a_lead, t_follow, catch_up_accel=0.0, catch_u
   anchor = MOONPILOT_STOP_REST + min(MOONPILOT_STOP_TAPER_T * v_ego, MOONPILOT_STOP_DISTANCE - MOONPILOT_STOP_REST)
   a_stop = stopping_decel(v_ego, v_lead_eff, a_lead, max(gap - anchor, MOONPILOT_MIN_SLACK))
   a = min(a, a_stop) if a_stop < -float(np.interp(v_ego, MOONPILOT_FLOOR_ADMISSION_BP, MOONPILOT_FLOOR_ADMISSION_V)) else a
-  # A crawl stop spends the rest gap toward MOONPILOT_CRAWL_REST before braking past the driver's peak,
-  # aiming a MIN_SLACK short to absorb lag and a lead braking harder.
+  # Crawl stop: spend the rest gap toward MOONPILOT_CRAWL_REST before braking past the driver's peak.
   cap = min(stopping_decel(v_ego, v_lead_eff, a_lead, max(gap - MOONPILOT_CRAWL_REST - MOONPILOT_MIN_SLACK, 0.05)), -MOONPILOT_CRAWL_STOP_DECEL)
   return a + float(np.interp(v_ego, MOONPILOT_SOFT_STOP_V, [1.0, 0.0])) * max(cap - a, 0.0)
 
@@ -1348,7 +1336,10 @@ class MoonpilotLongitudinalPlanner:
     t_follow = self._t_follow(sm)
     err_bp = self._err_bp(sm)
     e2e = sm['selfdriveState'].experimentalMode
-    threshold = model_release(v_ego) if self.model_braking else MOONPILOT_MODEL_BRAKE_THRESHOLD
+    # The model's stop hold yields to a departing leadOne once the model asks to go.
+    one = sm['radarState'].leadOne
+    go = one.present and one.vLead > MOONPILOT_SHOULD_STOP_SPEED and sm['modelV2'].action.desiredAcceleration > 0.0
+    threshold = model_release(v_ego) if self.model_braking and not go else MOONPILOT_MODEL_BRAKE_THRESHOLD
     model_accel = model_candidate(sm['modelV2'], e2e, enabled(MODEL_BRAKING, self.params), threshold)
     self.model_braking = model_accel is not None and not e2e
     self.model_fade = min(self.model_fade + self.dt / MOONPILOT_MODEL_BRAKE_FADE_T, 1.0) if self.model_braking else 0.0
@@ -1502,19 +1493,17 @@ class MoonpilotLongitudinalPlanner:
       a_prev = max(a_prev, 0.0)
     v_pred = max(0.0, v_ego + a_prev * self.action_t)
     x_pred = 0.5 * (v_ego + v_pred) * self.action_t
-    # The curve exit: while any curve term brakes, the positive ask is held to where the command already
-    # is (zero once it is braking), and after it lets go it rebuilds from there at a ramp instead of
-    # jumping to the cruise rung behind the comfort jerk (MOONPILOT_CURVE_EXIT_JERK). The slow ramp is
-    # for a car still cornering or a curve still ahead; with the wheel straight and nothing on the path
-    # that would brake at the set speed, it rebuilds at the comfort up-jerk (MOONPILOT_CURVE_EXIT_LAT_ACCEL).
+    # The exit ramp: while a curve term brakes or the plan brakes past MOONPILOT_BRAKE_EXIT_A, the positive
+    # ask is held where the command is; after release it rebuilds at MOONPILOT_CURVE_EXIT_JERK while still
+    # cornering or with a curve ahead, else at MOONPILOT_BRAKE_EXIT_JERK above the launch band.
     exit_jerk = MOONPILOT_CURVE_EXIT_JERK
-    if min(curve_accel(v_pred, x_pred, curve), lat_accel_hold(v_pred, v_hold), squeeze) < 0.0:
+    if min(curve_accel(v_pred, x_pred, curve), lat_accel_hold(v_pred, v_hold), squeeze) < 0.0 or a_prev < MOONPILOT_BRAKE_EXIT_A:
       self.curve_exit_cap = max(a_prev, 0.0)
     else:
       cornering = abs(measured_curvature) * CS.vEgo**2 >= MOONPILOT_CURVE_EXIT_LAT_ACCEL
       curve_ahead = curve_accel(max(v_cruise, v_pred), x_pred, curve) < 0.0
       if not (cornering or curve_ahead):
-        exit_jerk = MOONPILOT_JERK_UP
+        exit_jerk = float(np.interp(v_ego, [MOONPILOT_JERK_LAUNCH_SPEED, 2 * MOONPILOT_JERK_LAUNCH_SPEED], [MOONPILOT_JERK_LAUNCH, MOONPILOT_BRAKE_EXIT_JERK]))
       self.curve_exit_cap = min(self.curve_exit_cap + exit_jerk * self.dt, ACCEL_MAX)
     lead_states = []
     for source, lead, a_lead, a_lead_tau in leads:

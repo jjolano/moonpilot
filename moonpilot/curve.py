@@ -105,9 +105,9 @@ MOONPILOT_CURVE_EXIT_JERK = 0.25  # m/s^3; how fast the positive ask may rebuild
 # that ramp. It only caps the positive side, so it can never add braking.
 MOONPILOT_CURVE_EXIT_LAT_ACCEL = 1.0  # m/s^2 of measured lateral accel; at or above it the exit ramp
 # stays slow. Below it, and with no path sample that would brake at the set speed, the ramp rebuilds at
-# the comfort up-jerk instead: on route 00000408 a predicted intersection turn the car never took asked
-# -0.04..-0.32 m/s^2 for 0.7 s with the wheel at 3 degrees, and the slow ramp then held a pull-away
-# behind an accelerating lead near zero for 5 s while the cruise term asked +1.5.
+# `MOONPILOT_BRAKE_EXIT_JERK` (moonpilot/longitudinal.py) instead: on route 00000408 a predicted
+# intersection turn the car never took asked -0.04..-0.32 m/s^2 for 0.7 s with the wheel at 3 degrees,
+# and the slow ramp then held a pull-away behind an accelerating lead near zero for 5 s.
 MOONPILOT_CURVE_BIAS_T = 1.0  # s between a prediction and the measurement it is scored against
 MOONPILOT_CURVE_BIAS_RC = 20.0  # s time constant of the ratio filter
 MOONPILOT_CURVE_BIAS_MIN_LAT_ACCEL = 1.0  # m/s^2; below this both signals are noise
