@@ -47,7 +47,7 @@ PATH_SMOOTH = Feature(
   description=(
     "Filter the model's curvature request before the controller for calmer torque steps: 0.05 s takes about half the "
     + "steps out, 0.10 s most of the rest, 0.15 s little more. Above about 18 km/h the planned path is read that much "
-    + "further ahead, so the filter adds no steering lag there. Restart to apply."
+    + "further ahead, which removes half to three quarters of the filter's steering lag. Restart to apply."
   ),
   offroad_only=True,
   choices=("off", "0.05 s", "0.10 s", "0.15 s"),
