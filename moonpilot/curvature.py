@@ -1,15 +1,18 @@
-"""Response-aligned steering from the model's timestamped path.
+"""Plan-timed corrections to the model's curvature request: the look-ahead lead-in and the smoothing lead.
 
-The decoded `modelV2.action.desiredCurvature` stays authoritative. This module samples the model
-path at the time the steering response is expected, then adds only a bounded share of the
-difference. `clip_curvature` downstream still owns the command's jerk, lateral-acceleration, and
-maximum-curvature envelope.
+The decoded `modelV2.action.desiredCurvature` stays authoritative. modeld already samples the plan at
+`lateralDelay + 75 ms`, so a re-sample at the live capture age moves the request by well under
+0.01 m/s^2 and is not applied. What this module adds is time-shift, read from the model's path at
+the horizon the steering responds on (`capture age + lat_delay`):
 
-Capture age and receive age are checked independently. Any stale, future-dated, malformed, or
-out-of-grid input returns the decoded action exactly; no previous correction is retained.
+- `lead`: the `MoonpilotPathSmooth` filter's own time constant. A first-order filter lags a ramp by
+  tau, so adding the planned curvature's change over the next tau (`orientationRate.z / v` at
+  `horizon + tau` minus at `horizon`) in full before the filter cancels its lag on a curvature ramp.
+- `lookahead`: the turn-in lead-in, a mean of the planned curvature over a window ahead.
 
-`LAT_SMOOTH_SECONDS` is deliberately not imported: the seam passes the already-summed delay, which
-keeps this module off modeld's import graph (modeld imports its constants).
+`clip_curvature` downstream still owns the command's jerk, lateral-acceleration, and maximum-curvature
+envelope. Capture age and receive age are checked independently. Any stale, future-dated, malformed,
+slow or out-of-grid input returns the decoded action exactly; no previous correction is retained.
 """
 
 import functools
@@ -20,16 +23,15 @@ import numpy as np
 
 from openpilot.common.params import Params
 from openpilot.common.realtime import DT_CTRL, DT_MDL
-from openpilot.selfdrive.controls.lib.drive_helpers import MIN_SPEED, get_curvature_from_plan
+from openpilot.selfdrive.controls.lib.drive_helpers import MIN_SPEED
 
-from moonpilot.features import PATH_LOOKAHEAD, PATH_PREVIEW, PATH_SMOOTH, choice, enabled
+from moonpilot.features import PATH_LOOKAHEAD, PATH_SMOOTH, choice, enabled
 
-MOONPILOT_PREVIEW_GAIN = 0.3  # share of (response-aligned path - model request) added to the command
-MOONPILOT_PREVIEW_MAX_LAT_ACCEL = 0.8  # m/s^2; ceiling on what the delta itself may ask for
 MOONPILOT_PREVIEW_MIN_SPEED = 5.0  # m/s; below this the path curvature is noise
+MOONPILOT_SMOOTH_LEAD_MAX_LAT_ACCEL = 0.8  # m/s^2; ceiling on what the smoothing lead itself may ask for
 MOONPILOT_MAX_MODEL_AGE = 2 * DT_MDL  # s; two missed 20 Hz model periods disable the correction
 MOONPILOT_SMOOTH_TAUS = (0.0, 0.05, 0.10, 0.15)  # s; first-order time constant per MoonpilotPathSmooth choice, 0 = off
-# Look-ahead per MoonpilotPathLookahead choice: (window s, gain, cap m/s^2); None = off, the single sample above.
+# Look-ahead per MoonpilotPathLookahead choice: (window s, gain, cap m/s^2); None = off.
 # The mean planned curvature over [horizon, horizon + window] may only add turn to today's request, never take
 # any away, so a turn-in starts early while the apex and the exit stay as today's: on openpilot's recorded turns
 # (routes 3f8-410) the request started 0.05/0.21/0.05 s (light), 0.15/0.39/0.19 s (medium) and 0.30/0.62/0.26 s
@@ -53,8 +55,9 @@ def _toward(desired_curvature: float, target: float, v_ego: float, gain: float, 
 
 
 def response_aligned_curvature(model, desired_curvature: float, *, v_ego: float, lat_delay: float, model_recv_time: float, now: float,
-                               model_valid: bool, lookahead: tuple[float, float, float] | None = None) -> float:
-  """Return the decoded request plus a bounded path correction, or the request unchanged. Called once per control frame."""
+                               model_valid: bool, lookahead: tuple[float, float, float] | None = None, lead: float = 0.0) -> float:
+  """Return the decoded request plus the smoothing lead and the look-ahead lead-in, or the request unchanged.
+  Called once per control frame."""
   if not model_valid:
     return desired_curvature
 
@@ -80,33 +83,42 @@ def response_aligned_curvature(model, desired_curvature: float, *, v_ego: float,
     return desired_curvature
   if not all(np.isfinite(values).all() for values in (yaws, yaw_rates, t_idxs, rate_t_idxs)):
     return desired_curvature
-  if response_horizon <= 0.0 or response_horizon > t_idxs[-1]:
+  if response_horizon <= 0.0 or response_horizon + lead > t_idxs[-1]:
     return desired_curvature
 
-  today = _toward(desired_curvature, float(get_curvature_from_plan(yaws, yaw_rates, t_idxs, v_ego, response_horizon)), v_ego,
-                  MOONPILOT_PREVIEW_GAIN, MOONPILOT_PREVIEW_MAX_LAT_ACCEL)
-  if lookahead is None or response_horizon + lookahead[0] > t_idxs[-1]:
+  today = desired_curvature
+  if lead > 0.0:
+    # The planned curvature `lead` later than at the response horizon: exactly `slope * lead` on a ramp.
+    shift = float(np.interp(response_horizon + lead, t_idxs, yaw_rates) - np.interp(response_horizon, t_idxs, yaw_rates)) / max(v_ego, MIN_SPEED)
+    limit = MOONPILOT_SMOOTH_LEAD_MAX_LAT_ACCEL / max(v_ego, MIN_SPEED) ** 2
+    today = desired_curvature + float(np.clip(shift, -limit, limit))
+  start = response_horizon + lead  # the filter lags the lead-in too
+  if lookahead is None or start + lookahead[0] > t_idxs[-1]:
     return today
   window, gain, cap = lookahead
   # The planned curvature (yaw rate / speed) averaged over the window ahead of the response: a turn coming up
   # pulls the request in early and gradually.
-  samples = np.interp(np.arange(response_horizon, response_horizon + window + 1e-9, 0.05), t_idxs, yaw_rates)
-  ahead = _toward(desired_curvature, float(np.mean(samples)) / max(v_ego, MIN_SPEED), v_ego, gain, cap)
+  samples = np.interp(np.arange(start, start + window + 1e-9, 0.05), t_idxs, yaw_rates)
+  ahead = _toward(today, float(np.mean(samples)) / max(v_ego, MIN_SPEED), v_ego, gain, cap)
   ahead = today + float(np.interp(v_ego, *MOONPILOT_LOOKAHEAD_SPEEDS)) * (ahead - today)
   # Never less turn than today's request: averaging in a turn's easing would cut its apex and let it out
   # early, and both run wide.
   return today if (ahead - today) * today < 0.0 else ahead
 
 
+def _smooth_tau(params: Params) -> float:
+  return MOONPILOT_SMOOTH_TAUS[choice(PATH_SMOOTH, params)] if enabled(PATH_SMOOTH, params) else 0.0
+
+
 def moonpilot_curvature(params: Params | None = None) -> Callable[..., float] | None:
-  """Return the response-aligned reference when enabled, with the look-ahead chosen at the same time;
-  both are fixed until restart."""
+  """Return the reference with its look-ahead and smoothing lead bound, or None when both are off;
+  fixed until restart."""
   params = params or Params()
-  if not enabled(PATH_PREVIEW, params):
+  lookahead = MOONPILOT_LOOKAHEAD[choice(PATH_LOOKAHEAD, params) if enabled(PATH_LOOKAHEAD, params) else 0]
+  lead = _smooth_tau(params)
+  if lookahead is None and lead == 0.0:
     return None
-  level = choice(PATH_LOOKAHEAD, params) if enabled(PATH_LOOKAHEAD, params) else 0
-  lookahead = MOONPILOT_LOOKAHEAD[level]
-  return functools.partial(response_aligned_curvature, lookahead=lookahead) if lookahead else response_aligned_curvature
+  return functools.partial(response_aligned_curvature, lookahead=lookahead, lead=lead)
 
 
 class PathSmooth:
@@ -117,9 +129,9 @@ class PathSmooth:
   re-injecting its pre-disengage state. A non-finite request passes through untouched with the
   state held: this stage must never be the thing that turns a good value bad.
 
-  The lag the filter adds is `tau` seconds, and controlsd folds it into the `lat_delay` both the
-  response-aligned reference and the controller time against, so enabling it does not silently
-  desynchronize the fork from its own delay bookkeeping."""
+  The filter lags by `tau`. controlsd does not add it to the controller's `lat_delay` (the request
+  buffer already holds the filtered request); `moonpilot_curvature` binds it as the reference's `lead`,
+  which time-shifts the request ahead by the same `tau` above `MOONPILOT_PREVIEW_MIN_SPEED`."""
 
   def __init__(self, tau: float, dt: float = DT_CTRL):
     self.tau = tau
@@ -139,5 +151,5 @@ class PathSmooth:
 def moonpilot_path_smooth(params: Params | None = None) -> PathSmooth | None:
   """Return the curvature request filter at the chosen tau, or None when off; fixed until restart."""
   params = params or Params()
-  tau = MOONPILOT_SMOOTH_TAUS[choice(PATH_SMOOTH, params)] if enabled(PATH_SMOOTH, params) else 0.0
+  tau = _smooth_tau(params)
   return PathSmooth(tau) if tau > 0.0 else None

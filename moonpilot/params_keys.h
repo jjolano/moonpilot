@@ -34,17 +34,14 @@
     // bounded speed band; the feature is read every frame and safety candidates
     // still win through the planner's minimum.
     {"MoonpilotCoastGrade", {PERSISTENT, BOOL, "1"}},
-    // Off by default: it aligns the model path to its capture age plus steering
-    // delay; the response gain still needs on-device validation.
-    {"MoonpilotPathPreview", {PERSISTENT, BOOL, "0"}},
     // Off by default: an index into PATH_LOOKAHEAD.choices (0 off, then light / medium / strong):
-    // the response-aligned reference averages the planned curvature over a window ahead instead of
-    // one sample; inert unless MoonpilotPathPreview is on; chosen at construction, so a restart.
+    // the turn-in lead-in from the planned curvature averaged over a window ahead; chosen at
+    // construction, so a restart.
     {"MoonpilotPathLookahead", {PERSISTENT, INT, "0"}},
     // Off by default: an index into PATH_SMOOTH.choices (0 off, then 0.05 / 0.10 / 0.15 s),
-    // the time constant of a filter on the model's curvature request before the controller —
-    // that much path lag for calmer torque steps; chosen at construction, so the row takes a
-    // restart.
+    // the time constant of a filter on the model's curvature request before the controller,
+    // led by the same time on the planned path above 5 m/s; chosen at construction, so the row
+    // takes a restart.
     {"MoonpilotPathSmooth", {PERSISTENT, INT, "0"}},
     // Off by default: an index into STEER_HYSTERESIS.choices (0 off, then 0.3 / 0.7 / 1.3 % of
     // max torque), the half-width of a backlash on the fork torque controller's output; chosen at

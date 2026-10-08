@@ -29,18 +29,11 @@ TORQUE_LATERAL = Feature(
   offroad_only=True,
 )
 
-PATH_PREVIEW = Feature(
-  key="MoonpilotPathPreview",
-  title="response-aligned steering",
-  description="Align the model path with when steering is expected to respond, using live model age and steering delay. Restart to apply.",
-  offroad_only=True,
-)
-
 PATH_LOOKAHEAD = Feature(
   key="MoonpilotPathLookahead",
   title="turn in early",
   description=(
-    "Response-aligned steering only. Above about 40 km/h, starts turns earlier by looking further along the planned path; "
+    "Above about 40 km/h, starts turns earlier by looking further along the planned path; "
     + "never steers less than without it, so it does not run wide. Stronger starts earlier and cuts more toward the inside. "
     + "Restart to apply."
   ),
@@ -52,8 +45,9 @@ PATH_SMOOTH = Feature(
   key="MoonpilotPathSmooth",
   title="smooth planner path",
   description=(
-    "Filter the model's curvature request before the controller. The time constant is the steering lag added for calmer "
-    + "torque steps: 0.05 s takes about half the steps out, 0.10 s most of the rest, 0.15 s little more. Restart to apply."
+    "Filter the model's curvature request before the controller for calmer torque steps: 0.05 s takes about half the "
+    + "steps out, 0.10 s most of the rest, 0.15 s little more. Above about 18 km/h the planned path is read that much "
+    + "further ahead, so the filter adds no steering lag there. Restart to apply."
   ),
   offroad_only=True,
   choices=("off", "0.05 s", "0.10 s", "0.15 s"),
@@ -193,7 +187,7 @@ class Group:
 STEERING = Group(
   title="steering",
   description="How openpilot moves the wheel: whose controller, when a curve is entered, and whether openpilot can steer at all.",
-  features=(LATERAL_ENGAGE, TORQUE_LATERAL, PATH_PREVIEW, PATH_LOOKAHEAD, PATH_SMOOTH, STEER_HYSTERESIS, STEER_DAMPING, TURN_DESIRE),
+  features=(LATERAL_ENGAGE, TORQUE_LATERAL, PATH_LOOKAHEAD, PATH_SMOOTH, STEER_HYSTERESIS, STEER_DAMPING, TURN_DESIRE),
 )
 
 SPEED = Group(
