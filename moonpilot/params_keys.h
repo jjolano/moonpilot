@@ -34,6 +34,10 @@
     // bounded speed band; the feature is read every frame and safety candidates
     // still win through the planner's minimum.
     {"MoonpilotCoastGrade", {PERSISTENT, BOOL, "1"}},
+    // On by default: a shallow negative ask above -0.40 m/s^2 is raised to a coast and a deeper one is
+    // held as one press, so the car's brake arbitration does not flicker the brake lights; read
+    // every frame, so it applies immediately.
+    {"MoonpilotBrakeBand", {PERSISTENT, BOOL, "1"}},
     // Off by default: an index into PATH_LOOKAHEAD.choices (0 off, then light / medium / strong):
     // the turn-in lead-in from the planned curvature averaged over a window ahead; chosen at
     // construction, so a restart.

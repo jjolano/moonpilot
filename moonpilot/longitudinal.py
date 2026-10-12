@@ -113,7 +113,8 @@ from moonpilot.curve import (
 )
 from moonpilot.pose import MOONPILOT_POSE_MAX_DT
 from moonpilot.corridor import RollingCorridor, squeeze_accel
-from moonpilot.features import COAST_GRADE, CURVE_SPEED, LEAD_LATERAL, LONGITUDINAL, MODEL_BRAKING, SQUEEZE, enabled
+from moonpilot.brake_band import BrakeBand
+from moonpilot.features import BRAKE_BAND, COAST_GRADE, CURVE_SPEED, LEAD_LATERAL, LONGITUDINAL, MODEL_BRAKING, SQUEEZE, enabled
 from moonpilot.latency import (
   MOONPILOT_LAG_BLOCKS_KEY,
   MOONPILOT_LAG_HISTORY_KEY,
@@ -1244,6 +1245,7 @@ class MoonpilotLongitudinalPlanner:
     # The curve exit ramp's ceiling on the positive ask: zero while a curve term brakes, rebuilt at
     # `MOONPILOT_CURVE_EXIT_JERK` after it lets go, `ACCEL_MAX` (inert) once rebuilt or disengaged.
     self.curve_exit_cap = ACCEL_MAX
+    self.brake_band = BrakeBand()
     self.solve_time = 0.0
 
     self.v_desired_trajectory = np.zeros(CONTROL_N)
@@ -1283,6 +1285,7 @@ class MoonpilotLongitudinalPlanner:
       self.model_braking = False
       self.model_fade = 0.0
       self.curve_exit_cap = ACCEL_MAX
+      self.brake_band.reset()
 
     # Learn the chain's lag from the command that was in effect last frame (`output_a_target` is
     # assigned at the end of this one) and the acceleration the car answered with. Gated to the frames
@@ -1530,6 +1533,16 @@ class MoonpilotLongitudinalPlanner:
       model_weight=model_weight,
     )
 
+    # The brake band shapes what the car is asked for, after the policy picked it and before the comfort ramp.
+    # It never lifts the ask over `cruise_cap`, which the policy's output already sits under through the cruise
+    # slot's `min`: with throttle denied that is the coast accel, and nothing downstream enforces `allowThrottle`
+    # — only `aTarget` reaches the car, so a raised ask there would be held on throttle while the model expects
+    # the driver off the gas.
+    if not reset_state and enabled(BRAKE_BAND, self.params) and not e2e:
+      shaped = self.brake_band.update(a_cmd, v_ego, self.dt, lead_braking(lead_states))
+      a_cmd = min(shaped, cruise_cap(v_pred, e2e, steer_angle, self.CP, accel_coast, self.allow_throttle))
+    else:
+      self.brake_band.reset()
     a_target = float(np.clip(jerk_limit(a_cmd, a_prev, self.dt, v_ego, jerk_scale, lead_braking(lead_states)), ACCEL_MIN, ACCEL_MAX))
 
     if not math.isfinite(a_target):

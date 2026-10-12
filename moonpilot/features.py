@@ -133,6 +133,17 @@ COAST_GRADE = Feature(
   offroad_only=True,
 )
 
+BRAKE_BAND = Feature(
+  key="MoonpilotBrakeBand",
+  title="no brake-light flicker",
+  description=(
+    "Above about 18 km/h a slight slowdown is done by coasting, and real braking is one firm press of at least "
+    + "a second, so the brake lights do not blink on and off. Firmer braking and anything below 18 km/h are "
+    + "unchanged. Applies immediately."
+  ),
+  offroad_only=True,
+)
+
 # No requires: `requires` gates on importable Python modules, and tailscale here is a binary.
 # There is nothing to gate either way — the supervisor installs what is missing and the settings
 # row says so while it does.
@@ -195,7 +206,7 @@ SPEED = Group(
   description="What the car does with the pedals: whose planner sets the speed, and how it reads the road ahead.",
   # The lead's lateral prediction sits here rather than with the steering because the fork reaches
   # it through the planner's time gap, not through a steering request.
-  features=(LONGITUDINAL, MODEL_BRAKING, CURVE_SPEED, SQUEEZE, PATH_OUTSIDE, COAST_GRADE, LEAD_LATERAL, SLAM),
+  features=(LONGITUDINAL, MODEL_BRAKING, CURVE_SPEED, SQUEEZE, PATH_OUTSIDE, COAST_GRADE, BRAKE_BAND, LEAD_LATERAL, SLAM),
 )
 
 DEVICE = Group(
