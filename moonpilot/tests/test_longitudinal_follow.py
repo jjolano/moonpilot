@@ -14,6 +14,7 @@ import numpy as np
 from openpilot.cereal import custom, log
 
 import moonpilot.longitudinal as longitudinal
+from moonpilot.brake_band import MOONPILOT_BRAKE_BAND_ENTER_LEAD, MOONPILOT_BRAKE_BAND_FLOOR
 from moonpilot.longitudinal import (
   MOONPILOT_APPROACH_DECEL,
   MOONPILOT_ARRIVAL_MIN_T,
@@ -394,8 +395,9 @@ class TestFollowPolicy(unittest.TestCase):
     t_follow = MOONPILOT_T_FOLLOW[int(Personality.standard)]
     v_lead = 24.0
 
-    # the decay state, and the three gates that must not let it brake
-    for v_ego, gap, expected in ((26.0, 30.0, -1.00), (25.0, 30.0, -1.00), (24.0, 30.0, 0.00), (23.5, 30.0, 0.30), (23.0, 28.0, 0.60)):
+    # the decay state, and the three gates that must not let it brake. At 25 m/s the ego is 1 m/s the
+    # faster car at 1.2 s of headway: the floor is out of it, and the coast cushion is a third in.
+    for v_ego, gap, expected in ((26.0, 30.0, -1.00), (25.0, 30.0, -0.70), (24.0, 30.0, 0.00), (23.5, 30.0, 0.30), (23.0, 28.0, 0.60)):
       with self.subTest(v_ego=v_ego, gap=gap):
         self.assertAlmostEqual(lead_accel(v_ego, gap, v_lead, 0.0, t_follow), expected, delta=1e-9)
     # a lead that is slowing keeps the brake, however the speeds compare
@@ -435,6 +437,33 @@ class TestFollowPolicy(unittest.TestCase):
       with self.subTest(excess=excess):
         self.assertLess(gated, 0.0)
         self.assertEqual(lead_accel(v_ego, gap, v_ego - excess, 0.0, t_follow), gated)
+
+  def test_a_gap_deficit_at_matched_speed_is_coasted_open_not_braked(self):
+    """Flown through 110 recorded steady follows, the settled follow swung -0.4 <-> +0.2 m/s^2 every
+    second: inside its target the regulator asked for the full approach brake, the speed floor held it
+    off only while the lead-accel estimate stayed above -0.1, and on a steady lead that estimate wanders
+    +-0.2-0.3 by noise alone, so the brake band pressed and released. Inside the target at matched speed,
+    across that noise, the ask now never reaches the band's press — its lead-urgent entry, the shallower
+    of the two; the arrival term still sheds a real 0.3 m/s of closing, as a coast. A real closing, a real
+    brake, or a headway under the floor's 1.0 s still gets the regulator's brake, and below the band's
+    speed the cushion is not there at all."""
+    t_follow = MOONPILOT_T_FOLLOW[int(Personality.standard)]
+    v = 20.0
+    gap = t_follow * v - 4.5  # 1.225 s: well inside the 1.45 s target, past the cushion's headway fade
+    for dv, a_lead in itertools.product((-0.3, 0.0, 0.3), np.arange(-0.45, 0.451, 0.05)):
+      with self.subTest(dv=dv, a_lead=a_lead):
+        ask = lead_accel(v, gap, v + dv, a_lead, t_follow)
+        self.assertGreater(ask, MOONPILOT_BRAKE_BAND_ENTER_LEAD)
+        if dv >= 0.0:
+          self.assertGreaterEqual(ask, MOONPILOT_BRAKE_BAND_FLOOR - 1e-9)  # not closing: no more than the coast
+    self.assertLess(lead_accel(v, gap, v - 1.5, 0.0, t_follow), -0.5)  # really closing
+    self.assertLess(lead_accel(v, gap, v, -1.0, t_follow), -0.5)  # really braking
+    self.assertLess(lead_accel(v, 0.95 * v, v, 0.0, t_follow), -0.5)  # under the headway floor
+    for v_low, gap_low in ((4.0, 4.5), (4.9, 7.0)):
+      with self.subTest(v_low=v_low):
+        with mock.patch.object(longitudinal, "MOONPILOT_FOLLOW_COAST_LEAD_A", [10.0, 11.0]):  # cushion never admits
+          off = lead_accel(v_low, gap_low, v_low, 0.0, t_follow)
+        self.assertEqual(lead_accel(v_low, gap_low, v_low, 0.0, t_follow), off)
 
   def test_the_arrival_term_neither_taps_at_the_target_nor_switches_on_a_far_leads_accel(self):
     """Two route 000003f8 faults of the arrival term, one per end of the approach.

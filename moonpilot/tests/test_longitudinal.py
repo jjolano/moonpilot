@@ -1208,13 +1208,16 @@ class TestPlanner(unittest.TestCase):
     resting speed a guard: floor on reads 0.0009 m/s, floor off 0.117, and the floor's own positive
     test is `test_the_gap_target_is_not_a_reason_to_brake_below_the_leads_speed`. The brake band's
     committed press holds through the lead's ease-off, so the car rests 0.13 m further back than the
-    8.79 above (8.92 m, 1.37 s; band off reads 8.79 m, peak -1.61).
+    8.79 above (8.92 m, 1.37 s; band off reads 8.79 m, peak -1.61). The follow coast cushion
+    (`MOONPILOT_FOLLOW_COAST_*`) then spends the last of the closing on a lamp-free coast instead of the
+    regulator's brake, so the approach ends at the cushion's own headway edge: 7.87 m, 1.21 s, settled
+    by about 40 s rather than 25 — the price of not pressing for the last few tenths of a m/s.
     """
-    s = _fly(17.0, 61.2, 90.0, 17.0, lambda t: -3.5 if 2 <= t < 5 else 0.0, 25.0)
+    s = _fly(17.0, 61.2, 90.0, 17.0, lambda t: -3.5 if 2 <= t < 5 else 0.0, 40.0)
     self.assertTrue(any((v - vl) > 0.0 and 4.0 <= (g - MOONPILOT_STOP_DISTANCE) / (v - vl) <= 7.0 for v, vl, g in zip(s["v"], s["vl"], s["gap"], strict=False)))
-    self.assertAlmostEqual(s["min_gap"], 8.92, delta=0.05)
+    self.assertAlmostEqual(s["min_gap"], 7.87, delta=0.05)
     self.assertAlmostEqual(s["peak"], -1.62, delta=0.05)
-    self.assertAlmostEqual(s["end_gap"], 8.92, delta=0.05)
+    self.assertAlmostEqual(s["end_gap"], 7.87, delta=0.05)
     # the resting speed is the lead's, not a little under it: that is the invariant this floor holds
     self.assertAlmostEqual(s["v"][-1], s["vl"][-1], delta=0.005)
     self.assertGreater(s["gap"][-1] / max(s["v"][-1], 0.01), MOONPILOT_FOLLOW_SPEED_FLOOR_HEADWAY_T)
