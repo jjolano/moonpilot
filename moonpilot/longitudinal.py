@@ -114,6 +114,7 @@ from moonpilot.curve import (
 from moonpilot.pose import MOONPILOT_POSE_MAX_DT
 from moonpilot.corridor import RollingCorridor, squeeze_accel
 from moonpilot.brake_band import MOONPILOT_BRAKE_BAND_FLOOR, MOONPILOT_BRAKE_BAND_MIN_SPEED, BrakeBand
+from moonpilot.engine_coast import coast_budget, engine_floor
 from moonpilot.features import BRAKE_BAND, COAST_GRADE, CURVE_SPEED, LEAD_LATERAL, LONGITUDINAL, MODEL_BRAKING, SQUEEZE, enabled
 from moonpilot.latency import (
   MOONPILOT_LAG_BLOCKS_KEY,
@@ -796,7 +797,7 @@ def arrival_accel(closing, slack, a_lead) -> float:
   return max(-(closing**2) / (2.0 * max(slack, closing * MOONPILOT_ARRIVAL_MIN_T)), -MOONPILOT_APPROACH_DECEL) + max(float(a_lead), 0.0)
 
 
-def lead_accel(v_ego, gap, v_lead, a_lead, t_follow, catch_up_accel=0.0, catch_up_coast=0.0) -> float:
+def lead_accel(v_ego, gap, v_lead, a_lead, t_follow, catch_up_accel=0.0, catch_up_coast=0.0, coast=MOONPILOT_BRAKE_BAND_FLOOR) -> float:
   """The spacing regulator and one relative-speed approach for every slower lead.
 
   The spacing regulator holds gap == max(STOP_DISTANCE, t_follow * v_ego) and matches the lead's
@@ -898,13 +899,13 @@ def lead_accel(v_ego, gap, v_lead, a_lead, t_follow, catch_up_accel=0.0, catch_u
     w_a = (a_comfort - MOONPILOT_FOLLOW_SPEED_FLOOR_MIN_A_LEAD) / MOONPILOT_FOLLOW_SPEED_FLOOR_FADE_A + 1.0
     w = min(max(w_v, 0.0), 1.0) * min(max(w_a, 0.0), 1.0)
     a_track += w * max(MOONPILOT_K_V * (v_lead_match - v_ego) - a_track, 0.0)
-  if a_track < MOONPILOT_BRAKE_BAND_FLOOR and v_ego > MOONPILOT_BRAKE_BAND_MIN_SPEED:
+  if a_track < coast and v_ego > MOONPILOT_BRAKE_BAND_MIN_SPEED:
     # the coast cushion
     headway = gap / v_ego - MOONPILOT_FOLLOW_SPEED_FLOOR_HEADWAY_T
     w = min(max(headway / MOONPILOT_FOLLOW_COAST_HEADWAY_FADE_T, 0.0), 1.0)
     w *= float(np.interp(v_ego - v_lead_eff, MOONPILOT_FOLLOW_COAST_CLOSING, [1.0, 0.0]))
     w *= float(np.interp(a_lead, MOONPILOT_FOLLOW_COAST_LEAD_A, [0.0, 1.0]))
-    a_track += w * (MOONPILOT_BRAKE_BAND_FLOOR - a_track)
+    a_track += w * (coast - a_track)
   a_track = crawl_accel(a_track, v_ego, v_lead, a_lead)
   a_track = departure_crawl(a_track, v_ego, v_lead, a_lead)
   a_track = soft_stop(a_track, v_ego, gap, v_lead_eff)
@@ -1143,8 +1144,12 @@ def policy(
       if needed > 0.0:
         a_cruise = min(a_cruise, float(np.interp(runway, [needed, needed + target], [slow, a_open])))
   lead_asks = []
+  engine = engine_floor(CP, v_ego)  # moonpilot/engine_coast.py; None leaves the default
+  floor = MOONPILOT_BRAKE_BAND_FLOOR if engine is None else engine
   for source, gap, v_lead, a_lead in leads:
-    ask = lead_accel(v_ego, gap, v_lead, a_lead, t_follow, catch_up, MOONPILOT_CATCH_UP_COAST_FRACTION * coast)
+    ask = lead_accel(v_ego, gap, v_lead, a_lead, t_follow, catch_up, MOONPILOT_CATCH_UP_COAST_FRACTION * coast, floor)
+    if engine is not None:
+      ask = coast_budget(ask, v_ego, gap, v_lead, a_lead, engine, MOONPILOT_APPROACH_DECEL, MOONPILOT_FOLLOW_SPEED_FLOOR_HEADWAY_T, MOONPILOT_STOP_DISTANCE)
     if (
       v_lead < v_ego <= MOONPILOT_LEAD_COAST_MAX_V
       and gap <= MOONPILOT_LEAD_COAST_MAX_GAP
@@ -1526,7 +1531,8 @@ class MoonpilotLongitudinalPlanner:
     # — only `aTarget` reaches the car, so a raised ask there would be held on throttle while the model expects
     # the driver off the gas.
     if not reset_state and enabled(BRAKE_BAND, self.params) and not e2e:
-      shaped = self.brake_band.update(a_cmd, v_ego, self.dt, lead_braking(lead_states))
+      engine = engine_floor(self.CP, v_ego)
+      shaped = self.brake_band.update(a_cmd, v_ego, self.dt, lead_braking(lead_states), MOONPILOT_BRAKE_BAND_FLOOR if engine is None else engine)
       a_cmd = min(shaped, cruise_cap(v_pred, e2e, steer_angle, self.CP, accel_coast, self.allow_throttle))
     else:
       self.brake_band.reset()

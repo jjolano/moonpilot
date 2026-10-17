@@ -144,6 +144,17 @@ BRAKE_BAND = Feature(
   offroad_only=True,
 )
 
+ENGINE_COAST = Feature(
+  key="MoonpilotEngineCoast",
+  title="engine-braking coast (test)",
+  description=(
+    "Above about 18 km/h a slowdown down to the engine's own coast is done without the brakes, so following a "
+    + "lead lights the brake lights far less. Untested on the road: watch that the car still slows as asked. "
+    + "Toyota openpilot-longitudinal only. Takes effect after a restart."
+  ),
+  offroad_only=True,
+)
+
 # No requires: `requires` gates on importable Python modules, and tailscale here is a binary.
 # There is nothing to gate either way — the supervisor installs what is missing and the settings
 # row says so while it does.
@@ -206,7 +217,7 @@ SPEED = Group(
   description="What the car does with the pedals: whose planner sets the speed, and how it reads the road ahead.",
   # The lead's lateral prediction sits here rather than with the steering because the fork reaches
   # it through the planner's time gap, not through a steering request.
-  features=(LONGITUDINAL, MODEL_BRAKING, CURVE_SPEED, SQUEEZE, PATH_OUTSIDE, COAST_GRADE, BRAKE_BAND, LEAD_LATERAL, SLAM),
+  features=(LONGITUDINAL, MODEL_BRAKING, CURVE_SPEED, SQUEEZE, PATH_OUTSIDE, COAST_GRADE, BRAKE_BAND, ENGINE_COAST, LEAD_LATERAL, SLAM),
 )
 
 DEVICE = Group(

@@ -38,6 +38,9 @@
     // held as one press, so the car's brake arbitration does not flicker the brake lights; read
     // every frame, so it applies immediately.
     {"MoonpilotBrakeBand", {PERSISTENT, BOOL, "1"}},
+    // Off by default, a test toggle: Toyota PERMIT_BRAKING is held off while the request stays at the
+    // engine's own coast, and the planner coasts to it; set into CarParams at card start, so restart.
+    {"MoonpilotEngineCoast", {PERSISTENT, BOOL, "0"}},
     // Off by default: an index into PATH_LOOKAHEAD.choices (0 off, then light / medium / strong):
     // the turn-in lead-in from the planned curvature averaged over a window ahead; chosen at
     // construction, so a restart.

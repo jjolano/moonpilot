@@ -45,8 +45,10 @@ class BrakeBand:
     self.held = 0.0
     self.above = 0.0
 
-  def update(self, a_cmd: float, v_ego: float, dt: float, urgent: bool = False) -> float:
-    """`urgent`: a lead is slowing, so the press commits from `ENTER_LEAD` instead of `ENTER`."""
+  def update(self, a_cmd: float, v_ego: float, dt: float, urgent: bool = False, floor: float = MOONPILOT_BRAKE_BAND_FLOOR) -> float:
+    """`urgent`: a lead is slowing, so the press commits from `ENTER_LEAD` instead of `ENTER`. `floor`: the
+    lamp-free coast; every threshold moves with it (`moonpilot/engine_coast.py`)."""
+    shift = floor - MOONPILOT_BRAKE_BAND_FLOOR
     if v_ego < MOONPILOT_BRAKE_BAND_MIN_SPEED or not math.isfinite(a_cmd):
       self.reset()
       return a_cmd
@@ -54,13 +56,13 @@ class BrakeBand:
       self.held += dt
       # The policy's ask is not rate-limited and jitters by hundredths a frame: one frame over the release
       # is not the need ending, and letting go on it re-lit the lamps 0.2 s later on route 0000042b.
-      self.above = self.above + dt if a_cmd > MOONPILOT_BRAKE_BAND_RELEASE else 0.0
+      self.above = self.above + dt if a_cmd > MOONPILOT_BRAKE_BAND_RELEASE + shift else 0.0
       if a_cmd >= 0.0 or (self.held >= MOONPILOT_BRAKE_BAND_MIN_PRESS_T and self.above >= MOONPILOT_BRAKE_BAND_RELEASE_T - 1e-9):
         self.reset()
       else:
-        return min(a_cmd, MOONPILOT_BRAKE_BAND_HOLD)
-    if a_cmd < (MOONPILOT_BRAKE_BAND_ENTER_LEAD if urgent else MOONPILOT_BRAKE_BAND_ENTER):
+        return min(a_cmd, MOONPILOT_BRAKE_BAND_HOLD + shift)
+    if a_cmd < (MOONPILOT_BRAKE_BAND_ENTER_LEAD if urgent else MOONPILOT_BRAKE_BAND_ENTER) + shift:
       self.pressing = True
-      return min(a_cmd, MOONPILOT_BRAKE_BAND_HOLD)
-    return max(a_cmd, MOONPILOT_BRAKE_BAND_FLOOR) if a_cmd < 0.0 else a_cmd
+      return min(a_cmd, MOONPILOT_BRAKE_BAND_HOLD + shift)
+    return max(a_cmd, floor) if a_cmd < 0.0 else a_cmd
 

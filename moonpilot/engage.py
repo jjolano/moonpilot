@@ -105,7 +105,7 @@ from openpilot.cereal import log
 from openpilot.common.params import Params
 from openpilot.selfdrive.selfdrived.events import ET
 
-from moonpilot.features import LATERAL_ENGAGE, LONGITUDINAL, TORQUE_LATERAL, Feature, enabled
+from moonpilot.features import ENGINE_COAST, LATERAL_ENGAGE, LONGITUDINAL, TORQUE_LATERAL, Feature, enabled
 
 ButtonType = car.CarState.ButtonEvent.Type
 GearShifter = car.CarState.GearShifter
@@ -214,9 +214,10 @@ def car_unavailable_reason(feature: Feature, CP) -> str | None:
   than as a per-feature branch inside both panel files. `ui_state.CP` is None until carParams
   arrives offroad, which reads as "say nothing".
 
-  Three features have a reason, and only the first of them is a safety gate. `LATERAL_ENGAGE`'s is
+  Four features have a reason, and only the first of them is a safety gate. `LATERAL_ENGAGE`'s is
   the same `_unsupported_reason(CP)` `_available` reads, so the row and the behavior cannot
-  disagree. `TORQUE_LATERAL`'s and `LONGITUDINAL`'s are panel-facing only — nothing gates behavior
+  disagree. `ENGINE_COAST`'s is also the gate `moonpilot_engage_safety_param` reads before it flags
+  the car. `TORQUE_LATERAL`'s and `LONGITUDINAL`'s are panel-facing only — nothing gates behavior
   on them — because a car outside their seam's dispatch is a car the seam never runs on: the
   feature is inert there, not gated.
   """
@@ -228,16 +229,23 @@ def car_unavailable_reason(feature: Feature, CP) -> str | None:
     return "torque-steered cars only"
   if feature is LONGITUDINAL and not CP.openpilotLongitudinalControl:
     return "openpilot-longitudinal cars only"
+  if feature is ENGINE_COAST and not (CP.brand == "toyota" and CP.openpilotLongitudinalControl):
+    return "Toyota openpilot-longitudinal only"
   return None
 
 
 def moonpilot_engage_safety_param(CP, params: Params | None = None) -> None:
-  """The car side of the panda permission: the safety param the forked safety layer reads.
+  """The fork's CarParams hook: the safety param the forked safety layer reads, and the engine-coast
+  flag the forked Toyota carcontroller reads (`opendbc/car/moonpilot/engine_coast.py`).
 
   Called by card after the passive/dashcam handling and before `CarParams` is written, which is
-  the only window where the param can still change — panda and selfdrived both read it from there.
+  the only window where either can still change — panda, selfdrived, plannerd and the car's own
+  controller (which holds this same CarParams object) all read them from there.
   """
-  if not (_available(CP) and enabled(LATERAL_ENGAGE, params or Params())):
+  params = params or Params()
+  if car_unavailable_reason(ENGINE_COAST, CP) is None and enabled(ENGINE_COAST, params):
+    CP.flags |= int(ToyotaFlags.MOONPILOT_ENGINE_COAST)
+  if not (_available(CP) and enabled(LATERAL_ENGAGE, params)):
     return
   # A car with more than one safety config is not a config the fork knows how to flag, and a
   # partial flag would put openpilot and panda out of agreement. Leave it alone.
