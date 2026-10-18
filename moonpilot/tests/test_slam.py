@@ -95,7 +95,7 @@ class TestWindow(unittest.TestCase):
         corr = _window(_straight(time.monotonic(), v_ego=wheel, trans_x=truth)).update()
         self.assertTrue(corr["valid"])
         applied = wheel + corr["dVel"]
-        self.assertLessEqual(abs(applied - truth), abs(wheel - truth))  # never worse than the wheel
+        self.assertLessEqual(abs(applied - truth), abs(wheel - truth) + 1e-9)  # never worse than the wheel (to float rounding)
         if bias == 0.0:
           self.assertLess(abs(applied - truth), 0.05)  # and an honest wheel speed costs nothing
 

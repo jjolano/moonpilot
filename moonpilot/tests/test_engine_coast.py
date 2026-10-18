@@ -10,6 +10,7 @@ from opendbc.car.toyota.interface import CarInterface
 from opendbc.car.toyota.values import CAR, ToyotaFlags
 
 from moonpilot.engage import car_unavailable_reason, moonpilot_engage_safety_param
+from moonpilot.engine_coast import MOONPILOT_ENGINE_COAST_LEAD_T, coast_margin
 from moonpilot.features import ENGINE_COAST
 from moonpilot.longitudinal import MOONPILOT_COASTING_BP, MOONPILOT_COASTING_V, MoonpilotLongitudinalPlanner
 from moonpilot.tests.fakes import _params
@@ -57,6 +58,28 @@ class TestEngineCoast(unittest.TestCase):
 
   def test_both_sides_read_the_drivers_measured_coast(self):
     np.testing.assert_allclose(ENGINE_COAST_V, np.interp(ENGINE_COAST_BP, MOONPILOT_COASTING_BP, MOONPILOT_COASTING_V))
+
+  def test_the_headway_check_holds_at_every_moment_of_the_coast(self):
+    """The margin is the minimum over the whole coast, not its end points: at 1 m/s of closing and
+    20.65 m the speed-match point clears the 1.0 s floor by 0.13 m while the gap dips 0.03 m under it
+    at 2.03 s. Checked against a dense simulation over random follows."""
+    self.assertAlmostEqual(coast_margin(20.0, 20.65, 19.0, 0.0, -0.33, 1.0, 6.0), -0.0302, delta=1e-3)
+    rng = np.random.default_rng(0)
+    dt = 1e-3
+    for _ in range(300):
+      v_ego, v_lead = rng.uniform(5, 30), rng.uniform(0, 30)
+      gap, a_lead, coast = rng.uniform(3, 60), rng.uniform(-3, 0.5), rng.uniform(-0.4, -0.1)
+      ve, vl, g, t, worst = v_ego, v_lead, gap, 0.0, np.inf
+      while True:
+        worst = min(worst, g - max(ve, 6.0))
+        if t >= MOONPILOT_ENGINE_COAST_LEAD_T and ve <= vl:
+          break
+        vl_next = max(vl + (min(a_lead, 0.0) if t < MOONPILOT_ENGINE_COAST_LEAD_T else 0.0) * dt, 0.0)
+        ve_next = ve + coast * dt
+        g += 0.5 * (vl + vl_next - ve - ve_next) * dt
+        ve, vl, t = ve_next, vl_next, t + dt
+      with self.subTest(state=(v_ego, gap, v_lead, a_lead, coast)):
+        self.assertAlmostEqual(coast_margin(v_ego, gap, v_lead, a_lead, coast, 1.0, 6.0), worst, delta=0.02)
 
   def test_card_flags_only_a_toyota_on_openpilot_longitudinal_with_the_toggle(self):
     for brand, op_long, toggle, flagged in (

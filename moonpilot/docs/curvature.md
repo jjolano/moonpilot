@@ -16,6 +16,8 @@
   | 0.10 s | 75 ms | 25 ms | 3.1 → 3.2 | 32.8 → 25.8 mm/s² |
   | 0.15 s | 117 ms | 26 ms | 2.7 → 2.9 | 43.7 → 31.5 mm/s² |
 
+  `python -m moonpilot.lab smooth` reproduces the lag columns over the same four routes. The table used the cross-correlation peak. The lab instead uses the shift that minimizes the RMS difference over all pooled steering frames, and reads 40 / 83 / 124 ms without a lead and 13 / 20 / 23 ms with lead τ.
+
   The remaining lag is the model re-planning faster than its own path predicts. Scaling the lead past τ chased it down (1.5–2 × τ reached ~0–11 ms) but tracked the action worse at every scale tried — rms deviation 20.5–26.2 / 28.1–40.4 / 34.7–52.4 mm/s², all above lead τ's and at 2 × τ above the unled filter's — and at 0.10–0.15 s its lag spread went negative by tens of ms, so the lead stays at τ. Below 5 m/s the reference passes through and the filter lags by its full τ. On `00000408--9c6c861389` (filter applied to the logged request, wheel response held as recorded), the P-term's per-frame step RMS at <3 / 3–9 / ≥9 m/s fell from 169 / 65 / 13 CAN units to 68 / 33 / 7 at 0.05 s, 52 / 27 / 6 at 0.10 s and 49 / 25 / 6 at 0.15 s — most of the benefit by 0.10 s. `TestSmoothFactory`, `TestPathSmooth` and `TestSmoothingLead` pin it.
 
 ## Continuous torque friction compensation

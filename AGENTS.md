@@ -372,6 +372,7 @@ Last 2000 upstream commits, per seam file: `pyproject.toml` (391) moves almost w
 ## Working here
 
 - `tools/op.sh build | lint | test [target]` — build, lint, test. `tools/op.sh --help` lists the rest.
+- Offline replay claims go through `moonpilot/lab.py` (`python -m moonpilot.lab torque|smooth`): it extracts rlogs from `.cache/moonpilot-logs` into a derived cache, replays them through the fork code as it is now, and prints the metric beside a replay-vs-logged p99 error. A nonzero error means the drive ran different code or settings, not that the replay is wrong: routes before `d8b15bd1b` counted `MoonpilotPathSmooth`'s τ into the controller delay, so 40d replays exactly at `--delay-offset 0.10` and 40e at `0.05`. Add a claim as a route set in `ROUTE_SETS` plus a subcommand. The extracts hold only what the replays read, so keep the rlogs.
 - A dev PC without AVX2 (e.g. Celeron N5105) dies with `SIGILL` in the longitudinal MPC: comma's x86 `comma-deps-acados` wheel ships a Haswell-only `libblasfeo.so`. `moonpilot/blasfeo_portable.sh` rebuilds it as portable C from the blasfeo revision the wheel pins and swaps it into the venv and `c_generated_code/`; rerun after any reinstall of that wheel. Device builds (aarch64) are unaffected.
 - UI is Python + raylib; tizi (`openpilot/selfdrive/ui/layouts/`) and mici (`openpilot/selfdrive/ui/mici/layouts/`) are separate trees — a fork panel is registered in both.
 - Tests run through a unittest loader (`tools/test_runner.py`), so fork tests subclass `unittest.TestCase`.

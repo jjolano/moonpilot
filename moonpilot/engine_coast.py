@@ -10,8 +10,8 @@ raised to it whenever coasting there provably keeps the floor headway until spee
 (`coast_budget`). Off, or on any other car, the planner is bit-identical to the default.
 
 Measured on the PC, assuming the car meets the engine coast without brakes — which only a drive can
-show: steady follows (114 recorded, flown) 3.7 -> 0.6 lamp presses a minute, mild lead slowdowns
-(57 recorded) lamp-free in 22 rather than 3, with the lowest gap, TTC and headway of 137 recorded
+show: steady follows (114 recorded, flown) 3.7 -> 0.3 lamp presses a minute, mild lead slowdowns
+(57 recorded) lamp-free in 24 rather than 3, with the lowest gap, TTC and headway of 137 recorded
 slowdowns unchanged. The budget only pays at this depth: at the -0.10 coast it split presses
 (91 -> 110 on the mild slowdowns), which is why the default mode does not use it.
 """
@@ -28,21 +28,35 @@ def engine_floor(CP, v_ego: float) -> float | None:
   return engine_coast_floor(v_ego)
 
 
+def _quad_min(c0, c1, c2, T) -> float:
+  """Minimum of c0 + c1 t + c2 t^2 over [0, T]: the end points, and the vertex when it is inside."""
+  m = min(c0, c0 + c1 * T + c2 * T * T)
+  if c2 > 0.0 and 0.0 < -c1 / (2.0 * c2) < T:
+    m = min(m, c0 - c1 * c1 / (4.0 * c2))
+  return m
+
+
 def coast_margin(v_ego, gap, v_lead, a_lead, coast, headway_t, stop_distance) -> float:
-  """Meters a coast at `coast` leaves above max(headway_t * v, stop_distance) once speeds match,
-  with the lead's braking held for `MOONPILOT_ENGINE_COAST_LEAD_T` and constant after; negative
-  means the floor is crossed. Closed form, two phases."""
+  """The least meters a coast at `coast` keeps above max(headway_t * v_ego, stop_distance) at any
+  moment until speeds match — now included — with the lead's braking held for
+  `MOONPILOT_ENGINE_COAST_LEAD_T` and constant after; negative means the floor is crossed. In each
+  phase the gap is quadratic and the floor linear in time, so the minimum is exact."""
   decel = -coast
   a_l = min(float(a_lead), 0.0)
   t1 = MOONPILOT_ENGINE_COAST_LEAD_T if v_lead + a_l * MOONPILOT_ENGINE_COAST_LEAD_T >= 0.0 else v_lead / -a_l
-  ve1 = max(v_ego - decel * t1, 0.0)
-  vl1 = max(v_lead + a_l * t1, 0.0)
-  g1 = gap - ((v_ego - v_lead) * t1 + 0.5 * (-decel - a_l) * t1 * t1)
-  margin = g1 - max(headway_t * ve1, stop_distance)
-  closing = ve1 - vl1
+  r0 = v_ego - v_lead
+  # phase 1: gap(t) = gap - r0 t + (a_l + decel) t^2 / 2, ego speed v_ego - decel t
+  c2 = 0.5 * (a_l + decel)
+  margin = min(_quad_min(gap - headway_t * v_ego, -r0 + headway_t * decel, c2, t1), _quad_min(gap - stop_distance, -r0, c2, t1))
+  g1 = gap - r0 * t1 + c2 * t1 * t1
+  ve1 = v_ego - decel * t1
+  closing = ve1 - max(v_lead + a_l * t1, 0.0)
   if closing <= 0.0:
     return margin
-  return min(margin, g1 - closing * closing / (2.0 * decel) - max(headway_t * vl1, stop_distance))
+  # phase 2, lead at constant speed until the ego matches it: gap(s) = g1 - closing s + decel s^2 / 2
+  t2 = closing / decel
+  return min(margin, _quad_min(g1 - headway_t * ve1, -closing + headway_t * decel, 0.5 * decel, t2),
+             _quad_min(g1 - stop_distance, -closing, 0.5 * decel, t2))
 
 
 def coast_budget(ask, v_ego, gap, v_lead, a_lead, coast, approach_decel, headway_t, stop_distance) -> float:
