@@ -15,6 +15,7 @@ from openpilot.cereal.services import SERVICE_LIST
 from opendbc.car.car_helpers import interfaces
 from opendbc.car.structs import car
 from openpilot.common.constants import CV
+from openpilot.common.realtime import DT_CTRL
 from openpilot.tools.lib.logreader import LogReader
 from moonpilot.longitudinal import MoonpilotLongitudinalPlanner
 from moonpilot.longcontrol import MoonpilotLongControl
@@ -23,6 +24,7 @@ from moonpilot.lab import DEFAULT_ROOT, cached, drive_config, expand, runs
 EXTRACT_VERSION = 2
 LAMP_VERSION = 1
 LAMP_ADDRESS = 0x320  # VSC1S07: the skid-control ECU's own frame, where BRKON is the brake-lamp proxy
+CONTROL_VERSION = 1  # one row per carControl frame: the rate the acceleration controller is written for
 ROUTE_SETS = {
   # Engaged local drives. 0000042c/42d/42e have zero longActive frames and are skipped by the commands.
   "longitudinal": ("000003f8", "000003fe", "00000400", "00000401", "00000408", "0000040d", "0000040e", "00000410", "00000414", "0000043e", "0000043f"),
@@ -428,28 +430,92 @@ def _rolling_exits(args):
       print(f"  release t={at:.1f}s peak={peak:.3f} rise={rise:.3f} m/s^3")
 
 
+def _control_build(segs):
+  """One row per carControl frame: the tick rate the acceleration controller is written for (`DT_CTRL`).
+
+  Everything else is the newest logged message controlsd had at that tick, so a rate-based controller
+  (`MoonpilotLongControl`'s jerk ramps and PID) sees the inputs and the cadence it was tuned at."""
+  cp, latest = b"", {}
+  rows = []
+  for msg in LogReader(segs, sort_by_time=True):
+    kind = msg.which()
+    if kind == "carParams":
+      cp = msg.carParams.as_builder().to_bytes()
+    elif kind == "carState":
+      cs = msg.carState
+      latest[kind] = (cs.vEgo, cs.aEgo, cs.standstill, cs.cruiseState.standstill, cs.brakePressed, cs.gasPressed, cs.vCruise)
+    elif kind == "longitudinalPlan":
+      latest[kind] = (msg.longitudinalPlan.aTarget, msg.longitudinalPlan.shouldStop)
+    elif kind == "carControl":
+      cc = msg.carControl
+      if cp and all(k in latest for k in ("carState", "longitudinalPlan")):
+        rows.append((int(msg.logMonoTime), float(cc.longActive), float(cc.actuators.accel), *latest["longitudinalPlan"], *latest["carState"]))
+  if not rows:
+    raise ValueError("no complete control frames or carParams")
+  cols = np.asarray(rows, dtype=float).T
+  keys = ("t", "long_active", "accel", "a_target", "should_stop", "v_ego", "a_ego", "standstill", "cruise_standstill",
+          "brake_pressed", "gas_pressed", "v_cruise")
+  d = dict(zip(keys, cols, strict=True))
+  for k in ("long_active", "should_stop", "standstill", "cruise_standstill", "brake_pressed", "gas_pressed"):
+    d[k] = d[k].astype(bool)
+  d["cp"] = np.frombuffer(cp, dtype=np.uint8)
+  return d
+
+
+def extract_control(route: str, root: str = DEFAULT_ROOT) -> dict[str, np.ndarray]:
+  return cached(route, "control", CONTROL_VERSION, root, _control_build)
+
+
+def control_rate_dt(t_ns: np.ndarray) -> float:
+  """The median spacing of control frames, refusing anything that is not the rate the controller is written for.
+
+  A rate-based controller replayed at the wrong tick rate is a different controller: its jerk ramps and its
+  integrator advance per call, so a 20 Hz feed is one fifth the accel change per second. Fail loudly instead."""
+  if len(t_ns) < 10:
+    raise ValueError(f"only {len(t_ns)} control frames: too few to replay a rate-based controller")
+  dt = float(np.median(np.diff(t_ns)) * 1e-9)
+  if abs(dt - DT_CTRL) > 0.25 * DT_CTRL:
+    raise ValueError(f"control frames are {1e3 * dt:.1f} ms apart, not {1e3 * DT_CTRL:.0f} ms: this is not the control rate")
+  return dt
+
+
 def _longcontrol(args):
+  """The acceleration controller on the drive's own control ticks: the same `CI.get_pid_accel_limits` call controlsd
+  makes (nothing in cereal logs the limits), the logged plan and `carState`, and the logged accel as the reference."""
   for route in expand(args.routes, ROUTE_SETS):
     commit, _ = drive_config(route, args.root)
+    c = extract_control(route, args.root)
+    dt = control_rate_dt(c["t"])
+    d = extract(route, args.root)
     details = []
-    driven, logged, active, _ = replay(route, extract(route, args.root), args.root, details_out=details)
-    if _skip_no_engaged(route, active):
+    replayed, _, active, _ = replay(route, d, args.root, details_out=details)
+    if not active.any():
+      print(f"{route}: no longActive frames, skipping")
       continue
-    d = _details_arrays(details)
-    cp = messaging.log_from_bytes(extract(route, args.root)["cp"].tobytes(), car.CarParams)
+    plan = _details_arrays(details)
+    # The replayed plan, held at the value the planner last published, on the control ticks.
+    held = np.clip(np.searchsorted(plan["t"], c["t"] * 1e-9, side="right") - 1, 0, len(replayed) - 1)
+    cp = messaging.log_from_bytes(d["cp"].tobytes(), car.CarParams)
     ci = interfaces[cp.carFingerprint](cp)
-    loc = MoonpilotLongControl(cp)
-    out = np.zeros(len(driven))
-    for i in range(len(out)):
-      cs = SimpleNamespace(vEgo=float(d["v_ego"][i]), aEgo=float(d["a_ego"][i]), vCruise=float(d["v_cruise"][i]),
-                           brakePressed=bool(d["brake_pressed"][i]), gasPressed=bool(d["gas_pressed"][i]),
-                           cruiseState=SimpleNamespace(standstill=bool(d["cruise_standstill"][i])))
-      limits = ci.get_pid_accel_limits(cp, cs.vEgo, cs.vCruise * CV.KPH_TO_MS)
-      out[i] = loc.update(bool(d["long_active"][i]), cs, float(driven[i]), bool(d["replay_should_stop"][i]), limits)
-    mask = active & np.isfinite(d["logged_accel"])
-    err = float(np.percentile(np.abs(out[mask] - d["logged_accel"][mask]), 95))
-    plan_err = float(np.percentile(np.abs(driven[mask] - d["logged_a_target"][mask]), 95))
-    print(f"{route}: commit {commit}, longcontrol replay-vs-logged p95 {err:.4f}, plan p95 {plan_err:.4f}, frames {mask.sum()}")
+    out_logged, out_replayed = np.zeros(len(c["t"])), np.zeros(len(c["t"]))
+    for target, out in ((c["a_target"], out_logged), (replayed[held], out_replayed)):
+      loc = MoonpilotLongControl(cp)
+      for i in range(len(out)):
+        cs = SimpleNamespace(vEgo=float(c["v_ego"][i]), aEgo=float(c["a_ego"][i]), vCruise=float(c["v_cruise"][i]),
+                             standstill=bool(c["standstill"][i]), brakePressed=bool(c["brake_pressed"][i]),
+                             gasPressed=bool(c["gas_pressed"][i]), cruiseState=SimpleNamespace(standstill=bool(c["cruise_standstill"][i])))
+        limits = ci.get_pid_accel_limits(cp, cs.vEgo, cs.vCruise * CV.KPH_TO_MS)
+        if not c["long_active"][i]:
+          loc.reset()  # controlsd's own line, so the integrator does not carry across a disengagement
+        out[i] = loc.update(bool(c["long_active"][i]), cs, float(target[i]), bool(c["should_stop"][i]), limits)
+    mask = c["long_active"] & np.isfinite(c["accel"])
+    err_logged = float(np.percentile(np.abs(out_logged[mask] - c["accel"][mask]), 95))
+    err_replayed = float(np.percentile(np.abs(out_replayed[mask] - c["accel"][mask]), 95))
+    plan_err = float(np.percentile(np.abs(replayed[active] - plan["logged_a_target"][active]), 95))
+    print(f"{route}: commit {commit}, control frames {mask.sum()} at {1e3 * dt:.1f} ms;")
+    print(f"  controller p95 vs logged accel: on the logged plan {err_logged:.4f} (isolates the controller),"
+          + f" on the replayed plan {err_replayed:.4f} m/s^2 (that plus the planner's own {plan_err:.4f})")
+
 
 
 def register(sub):
