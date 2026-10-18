@@ -5,7 +5,9 @@ Phase 1 of the true-SLAM path (`moonpilot/docs/slam-spike.md`). Short-horizon po
 dead-reckons the body at 20 Hz (wheel speed forward, VO lateral and yaw) and soft-corrects
 position against a GPS fix whenever one clears the gate. Nothing here is in the control path:
 `moonpilot/leadd.py` fills `moonpilotState.egoPose` from this tracker when `MoonpilotSlam` is on,
-and a replay can score chained-pose RMSE against LLK the way `test_slam.py` scores speed.
+and a replay can score chained-pose RMSE against LLK the way `test_slam.py` scores speed
+(`python -m moonpilot.lab pose`; the drives in this checkout's cache carry qcom `gpsLocation` and no
+`gpsLocationExternal`/LLK, so there it scores against that, 9.3 / 6.2 m chained RMSE on 43f/43e).
 
 Four things that are not obvious:
 
@@ -37,7 +39,8 @@ import math
 
 R_EARTH = 6378137.0  # m; WGS84 equatorial radius, same constant the spike used
 
-# Fork-owned tuning. Tune by replaying a route and watching chained RMSE against LLK.
+# Fork-owned tuning. Tune by replaying a route and watching chained RMSE against LLK
+# (`python -m moonpilot.lab pose`; the cached drives carry gpsLocation only).
 MOONPILOT_POSE_MAX_HACC = 15.0  # m; worse than this is not a gate we trust. 0 passes as unknown.
 MOONPILOT_POSE_GATE_RADIUS = 50.0  # m; reject a fix this far from the dead-reckon as an outlier
 MOONPILOT_POSE_GPS_ALPHA = 0.25  # per-fix blend toward GPS ENU; 1 Hz ≈ 4 s time constant

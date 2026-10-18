@@ -33,16 +33,18 @@ MOONPILOT_MAX_MODEL_AGE = 2 * DT_MDL  # s; two missed 20 Hz model periods disabl
 MOONPILOT_SMOOTH_TAUS = (0.0, 0.05, 0.10, 0.15)  # s; first-order time constant per MoonpilotPathSmooth choice, 0 = off
 # Look-ahead per MoonpilotPathLookahead choice: (window s, gain, cap m/s^2); None = off.
 # The mean planned curvature over [horizon, horizon + window] may only add turn to today's request, never take
-# any away, so a turn-in starts early while the apex and the exit stay as today's: on openpilot's recorded turns
-# (routes 3f8-410) the request started 0.05/0.21/0.05 s (light), 0.15/0.39/0.19 s (medium) and 0.30/0.62/0.26 s
-# (strong) earlier at 5-10/10-17/>17 m/s with every turn's apex at 100% of today's (p10 included) and no outward
-# drift at the median. Unrestricted, the same averages cut the apex to 82-96% and let turns out early -- running
-# wide. The cost is a turn-in that begins inside the lane: 0.5-1.1 / 1.0-2.2 / 1.1-3.1 m median open-loop,
-# before the model's own re-planning. None makes highway builds lighter: the controller adds that abruptness.
+# any away, so a turn-in starts early while the apex and the exit stay as today's: replayed on the recorded turns
+# of routes 3f8-410 (python -m moonpilot.lab lookahead) the request started 0.00/0.10/0.12 s (light), 0.00/0.20/0.20 s
+# (medium) and 0.00/0.35/0.24 s (strong) earlier at 5-10/10-17/>17 m/s with every turn's apex at 100% of today's (p10
+# included) and no outward drift at the median; the 5-10 column is after the fade below. Unrestricted, the same
+# averages cut the apex to 82-96% and let turns out early -- running wide; that is the pre-guard variant, which this
+# checkout can no longer run. The cost is a turn-in that begins inside the lane: 0.4-0.6 / 0.8-1.2 / 1.1-1.5 m median
+# open-loop, before the model's own re-planning. None makes highway builds lighter: the controller adds that abruptness.
 MOONPILOT_LOOKAHEAD: tuple[tuple[float, float, float] | None, ...] = (None, (1.0, 0.3, 0.8), (1.0, 0.6, 1.5), (1.5, 0.6, 1.5))
 # Below about 36 km/h, residential corners and intersections, an early turn-in is a cut toward the inside -- the curb
-# on a right turn -- for little lead (0.05-0.30 s at 5-10 m/s). Faded out there: at 5-10 m/s the lead-in's median
-# open-loop inside drift fell from 0.8-2.0 m to 0.07-0.15 m, and the 10-17 and >17 m/s leads were unchanged.
+# on a right turn -- for little lead (up to ~0.1 s of median lead at 5-10 m/s, unfaded). Faded out there: at 5-10 m/s
+# the lead-in's median open-loop inside drift fell from 0.2-0.5 m with the fade disabled to 0.00 m, and the 10-17 and
+# >17 m/s leads were unchanged.
 MOONPILOT_LOOKAHEAD_SPEEDS = ([8.0, 12.0], [0.0, 1.0])  # m/s: none below 8, full from 12
 
 

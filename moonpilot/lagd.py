@@ -8,9 +8,11 @@ The identification is `LateralLagEstimator` itself: same signal pair (`desiredCu
 measured defect of the stock learner on this car:
 
 - **Speed gate 10 m/s, not 50 mph.** Stock learns only above 22.35 m/s and applies the one number at
-  every speed. Replayed over routes 000003f3…0000040a (stock estimator, gated per band), the delay is
-  flat where it can be measured: 0.39 s at 10–17 m/s, 0.36 at 17–22, 0.40 above. Below 10 m/s too few
-  windows clear the gates to say anything, so the gate stops there.
+  every speed. Replayed over routes 000003f3…0000040a (stock estimator, gated per band,
+  `python -m moonpilot.lab lagd-bands`), the delay is flat where it can be measured: 0.40 s over the
+  three blocks the 10–17 m/s band completes and 0.36 over the 11 blocks at 17–22; above 22 m/s no
+  block completes on those routes, and below 10 m/s too few windows clear the gates to say anything,
+  so the gate stops there.
 - **A 10-block ring, not 50.** A completed block weighs 1/(valid blocks), 1/50 at steady state, and
   highway blocks are rare: those routes earned one, moving the applied value 0.215 → 0.228 against a
   measured ~0.40. Ten blocks — nine valid once the ring wraps, `BlockAverage` excludes the slot being

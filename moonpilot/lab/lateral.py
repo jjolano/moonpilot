@@ -22,7 +22,7 @@ from moonpilot.curvature import MOONPILOT_PREVIEW_MIN_SPEED, MOONPILOT_SMOOTH_TA
 from moonpilot.lab import DEFAULT_ROOT, cached, drive_config, expand, lag_s, param_index, predates, reversals_per_s
 from moonpilot.latcontrol import MOONPILOT_DAMPING_T, MOONPILOT_TORQUE_HYSTERESIS, MoonpilotLatControlTorque
 
-EXTRACT_VERSION = 1  # bump whenever _build() changes what it stores; old extracts are then ignored
+EXTRACT_VERSION = 2  # bump whenever _build() changes what it stores; v1's steer_limited paired the wrong frames
 ROUTE_SETS = {
   # MoonpilotSteerHysteresis's claim; both drove PathSmooth before d8b15bd1b, which the as-driven config reconstructs.
   "hysteresis": ("0000040d--b31ecdf74b", "0000040e--20803b67bd"),
@@ -69,9 +69,9 @@ def _build(segs: list[str]) -> dict[str, np.ndarray]:
         rows.append((t, sds_t, len(models["m_t"]) - 1, cc.latActive, cc.actuators.curvature, cc.actuators.torque, steer_limited,
                      *latest["carState"], *latest["vehicleParameters"], *latest["lateralDelay"], *latest["lateralTorqueParameters"]))
       # controlsd judges the frame it just published against the newest carOutput, and the next frame reads the verdict.
-      if co_torque is not None and prev_torque is not None:
-        steer_limited = abs(prev_torque - co_torque) > 1e-2
       prev_torque = cc.actuators.torque
+      if co_torque is not None:
+        steer_limited = abs(prev_torque - co_torque) > 1e-2
 
   if not rows or not cp:
     raise ValueError("no complete control frames or no carParams")
@@ -195,7 +195,10 @@ def _smooth(args):
 
 
 def register(sub):
-  for name, fn, default in (("torque", _torque, "hysteresis"), ("smooth", _smooth, "smooth")):
-    p = sub.add_parser(name, help=fn.__name__)
+  for name, fn, default, help_text in (
+    ("torque", _torque, "hysteresis", "MoonpilotSteerHysteresis: torque reversals per second"),
+    ("smooth", _smooth, "smooth", "MoonpilotPathSmooth: request lag behind the model's action"),
+  ):
+    p = sub.add_parser(name, help=help_text, description=help_text)
     p.add_argument("--routes", nargs="+", default=[default], help=f"route names or sets: {', '.join(ROUTE_SETS)}")
     p.set_defaults(fn=fn)

@@ -59,13 +59,15 @@ MOONPILOT_FRICTION_DEADBAND = 0.05  # m/s^2; keep near-zero noise out of frictio
 MOONPILOT_VERSION = 1001  # logged; a fork band upstream's counter will not reach
 MOONPILOT_VERSION_HYSTERESIS = 1002  # the same law with output hysteresis on
 # Half-widths in normalized steer torque per MoonpilotSteerHysteresis choice. On a RAV4 (STEER_MAX 1500)
-# these are ~4.5 / 10.5 / 19.5 CAN units; route 40d/40e replays cut torque reversals 2-4x at 5-10 units.
+# these are ~4.5 / 10.5 / 19.5 CAN units; `python -m moonpilot.lab torque` cuts torque reversals on 40d/40e
+# from 14.2/15.9 per s to 4.3/5.6 at 0.7%.
 MOONPILOT_TORQUE_HYSTERESIS = (0.0, 0.003, 0.007, 0.013)
 # Derivative time per MoonpilotSteerDamping choice: P + D = KP * (error + T * error_rate), a lead of T
 # seconds on the feedback. In hands-off curves at 3-17 m/s (routes 3f8-410, matched by speed and turn
 # size against the same driver's manual curves) 22-24% of the wheel's motion was above 1 Hz against the
-# driver's 4-11%, and P carried it: P's 1-5 Hz content equalled its turn-scale correction and moved with
-# the wheel at r = 0.9, 82% of it at 1-2 Hz. At 1.2 Hz these are 21 / 37 / 48 degrees of lead.
+# driver's 4-10%, and P carried it: P's 1-5 Hz content equalled its turn-scale correction and moved with
+# the wheel at r = 0.9, 81% of it at 1-2 Hz. At 1.2 Hz these are 21 / 37 / 48 degrees of lead.
+# `python -m moonpilot.lab damping` replays the levels: they put 42 / 83 / 125% of P's 1-2 Hz action into D.
 MOONPILOT_DAMPING_T = (0.0, 0.05, 0.10, 0.15)  # s
 # Where the weave was measured, and where the angle and rate sensors are fine enough to damp: off below
 # 3 m/s (KP 30 and up), full from 5 to 15 m/s, faded out by 20 m/s, where the wheel already matched the driver.

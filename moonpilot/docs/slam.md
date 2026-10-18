@@ -26,7 +26,10 @@ numpy only, so it runs on the device's own CPU. Seven things about it are not ob
   the exposure by modeld's inference and send latency, a measured 30.5 ms median (p95 33.5, max
   200) over 13k corpus frames, and replaying the corpus through both arms puts the difference at
   −0.85 correlation with `aEgo` and +0.019 m/s of under-correction while braking, 23 % of the
-  correction's own size there. `PriorChannel` samples the wheel speed with its own message times and
+  correction's own size there. `python -m moonpilot.lab slam` re-measures both: on `0000043f` and
+  `0000043e` the publish latency is 32.9 / 33.2 ms median (p95 36.0 / 34.2) and the arm difference
+  −0.984 / −0.982 correlation with `aEgo` and +0.059 / +0.038 m/s while braking, 75.8 % / 44.8 % of
+  the correction. `PriorChannel` samples the wheel speed with its own message times and
   interpolates it onto that time; a frame the samples do not span is skipped, never extrapolated.
 - **The gate is live, not restart-gated.** `leadd` feeds the window whether or not `MoonpilotSlam`
   is on, so turning it on is immediate instead of five seconds of refill. That is also why the
@@ -51,7 +54,9 @@ numpy only, so it runs on the device's own CPU. Seven things about it are not ob
   0.1 m/s on 0.05 % of frames (worst +0.578), while this 14-segment route measures 0.80 %
   (32 of 4,014 parked frames, worst +0.114) — the rate is route-dependent, and 0 of the 32
   excursions coincide with engaged longitudinal control, so latent clamp behavior on this drive
-  rather than realized creep. Measured closed-loop, a +0.15 correction beside a
+  rather than realized creep. Replayed on `0000043f` / `0000043e`: 1.19 % / 0.26 % of parked frames
+  past 0.1 m/s (worst +0.148 / +0.111), again with no engaged-longitudinal frame among them.
+  Measured closed-loop, a +0.15 correction beside a
   lead reporting 0.12 m/s cleared should-stop and took the delivered command from `CP.stopAccel` to
   −0.02 — after which `controlsd`'s own `cruiseControl.resume` asks the car's ACC to pull away.
   `MOONPILOT_SLAM_MAX_SCALE_ERR` (0.1 of `v_ego`) is zero there by construction on any route and inert where the
@@ -82,6 +87,13 @@ correction and without it — to hold that a correction of half a meter per seco
 without reshaping it. The on-device proof the plan calls for is a replay: logged `carState` +
 `cameraOdometry` through the window, against `gpsLocationExternal` as truth, RMSE down or equal, and
 `egoCorrection.valid` duty ≥ 95 % onroad — met on this route at 100.00 % (14,955/14,955): PASS.
+**That route and that truth service are not in this checkout's cache.** `python -m moonpilot.lab slam`
+runs the same replay on `0000043f` / `0000043e`, whose only truth service is qcom `gpsLocation`:
+against it the corrected speed RMSE is 0.553 / 0.391 m/s against 0.517 / 0.339 raw — not down — while
+the duty is 99.96 % (22,028/22,037) and 99.84 % (5,624/5,633) and the correction reproduces the logged
+one to 0.019 / 0.018 m/s RMSE (`python -m moonpilot.lab slam`). That is not the gate's truth, so the
+criterion stands unverified on this cache, and the truth substitution is the first thing to suspect
+before the feature.
 
 ## The ego pose
 

@@ -21,6 +21,8 @@ import importlib
 import os
 import pkgutil
 import subprocess
+import sys
+from collections.abc import Mapping, Sequence
 from functools import cache
 
 import numpy as np
@@ -114,7 +116,7 @@ def lag_s(ref: np.ndarray, x: np.ndarray, mask: np.ndarray, dt: float = DT_CTRL,
   return i * dt
 
 
-def expand(names: list[str], sets: dict[str, tuple[str, ...]]) -> list[str]:
+def expand(names: list[str], sets: Mapping[str, Sequence[str]]) -> list[str]:
   """Route names, with any set name replaced by its routes."""
   return [r for n in names for r in sets.get(n, (n,))]
 
@@ -123,10 +125,16 @@ def main(argv: list[str] | None = None):
   parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
   parser.add_argument("--root", default=DEFAULT_ROOT, help="directory of <route>--<seg>/rlog.zst")
   sub = parser.add_subparsers(required=True)
-  # Each submodule with a `register(sub)` adds its own subcommands, each setting `fn(args)`.
+  # Each submodule with a `register(sub)` adds its own subcommands, each setting `fn(args)`. One that fails to import
+  # costs its own subcommands, named on stderr, not the whole lab.
   for info in pkgutil.iter_modules(__path__):
-    module = importlib.import_module(f"{__name__}.{info.name}")
-    if hasattr(module, "register"):
-      module.register(sub)
+    if info.name.startswith("_"):
+      continue
+    try:
+      module = importlib.import_module(f"{__name__}.{info.name}")
+      if hasattr(module, "register"):
+        module.register(sub)
+    except Exception as e:
+      print(f"moonpilot.lab: skipping {info.name}: {e!r}", file=sys.stderr)
   args = parser.parse_args(argv)
   args.fn(args)

@@ -22,7 +22,7 @@ device. Read its `README.md`; three things decide whether it answers your questi
   engaged-control baseline you think you see there is not backed by data.
 - Its `baselines/` were baked by the *other* fork's `openpilot/tools/drive_lab`, run from a
   sunnypilot worktree. moonpilot has no `tools/drive_lab`; those reports can be read, not re-run.
-  moonpilot's own replays live in `moonpilot/lab.py` (AGENTS.md, **Working here**).
+  moonpilot's own replays live in `moonpilot/lab/` (AGENTS.md, **Working here**).
 - The logs predate moonpilot's schema. Tag `@107` in them carries sunnypilot's struct, so
   moonpilot's cereal names it `moonpilotState` and then raises
   `KjException: Schema mismatch` on access. Skip that field on corpus logs.
