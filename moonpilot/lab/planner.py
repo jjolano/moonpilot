@@ -28,6 +28,7 @@ CONTROL_VERSION = 1  # one row per carControl frame: the rate the acceleration c
 ROUTE_SETS = {
   # Engaged local drives. 0000042c/42d/42e have zero longActive frames and are skipped by the commands.
   "longitudinal": ("000003f8", "000003fe", "00000400", "00000401", "00000408", "0000040d", "0000040e", "00000410", "00000414", "0000043e", "0000043f"),
+  "lead-approach": ("000003f8", "00000400", "00000401", "00000408", "0000040d", "0000040e", "00000410", "00000414", "0000043e", "0000043f"),
 }
 MESSAGES = ("carState", "controlsState", "carControl", "vehicleParameters", "radarState", "selfdriveState", "moonpilotState", "modelV2")
 ON_BY_DEFAULT = {"MoonpilotLongitudinal", "MoonpilotModelBraking", "MoonpilotBrakeBand", "MoonpilotCurveSpeed", "MoonpilotLeadLateral", "MoonpilotCoastGrade"}
@@ -165,6 +166,8 @@ def replay(route, data, root=DEFAULT_ROOT, overrides=None, details_out=None):
         plan_reader = plan.longitudinalPlan if plan is not None else None
         details_out.append({
           "t": mono * 1e-9,
+          "manual_authority": not cc.longActive and not cs.cruiseState.enabled and cs.gearShifter == car.CarState.GearShifter.drive,
+          "radar_present": bool(lead.radar),
           "v_ego": float(cs.vEgo),
           "a_ego": float(cs.aEgo),
           "v_cruise": float(cs.vCruise),
@@ -518,7 +521,106 @@ def _longcontrol(args):
 
 
 
+def _approach_windows(mask, times, gaps, minimum_duration):
+  windows, start = [], None
+  for i in range(len(mask) + 1):
+    joined = i < len(mask) and mask[i] and (start is None or 0 < times[i] - times[i - 1] <= 0.15)
+    if joined:
+      if start is None:
+        start = i
+    elif start is not None:
+      end = i - 1
+      duration = times[end] - times[start]
+      if duration >= minimum_duration:
+        windows.append((float(np.median(gaps[start:end + 1])), float(duration)))
+      start = i if i < len(mask) and mask[i] else None
+  return windows
+
+
+def _window_summary(label, windows):
+  if not windows:
+    print(f"  {label}: 0 windows meeting duration threshold")
+    return
+  gaps = np.asarray([w[0] for w in windows])
+  durations = np.asarray([w[1] for w in windows])
+  print(f"  {label}: {len(windows)} unpaired lead-slot windows; median gap {np.median(gaps):.2f} m "
+        + f"(range {np.min(gaps):.2f}-{np.max(gaps):.2f}); duration median {np.median(durations):.1f} s "
+        + f"(range {np.min(durations):.1f}-{np.max(durations):.1f} s)")
+
+
+def _approach_scenarios():
+  from unittest import mock
+  from moonpilot.tests.test_longitudinal import _fly
+  import moonpilot.longitudinal as longitudinal
+
+  scenarios = (
+    ("steady lead", 12.0, 43.2, 80.0, 3.0, lambda t: 0.0),
+    ("stopped lead", 12.0, 43.2, 80.0, 0.0, lambda t: 0.0),
+    ("lead brakes after 4s", 12.0, 43.2, 80.0, 3.0, lambda t: -1.5 if t >= 4.0 else 0.0),
+    ("ordinary 16->11.7m/s", 16.0, 58.0, 119.0, 11.7, lambda t: 0.0),
+  )
+
+  def report(label, result):
+    cmd, times, gaps = np.asarray(result["cmd"]), np.arange(len(result["cmd"])) * 0.05, np.asarray(result["gap"])
+    for threshold in (-0.05, -0.25):
+      crossed = np.flatnonzero(cmd < threshold)
+      print(f"  first cmd < {threshold:.2f}: " +
+            (f"{times[crossed[0]]:.2f}s, gap {gaps[crossed[0]]:.2f}m" if len(crossed) else "not reached"))
+    print(f"  {label}: peak {result['peak']:.3f} m/s^2, end gap {result['end_gap']:.2f} m, "
+          + f"minimum gap {result['min_gap']:.2f} m, contact={result['contact']}")
+
+  print("Current full planner, existing _fly point-mass harness (no actuator delay):")
+  for label, v0, setpoint, gap, v_lead, accel in scenarios:
+    report(label, _fly(v0, setpoint, gap, v_lead, accel, 55.0))
+  label, v0, setpoint, gap, v_lead, accel = scenarios[0]
+  with mock.patch.object(longitudinal, "MOONPILOT_MOVING_STOP_RESERVE", 0.0), \
+       mock.patch.object(longitudinal, "MOONPILOT_ARRIVAL_COAST_T", float("inf")):
+    former = _fly(v0, setpoint, gap, v_lead, accel, 55.0)
+  print("Reserve and coast-first off in current code: arrival then aims at STOP_DISTANCE, not the pre-change STOP_REST,")
+  print("behind a moving lead, so this is near the pre-change law, not identical; check out the pre-change commit for that.")
+  report("steady lead, reserve and coast off", former)
+
+
+def _lead_approach(args):
+  if not args.smoke_only:
+    pooled = {"moving": [], "stationary": []}
+    for route in expand(args.routes, ROUTE_SETS):
+      commit, config = drive_config(route, args.root)
+      details = []
+      replayed, logged, active, _ = replay(route, extract(route, args.root), args.root, details_out=details)
+      d = _details_arrays(details)
+      mask = active & np.isfinite(logged)
+      p95 = float(np.percentile(np.abs(replayed[mask] - logged[mask]), 95)) if mask.any() else float("nan")
+      print(f"{route}: commit {commit}, config {config}")
+      print(f"  replay-vs-logged p95 |aTarget error| {p95:.4f} m/s^2 on {mask.sum()} engaged frames "
+            + "(current-code mismatch is expected on pre-change logs)")
+      times, gaps = d["t"], d["d_rel"]
+      manual = d["manual_authority"] & d["radar_present"] & d["lead_present"]
+      manual_seconds = float(np.sum(np.minimum(np.diff(times, prepend=times[0]), 0.1) * manual))
+      moving = manual & (d["v_lead"] >= 1.0) & (d["v_lead"] < 5.0) & (np.abs(d["v_ego"] - d["v_lead"]) < 0.5) & (gaps > 2.0) & (gaps < 30.0)
+      stationary = manual & d["brake_pressed"] & (d["v_ego"] < 0.05) & (np.abs(d["v_lead"]) < 0.2) & (gaps > 2.0) & (gaps < 20.0)
+      windows = {"moving": _approach_windows(moving, times, gaps, 1.0), "stationary": _approach_windows(stationary, times, gaps, 2.0)}
+      _window_summary("moving lead (1<=vLead<5, speed match <0.5 m/s)", windows["moving"])
+      _window_summary("braked stationary lead", windows["stationary"])
+      for kind, found in windows.items():
+        pooled[kind] += found
+      print(f"  manual-authority lead data: {manual_seconds / 60:.1f} minutes")
+    print("All routes:")
+    _window_summary("moving lead (1<=vLead<5, speed match <0.5 m/s)", pooled["moving"])
+    _window_summary("braked stationary lead", pooled["stationary"])
+    print("  Descriptive unpaired lead-slot windows only; radar track IDs may swap. Not a fixed driver target or safety proof.")
+  _approach_scenarios()
+
+
+def _register_lead_approach(sub):
+  parser = sub.add_parser("lead-approach", help="manual lead windows and full-planner coast-first diagnostic")
+  parser.add_argument("--routes", nargs="+", default=["lead-approach"], help=f"route names or IDs: {', '.join(ROUTE_SETS)}")
+  parser.add_argument("--smoke-only", action="store_true", help="skip route replay and run only planner scenarios")
+  parser.set_defaults(fn=_lead_approach)
+
+
 def register(sub):
+  _register_lead_approach(sub)
   commands = (
     ("planner-fidelity", _fidelity),
     ("brake-band", _band),

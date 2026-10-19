@@ -23,8 +23,9 @@ is:
     continuous scale, because ``inPath`` at highway speed is mostly the model's own lateral
     uncertainty and a linear map from it put a moving target under the regulator
     (``MOONPILOT_OUT_OF_PATH_ENTER``);
-  - one relative-speed arrival term targeting the greater of the soft rest gap and the lead's
-    headway, continuous from a stopped lead through a crawl to ordinary moving following;
+  - one relative-speed arrival term targeting the greater of the soft rest gap (plus a moving-lead
+    reserve) and the lead's headway, continuous from a stopped lead through a crawl to ordinary
+    moving following, coasting first while its braking-distance budget allows;
   - a time-to-collision approach term that takes over once the headway it wants passes the
     regulator's braking authority, and behind it a stopping floor — the old kinematic term kept as a
     bound, since a proportional TTC term ramps rather than stops and binds too late above ~34 m/s.
@@ -256,6 +257,10 @@ MOONPILOT_APPROACH_DECEL = 1.0  # m/s^2; the spacing regulator's braking authori
 # command noise from 0.141 to 0.122 m/s^2 and its frames under -0.5 from 171 to 117; 2 s buys 0.006 more
 # for another 0.15 m inside the target.
 MOONPILOT_ARRIVAL_MIN_T = 1.5
+# Coast-first arrival behind a moving lead: coast while the braking budget at COAST_DECEL leaves more
+# than COAST_T of closing, then blend into the original law. Sweep: docs/longitudinal.md.
+MOONPILOT_ARRIVAL_COAST_T = 1.5  # s
+MOONPILOT_ARRIVAL_COAST_DECEL = 0.8  # m/s^2
 # Below set speed, a far moving-lead approach may take the slow rung while a gentle coast still has
 # room to arrive. Flown on `_fly`: 12->10 m/s from 120 m at 64.8 kph never settles within 0.5 m in
 # 100 s without it and settles at 58 s with it; 24->22 m/s from 100 m at 108 kph 65 s -> 46 s; route
@@ -273,10 +278,11 @@ MOONPILOT_CATCH_UP_COAST_FRACTION = 0.2
 # reverted for raising the average decel and peak; that raise is now the point, on the driver's data.
 MOONPILOT_FLOOR_ADMISSION_BP = [8.0, 14.0]  # m/s
 MOONPILOT_FLOOR_ADMISSION_V = [1.0, 1.6]  # m/s^2
-# The soft rest point used by the shared arrival law. Moving leads transition continuously onto
-# their time-gap target; a stopped lead is not a separate approach mode. The spacing regulator and
-# stopping floor still protect the nominal gap, so this is a comfort aim, not a contact margin.
+# The soft rest point for the shared arrival law, 0.8 m inside the regulator's STOP_DISTANCE floor. Behind
+# a lead moving at creep speed or more both rise to STOP_DISTANCE + MOVING_STOP_RESERVE; the reserve melts
+# linearly as the lead slows to rest. Settles: docs/longitudinal.md.
 MOONPILOT_STOP_REST = 5.2  # m
+MOONPILOT_MOVING_STOP_RESERVE = 2.0  # m
 MOONPILOT_TTC_TARGET = 3.0  # s; headway the approach term holds the closing rate inside. Lower is
 # shallower — a_ttc = -K*(closing - slack/T) deepens with T, so this
 # is the dial between the floor's plateau (T below ~2 the term never
@@ -800,13 +806,10 @@ def arrival_accel(closing, slack, a_lead) -> float:
 def lead_accel(v_ego, gap, v_lead, a_lead, t_follow, catch_up_accel=0.0, catch_up_coast=0.0, coast=MOONPILOT_BRAKE_BAND_FLOOR) -> float:
   """The spacing regulator and one relative-speed approach for every slower lead.
 
-  The spacing regulator holds gap == max(STOP_DISTANCE, t_follow * v_ego) and matches the lead's
-  speed; its braking authority is capped at the approach decel, so large speed errors do not turn
-  into hard braking through the gain. STOP_DISTANCE is a *floor* rather than an offset added to
-  every headway: added, the effective headway was ``t_follow + STOP_DISTANCE / v_ego`` — 1.65 s at
-  30 m/s where the driver chose 1.45, 2.05 s at 10 m/s, 3.45 s at 3 m/s — so the car hung back
-  further the slower it went. It only governs below ``STOP_DISTANCE / t_follow`` (4.1 m/s at the
-  standard personality), which is the region where there is no time gap left to hold.
+  The spacing regulator holds the larger of the time gap and a low-speed rest floor: STOP_DISTANCE plus
+  MOVING_STOP_RESERVE scaled by the slower car's speed over creep speed, so it is STOP_DISTANCE at rest
+  (a departing lead still releases the standstill hold).
+  Regulator braking is capped at APPROACH_DECEL; TTC and the stopping floor own deeper requests.
 
   The nominal follow gap is a soft boundary while closing. The regulator moves its working target
   inward by at most `MOONPILOT_FOLLOW_CUSHION`, with the uncapped distance equal to closing speed
@@ -829,14 +832,10 @@ def lead_accel(v_ego, gap, v_lead, a_lead, t_follow, catch_up_accel=0.0, catch_u
   window it is what makes the approach respond to a lead that starts slowing, because it reads the
   closing rate, which the lead's own speed history drives.
 
-  The arrival term matches the lead's braking-previewed speed at
-  ``max(STOP_REST, t_follow * v_lead_arrive)`` (comfort accel). The target is continuous through a crawl and a stop:
-  no lead-speed threshold switches between full-stop and moving-lead approaches. Its slack is
-  floored at ``ARRIVAL_MIN_T * closing``, so the request eases as closing disappears even when the
-  preferred rest point has already been crossed. Positive lead acceleration retires it continuously.
-  Below set speed, the slow-rung catch-up is available only while coasting still has room to match;
-  that credit fades to zero as the lead's speed falls to rest. TTC and the stopping floor remain
-  independent minima, with their braking preview, sustain and admission unchanged.
+  Arrival matches the lead's braking-previewed speed at the larger of its time gap and the soft rest
+  point (plus the moving-lead reserve). Behind a moving lead it coasts while its braking budget lasts
+  (`MOONPILOT_ARRIVAL_COAST_*`, raw sustain-bounded lead braking, so a slowing lead spends it), then
+  hands back to the original law. TTC and the stopping floor remain independent minima.
 
   The third is the stopping floor, the kinematic term kept as a bound rather than as the approach,
   and it is measured in the frame the gap actually closes in. Outside `MOONPILOT_MIN_SLACK` it is
@@ -869,12 +868,17 @@ def lead_accel(v_ego, gap, v_lead, a_lead, t_follow, catch_up_accel=0.0, catch_u
   # MOONPILOT_LEAD_ACCEL_COMFORT_NOISE
   a_comfort = float(a_lead) * min(max(abs(float(a_lead)) / MOONPILOT_LEAD_ACCEL_COMFORT_NOISE - 1.0, 0.0), 1.0)
   v_lead_match = v_lead + max(a_comfort, 0.0) * MOONPILOT_LEAD_PREVIEW_T
-  gap_target = max(MOONPILOT_STOP_DISTANCE, t_follow * v_ego)
+  v_lead_arrive = max(0.0, v_lead + min(a_comfort, 0.0) * MOONPILOT_LEAD_PREVIEW_T)
+  moving = min(v_lead_arrive / MOONPILOT_CREEP_SPEED, 1.0)
+  # Arrival's rest point rises to the regulator's floor, both STOP_DISTANCE + reserve behind a moving lead.
+  moving_rest = MOONPILOT_STOP_REST + (MOONPILOT_STOP_DISTANCE - MOONPILOT_STOP_REST + MOONPILOT_MOVING_STOP_RESERVE) * moving
+  stop_floor = MOONPILOT_STOP_DISTANCE + MOONPILOT_MOVING_STOP_RESERVE * min(v_ego / MOONPILOT_CREEP_SPEED, moving)
+  gap_target = max(stop_floor, t_follow * v_ego)
   closing_match = max(v_ego - v_lead_match, 0.0)
   gap_cushion = min(
     MOONPILOT_FOLLOW_CUSHION,
     closing_match * MOONPILOT_K_V / MOONPILOT_K_GAP,
-    max(t_follow * v_ego - MOONPILOT_STOP_DISTANCE, 0.0),
+    max(t_follow * v_ego - stop_floor, 0.0),
   )
   a_track = MOONPILOT_K_GAP * (gap - gap_target + gap_cushion) + MOONPILOT_K_V * (v_lead_match - v_ego)
   if a_track > 0.0:
@@ -917,18 +921,22 @@ def lead_accel(v_ego, gap, v_lead, a_lead, t_follow, catch_up_accel=0.0, catch_u
   slack = max(gap - MOONPILOT_STOP_DISTANCE, 0.0)
   a_ttc = -MOONPILOT_K_TTC * (closing - slack / float(np.interp(v_ego, MOONPILOT_TTC_TARGET_BP, MOONPILOT_TTC_TARGET_V)))
   a = min(a_track, a_ttc) if a_ttc < -MOONPILOT_APPROACH_DECEL else a_track
-  # One arrival law for stopped, crawling and faster moving leads. The rest target is soft:
-  # never divide by a tenth of a meter merely because the preferred gap has already been spent.
-  # On the comfort accel; TTC and the stopping floor keep the raw one.
-  v_lead_arrive = max(0.0, v_lead + min(a_comfort, 0.0) * MOONPILOT_LEAD_PREVIEW_T)
-  arrival_target = max(MOONPILOT_STOP_REST, t_follow * v_lead_arrive)
-  a_arrive = arrival_accel(max(v_ego - v_lead_arrive, 1e-6), gap - arrival_target, a_comfort)
+  # The reserve is spent continuously if the lead comes to rest.
+  arrival_slack = gap - max(moving_rest, t_follow * v_lead_arrive)
+  a_arrive = arrival_accel(max(v_ego - v_lead_arrive, 1e-6), arrival_slack, a_comfort)
+  # Coast budget: slack - closing**2 / (2 * COAST_DECEL) for a steady lead; braking only shrinks it.
+  bound = stopping_decel(v_ego, v_lead_eff, a_lead, max(arrival_slack, 0.1))
+  coast_time = max(arrival_slack, 0.0) * (1.0 + bound / MOONPILOT_ARRIVAL_COAST_DECEL) / closing
+  w_coast = min(max(coast_time / MOONPILOT_ARRIVAL_COAST_T, 0.0), 1.0)
+  # Small closing finishes on the original soft law; a stopped lead keeps its tuned approach.
+  w_coast *= moving * min(max(closing / (MOONPILOT_ARRIVAL_COAST_DECEL * MOONPILOT_ARRIVAL_COAST_T) - 1.0, 0.0), 1.0)
+  a_coast = -MOONPILOT_APPROACH_DECEL + (MOONPILOT_APPROACH_DECEL + coast) * w_coast
+  a_arrive = max(a_arrive, a_coast + max(a_comfort, 0.0))
   if catch_up_accel > 0.0 and catch_up_coast < 0.0 and a_lead > -MOONPILOT_LEAD_ACCEL_TAU_RESET:
     used = a_arrive / catch_up_coast
     if used < 1.0:
-      # Stop-and-go gets no catch-up throttle. The credit fades in continuously where the headway
-      # target leaves the soft rest gap, reaching full strength at the old moving-lead boundary.
-      weight = float(np.interp(t_follow * v_lead_eff, [MOONPILOT_STOP_REST, MOONPILOT_STOP_DISTANCE], [0.0, 1.0]))
+      # Stop-and-go gets no catch-up throttle; the credit fades in as headway leaves the rest floor.
+      weight = float(np.interp(t_follow * v_lead_eff, [MOONPILOT_STOP_REST, max(MOONPILOT_STOP_DISTANCE, moving_rest)], [0.0, 1.0]))
       a_arrive += catch_up_accel * weight * (1.0 - used)
   a = min(a, a_arrive)
   # The stopping floor makes this law safe outside the final soft meter rather than merely responsive.
