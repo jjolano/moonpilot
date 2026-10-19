@@ -116,7 +116,7 @@ from moonpilot.pose import MOONPILOT_POSE_MAX_DT
 from moonpilot.corridor import RollingCorridor, squeeze_accel
 from moonpilot.brake_band import MOONPILOT_BRAKE_BAND_FLOOR, MOONPILOT_BRAKE_BAND_MIN_SPEED, BrakeBand
 from moonpilot.engine_coast import coast_budget, engine_floor
-from moonpilot.features import BRAKE_BAND, COAST_GRADE, CURVE_SPEED, LEAD_LATERAL, LONGITUDINAL, MODEL_BRAKING, SQUEEZE, enabled
+from moonpilot.features import BRAKE_BAND, COAST_GRADE, CURVE_SPEED, EXPERIMENTAL_MODE, LEAD_LATERAL, LONGITUDINAL, MODEL_BRAKING, SQUEEZE, enabled
 from moonpilot.latency import (
   MOONPILOT_LAG_BLOCKS_KEY,
   MOONPILOT_LAG_HISTORY_KEY,
@@ -1338,7 +1338,7 @@ class MoonpilotLongitudinalPlanner:
     steer_angle = CS.steeringAngleDeg - sm['vehicleParameters'].angleOffsetDeg
     t_follow = self._t_follow(sm)
     err_bp = self._err_bp(sm)
-    e2e = sm['selfdriveState'].experimentalMode
+    e2e = enabled(EXPERIMENTAL_MODE, self.params)
     # The model's stop hold yields to a departing leadOne once the model asks to go.
     one = sm['radarState'].leadOne
     go = one.present and one.vLead > MOONPILOT_SHOULD_STOP_SPEED and sm['modelV2'].action.desiredAcceleration > 0.0
@@ -1860,22 +1860,9 @@ class MoonpilotLongitudinalPlanner:
     pm.send('longitudinalPlan', plan_send)
 
 
-def moonpilot_longitudinal_active(CP, params: Params | None = None) -> bool:
-  """Whether the fork's planner is the one in place on this car, without building one.
-
-  The same decision `moonpilot_longitudinal_planner` makes, so the two cannot disagree — the UI
-  asks this to widen the displayed road camera below its speed threshold when the fork planner is
-  driving, and a fork planner that is not in place must not have that say. `CP` is None until
-  `carParams` lands, which reads as "not yet" rather than as a verdict on the car.
-  """
-  if CP is None:
-    return False
-  return bool(enabled(LONGITUDINAL, params or Params()) and CP.openpilotLongitudinalControl)
-
-
 def moonpilot_longitudinal_planner(CP, params: Params | None = None) -> MoonpilotLongitudinalPlanner | None:
   """The seam's fork side: the fork planner when the driver wants it, None to leave upstream's in
   place. The param is read once, here, so the toggle takes a restart."""
-  if not moonpilot_longitudinal_active(CP, params):
+  if not (enabled(LONGITUDINAL, params or Params()) and CP.openpilotLongitudinalControl):
     return None
   return MoonpilotLongitudinalPlanner(CP)

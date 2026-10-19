@@ -20,8 +20,8 @@ def main():
   ldw = LaneDepartureWarning()
   longitudinal_planner = moonpilot_longitudinal_planner(CP) or LongitudinalPlanner(CP)  # moonpilot seam, see AGENTS.md
   pm = messaging.PubMaster(['longitudinalPlan', 'driverAssistance'])
-  sm = messaging.SubMaster(['carControl', 'carState', 'controlsState', 'vehicleParameters', 'radarState', 'modelV2', 'selfdriveState',
-                           'moonpilotState'],  # moonpilot seam, see AGENTS.md
+  sm = messaging.SubMaster(['carControl', 'carState', 'controlsState', 'radarState', 'modelV2', 'selfdriveState',
+                           'vehicleParameters', 'moonpilotState'],  # moonpilot seam, see AGENTS.md
                            poll='modelV2')
 
   while True:

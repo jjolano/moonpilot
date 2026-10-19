@@ -6,6 +6,10 @@
 {"MoonpilotLeadLateral", {PERSISTENT, BOOL, "1"}},
     {"MoonpilotTorqueLateral", {PERSISTENT, BOOL, "1"}},
     {"MoonpilotLongitudinal", {PERSISTENT, BOOL, "1"}},
+    // Off by default: upstream dropped chill mode and its ExperimentalMode
+    // param (#39097), so the fork planner's own choice between the model's raw
+    // accel and its gated path lives here. Read every frame.
+    {"MoonpilotExperimentalMode", {PERSISTENT, BOOL, "0"}},
     // On by default: `policy` takes the minimum, so the model's ask can only
     // ever add braking, and past the deadband it is bounded by the actuator's
     // own ACCEL_MIN rather than a fork floor.

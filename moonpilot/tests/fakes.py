@@ -12,7 +12,9 @@ class FakeParams:
 
   def __init__(self, on=True, overrides=None):
     self._on = on
-    self._overrides = dict(overrides or {})
+    # Off unless asked: on for every key would put every planner test in experimental mode, which swaps the
+    # planner's whole candidate set rather than adding one feature.
+    self._overrides = {"MoonpilotExperimentalMode": False, **dict(overrides or {})}
     self.puts: dict[str, Any] = {}
 
   def get(self, key, return_default=False):

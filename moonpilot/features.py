@@ -94,6 +94,16 @@ LONGITUDINAL = Feature(
   offroad_only=True,
 )
 
+EXPERIMENTAL_MODE = Feature(
+  key="MoonpilotExperimentalMode",
+  title="experimental mode",
+  description=(
+    "moonpilot longitudinal passes the model's own acceleration straight through, as openpilot's experimental mode "
+    + "did; no-flicker braking, the model-braking deadband and coast on grade stand aside. Applies immediately."
+  ),
+  offroad_only=True,
+)
+
 MODEL_BRAKING = Feature(
   key="MoonpilotModelBraking",
   title="model braking",
@@ -217,7 +227,7 @@ SPEED = Group(
   description="What the car does with the pedals: whose planner sets the speed, and how it reads the road ahead.",
   # The lead's lateral prediction sits here rather than with the steering because the fork reaches
   # it through the planner's time gap, not through a steering request.
-  features=(LONGITUDINAL, MODEL_BRAKING, CURVE_SPEED, SQUEEZE, PATH_OUTSIDE, COAST_GRADE, BRAKE_BAND, ENGINE_COAST, LEAD_LATERAL, SLAM),
+  features=(LONGITUDINAL, EXPERIMENTAL_MODE, MODEL_BRAKING, CURVE_SPEED, SQUEEZE, PATH_OUTSIDE, COAST_GRADE, BRAKE_BAND, ENGINE_COAST, LEAD_LATERAL, SLAM),
 )
 
 DEVICE = Group(

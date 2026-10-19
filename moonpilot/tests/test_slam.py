@@ -38,7 +38,7 @@ from moonpilot.slam import (
   ego_speed_correction,
 )
 from moonpilot.longitudinal import MOONPILOT_STOP_DISTANCE
-from moonpilot.tests.test_longitudinal import _inputs, _lead, _planner
+from moonpilot.tests.test_longitudinal import _inputs, _lead, _plant_sm, _planner
 
 ROOT = Path(__file__).resolve().parents[2]
 DT = 1.0 / MOONPILOT_SLAM_RATE_HZ
@@ -341,7 +341,7 @@ class TestUpstreamManeuverWithCorrection(unittest.TestCase):
   def _planner(cls, correction):
     class CorrectedPlanner(MoonpilotLongitudinalPlanner):
       def update(self, sm):
-        super().update(cls._Sm(sm, correction))
+        super().update(cls._Sm(_plant_sm(sm), correction))
 
     def factory(CP, init_v=0.0, init_a=0.0, dt=DT_MDL):
       return CorrectedPlanner(CP, init_v=init_v, init_a=init_a, dt=dt)
@@ -350,7 +350,7 @@ class TestUpstreamManeuverWithCorrection(unittest.TestCase):
 
   def _run(self, correction):
     factory, _ = self._planner(correction)
-    maneuver = next(m for m in create_maneuvers({"e2e": False, "force_decel": False}) if m.title == self.TITLE)
+    maneuver = next(m for m in create_maneuvers({"force_decel": False}) if m.title == self.TITLE)
     with mock.patch.object(plant_mod, "LongitudinalPlanner", factory):
       valid, logs = maneuver.evaluate()
     self.assertTrue(valid)  # no contact, no stall, and still decelerating to the stop

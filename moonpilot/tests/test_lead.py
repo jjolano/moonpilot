@@ -105,7 +105,7 @@ class RendererSubMaster:
       "modelV2": SimpleNamespace(),
       "moonpilotState": state,
       "radarState": None,
-      "selfdriveState": SimpleNamespace(experimentalMode=False),
+      "selfdriveState": SimpleNamespace(),
     }
 
   def __getitem__(self, service):
@@ -762,7 +762,6 @@ class PlannerSubMaster:
     controls_state.controlsState.longControlState = log.LongitudinalPlan.LongitudinalPlanSource.lead0
 
     selfdrive_state = messaging.new_message("selfdriveState")
-    selfdrive_state.selfdriveState.experimentalMode = False
     selfdrive_state.selfdriveState.enabled = True
 
     vehicle_parameters = messaging.new_message("vehicleParameters")

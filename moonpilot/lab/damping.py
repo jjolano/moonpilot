@@ -292,11 +292,11 @@ def _weave(args):
           flutter.append((v, p_high / max(p_low, 1e-12), p_low / max(ff_low, 1e-12), abs(float(np.corrcoef(wheel, command)[0, 1]))))
     print(f"{name}: manual {minutes['manual']:.0f} min, openpilot {minutes['op']:.0f} min (running), replay vs logged p99 |err| {shown}")
   for lo, hi in ((3, 10), (10, 17)):
-    for tlo, thi in ((1, 2), (2, 3), (3, 9)):
-      cells = {cls: [r[2] for r in hf[cls] if lo <= r[0] < hi and tlo <= r[1] < thi] for cls in ("manual", "op")}
+    for t_lo, t_hi in ((1, 2), (2, 3), (3, 9)):
+      cells = {cls: [r[2] for r in hf[cls] if lo <= r[0] < hi and t_lo <= r[1] < t_hi] for cls in ("manual", "op")}
       if all(len(v) >= 3 for v in cells.values()):
         e, m = 100 * float(np.median(cells["op"])), 100 * float(np.median(cells["manual"]))
-        print(f"wheel motion above 1 Hz, {lo}-{hi} m/s, turn {tlo}-{thi} m/s^2: "
+        print(f"wheel motion above 1 Hz, {lo}-{hi} m/s, turn {t_lo}-{t_hi} m/s^2: "
               + f"engaged {e:.0f}% (n={len(cells['op'])}), manual {m:.0f}% (n={len(cells['manual'])})")
   for cls in ("manual", "op"):
     share = np.mean(spec[cls], axis=0)

@@ -9,6 +9,7 @@ import itertools
 import math
 import unittest
 from pathlib import Path
+from typing import cast
 from unittest import mock
 
 import numpy as np
@@ -21,6 +22,7 @@ from opendbc.car.interfaces import ACCEL_MIN
 from opendbc.car.structs import car
 from openpilot.cereal import custom, log, messaging
 from openpilot.common.constants import CV
+from openpilot.common.params import Params
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.controls.lib.drive_helpers import CONTROL_N
 from openpilot.selfdrive.modeld.constants import ModelConstants
@@ -93,7 +95,6 @@ from moonpilot.longitudinal import (
   lead_state_at,
   model_candidate,
   model_release,
-  moonpilot_longitudinal_active,
   moonpilot_longitudinal_planner,
   policy,
   required_decel,
@@ -182,7 +183,6 @@ def _inputs(
   lead_two=None,
   standstill=None,
   personality=Personality.standard,
-  experimental=False,
   enabled=True,
   force_decel=False,
   throttle_prob=1.0,
@@ -220,7 +220,6 @@ def _inputs(
   controls_state.controlsState.longControlState = car.CarControl.Actuators.LongControlState.pid
 
   selfdrive_state = messaging.new_message("selfdriveState")
-  selfdrive_state.selfdriveState.experimentalMode = bool(experimental)
   selfdrive_state.selfdriveState.enabled = bool(enabled)
   selfdrive_state.selfdriveState.personality = personality
 
@@ -882,7 +881,7 @@ class TestCoastGrade(unittest.TestCase):
 
   @staticmethod
   def _cruise(pitch, v_ego, v_cruise=COAST_SET_SPEED, e2e=False, coast_band=MOONPILOT_COAST_BAND, allow_throttle=True):
-    sm = _inputs(v_ego=v_ego, v_cruise_kph=v_cruise * 3.6, pitch=pitch, experimental=e2e)
+    sm = _inputs(v_ego=v_ego, v_cruise_kph=v_cruise * 3.6, pitch=pitch)
     return cruise_accel(
       v_ego,
       v_cruise,
@@ -1481,8 +1480,8 @@ class TestPlanner(unittest.TestCase):
     planner.update(_inputs(v_ego=20.0, v_cruise_kph=30.0, lead=_lead(35.0, 30.0)))
     self.assertEqual(planner.source, Source.cruise)
 
-    planner = _planner()
-    planner.update(_inputs(v_ego=20.0, v_cruise_kph=108.0, lead=_lead(35.0, 30.0), experimental=True, model_accel=-2.0))
+    planner = _planner(params_overrides={"MoonpilotExperimentalMode": True})
+    planner.update(_inputs(v_ego=20.0, v_cruise_kph=108.0, lead=_lead(35.0, 30.0), model_accel=-2.0))
     self.assertEqual(planner.source, Source.e2e)
 
   def test_second_lead_only_binds_when_it_is_the_slower_candidate(self):
@@ -1914,35 +1913,6 @@ class TestPlannerSeam(unittest.TestCase):
     self.assertIsNone(moonpilot_longitudinal_planner(_cp(openpilot_longitudinal=False), _params(on=True)))
 
 
-class TestPlannerActivePredicate(unittest.TestCase):
-  """`moonpilot_longitudinal_active`: the factory's own decision, readable without building a planner.
-
-  The UI asks it inside the render loop — the road view widens the displayed camera below its speed
-  threshold when the fork planner is the one in place — so the load-bearing property is that it can
-  never disagree with what plannerd actually constructed.
-  """
-
-  def test_it_agrees_with_the_factory_in_every_case(self):
-    for olc in (True, False):
-      for on in (True, False):
-        CP, params = _cp(openpilot_longitudinal=olc), _params(on=on)
-        self.assertEqual(
-          moonpilot_longitudinal_active(CP, params), moonpilot_longitudinal_planner(CP, params) is not None, msg=f"openpilot_longitudinal={olc} param_on={on}"
-        )
-
-  def test_no_carp_params_yet_is_not_active(self):
-    """`ui_state.CP` stays None until `carParams` lands, and this runs on the render path"""
-    self.assertFalse(moonpilot_longitudinal_active(None, _params(on=True)))
-    self.assertIsNone(moonpilot_longitudinal_planner(None, _params(on=True)))
-
-  def test_both_ui_trees_widen_the_camera_on_it(self):
-    """Two files, one decision: tizi and mici are separate trees and either one alone would leave a
-    device showing a camera the fork's planner never asked for."""
-    for tree in ("ui/onroad", "ui/mici/onroad"):
-      text = (ROOT / "openpilot" / "selfdrive" / tree / "augmented_road_view.py").read_text()
-      self.assertTrue("moonpilot_longitudinal_active(ui_state.CP, ui_state.params)" in text, msg=tree)
-
-
 class TestModelBraking(unittest.TestCase):
   """`MoonpilotModelBraking`: the model's own accel as a braking-only candidate outside experimental
   mode, behind a deadband and otherwise bounded only by the actuator.
@@ -1954,8 +1924,8 @@ class TestModelBraking(unittest.TestCase):
   """
 
   @staticmethod
-  def _run(params_on=True, frames=40, **inputs):
-    planner = _planner(params_on=params_on)
+  def _run(params_on=True, frames=40, experimental=False, **inputs):
+    planner = _planner(params_on=params_on, params_overrides={"MoonpilotExperimentalMode": experimental})
     sm = _inputs(**inputs)
     for _ in range(frames):
       planner.update(sm)
@@ -2133,18 +2103,45 @@ class TestModelBraking(unittest.TestCase):
     self.assertTrue('{"MoonpilotModelBraking", {PERSISTENT, BOOL, "1"}}' in text)
 
 
+def _plant_sm(sm):
+  """Upstream's plant stopped building carControl and vehicleParameters once its own planner stopped
+  reading them (#39097). plannerd still subscribes both for the fork planner, so the plant's dict gets
+  their defaults here: no pose, no steering offset."""
+  return {"carControl": messaging.new_message("carControl").carControl,
+          "vehicleParameters": messaging.new_message("vehicleParameters").vehicleParameters, **sm}
+
+
+class _ModeParams:
+  """The real store with `MoonpilotExperimentalMode` pinned: upstream's maneuvers dropped their `e2e`
+  argument along with chill mode, and the fork planner reads its mode from this param instead."""
+
+  def __init__(self, real, e2e):
+    self._real, self._e2e = real, e2e
+
+  def get(self, key, **kwargs):
+    return self._e2e if key == "MoonpilotExperimentalMode" else self._real.get(key, **kwargs)
+
+  def __getattr__(self, name):
+    return getattr(self._real, name)
+
+
 class TestUpstreamManeuvers(unittest.TestCase):
   """Upstream's maneuver suite, run through the seam: the plant builds whatever the seam returns,
   so patching the symbol it binds is exactly how plannerd picks the fork planner."""
 
-  @staticmethod
-  def _fork_planner(CP, init_v=0.0, init_a=0.0, dt=DT_MDL):
-    return MoonpilotLongitudinalPlanner(CP, init_v=init_v, init_a=init_a, dt=dt)
+  class _PlantPlanner(MoonpilotLongitudinalPlanner):
+    def update(self, sm):
+      super().update(_plant_sm(sm))
 
   def test_upstream_maneuvers_pass(self):
-    with mock.patch.object(plant_mod, "LongitudinalPlanner", self._fork_planner):
-      for e2e, force_decel in itertools.product([True, False], repeat=2):
-        for maneuver in create_maneuvers({"e2e": e2e, "force_decel": force_decel}):
+    for e2e, force_decel in itertools.product([True, False], repeat=2):
+      def factory(CP, init_v=0.0, init_a=0.0, dt=DT_MDL, e2e=e2e):
+        planner = self._PlantPlanner(CP, init_v=init_v, init_a=init_a, dt=dt)
+        planner.params = cast(Params, _ModeParams(planner.params, e2e))
+        return planner
+
+      with mock.patch.object(plant_mod, "LongitudinalPlanner", factory):
+        for maneuver in create_maneuvers({"force_decel": force_decel}):
           with self.subTest(title=maneuver.title, e2e=e2e, force_decel=force_decel):
             valid, _ = maneuver.evaluate()
             assert valid
