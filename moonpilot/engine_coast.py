@@ -5,9 +5,11 @@ the PCM choose the friction brakes (PERMIT_BRAKING), and between about -0.15 and
 lamps on and off. The driver's own lift-off is -0.33 at speed with no brakes at all. With the toggle on,
 the forked Toyota carcontroller (`opendbc/car/moonpilot/engine_coast.py`) holds PERMIT_BRAKING off while
 the request stays at that engine coast, and the planner coasts to it: the brake band's thresholds shift
-down by the difference, the follow cushion targets it, and a lead ask down to the approach decel is
+down by the difference, the follow cushion targets it, a lead ask down to the approach decel is
 raised to it whenever coasting there provably keeps the floor headway until speeds match
-(`coast_budget`). Off, or on any other car, the planner is bit-identical to the default.
+(`coast_budget`), and a far arrival holds speed until its ask passes 0.45 of it
+(`MOONPILOT_ARRIVAL_HOLD_*` in `moonpilot/longitudinal.py`). Off, or on any other car, the planner is
+bit-identical to the default.
 
 Measured on the PC, assuming the car meets the engine coast without brakes — which only a drive can
 show: steady follows (114 recorded, flown) 3.7 -> 0.3 lamp presses a minute, mild lead slowdowns

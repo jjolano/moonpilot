@@ -261,6 +261,10 @@ MOONPILOT_ARRIVAL_MIN_T = 1.5
 # than COAST_T of closing, then blend into the original law. Sweep: docs/longitudinal.md.
 MOONPILOT_ARRIVAL_COAST_T = 1.5  # s
 MOONPILOT_ARRIVAL_COAST_DECEL = 0.8  # m/s^2
+# Engine coast only: a far arrival holds speed while shallower than HOLD_START of the coast, whole by
+# HOLD_FULL — the driver's manual approaches (docs/longitudinal.md). Default mode's -0.10 cannot wait.
+MOONPILOT_ARRIVAL_HOLD_START = 0.45  # fraction of the engine coast
+MOONPILOT_ARRIVAL_HOLD_FULL = 0.6
 # Below set speed, a far moving-lead approach may take the slow rung while a gentle coast still has
 # room to arrive. Flown on `_fly`: 12->10 m/s from 120 m at 64.8 kph never settles within 0.5 m in
 # 100 s without it and settles at 58 s with it; 24->22 m/s from 100 m at 108 kph 65 s -> 46 s; route
@@ -938,6 +942,10 @@ def lead_accel(v_ego, gap, v_lead, a_lead, t_follow, catch_up_accel=0.0, catch_u
       # Stop-and-go gets no catch-up throttle; the credit fades in as headway leaves the rest floor.
       weight = float(np.interp(t_follow * v_lead_eff, [MOONPILOT_STOP_REST, max(MOONPILOT_STOP_DISTANCE, moving_rest)], [0.0, 1.0]))
       a_arrive += catch_up_accel * weight * (1.0 - used)
+  # Engine coast only: hold speed while the far arrival is shallow (MOONPILOT_ARRIVAL_HOLD_*).
+  hold_full, hold_start = MOONPILOT_ARRIVAL_HOLD_FULL * coast, MOONPILOT_ARRIVAL_HOLD_START * coast
+  if coast < MOONPILOT_BRAKE_BAND_FLOOR and hold_full < a_arrive < 0.0:
+    a_arrive += w_coast * (float(np.interp(a_arrive, [hold_full, hold_start], [hold_full, 0.0])) - a_arrive)
   a = min(a, a_arrive)
   # The stopping floor makes this law safe outside the final soft meter rather than merely responsive.
   # A TTC term ramps on closing rate, and ramping is not stopping: at 36 m/s with TTC_TARGET = 5 it

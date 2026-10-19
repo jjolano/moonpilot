@@ -9,10 +9,12 @@ from opendbc.car.moonpilot.engine_coast import ENGINE_COAST_BP, ENGINE_COAST_EXI
 from opendbc.car.toyota.interface import CarInterface
 from opendbc.car.toyota.values import CAR, ToyotaFlags
 
+import moonpilot.longitudinal as longitudinal
+from moonpilot.brake_band import MOONPILOT_BRAKE_BAND_FLOOR
 from moonpilot.engage import car_unavailable_reason, moonpilot_engage_safety_param
 from moonpilot.engine_coast import MOONPILOT_ENGINE_COAST_LEAD_T, coast_margin
 from moonpilot.features import ENGINE_COAST
-from moonpilot.longitudinal import MOONPILOT_COASTING_BP, MOONPILOT_COASTING_V, MoonpilotLongitudinalPlanner
+from moonpilot.longitudinal import MOONPILOT_ARRIVAL_HOLD_FULL, MOONPILOT_COASTING_BP, MOONPILOT_COASTING_V, MoonpilotLongitudinalPlanner, lead_accel
 from moonpilot.tests.fakes import _params
 from moonpilot.tests.test_engage import _cp
 from moonpilot.tests.test_longitudinal import DT_MDL, _inputs, _lead
@@ -104,6 +106,27 @@ class TestEngineCoast(unittest.TestCase):
     for args in ((19.0, 21.0), (20.0, 26.0, -3.0)):
       with self.subTest(args=args):
         self.assertAlmostEqual(min(_follow(True, *args)), min(_follow(False, *args)), delta=1e-6)
+
+  def test_a_far_shallow_arrival_holds_speed_only_with_the_engine_coast(self):
+    """Route 0000044d: a lead 5 m/s slower at 119 m drew -0.13 from first sight. With the engine coast the
+    arrival holds there, then ramps in continuously and is whole past HOLD_FULL; default mode, whose only
+    lamp-free decel is -0.10, still coasts from first sight."""
+    floor = engine_coast_floor(20.0)
+
+    def ask(gap, coast=floor, hold=True):
+      if hold:
+        return lead_accel(20.0, gap, 15.0, 0.0, 1.45, coast=coast)
+      with mock.patch.multiple(longitudinal, MOONPILOT_ARRIVAL_HOLD_START=0.0, MOONPILOT_ARRIVAL_HOLD_FULL=0.0):
+        return lead_accel(20.0, gap, 15.0, 0.0, 1.45, coast=coast)
+
+    self.assertLess(ask(119.0, hold=False), -0.12)
+    self.assertEqual(ask(119.0), 0.0)
+    self.assertEqual(ask(119.0, coast=MOONPILOT_BRAKE_BAND_FLOOR), ask(119.0, coast=MOONPILOT_BRAKE_BAND_FLOOR, hold=False))
+    self.assertLess(ask(60.0), MOONPILOT_ARRIVAL_HOLD_FULL * floor)
+    self.assertEqual(ask(60.0), ask(60.0, hold=False))
+    asks = np.array([ask(gap) for gap in np.arange(130.0, 40.0, -0.05)])
+    self.assertLessEqual(np.diff(asks).max(), 0.0)  # never eases as the gap closes
+    self.assertLess(np.abs(np.diff(asks)).max(), 0.01)  # and never steps
 
   def test_the_flag_means_nothing_on_another_brand(self):
     """Bit 20 belongs to `ToyotaFlags` only; the same bit on another brand's flags is that brand's own."""
