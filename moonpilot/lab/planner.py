@@ -846,6 +846,82 @@ def _manual_decel(args):
           + f"{np.median(headway):.2f} s, p10 {np.percentile(headway, 10):.2f}, p90 {np.percentile(headway, 90):.2f}; the law's is {t_follow} s")
 
 
+def _plant_inputs(v, a, gap, v_lead, a_lead, v_cruise):
+  """Upstream's maneuver plant's messages (`plant.py` step): radar lead in path, a model that does not see the lead."""
+  from openpilot.cereal import log
+  from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState
+  from openpilot.selfdrive.controls.radard import _LEAD_ACCEL_TAU
+  from openpilot.selfdrive.modeld.constants import ModelConstants
+  radar, control, ss, cs, model = (messaging.new_message(s) for s in ("radarState", "controlsState", "selfdriveState", "carState", "modelV2"))
+  lead = log.RadarState.LeadData.new_message(dRel=float(gap), vRel=float(v_lead - v), vLead=float(v_lead), vLeadK=float(v_lead), aLeadK=float(a_lead),
+                                             aLeadTau=float(_LEAD_ACCEL_TAU), present=True, modelProb=1.0, radar=True)
+  radar.radarState.leadOne = radar.radarState.leadTwo = lead
+  model.modelV2.position = log.XYZTData.new_message(x=[float(x) for x in (v + 0.5) * np.array(ModelConstants.T_IDXS)])
+  model.modelV2.action.desiredAcceleration = float(a + 0.5)
+  model.modelV2.velocity = log.XYZTData.new_message(x=[float(v)] + [float(v + 0.5)] * (len(ModelConstants.T_IDXS) - 1))
+  model.modelV2.acceleration = log.XYZTData.new_message(x=[0.0] * len(ModelConstants.T_IDXS))
+  control.controlsState.longControlState = LongCtrlState.pid
+  ss.selfdriveState.personality = log.LongitudinalPersonality.standard
+  cs.carState.vEgo, cs.carState.aEgo, cs.carState.vCruise = float(v), float(a), float(v_cruise * 3.6)
+  return {"radarState": radar.radarState, "carState": cs.carState, "controlsState": control.controlsState,
+          "selfdriveState": ss.selfdriveState, "modelV2": model.modelV2}
+
+
+def _hard_brake_run(kind, v0, a_brake, lag, onset=5.0, T=30.0):
+  """A 1.45 s follow at v0 whose lead brakes to rest at `onset`: (min gap, peak, s to an ask <= -3.0, s to FCW)."""
+  from openpilot.selfdrive.controls.lib.longitudinal_planner import ACCEL_MIN, LongitudinalPlanner
+  from opendbc.car.toyota.interface import CarInterface
+  from opendbc.car.toyota.values import CAR
+  from moonpilot.tests.test_engine_coast import _planner
+  from moonpilot.tests.test_longitudinal import _plant_sm
+  if kind == "upstream":
+    CP = CarInterface.get_non_essential_params(CAR.TOYOTA_RAV4_TSS2)
+    CP.openpilotLongitudinalControl = True
+    planner = LongitudinalPlanner(CP, init_v=v0)
+    update = planner.update
+  elif kind == "ideal":
+    planner, update = None, None
+  else:
+    planner = _planner(kind == "fork+engine")
+    update = lambda sm: planner.update(_plant_sm(sm))  # noqa: E731
+  plant = _LaggedPlant() if lag else None
+  v, v_lead, gap, a, v_prev = v0, v0, 1.45 * v0, 0.0, v0
+  gaps, cmds, fcw = [], [], []
+  for i in range(round(T / DT_MDL)):
+    t = i * DT_MDL
+    if planner is None or update is None:
+      cmd, warned = (ACCEL_MIN if t >= onset else 0.0), False
+    else:
+      update(_plant_inputs(v, a, gap, v_lead, (v_lead - v_prev) / DT_MDL, v0 + 1.0))
+      cmd, warned = float(planner.output_a_target), bool(planner.fcw)
+    v_prev = v_lead
+    cmds.append(cmd)
+    fcw.append(warned)
+    a = plant.step(cmd) if plant else cmd
+    v_next = max(0.0, v_lead + (a_brake * DT_MDL if t >= onset else 0.0))
+    v = max(0.0, v + a * DT_MDL)
+    gap += (0.5 * (v_lead + v_next) - v) * DT_MDL
+    v_lead = v_next
+    gaps.append(gap)
+  deep, warn = np.flatnonzero(np.asarray(cmds) <= -3.0), np.flatnonzero(fcw)
+  return min(gaps), min(cmds), (deep[0] * DT_MDL - onset) if deep.size else math.nan, (warn[0] * DT_MDL - onset) if warn.size else math.nan
+
+
+def _hard_brake(args):
+  """A lead braking hard to rest from a 1.45 s follow: upstream's planner, the fork's (default, engine coast) and an ideal
+  response (ACCEL_MIN from the lead's first braking frame), on upstream's plant inputs, through no plant and the lagged
+  one. Contact is a min gap under 0.4 m, upstream's maneuver bar."""
+  kinds = ("upstream", "fork", "fork+engine", "ideal")
+  print("min gap m / peak / s to ask <= -3.0 / s to FCW, per planner")
+  print(f"{'plant':5s} {'v0':>4s} {'lead a':>6s}  " + "  ".join(f"{k:>30s}" for k in kinds))
+  for lag in (False, True):
+    for v0 in (20.0, 25.0, 30.0):
+      for a_brake in (-3.5, -5.0):
+        cells = (_hard_brake_run(k, v0, a_brake, lag) for k in kinds)
+        print(f"{'lag' if lag else 'none':5s} {v0:4.0f} {a_brake:6.1f}  "
+              + "  ".join(f"{g:7.2f} {pk:5.2f} {d:5.2f} {w:5.2f}{' X' if g < 0.4 else '  '}" for g, pk, d, w in cells))
+
+
 def _register_manual(sub):
   parser = sub.add_parser("lead-hold", help="engine-coast arrival hold: driver bins, replayed drive, lagged/noisy flights")
   parser.add_argument("--routes", nargs="+", default=["manual-approach"], help=f"route names or sets: {', '.join(ROUTE_SETS)}")
@@ -856,6 +932,7 @@ def _register_manual(sub):
   parser.add_argument("--routes", nargs="+", default=["manual-approach"], help=f"route names or sets: {', '.join(ROUTE_SETS)}")
   parser.add_argument("--t-follow", type=float, default=1.45, help="the target's time gap, s (standard personality's 1.45)")
   parser.set_defaults(fn=_manual_decel)
+  sub.add_parser("hard-brake", help="lead braking hard from a follow: upstream vs fork vs ideal, with and without lag").set_defaults(fn=_hard_brake)
 
 
 def register(sub):
