@@ -20,7 +20,7 @@ from opendbc.car.structs import car
 
 from moonpilot.lab import DEFAULT_ROOT, cached, drive_config, expand, runs
 from moonpilot.lab import planner as lab_planner
-from moonpilot.lead import MOONPILOT_INPATH_RC, MOONPILOT_MIN_Y_STD, MOONPILOT_PATH_HALF_WIDTH, MOONPILOT_RADAR_TO_CAMERA
+from moonpilot.lead import MOONPILOT_INPATH_RC, MOONPILOT_INPATH_YSTD_FLOOR, MOONPILOT_MIN_Y_STD, MOONPILOT_PATH_HALF_WIDTH, MOONPILOT_RADAR_TO_CAMERA
 from moonpilot.longitudinal import (
   MOONPILOT_OUT_OF_PATH_ENTER,
   MOONPILOT_OUT_OF_PATH_LEAVE,
@@ -180,13 +180,13 @@ def grid(d, rows):
   return x, y, s, p
 
 
-def raw_in_path(y, s, path, half_width=MOONPILOT_PATH_HALF_WIDTH, weights="inverse variance"):
-  """`lead_in_path` before its filter, on `grid`'s arrays: the Gaussian-in-corridor probability per sample, then the mean
-  weighted by 1/yStd^2 (or uniform)."""
+def raw_in_path(y, s, path, half_width=MOONPILOT_PATH_HALF_WIDTH, weights="inverse variance", std_floor=MOONPILOT_INPATH_YSTD_FLOOR):
+  """`lead_in_path` before its filter, on `grid`'s arrays: the Gaussian-in-corridor probability per sample (true std), then the
+  mean weighted by 1/max(yStd, std_floor)^2 (or uniform). The defaults are the shipped code; `std_floor=0` is the drives'."""
   s = np.maximum(s, MOONPILOT_MIN_Y_STD)
   dy, scale = y - path, math.sqrt(2.0) * s
   p = 0.5 * ((_erf((half_width - dy) / scale) + _erf((half_width + dy) / scale)).astype(float))
-  w = 1.0 / s**2 if weights == "inverse variance" else np.ones_like(s)
+  w = 1.0 / np.maximum(s, std_floor) ** 2 if weights == "inverse variance" else np.ones_like(s)
   return (p * w).sum(1) / w.sum(1)
 
 
@@ -253,10 +253,12 @@ def _tables(d, mask, label):
       print(f"  {lo:3.0f}-{hi:3.0f} m/s " + _summary(d, mask & cmask & (d["v_ego"] >= lo) & (d["v_ego"] < hi), d["mp_in_path"], d["t_follow"], d["leaving"]))
 
 
-def _window(d, routes, route, start, end):
+def _window(d, routes, route, start, end, after):
+  """One row per second, as logged and under the shipped floor (`after` = `_emulate`'s t_follow and latch)."""
   i0 = d["route"] == routes.index(route)
-  print(f"\n{route} {start:.0f}-{end:.0f} s, one row per second (path_y right-positive, off = yRel + path_y; class by |off|)")
-  print("   t     v  dRel  yRel path_y   off class     inPath  latched t_follow base  valid")
+  tf_after, leaving_after = after
+  print(f"\n{route} {start:.0f}-{end:.0f} s, one row per second (path_y right-positive, off = yRel + path_y; class by |off|); logged | floored weights")
+  print("   t     v  dRel  yRel path_y   off class     inPath  latched t_follow base | latched t_follow  valid")
   for sec in range(int(start), int(end) + 1):
     idx = np.flatnonzero(i0 & (d["el"] >= sec))
     if not idx.size:
@@ -265,14 +267,18 @@ def _window(d, routes, route, start, end):
     a = abs(d["off"][i])
     cls = "in-lane" if a < LANE else "adjacent" if ADJACENT[0] <= a < ADJACENT[1] else "between" if a < ADJACENT[0] else "far"
     row = f"{d['el'][i]:6.1f} {d['v_ego'][i]:5.1f} {d['d_rel'][i]:5.1f} {d['y_rel'][i]:5.2f} {d['path_y'][i]:6.2f} {d['off'][i]:5.2f} {cls:9s}"
-    state = "LATCHED" if d["leaving"][i] else "-"
-    print(f"{row} {d['mp_in_path'][i]:6.2f}  {state:8s} {d['t_follow'][i]:6.3f} {d['base'][i]:4.2f}  {'' if d['valid'][i] else 'no'}")
+    state, state_after = ("LATCHED" if lv[i] else "-" for lv in (d["leaving"], leaving_after))
+    shown = f"{d['mp_in_path'][i]:6.2f}  {state:8s} {d['t_follow'][i]:6.3f} {d['base'][i]:4.2f} | {state_after:8s} {tf_after[i]:6.3f}"
+    print(f"{row} {shown}  {'' if d['valid'][i] else 'no'}")
   w = i0 & (d["el"] >= start) & (d["el"] <= end) & d["valid"]
   inl = w & (np.abs(d["off"]) < LANE)
-  first = d["el"][w & d["leaving"]]
-  onset = first[0] if first.size else math.nan
-  print(f" window frames {int(w.sum())}: in-lane {np.mean(inl[w]):.3f}, latched {np.mean(d['leaving'][w]):.3f} (first at {onset:.2f} s)")
-  print(f" t_follow/base mean {np.mean(d['t_follow'][w] / d['base'][w]):.3f}, in-lane frames latched {np.mean(d['leaving'][inl]):.3f}")
+  print(f" window frames {int(w.sum())}: in-lane {np.mean(inl[w]):.3f}")
+  for label, tf, leaving in (("logged", d["t_follow"], d["leaving"]), ("floored weights", tf_after, leaving_after)):
+    first = d["el"][w & leaving]
+    onset = first[0] if first.size else math.nan
+    ratio = np.mean(tf[w] / d["base"][w])
+    head = f"  {label:16s} latched {np.mean(leaving[w]):.3f} (first at {onset:.2f} s)"
+    print(f"{head}, t_follow/base mean {ratio:.3f}, in-lane frames latched {np.mean(leaving[inl]):.3f}")
 
 
 def _below(x, thresholds=(MOONPILOT_OUT_OF_PATH_ENTER, MOONPILOT_OUT_OF_PATH_LEAVE), digits=3):
@@ -297,7 +303,7 @@ def _causes(d):
   w /= w.sum(1, keepdims=True)
   dy, scale = y - p, math.sqrt(2) * s_c
   per = 0.5 * (_erf((MOONPILOT_PATH_HALF_WIDTH - dy) / scale) + _erf((MOONPILOT_PATH_HALF_WIDTH + dy) / scale)).astype(float)
-  print(" leadd's grid: weight share and per-sample probability by second of the 4 s horizon (mean over in-lane frames):")
+  print(" leadd's grid, weights unfloored as the drives ran: weight share and per-sample probability by second of the 4 s horizon (in-lane frames):")
   for lo in range(4):
     cols = (DRIVE_GRID >= lo) & ((DRIVE_GRID < lo + 1) if lo < 3 else (DRIVE_GRID <= lo + 1))
     share, inside, away = w[:, cols].sum(1).mean(), per[:, cols].mean(), np.median(np.abs(dy)[:, cols])
@@ -316,14 +322,16 @@ def _causes(d):
   hold_p = lambda p_: np.repeat(p_[:, :1], p_.shape[1], axis=1)  # noqa: E731
   hold_y = lambda y_: np.repeat(y_[:, :1], y_.shape[1], axis=1)  # noqa: E731
   variants = {
-    "current": lambda y_, s_, p_: raw_in_path(y_, s_, p_),
+    "shipped (floored weights)": lambda y_, s_, p_: raw_in_path(y_, s_, p_),
+    "no floor (the drives)": lambda y_, s_, p_: raw_in_path(y_, s_, p_, std_floor=0.0),
     "uniform weights": lambda y_, s_, p_: raw_in_path(y_, s_, p_, weights="uniform"),
-    "horizon 2 s": lambda y_, s_, p_: raw_in_path(y_[:, :9], s_[:, :9], p_[:, :9]),
-    "lead y held at its radar value": lambda y_, s_, p_: raw_in_path(hold_y(y_), s_, p_),
-    "path held at its value now": lambda y_, s_, p_: raw_in_path(y_, s_, hold_p(p_)),
-    "both held (yStd alone)": lambda y_, s_, p_: raw_in_path(hold_y(y_), s_, hold_p(p_)),
-    "corridor half width 2.5 m": lambda y_, s_, p_: raw_in_path(y_, s_, p_, half_width=2.5),
-    "yStd floored at 1.0 m": lambda y_, s_, p_: raw_in_path(y_, np.maximum(s_, 1.0), p_),
+    "no floor, horizon 2 s": lambda y_, s_, p_: raw_in_path(y_[:, :9], s_[:, :9], p_[:, :9], std_floor=0.0),
+    "no floor, lead y held": lambda y_, s_, p_: raw_in_path(hold_y(y_), s_, p_, std_floor=0.0),
+    "no floor, path held": lambda y_, s_, p_: raw_in_path(y_, s_, hold_p(p_), std_floor=0.0),
+    "no floor, both held": lambda y_, s_, p_: raw_in_path(hold_y(y_), s_, hold_p(p_), std_floor=0.0),
+    "no floor, half width 2.5 m": lambda y_, s_, p_: raw_in_path(y_, s_, p_, half_width=2.5, std_floor=0.0),
+    "floor 0.5 m": lambda y_, s_, p_: raw_in_path(y_, s_, p_, std_floor=0.5),
+    "floor in the probability too": lambda y_, s_, p_: raw_in_path(y_, np.maximum(s_, MOONPILOT_INPATH_YSTD_FLOOR), p_),
   }
   in_dist, adj_dist = d["d_rel"][rows], d["d_rel"][adj]
   for name, fn in variants.items():
@@ -335,36 +343,41 @@ def _causes(d):
     print(f"  {name:31s} " + " | ".join(cells))
 
 
-def _fix(d):
-  """The proposed fix through leadd's filter and the planner's latch: only the horizon (`MOONPILOT_INPATH_HORIZON`) changes."""
+def _emulate(d, floor, horizon=4.0):
+  """leadd's filter and the planner's latch over every frame with a vision slot, at a weight floor and horizon: (t_follow, latched)."""
   vision = (d["mp_present"] > 0) & (d["mp_source"] == 1)
   rows = np.flatnonzero(vision)
   y, s, p = grid(d, rows)[1:]
-  results = {}
-  for horizon in (4.0, 3.0, 2.0, 1.0, 0.0):
-    n = int(round(horizon / 0.25)) + 1
-    raw = np.ones(len(d["t"]))
-    raw[rows] = raw_in_path(y[:, :n], s[:, :n], p[:, :n])
-    results[horizon] = emulate_t_follow(raw, d, vision)
-  tf, leaving = results[4.0]
-  print("\nthe fix: leadd's filter + the planner's latch and slew emulated over every frame, by the horizon leadd evaluates")
+  n = int(round(horizon / 0.25)) + 1
+  raw = np.ones(len(d["t"]))
+  raw[rows] = raw_in_path(y[:, :n], s[:, :n], p[:, :n], std_floor=floor)
+  return emulate_t_follow(raw, d, vision)
+
+
+def _fix(d):
+  """The shipped weighting through leadd's filter and the planner's latch, against the drives' (no floor); and what a shorter horizon would add."""
+  floor = MOONPILOT_INPATH_YSTD_FLOOR
+  cases = (("logged: no floor, 4 s", 0.0, 4.0), ("shipped: floor, 4 s", floor, 4.0), ("no floor, 2 s", 0.0, 2.0), ("floor, 2 s", floor, 2.0))
+  results = {label: _emulate(d, floor, horizon) for label, floor, horizon in cases}
+  tf, leaving = results["logged: no floor, 4 s"]
+  print("\nleadd's filter + the planner's latch and slew emulated over every frame, by weighting and horizon")
   differ, worst = int(np.sum(leaving != d["leaving"])), np.max(np.abs(tf - d["t_follow"]))
-  print(f"  horizon 4 s is the shipped one; vs the planner's own `_t_follow`: latch differs on {differ} of {len(leaving)} frames,")
+  print(f"  the logged drives' weighting vs the planner's own `_t_follow`: latch differs on {differ} of {len(leaving)} frames,")
   print(f"  max t_follow diff {worst:.3f} s")
   for cname, cmask in _classes(d).items():
     print(f" {cname}: latched fraction, mean t_follow/base")
-    for horizon, (tf, leaving) in results.items():
+    for label, (tf, leaving) in results.items():
       cells = []
       for lo, hi in zip(BINS[:-1], BINS[1:], strict=True):
         m = d["valid"] & cmask & (d["d_rel"] >= lo) & (d["d_rel"] < hi)
         ratio = np.mean(tf[m] / d["base"][m])
         cells.append(f"{lo:.0f}-{hi:.0f}: {np.mean(leaving[m]):.3f} {ratio:.3f}" if m.sum() > 20 else f"{lo:.0f}-{hi:.0f}: n={int(m.sum())}")
-      print(f"  horizon {horizon:.0f} s  " + " | ".join(cells))
+      print(f"  {label:22s} " + " | ".join(cells))
   eng = d["valid"] & (d["long_active"] > 0) & (np.abs(d["off"]) < LANE)
   print(f" engaged in-lane frames {int(eng.sum())}, mean t_follow/base and mean gap shortfall at the car's speed:")
-  for horizon, (tf, leaving) in results.items():
+  for label, (tf, leaving) in results.items():
     short = np.mean((d["base"][eng] - tf[eng]) * d["v_ego"][eng])
-    print(f"  horizon {horizon:.0f} s  latched {np.mean(leaving[eng]):.3f}  t_follow/base {np.mean(tf[eng] / d['base'][eng]):.3f}  shortfall {short:.2f} m")
+    print(f"  {label:22s} latched {np.mean(leaving[eng]):.3f}  t_follow/base {np.mean(tf[eng] / d['base'][eng]):.3f}  shortfall {short:.2f} m")
   _adjacent_episodes(d, results)
 
 
@@ -378,17 +391,18 @@ def _adjacent_episodes(d, results):
   span = f"duration median {np.median(seconds):.2f} s p90 {np.percentile(seconds, 90):.2f} s max {seconds.max():.1f} s"
   print(f"\nadjacent leads ({ADJACENT[0]}-{ADJACENT[1]} m): {int(adj.sum())} frames in {len(episodes)} episodes, {span};")
   print(f" in-lane for most of the second before: {from_lane} episodes")
-  for horizon, (_, leaving) in results.items():
+  for label, (_, leaving) in results.items():
     before = np.array([bool(leaving[e.start - 1]) if e.start else False for e in episodes])
     during = np.array([bool(leaving[e].any()) for e in episodes])
     frames = sum(int(leaving[e].sum()) for e in episodes)
     carried = sum(int(leaving[e].sum()) for e, b in zip(episodes, before, strict=True) if b)
     newly = int((during & ~before).sum())
     latched = f"latched frames {frames:4d} (in episodes latched before they began: {carried:4d})"
-    print(f"  horizon {horizon:.0f} s  {latched}; episodes latched {int(during.sum()):3d}, new {newly}")
+    print(f"  {label:22s} {latched}; episodes latched {int(during.sum()):3d}, new {newly}")
   for e, sec in zip(episodes, seconds, strict=True):
     if sec >= 1.0:
-      flags = " ".join(f"h{h:.0f}:{int(lv[e].sum())}/{e.stop - e.start}" for h, (_, lv) in results.items())
+      flags = " ".join(f"{int(lv[e].sum())}" for _, (_, lv) in results.items())
+      flags = f"{flags} of {e.stop - e.start} ({', '.join(results)})"
       print(f"  episode >= 1 s: {sec:.1f} s at dRel {d['d_rel'][e.start]:.0f} m, offset {np.median(d['off'][e]):.1f} m, latched frames {flags}")
 
 
@@ -400,10 +414,11 @@ def _inpath(args):
   plus, minus = np.median(np.abs(d["off"][followed])), np.median(np.abs(d["y_rel"] - d["path_y"])[followed])
   print(f"convention check on {int(followed.sum())} followed-lead frames (10+ m/s, 20-80 m): median |yRel + path_y| {plus:.2f} m,")
   print(f"  median |yRel - path_y| {minus:.2f} m: the sum is the offset")
-  _tables(d, d["valid"], f"all valid frames (radar leadOne, leadd vision slot 0 agreeing, v > {MIN_SPEED:.0f} m/s)")
-  _tables(d, d["valid"] & (d["long_active"] > 0), "engaged frames (carControl.longActive)")
+  _tables(d, d["valid"], f"as logged: all valid frames (radar leadOne, leadd vision slot 0 agreeing, v > {MIN_SPEED:.0f} m/s)")
+  _tables(d, d["valid"] & (d["long_active"] > 0), "as logged: engaged frames (carControl.longActive)")
+  after = _emulate(d, MOONPILOT_INPATH_YSTD_FLOOR)
   for route in (r for r in routes if r in args.window_routes):
-    _window(d, routes, route, args.start, args.end)
+    _window(d, routes, route, args.start, args.end, after)
   _causes(d)
   _fix(d)
 

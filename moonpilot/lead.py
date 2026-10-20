@@ -33,6 +33,16 @@ MOONPILOT_MIN_SPEED_FOR_YAW = 1.0  # m/s; below this, yawRel is meaningless -> 0
 MOONPILOT_MIN_Y_STD = 0.05  # m; floor on yStd so the Gaussian never collapses
 MOONPILOT_OUT_OF_PATH_DANGER = 0.4  # relaxed MPC danger factor for a fully out-of-path lead
 MOONPILOT_INPATH_RC = 1.0  # s; decay time constant of the asymmetric inPath filter
+# Floor on the lateral std in the 1/yStd^2 weights of `lead_in_path` -- the weights only; each sample's own corridor
+# probability still uses its true std. Measured on 14 local routes (98k frames with an in-lane radar lead, the model's own path
+# as reference): the model's 4 s knot sits a median 4.2 m off an in-lane lead's position with a median yStd of 0.17 m, against
+# 3.0 m at the 2 s knot, so inverse-variance weighting put 0.64 of the weight on that biased knot (0.92 at 60-90 m, where the
+# first knot's std is wider). The unfiltered inPath fell below the latch's ENTER on 73 % of in-lane 60-90 m frames and the planner
+# was latched out of path on 67 % of them (t_follow 0.81 of the personality's). With the floor at 1.0 m: 1.5 % and 0.7 %. An
+# adjacent lead still reads out of path (unfiltered below ENTER on 59 % of 60-90 m frames, against 75 % unfloored), and a floor
+# of 0.5 m leaves the in-lane figures at 2.4 % / 1.4 %. `python -m moonpilot.lab inpath --routes longitudinal manual-approach`
+# prints the table.
+MOONPILOT_INPATH_YSTD_FLOOR = 1.0  # m
 # Dense where a cut-in matters, none of it past the ~4 s where a cut-in can still be avoided.
 MOONPILOT_INPATH_HORIZON = 4.0  # s; the last sample the grid is evaluated at, and so the last one
 # the planner can act on. The renderers stop their lead line here too: past it the model's own
@@ -289,9 +299,10 @@ def lead_in_path(t, x, y, y_std, ego_path_x, ego_path_y, filt) -> float:
   """One scalar in-path probability, inverse-variance weighted and asymmetrically filtered.
 
   `filt` is a caller-owned FirstOrderFilter whose state must persist across frames. Weighting by
-  1/yStd^2 lets the samples the model is confident about dominate; if yStd is flat this degenerates
-  to a uniform mean. Rising is instant (stock behavior returns immediately), decaying takes about
-  MOONPILOT_INPATH_RC of consistent evidence. Both directions fail safe.
+  1/yStd^2 lets the samples the model is confident about dominate, but only down to
+  MOONPILOT_INPATH_YSTD_FLOOR: below it the weights are flat, so one far knot with a small std and a
+  biased position cannot outvote the near samples. Rising is instant (stock behavior returns
+  immediately), decaying takes about MOONPILOT_INPATH_RC of consistent evidence. Both directions fail safe.
   """
   if len(t) < 2 or len(x) < 2 or len(y) < 2 or len(ego_path_x) == 0 or len(ego_path_y) == 0:
     filt.x = 1.0
@@ -305,8 +316,8 @@ def lead_in_path(t, x, y, y_std, ego_path_x, ego_path_y, filt) -> float:
     return 1.0
 
   probs = np.array(lead_in_path_prob(x_d, y_d, s_d, ego_path_x, ego_path_y), dtype=float)
-  s_clamped = np.maximum(s_d[: probs.size], MOONPILOT_MIN_Y_STD)
-  weights = 1.0 / s_clamped**2
+  s_weighted = np.maximum(s_d[: probs.size], MOONPILOT_INPATH_YSTD_FLOOR)
+  weights = 1.0 / s_weighted**2
   raw = float(np.sum(probs * weights) / np.sum(weights))
   return _rise_hold(raw, filt)
 

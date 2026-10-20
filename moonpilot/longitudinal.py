@@ -375,27 +375,16 @@ MOONPILOT_OUT_OF_PATH_T_FOLLOW = 0.7  # time-gap scale for a lead predicted to l
 # ...and the evidence that asks for it, as a two-state decision with hysteresis rather than a
 # continuous scale. `moonpilot.lead.inPath` is a probability that the lead's own lateral Gaussian
 # lies inside the ego path corridor, evaluated over a 4 s horizon and filtered with an instant rise
-# and a 1.0 s decay. Two things about it are measured, on route 000003df segments 5, 13, 17 and 18,
-# 689 samples where radard's yRel and the published inPath for the same slot agree within 0.25 s:
-#
-#   lead                 n     inPath median   p10    p90
-#   in lane (<1.8 m)   621        0.54        0.23   0.92
-#   adjacent (>3 m)     50        0.13        0.02   0.95
-#
-# So the number is a real signal but a weak one — corr(|yRel|, inPath) is -0.22, and the p90s nearly
-# touch — and mapping it linearly onto a time gap was the mistake. A lead the car was comfortably
-# following in lane read 0.54 at best and 0.23 at its p10, so the linear map delivered a permanent
-# 1.10-1.30 s headway where the personality asks 1.45: a 36 m target silently given as 28-33 m,
-# breathing with the estimate. That is a moving target under a proportional regulator, which is the
-# second half of the reported fault.
-#
-# These two thresholds are the fix, and 0.10 is where the separation is: it fires on 4.2 % of in-lane
-# leads and 46.9 % of adjacent-lane ones, the best ratio available (0.20 gives 7.6 % against 63.3 %,
-# 0.30 gives 15.6 % against 67.3 %, and above 0.40 the in-lane false-fires double). The reduction is
-# a claim about the lead *leaving*, it takes strong evidence for it, and it latches until the
-# evidence is clearly gone — the band between the two is the hysteresis, wide enough that inPath's own
-# jitter cannot cross it. The failure direction is the safe one: inPath that says nothing leaves the
-# car at the personality's own headway, and the only thing the feature can fail to do is close up.
+# and a 1.0 s decay. The thresholds were set on route 000003df (segments 5, 13, 17, 18; 689 samples: in
+# lane <1.8 m, n=621, median 0.54 / p10 0.23; adjacent >3 m, n=50, median 0.13 / p10 0.02), before
+# `MOONPILOT_INPATH_YSTD_FLOOR`. Mapping inPath linearly onto the time gap had given an in-lane lead a
+# permanent 1.10-1.30 s headway where the personality asks 1.45, a moving target under a proportional
+# regulator. 0.10 is where in-lane and adjacent leads separated then (4.2 % against 46.9 %; 0.20 gave
+# 7.6 / 63.3 %, 0.30 15.6 / 67.3 %), and the latch holds until LEAVE, a band wider than inPath's own
+# jitter. The failure direction is NOT benign: an in-lane lead read as leaving closes the gap. Before
+# the floor, the model's biased 4 s knot latched in-lane leads on 67 % of 60-90 m frames and 23 % of
+# engaged in-lane frames (route 0000044d: 1.01 s for 31 s); with it, 0.7 % and 0.2 %
+# (`python -m moonpilot.lab inpath --routes longitudinal manual-approach`).
 MOONPILOT_OUT_OF_PATH_ENTER = 0.10
 MOONPILOT_OUT_OF_PATH_LEAVE = 0.30
 # The driver's ladder: one accel per named driving state, measured from ~4 h of manual longitudinal

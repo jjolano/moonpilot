@@ -38,8 +38,8 @@ struct MoonpilotState @0x81c2f05a394cf4af {  # moonpilot seam: upstream's reserv
     # Derived here so every consumer agrees. yawRel: lead heading relative to the ego x
     # axis, atan2(dy/dt, v), left positive, one entry per t.
     # inPathProb: per-sample probability that the lead's lateral Gaussian lies inside the
-    # ego path corridor, one entry per t. inPath: those probabilities inverse-variance
-    # weighted into one scalar and asymmetrically filtered. 1.0 means fully in path.
+    # ego path corridor, one entry per t. inPath: those probabilities weighted by 1/max(yStd, MOONPILOT_INPATH_YSTD_FLOOR)^2
+    # into one scalar and asymmetrically filtered. 1.0 means fully in path.
     yawRel @13 :List(Float32);
     inPath @14 :Float32;
     inPathProb @15 :List(Float32);

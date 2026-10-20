@@ -32,6 +32,7 @@ from moonpilot.lead import (
   MOONPILOT_OUT_OF_PATH_DANGER,
   MOONPILOT_PATH_HALF_WIDTH,
   MOONPILOT_RADAR_TO_CAMERA,
+  MOONPILOT_INPATH_YSTD_FLOOR,
   LeadAccelEstimator,
   lead_danger_factor,
   lead_in_path,
@@ -40,6 +41,7 @@ from moonpilot.lead import (
   normalize_lead,
   resample,
 )
+from moonpilot.longitudinal import MOONPILOT_OUT_OF_PATH_ENTER, MOONPILOT_OUT_OF_PATH_LEAVE
 from moonpilot.tests.fakes import _params
 
 STRAIGHT_PATH_X = list(np.linspace(0.0, 60.0, 33))
@@ -546,6 +548,43 @@ class TestLeadInPath(unittest.TestCase):
     assert MOONPILOT_INPATH_GRID[0] == 0.0
     assert MOONPILOT_INPATH_GRID[-1] >= 4.0
     assert MOONPILOT_INPATH_GRID[-1] < LEAD_T[-1]
+
+  # A far lead on a straight path, in the model's own shape (route 0000044d at 211 s, and the corpus' p90 / p10 of the 4 s
+  # knot): near the 0 s sample the std is a few tenths, at 2 s it is wide, and the 4 s knot sits meters off the lead's own
+  # position with a tiny std. That knot is the hazard: with inverse-variance weights it outvotes everything else.
+  FAR_X = [75.0 + 20.0 * i for i in range(6)]
+  FAR_PATH_X, FAR_PATH_Y = list(np.linspace(0.0, 200.0, 33)), [0.0] * 33
+
+  def _settled(self, y, y_std):
+    """The filtered inPath after ten seconds of the same frame: the raw value, long past the filter's one-second decay."""
+    filt, out = _filter(1.0), None
+    for _ in range(int(10.0 / DT_MDL)):
+      out = lead_in_path(list(LEAD_T), self.FAR_X, y, y_std, self.FAR_PATH_X, self.FAR_PATH_Y, filt)
+    return out
+
+  def test_one_confident_far_knot_does_not_outvote_an_in_lane_lead(self):
+    """Measured on 98k in-lane radar-lead frames (`python -m moonpilot.lab inpath`): the 4 s knot is a median 4 m off with a 0.17 m
+    std, so it took 0.64 of the weight (0.92 at 60-90 m) and an in-lane lead read below the latch's ENTER on 73 % of 60-90 m
+    frames. The lead here is in lane now (y 0 at 0 s) and the model's 4 s knot is off with a std an order below the others."""
+    in_lane = self._settled([0.0, 0.0, 6.0, 1.2, 3.0, -6.8], [0.47, 2.66, 0.05, 1.26, 1.71, 1.85])
+    assert in_lane > MOONPILOT_OUT_OF_PATH_LEAVE, in_lane
+
+  def test_an_adjacent_lead_still_reads_out_of_path(self):
+    """The floor flattens the weights, it does not move the probabilities: a lead 3.5 m off across the whole horizon, with
+    the model modestly unsure, is out of path by every sample."""
+    adjacent = self._settled([3.5] * 6, [0.45, 1.0, 0.3, 0.5, 0.6, 1.0])
+    assert adjacent < MOONPILOT_OUT_OF_PATH_ENTER, adjacent
+
+  def test_the_floor_is_on_the_weights_not_the_probabilities(self):
+    """Below the floor every sample weighs the same, so a flat 0.2 m std is a plain mean of the per-sample probabilities - and
+    each of those is still the true-std Gaussian, a far lead's 4 s sample included."""
+    y, y_std = [0.0, 0.0, 6.0, 1.2, 3.0, -6.8], [0.2] * 6
+    assert MOONPILOT_INPATH_YSTD_FLOOR > max(y_std)
+    x_d, y_d = resample(LEAD_T, self.FAR_X, MOONPILOT_INPATH_GRID), resample(LEAD_T, y, MOONPILOT_INPATH_GRID)
+    probs = lead_in_path_prob(x_d, y_d, resample(LEAD_T, y_std, MOONPILOT_INPATH_GRID), self.FAR_PATH_X, self.FAR_PATH_Y)
+    assert probs[-1] < 0.01, probs
+    settled = lead_in_path(list(LEAD_T), self.FAR_X, y, y_std, self.FAR_PATH_X, self.FAR_PATH_Y, _filter(0.0))
+    self.assertAlmostEqual(settled, float(np.mean(probs)), places=9)
 
 
 class TestRendererLeadPath(unittest.TestCase):
