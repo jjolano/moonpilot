@@ -1031,6 +1031,31 @@ class TestStalenessScope(unittest.TestCase):
               differ += a_aged < a_fresh - 1e-9
     self.assertGreater(differ, 0)  # the arms are not identical over this grid, so the claim means something
 
+  def test_an_older_radar_lead_is_not_planned_as_braking_less(self):
+    """Through `update`: a braking lead's accel decays over `action_t` only, so the applied radar age (message age plus
+    the learned radar latency, `_lead_age`) adds travel, not decay. Held at a 12 m/s matched-speed follow 30 m behind a
+    lead the estimator reads at -3 m/s^2 with radard's 1.5 s decay (an onset's first frames), the aged command is no
+    shallower than the fresh one; decaying over the age too read -1.465 against -1.493 at 0.176 s, -0.695 at 0.5 s."""
+
+    class Onset(LeadAccelEstimator):
+      def update(self, lead):
+        super().update(lead)
+        return -3.0, MOONPILOT_LEAD_ACCEL_TAU
+
+    def command(age):
+      aged = mock.patch.object(MoonpilotLongitudinalPlanner, "_lead_age", lambda self, lead, lead_age: age)
+      with mock.patch("moonpilot.longitudinal.LeadAccelEstimator", Onset), aged:
+        planner = _planner()
+        sm = _inputs(v_ego=12.0, v_cruise_kph=63.0, lead=_lead(30.0, 12.0))
+        for _ in range(60):
+          planner.update(sm)
+        return planner.output_a_target
+
+    fresh = command(0.0)
+    self.assertLess(fresh, -1.0)  # a real brake, not a coast the brake band would flatten
+    for age in (0.176, 0.5):
+      self.assertLessEqual(command(age), fresh + 1e-6)
+
 
 class TestPlanner(unittest.TestCase):
   def test_resume_from_a_standstill_commands_movement(self):

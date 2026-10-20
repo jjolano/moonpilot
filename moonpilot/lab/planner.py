@@ -844,6 +844,66 @@ def _manual_decel(args):
   if headway.size:
     print(f"Settled following above 8 m/s ({follow.sum() * DT_MDL / 60:.1f} min, speeds within 0.3 m/s, lead steady): headway median "
           + f"{np.median(headway):.2f} s, p10 {np.percentile(headway, 10):.2f}, p90 {np.percentile(headway, 90):.2f}; the law's is {t_follow} s")
+  if args.previous:
+    _manual_vs_laws(args.previous, d, approach & ~leaves, need, t_follow)
+
+
+def _module_at(commit, path="moonpilot/longitudinal.py"):
+  """`path` as it was at `commit`, imported beside the current module (its own imports resolve to today's tree)."""
+  import importlib.util
+  import subprocess
+  import tempfile
+  source = subprocess.run(["git", "show", f"{commit}:{path}"], capture_output=True, text=True, check=True).stdout
+  with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as f:
+    f.write(source)
+  spec = importlib.util.spec_from_file_location(f"moonpilot_longitudinal_{commit}", f.name)
+  module = importlib.util.module_from_spec(spec)
+  spec.loader.exec_module(module)
+  return module
+
+
+def _manual_vs_laws(previous, d, mask, need, t_follow):
+  """The shipped lead law and `previous`'s, as `policy` asks them (engine-coast RAV4, cruise at the ego's speed, before
+  the brake band), beside the unified requirement and the driver's aEgo on the same manual approach frames."""
+  import moonpilot.longitudinal as now
+  from opendbc.car.toyota.interface import CarInterface
+  from opendbc.car.toyota.values import CAR, ToyotaFlags
+  old = _module_at(previous)
+  CP = CarInterface.get_non_essential_params(CAR.TOYOTA_RAV4_TSS2)
+  CP.openpilotLongitudinalControl = True
+  CP.flags |= ToyotaFlags.MOONPILOT_ENGINE_COAST.value
+  src = now.LongitudinalPlanSource.lead0
+
+  def ask(module, i, extra):
+    lead = (src, d["gap"][i], d["v_lead"][i], d["a_lead"][i], *extra)
+    return module.policy(d["v"][i], [lead], d["v"][i], t_follow, False, None, 0.0, CP, -0.3, True)[0]
+
+  idx = np.flatnonzero(mask)
+  laws = {
+    "now": np.array([ask(now, i, (now.brake_sustain(d["a_lead"][i]),)) for i in idx]),
+    previous[:9]: np.array([ask(old, i, ()) for i in idx]),
+    "unified": need[idx],
+  }
+  a, v, req = d["a"][idx], d["v"][idx], need[idx]
+  names = tuple(laws)
+  print(f"\nLead laws against the driver on the same {idx.size * DT_MDL / 60:.1f} min (leads that stay), binned by the unified requirement: "
+        + "frames, driver median aEgo, then each law's median ask; per band, median |ask - aEgo| and where now and previous differ")
+  for lo, hi in ((2.0, 8.0), (8.0, 15.0), (15.0, 45.0)):
+    band = (v >= lo) & (v < hi)
+    if not band.any():
+      continue
+    diff = laws["now"] - laws[names[1]]
+    moved = band & (np.abs(diff) > 0.05)
+    shift = np.median(diff[moved]) if moved.any() else 0.0
+    print(f"  {lo:.0f}-{hi:.0f} m/s ({band.sum() * DT_MDL / 60:.1f} min): |ask - aEgo| "
+          + "  ".join(f"{n} {np.median(np.abs(x - a)[band]):.2f}" for n, x in laws.items())
+          + f"; now differs from {names[1]} by > 0.05 on {moved[band].mean() * 100:.1f}% (median {shift:+.2f})")
+    edges = (-10.0, -1.5, -1.0, -0.5, -0.33, -0.2, -0.1, 0.0)
+    for b_lo, b_hi in zip(edges[:-1], edges[1:], strict=True):
+      m = band & (req >= b_lo) & (req < b_hi)
+      if m.sum() >= 20:
+        asks = "  ".join(f"{n} {np.median(x[m]):6.2f}" for n, x in laws.items())
+        print(f"    [{b_lo:6.2f}, {b_hi:5.2f})  {m.sum():5d}  driver {np.median(a[m]):6.2f}  {asks}")
 
 
 def _plant_inputs(v, a, gap, v_lead, a_lead, v_cruise):
@@ -1025,6 +1085,7 @@ def _register_manual(sub):
   parser = sub.add_parser("manual-decel", help="the unified approach requirement against the driver's own longitudinal")
   parser.add_argument("--routes", nargs="+", default=["manual-approach"], help=f"route names or sets: {', '.join(ROUTE_SETS)}")
   parser.add_argument("--t-follow", type=float, default=1.45, help="the target's time gap, s (standard personality's 1.45)")
+  parser.add_argument("--previous", help="also compare the shipped lead law with this commit's on the same frames")
   parser.set_defaults(fn=_manual_decel)
   sub.add_parser("hard-brake", help="lead braking hard from a follow: upstream vs fork vs ideal, with and without lag").set_defaults(fn=_hard_brake)
   parser = sub.add_parser("sustain", help="the lead-brake sustain horizon: fixed vs scaled, hard brakes, taps, drives")
