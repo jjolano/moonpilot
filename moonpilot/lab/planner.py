@@ -934,71 +934,86 @@ def _approach_runs(t, route, ok, gap, target, lead_in=10.0, min_s=3.0):
   return runs
 
 
-def _onset(x, threshold, hold=1):
-  """First index where `x` stays at or below `threshold` for `hold` frames, or None."""
-  below = np.convolve(x <= threshold, np.ones(hold), mode="valid") >= hold
-  return int(np.argmax(below)) if below.any() else None
+def _onset(event, s, e, hold=1):
+  """First index in [s, e) where boolean `event` has held `hold` frames; -1 if it already holds at s (it began before the
+  window, onset unknown: left-censored); None if it never does."""
+  held = np.convolve(event[s:e], np.ones(hold), mode="valid") >= hold
+  if not held.any():
+    return None
+  k = int(np.argmax(held))
+  return -1 if k == 0 else s + k
 
 
-def _onset_report(label, runs, t, v, gap, target, closing, series):
-  """Per start-speed band: for each actor, how many runs reach -0.05 / -0.3 and the median time to the target (gap past the
-  target over the closing) when they do; for every actor but the first, how often and by how much it starts before it."""
-  first = next(iter(series))
-  print(f"\n{label}: {len(runs)} approaches. Per actor, reached -0.05 (n, median s to target there) | reached -0.3 (same)")
+def _paired(t, runs, ref, cand, shift):
+  """`cand`'s onset (+ `shift` s) against `ref`'s, on runs where both are observed."""
+  first, after, censored = [], [], 0
+  for s, e in runs:
+    a, b = ref(s, e), cand(s, e)
+    if a == -1 or b == -1:
+      censored += 1
+    elif a is not None and b is not None:
+      dt = t[a] - (t[b] + shift)
+      (first if dt > 0.0 else after).append(abs(dt))
+  n = len(first) + len(after)
+
+  def med(x):
+    return f"{np.median(x):4.1f} s" if x else "   - "
+  return f"first {len(first):3d}/{n:<3d} by {med(first)}, after {len(after):3d} by {med(after)}, censored {censored}"
+
+
+def _onset_report(label, runs, t, v, gap, closing, rows):
+  """`rows`: (name, reference onset, candidate onset, shift s), each onset `(s, e) -> index | -1 | None`."""
+  print(f"\n{label}: {len(runs)} approaches")
   for lo, hi in ((5.0, 12.0), (12.0, 20.0), (20.0, 45.0)):
     band = [(s, e) for s, e in runs if lo <= v[s] < hi]
-    if not band:
-      continue
-    print(f"  {lo:.0f}-{hi:.0f} m/s at the start: {len(band)} approaches, gap {np.median([gap[s] for s, _ in band]):.0f} m, "
-          + f"closing {np.median([closing[s] for s, _ in band]):.1f} m/s (medians)")
-    onsets = {n: [[None if (k := _onset(x[s:e], thr, hold)) is None else s + k for s, e in band] for thr in (-0.05, -0.3)]
-              for n, (x, hold) in series.items()}
-    for n, (soft, firm) in onsets.items():
-      cells = []
-      for found in (soft, firm):
-        ttt = [(gap[i] - target[i]) / max(closing[i], 0.1) for i in found if i is not None]
-        cells.append(f"{len(ttt):3d} {np.median(ttt):5.1f} s" if ttt else "  0     -  ")
-      lead = ""
-      if n != first:
-        pairs = [(t[a] - t[b]) for a, b in zip(onsets[first][0], soft, strict=True) if a is not None and b is not None]
-        if pairs:
-          earlier = [p for p in pairs if p > 0.0]
-          lead = f"   starts before {first} in {len(earlier)}/{len(pairs)}" + (f", median {np.median(earlier):.1f} s earlier" if earlier else "")
-      print(f"    {n:12s} {cells[0]} | {cells[1]}{lead}")
+    if band:
+      print(f"  {lo:.0f}-{hi:.0f} m/s at the start: {len(band)}, gap {np.median([gap[s] for s, _ in band]):.0f} m, "
+            + f"closing {np.median([closing[s] for s, _ in band]):.1f} m/s (medians)")
+      for name, ref, cand, shift in rows:
+        print(f"    {name:40s} {_paired(t, band, ref, cand, shift)}")
 
 
 def _approach_onsets(args):
-  """Where approaches to a slower radar lead start slowing. Manual drives: the driver (aEgo held 0.5 s past the threshold)
-  against each `_lead_laws` law asked open-loop on the driver's own states. Engaged drives (`--engaged`): the logged
-  command against today's planner replayed on them. Open-loop is exact up to the earlier onset — until then both saw
-  the same states — so 'starts before' is the clean statistic; a later onset is measured on a trajectory already slowed."""
+  """Where approaches to a slower radar lead start slowing — descriptive. Manual drives: each `_lead_laws` law is asked at
+  the states the driver drove (cruise at the ego's speed, so it holds where the driver may still be accelerating) and
+  its ask onset compared with the driver's decisions (gas release, brake press) and, shifted by `--lag`, with the
+  driver's physical slowing. A closed-loop law would leave the driver's states once its command differs, so 'first' and
+  'after' do not predict closed-loop onset. Windows that open already slowing are left-censored, not counted. Engaged
+  drives (`--engaged`): the logged command against today's planner replayed on them."""
   t_follow = args.t_follow
   d = _pooled_manual(expand(args.routes, ROUTE_SETS), args.root)
-  v, gap, v_lead = d["v"], d["gap"], d["v_lead"]
+  t, v, gap, v_lead = d["t"], d["v"], d["gap"], d["v_lead"]
   target, closing = _arrival_target(v_lead, t_follow), v - v_lead
   ok = (d["manual"] > 0) & (d["lead"] > 0) & (v > 5.0) & (closing > 1.0) & (gap > target)
-  runs = _approach_runs(d["t"], d["route"], ok, gap, target)
+  runs = _approach_runs(t, d["route"], ok, gap, target)
   idx = np.unique(np.concatenate([np.arange(s, e) for s, e in runs])) if runs else np.array([], dtype=int)
-  series = {"driver": (d["a"], round(0.5 / DT_MDL))}
+  gas, brake, a = d["gas"] > 0, d["brake"] > 0, d["a"]
+  hold = round(0.5 / DT_MDL)
+  rows = []
   for n, f in _lead_laws(args, t_follow).items():
-    x = np.zeros(len(v))
-    x[idx] = [f(v[i], gap[i], v_lead[i], d["a_lead"][i]) for i in idx]
-    series[n] = (x, 1)
-  _onset_report("Manual approaches, laws open-loop on the driver's states", runs, d["t"], v, gap, target, closing, series)
+    ask = np.zeros(len(v))
+    ask[idx] = [f(v[i], gap[i], v_lead[i], d["a_lead"][i]) for i in idx]
+    rows += [
+      (f"{n} ask -0.05 vs gas release", lambda s, e: _onset(~gas, s, e), lambda s, e, x=ask: _onset(x <= -0.05, s, e), 0.0),
+      (f"{n} ask -0.5 vs brake press", lambda s, e: _onset(brake, s, e), lambda s, e, x=ask: _onset(x <= -0.5, s, e), 0.0),
+      (f"{n} ask -0.05 + lag vs aEgo -0.05", lambda s, e: _onset(a <= -0.05, s, e, hold), lambda s, e, x=ask: _onset(x <= -0.05, s, e), args.lag),
+    ]
+  _onset_report("Manual approaches: law asks on the driver's states; 'first' = the law's onset precedes the driver's", runs, t, v, gap, closing, rows)
 
   for route in expand(args.engaged, ROUTE_SETS):
     commit, _ = drive_config(route, args.root)
     details = []
     replayed, logged, active, _ = replay(route, extract(route, args.root), args.root, details_out=details)
     e = _details_arrays(details)
-    lead = e["lead_present"] & e["radar_present"]
     target_e, closing_e = _arrival_target(e["v_lead"], t_follow), e["v_ego"] - e["v_lead"]
-    ok_e = active & lead & (e["v_ego"] > 5.0) & (closing_e > 1.0) & (e["d_rel"] > target_e)
+    ok_e = active & e["lead_present"] & e["radar_present"] & (e["v_ego"] > 5.0) & (closing_e > 1.0) & (e["d_rel"] > target_e)
     runs_e = _approach_runs(e["t"], np.zeros(len(ok_e)), ok_e, e["d_rel"], target_e)
     m = active & np.isfinite(logged)
     p95 = float(np.percentile(np.abs(replayed - logged)[m], 95)) if m.any() else math.nan
-    _onset_report(f"Engaged {route} (ran {commit[:9]}; replay vs logged p95 {p95:.3f})", runs_e, e["t"], e["v_ego"], e["d_rel"], target_e, closing_e,
-                  {"logged": (np.nan_to_num(logged), 1), "now": (replayed, 1)})
+    logged = np.nan_to_num(logged)
+    rows_e = [(f"now vs logged at {thr}", lambda s, e, x=logged <= thr: _onset(x, s, e), lambda s, e, x=replayed <= thr: _onset(x, s, e), 0.0)
+              for thr in (-0.05, -0.3)]
+    _onset_report(f"Engaged {route} (ran {commit[:9]}; replay vs logged p95 {p95:.3f})", runs_e, e["t"], e["v_ego"], e["d_rel"], closing_e, rows_e)
 
 
 def _plant_inputs(v, a, gap, v_lead, a_lead, v_cruise):
@@ -1189,6 +1204,7 @@ def _register_manual(sub):
   parser.add_argument("--t-follow", type=float, default=1.45, help="the target's time gap, s")
   parser.add_argument("--previous", default="dcc538d78", help="the previous lead law's commit")
   parser.add_argument("--prototype", help="also the retired unified_lead_accel at this commit (4a23d0368)")
+  parser.add_argument("--lag", type=float, default=0.36, help="command to aEgo lag, s (MoonpilotLongLag on this device)")
   parser.set_defaults(fn=_approach_onsets)
   sub.add_parser("hard-brake", help="lead braking hard from a follow: upstream vs fork vs ideal, with and without lag").set_defaults(fn=_hard_brake)
   parser = sub.add_parser("sustain", help="the lead-brake sustain horizon: fixed vs scaled, hard brakes, taps, drives")
