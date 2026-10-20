@@ -7,6 +7,9 @@ rather than hidden: window overrides the drive did not carry (a marketplace mode
 and the car's own brake arbitration, which no replay models — `brake-lamps` reports the drive's real BRKON, not what
 the band would have produced.
 """
+import math
+from collections import deque
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import numpy as np
@@ -15,20 +18,24 @@ from openpilot.cereal.services import SERVICE_LIST
 from opendbc.car.car_helpers import interfaces
 from opendbc.car.structs import car
 from openpilot.common.constants import CV
-from openpilot.common.realtime import DT_CTRL
+from openpilot.common.realtime import DT_CTRL, DT_MDL
 from openpilot.tools.lib.logreader import LogReader
 from moonpilot.longitudinal import MoonpilotLongitudinalPlanner
 from moonpilot.longcontrol import MoonpilotLongControl
-from moonpilot.lab import DEFAULT_ROOT, cached, drive_config, expand, runs
+from moonpilot.lab import DEFAULT_ROOT, cached, drive_config, expand, runs, segments
 
 EXTRACT_VERSION = 2
 LAMP_VERSION = 1
 LAMP_ADDRESS = 0x320  # VSC1S07: the skid-control ECU's own frame, where BRKON is the brake-lamp proxy
 CONTROL_VERSION = 1  # one row per carControl frame: the rate the acceleration controller is written for
+MANUAL_VERSION = 1
 ROUTE_SETS = {
   # Engaged local drives. 0000042c/42d/42e have zero longActive frames and are skipped by the commands.
   "longitudinal": ("000003f8", "000003fe", "00000400", "00000401", "00000408", "0000040d", "0000040e", "00000410", "00000414", "0000043e", "0000043f"),
   "lead-approach": ("000003f8", "00000400", "00000401", "00000408", "0000040d", "0000040e", "00000410", "00000414", "0000043e", "0000043f"),
+  # The driver's own longitudinal behind radar leads; routes without such frames are counted as empty.
+  "manual-approach": ("000003f8", "000003fe", "00000400", "00000401", "00000408", "0000040d", "0000040e", "00000410", "00000414",
+                      "0000042b", "0000042c", "0000043e", "0000043f", "0000044d"),
 }
 MESSAGES = ("carState", "controlsState", "carControl", "vehicleParameters", "radarState", "selfdriveState", "moonpilotState", "modelV2")
 ON_BY_DEFAULT = {"MoonpilotLongitudinal", "MoonpilotModelBraking", "MoonpilotBrakeBand", "MoonpilotCurveSpeed", "MoonpilotLeadLateral", "MoonpilotCoastGrade"}
@@ -619,8 +626,241 @@ def _register_lead_approach(sub):
   parser.set_defaults(fn=_lead_approach)
 
 
+def _manual_frames(route, root=DEFAULT_ROOT):
+  """The driver's own longitudinal and the radar lead, one row per planner tick of the route's extract, with the lead's
+  accel from the planner's own `LeadAccelEstimator` run over the same rows."""
+  from moonpilot.lead import LeadAccelEstimator
+
+  def build(_segs):
+    data = extract(route, root)
+    blob, offsets = data["blob"], data["offsets"]
+    index = {k: 1 + i * 3 for i, k in enumerate(MESSAGES)}
+    estimator, rows = LeadAccelEstimator(), []
+    for row in offsets:
+      def read(kind, row=row):
+        start, size = row[index[kind]], row[index[kind] + 1]
+        return messaging.log_from_bytes(blob[start:start + size].tobytes())
+      cs, cc, lead = read("carState").carState, read("carControl").carControl, read("radarState").radarState.leadOne
+      a_lead, _ = estimator.update(lead)
+      manual = not cc.longActive and not cs.cruiseState.enabled and cs.gearShifter == car.CarState.GearShifter.drive
+      rows.append((row[0] * 1e-9, manual, cs.vEgo, cs.aEgo, cs.gasPressed, cs.brakePressed, lead.present and lead.radar, lead.dRel, lead.vLead, a_lead))
+    keys = ("t", "manual", "v", "a", "gas", "brake", "lead", "gap", "v_lead", "a_lead")
+    return {k: np.asarray(col, dtype=float) for k, col in zip(keys, zip(*rows, strict=True), strict=True)}
+
+  return cached(route, "manual", MANUAL_VERSION, root, build)
+
+
+def _pooled_manual(routes, root):
+  """Every route's manual frames end to end, with `route` numbering them so episodes never span two drives."""
+  frames = [_manual_frames(r, root) for r in routes]
+  d = {k: np.concatenate([f[k] for f in frames]) for k in frames[0] if k != "segments"}
+  d["route"] = np.concatenate([np.full(len(f["t"]), i) for i, f in enumerate(frames)])
+  return d
+
+
+def _bin_rows(d, mask, need, bins):
+  for lo, hi in zip(bins[:-1], bins[1:], strict=True):
+    m = mask & (need >= lo) & (need < hi)
+    if m.any():
+      print(f"    [{lo:5.2f}, {hi:5.2f})  {m.sum():6d}  gas {d['gas'][m].mean() * 100:3.0f}%  brake {d['brake'][m].mean() * 100:3.0f}%  "
+            + f"median aEgo {np.median(d['a'][m]):6.2f} (p25 {np.percentile(d['a'][m], 25):6.2f}, p75 {np.percentile(d['a'][m], 75):6.2f})")
+
+
+HOLD_FLY_DEAD_S, HOLD_FLY_TAU_S = 0.2, 0.25  # the plant: dead time, then a first-order lag on the command
+HOLD_FLY_SCENARIOS = (  # (label, v0, set kph, gap0, v_lead0, lead accel (t, v_lead), seconds)
+  ("20 -> 15 m/s from 119 m", 20.0, 72.0, 119.0, 15.0, lambda t, vl: 0.0, 80.0),
+  ("same, lead +0.18 for 10 s", 20.0, 72.0, 119.0, 15.0, lambda t, vl: 0.18 if t < 10.0 else 0.0, 80.0),
+  ("000003e4: 16 -> 11.7 from 119 m", 16.0, 58.0, 119.0, 11.7, lambda t, vl: 0.0, 80.0),
+  ("lead -1.5 to 5 m/s at 6 s", 20.0, 72.0, 119.0, 15.0, lambda t, vl: -1.5 if t > 6.0 and vl > 5.0 else 0.0, 60.0),
+  ("lead -3.5 to rest at 6 s", 20.0, 72.0, 119.0, 15.0, lambda t, vl: -3.5 if t > 6.0 else 0.0, 60.0),
+  ("lead -3.5 to rest at 12 s", 20.0, 72.0, 119.0, 15.0, lambda t, vl: -3.5 if t > 12.0 else 0.0, 60.0),
+)
+
+
+class _LaggedPlant:
+  """Acceleration following the command after `HOLD_FLY_DEAD_S` of dead time, then a first-order lag of
+  `HOLD_FLY_TAU_S`, exactly discretized at the tick: the command fed on frame i first moves `a` on frame i + dead/dt."""
+
+  def __init__(self, dt=DT_MDL):
+    self.queue = deque([0.0] * round(HOLD_FLY_DEAD_S / dt))
+    self.alpha = 1.0 - math.exp(-dt / HOLD_FLY_TAU_S)
+    self.a = 0.0
+
+  def step(self, cmd):
+    delayed = self.queue.popleft()  # the oldest leaves before this frame's command joins
+    self.queue.append(cmd)
+    self.a += (delayed - self.a) * self.alpha
+    return self.a
+
+
+
+def _fly_lagged(v0, v_set_kph, gap0, v_lead0, a_lead_fn, T, seed=None):
+  """The engine-coast RAV4 planner against a scripted lead through a lagged point-mass plant; with a seed, white radar
+  noise on `dRel` (0.3 m + 0.4 %) and `vLead` (0.05 m/s)."""
+  from moonpilot.tests.test_engine_coast import _planner
+  from moonpilot.tests.test_longitudinal import _inputs, _lead
+  rng = np.random.default_rng(seed) if seed is not None else None
+  planner, plant, v, gap, v_lead = _planner(True), _LaggedPlant(), v0, gap0, v_lead0
+  out = {k: [] for k in ("v", "gap", "v_lead", "cmd")}
+  for i in range(round(T / DT_MDL)):
+    d_seen, v_seen = gap, v_lead
+    if rng is not None:
+      d_seen, v_seen = gap + rng.normal(0.0, 0.3 + 0.004 * gap), v_lead + rng.normal(0.0, 0.05)
+    planner.update(_inputs(v_ego=max(v, 0.0), v_cruise_kph=v_set_kph, a_ego=plant.a, lead=_lead(max(d_seen, 0.0), max(v_seen, 0.0)), personality=1))
+    for k, x in zip(out, (v, gap, v_lead, float(planner.output_a_target)), strict=True):
+      out[k].append(x)
+    a = plant.step(float(planner.output_a_target))
+    v_next = max(0.0, v_lead + float(a_lead_fn(i * DT_MDL, v_lead)) * DT_MDL)
+    v = max(0.0, v + a * DT_MDL)
+    gap += (0.5 * (v_lead + v_next) - v) * DT_MDL
+    v_lead = v_next
+  return {k: np.asarray(x) for k, x in out.items()}
+
+
+def _fly_metrics(r):
+  """First ask past -0.05 (gap there), peak, minimum gap, the command's noise about its 1 s mean, and how many frames
+  after that first ask the command came back above -0.01 while still closing faster than 0.5 m/s — a return to the hold."""
+  cmd, gap = r["cmd"], r["gap"]
+  onset = np.flatnonzero(cmd < -0.05)
+  closing = r["v"] - r["v_lead"]
+  back = int(np.sum((cmd[onset[0]:] > -0.01) & (closing[onset[0]:] > 0.5))) if onset.size else 0
+  hf = float(np.std((cmd - np.convolve(cmd, np.ones(20) / 20, mode="same"))[10:-10]))
+  return {"onset": float(gap[onset[0]]) if onset.size else float("nan"), "peak": float(cmd.min()), "min_gap": float(gap.min()), "hf": hf, "back": back}
+
+
+def _lead_hold(args):
+  """The engine-coast arrival hold (`MOONPILOT_ARRIVAL_HOLD_*`): the driver data it is shaped on, where it changes a
+  recorded drive's command, and lagged, noisy closed-loop flights with it on and off."""
+  from unittest import mock
+  import moonpilot.longitudinal as longitudinal
+  off = mock.patch.multiple(longitudinal, MOONPILOT_ARRIVAL_HOLD_START=0.0, MOONPILOT_ARRIVAL_HOLD_FULL=0.0)
+
+  routes = expand(args.routes, ROUTE_SETS)
+  d = _pooled_manual(routes, args.root)
+  closing, slack = d["v"] - d["v_lead"], d["gap"] - 1.45 * d["v_lead"]
+  mask = (d["manual"] > 0) & (d["lead"] > 0) & (d["v"] > 12.0) & (closing > 1.0) & (slack > 5.0)
+  need = -(closing**2) / (2.0 * np.maximum(slack, 1e-3))
+  print(f"Driver: {mask.sum() * DT_MDL / 60:.1f} min of manual approaches above 12 m/s on {len(set(d['route'][mask]))} of {len(routes)} routes "
+        + "(radar lead slower by > 1 m/s, gap > 5 m past 1.45 s); the arrival term's ask, binned:")
+  _bin_rows(d, mask, need, (-0.5, -0.33, -0.25, -0.2, -0.15, -0.1, -0.05, 0.0))
+
+  route = args.replay_route
+  data = extract(route, args.root)
+  details = []
+  on, logged, active, _ = replay(route, data, args.root, details_out=details)
+  with off:
+    held_off, _, _, _ = replay(route, data, args.root)
+  t0 = next(iter(LogReader(segments(route, args.root)[0], sort_by_time=True))).logMonoTime * 1e-9
+  t = np.asarray([row["t"] for row in details]) - t0
+  engaged = active & np.isfinite(logged)
+  print(f"\nReplay {route} (commit {drive_config(route, args.root)[0][:9]}): hold off reproduces the log to p95 "
+        + f"{np.percentile(np.abs(held_off - logged)[engaged], 95):.4f} m/s^2 on {engaged.sum()} engaged frames. Where the hold changes the ask:")
+  for s in runs(engaged & (np.abs(on - held_off) > 0.005)):
+    print(f"  {t[s.start]:7.1f}-{t[s.stop - 1]:7.1f} s  logged {logged[s].min():6.3f}..{logged[s].max():6.3f}  "
+          + f"hold off {held_off[s].min():6.3f}..{held_off[s].max():6.3f}  hold on {on[s].min():6.3f}..{on[s].max():6.3f}")
+
+  print(f"\nFlown: engine-coast RAV4, {HOLD_FLY_DEAD_S} s dead time + {HOLD_FLY_TAU_S} s lag, clean and {args.seeds} noisy seeds "
+        + "(worst over seeds after the slash). onset = gap at the first ask past -0.05; back = frames returned to the hold.")
+  print(f"  {'scenario':32s} {'hold':4s} {'onset':>6s} {'peak':>13s} {'min gap':>13s} {'hf':>5s} {'back':>4s}")
+  for label, *scenario in HOLD_FLY_SCENARIOS:
+    for name, ctx in (("off", off), ("on", nullcontext())):
+      with ctx:
+        clean = _fly_metrics(_fly_lagged(*scenario))
+        noisy = [_fly_metrics(_fly_lagged(*scenario, seed=s)) for s in range(args.seeds)] or [clean]
+      print(f"  {label:32s} {name:4s} {clean['onset']:6.1f} {clean['peak']:6.2f}/{min(n['peak'] for n in noisy):6.2f} "
+            + f"{clean['min_gap']:6.2f}/{min(n['min_gap'] for n in noisy):6.2f} {max(n['hf'] for n in noisy):5.2f} "
+            + f"{max([clean['back']] + [n['back'] for n in noisy]):4d}")
+
+
+def _rest_gaps(route, v, lead, v_lead, gap, settle_s=1.0):
+  """The gap behind a stopped radar lead, once per ego stop: the ego arms above 2 m/s and the stop fires on its first
+  standstill frame (below 0.1 m/s) in the same route; the lead is read on that frame or up to `settle_s` into the
+  standstill (a radar dropout at the stop frame). Only motion above 2 m/s re-arms, so radar reacquisition or `vLead`
+  jitter during one standstill, and a creep and re-stop, are the same stop."""
+  settle = round(settle_s / DT_MDL)
+  gaps, armed = [], False
+  for i in range(len(v)):
+    if i and route[i] != route[i - 1]:
+      armed = False
+    if v[i] > 2.0:
+      armed = True
+    elif armed and v[i] < 0.1:
+      armed = False
+      for j in range(i, min(i + settle, len(v))):
+        if route[j] != route[i] or v[j] >= 0.1:
+          break
+        if lead[j] and v_lead[j] < 0.2 and gap[j] < 20.0:
+          gaps.append(float(gap[j]))
+          break
+  return np.asarray(gaps)
+
+
+def _manual_decel(args):
+  """The unified approach requirement against the driver's own longitudinal: `stopping_decel` (the lead's braking held
+  for up to its sustain, positive lead accel ignored) to the arrival target, max(moving rest, t_follow * v_lead), on
+  manual frames behind a radar lead; then where the driver actually ends up — rest gaps and settled headways."""
+  from moonpilot.longitudinal import (MOONPILOT_CREEP_SPEED, MOONPILOT_MOVING_STOP_RESERVE, MOONPILOT_STOP_DISTANCE, MOONPILOT_STOP_REST,
+                                      lead_accel_estimate, stopping_decel)
+  t_follow = args.t_follow
+  routes = expand(args.routes, ROUTE_SETS)
+  d = _pooled_manual(routes, args.root)
+  v, v_lead, gap = d["v"], d["v_lead"], d["gap"]
+  reserve = MOONPILOT_STOP_DISTANCE - MOONPILOT_STOP_REST + MOONPILOT_MOVING_STOP_RESERVE
+  rest = MOONPILOT_STOP_REST + reserve * np.clip(v_lead / MOONPILOT_CREEP_SPEED, 0.0, 1.0)
+  target = np.maximum(rest, t_follow * v_lead)
+  lead = (d["manual"] > 0) & (d["lead"] > 0)
+  a_lead = np.array([lead_accel_estimate(x) for x in d["a_lead"]])
+  need = np.array([stopping_decel(*x) if m else 0.0 for m, x in zip(lead, zip(v, v_lead, a_lead, np.maximum(gap - target, 0.1), strict=True), strict=True)])
+  approach = lead & (v > 2.0) & (gap - target > 1.0) & (need < 0.0)
+  # A lead that leaves within 5 s (radar lead gone, or its gap jumping 5 m in a frame: another object) is one the
+  # driver may already be passing or watching turn off; the ratios below are on the leads that stay.
+  leaves = np.zeros(len(v), dtype=bool)
+  for i in np.flatnonzero(approach & (need <= -0.2)):
+    ahead = slice(i, min(i + round(5.0 / DT_MDL), len(v)))
+    same = d["route"][ahead] == d["route"][i]
+    leaves[i] = not (d["lead"][ahead][same] > 0).all() or bool((np.abs(np.diff(gap[ahead][same])) > 5.0).any())
+  to_target = (gap - target) / np.maximum(v - v_lead, 0.05)
+  print(f"{approach.sum() * DT_MDL / 60:.1f} min of manual approach frames on {len(set(d['route'][approach]))} of {len(routes)} routes; "
+        + "the unified requirement, binned, against what the driver did:")
+  for lo, hi in ((2.0, 8.0), (8.0, 15.0), (15.0, 45.0)):
+    band = approach & (v >= lo) & (v < hi)
+    deep = band & (need <= -0.2)
+    stays = deep & ~leaves
+    ratio = d["a"][stays] / need[stays]
+    print(f"  {lo:.0f}-{hi:.0f} m/s: {band.sum() * DT_MDL / 60:.1f} min. Asking -0.2 or deeper, the lead leaves within 5 s on "
+          + f"{leaves[deep].mean() * 100:.0f}% of frames; where it stays the driver's aEgo / requirement is "
+          + (f"median {np.median(ratio):.2f} (p25 {np.percentile(ratio, 25):.2f}, p75 {np.percentile(ratio, 75):.2f})" if ratio.size else "n/a"))
+    by_time = [(a, b, stays & (to_target >= a) & (to_target < b)) for a, b in ((0, 3), (3, 6), (6, 10), (10, np.inf))]
+    print("    by time to the target at the current closing: " + ", ".join(
+      f"{a}-{b} s {np.median(d['a'][m] / need[m]):.2f} (n {m.sum()})" for a, b, m in by_time if m.sum() >= 50))
+    _bin_rows(d, band, need, (-10.0, -1.5, -1.0, -0.5, -0.33, -0.2, -0.1, 0.0))
+
+  rests = _rest_gaps(d["route"], v, lead, v_lead, gap)
+  if rests.size:
+    print(f"\nRest gap behind a stopped lead ({rests.size} stops from above 2 m/s): median {np.median(rests):.2f} m, p10 {np.percentile(rests, 10):.2f}, "
+          + f"p90 {np.percentile(rests, 90):.2f}; the law's rest point is {MOONPILOT_STOP_REST} m")
+  follow = lead & (v > 8.0) & (np.abs(v - v_lead) < 0.3) & (np.abs(a_lead) < 0.3)
+  headway = gap[follow] / v[follow]
+  if headway.size:
+    print(f"Settled following above 8 m/s ({follow.sum() * DT_MDL / 60:.1f} min, speeds within 0.3 m/s, lead steady): headway median "
+          + f"{np.median(headway):.2f} s, p10 {np.percentile(headway, 10):.2f}, p90 {np.percentile(headway, 90):.2f}; the law's is {t_follow} s")
+
+
+def _register_manual(sub):
+  parser = sub.add_parser("lead-hold", help="engine-coast arrival hold: driver bins, replayed drive, lagged/noisy flights")
+  parser.add_argument("--routes", nargs="+", default=["manual-approach"], help=f"route names or sets: {', '.join(ROUTE_SETS)}")
+  parser.add_argument("--replay-route", default="0000044d", help="engaged drive to replay with the hold on and off")
+  parser.add_argument("--seeds", type=int, default=5, help="noisy flights per scenario")
+  parser.set_defaults(fn=_lead_hold)
+  parser = sub.add_parser("manual-decel", help="the unified approach requirement against the driver's own longitudinal")
+  parser.add_argument("--routes", nargs="+", default=["manual-approach"], help=f"route names or sets: {', '.join(ROUTE_SETS)}")
+  parser.add_argument("--t-follow", type=float, default=1.45, help="the target's time gap, s (standard personality's 1.45)")
+  parser.set_defaults(fn=_manual_decel)
+
+
 def register(sub):
   _register_lead_approach(sub)
+  _register_manual(sub)
   commands = (
     ("planner-fidelity", _fidelity),
     ("brake-band", _band),
