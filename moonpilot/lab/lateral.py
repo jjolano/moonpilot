@@ -28,7 +28,11 @@ ROUTE_SETS = {
   "hysteresis": ("0000040d--b31ecdf74b", "0000040e--20803b67bd"),
   # MoonpilotPathSmooth's lag table (moonpilot/docs/curvature.md).
   "smooth": ("00000413--e204529ce6", "00000414--32736d038c", "00000417--e0a9135c4e", "00000418--c554e5658b"),
+  # Engaged lateral drives (3f8-418, 43e, 43f, 44d) beside the two all-manual drives 44e/44f, for lane-position.
+  "lanes": (*(f"0000{i:04x}" for i in range(0x3F8, 0x411)), "00000413", "00000414", "00000417", "00000418", "0000043e", "0000043f",
+            "0000044d", "0000044e", "0000044f"),
 }
+LANE_VERSION = 1
 SMOOTH_IN_DELAY_UNTIL = "d8b15bd1b"  # before this commit controlsd added PathSmooth's tau to the controller's lat_delay
 
 
@@ -194,10 +198,56 @@ def _smooth(args):
     print(f"  tau {tau:.2f} s: {no_lead:4.0f} ms no lead, {led:4.0f} ms lead tau")
 
 
+def _lane_build(segs: list[str]) -> dict[str, np.ndarray]:
+  """Per modelV2: the ego lane's centre and width from laneLines 1/2 at x = 0 (y right-positive, so a positive centre is
+  the ego left of it), the weaker line's prob, the path's curvature, speed, and who steered."""
+  rows, lat, cs = [], False, (0.0, False)
+  for m in LogReader(segs, sort_by_time=True):
+    w = m.which()
+    if w == "carControl":
+      lat = m.carControl.latActive
+    elif w == "carState":
+      cs = (m.carState.vEgo, m.carState.steeringPressed)
+    elif w == "modelV2" and len(m.modelV2.laneLines) == 4 and len(m.modelV2.laneLineProbs) == 4:
+      mv = m.modelV2
+      left, right = mv.laneLines[1].y[0], mv.laneLines[2].y[0]
+      rows.append((m.logMonoTime * 1e-9, lat, cs[1], cs[0], 0.5 * (left + right), right - left, min(mv.laneLineProbs[1], mv.laneLineProbs[2]),
+                   mv.action.desiredCurvature))
+  keys = ("t", "lat", "pressed", "v", "center", "width", "prob", "curv")
+  return {k: np.asarray(c, dtype=float) for k, c in zip(keys, zip(*rows, strict=True), strict=True)}
+
+
+def _lane_position(args):
+  """Where in the lane the car sits, openpilot steering (hands off) against the driver, on well-seen lanes above 8 m/s:
+  offset left of the lane centre on straights, and toward the inside of curves (by the path's lateral accel). Both
+  classes share the camera mount, so its offset cancels in the comparison."""
+  parts = []
+  for r in expand(args.routes, ROUTE_SETS):
+    try:
+      parts.append(cached(r, "lanes", LANE_VERSION, args.root, _lane_build))
+    except FileNotFoundError as e:
+      print(f"{r}: skipped, {e}")
+  d = {k: np.concatenate([p[k] for p in parts]) for k in parts[0]}
+  seen = (d["v"] > 8.0) & (d["prob"] > 0.7) & (d["width"] > 2.8) & (d["width"] < 4.5)
+  who = {"openpilot": seen & (d["lat"] > 0) & (d["pressed"] == 0), "driver": seen & (d["lat"] == 0)}
+  a_lat = d["curv"] * d["v"] ** 2
+  inside = -d["center"] * np.sign(d["curv"])  # desiredCurvature is positive to the right (y right, z down): the inside is right
+  q = lambda x: f"{np.median(x):+.2f} (p10 {np.percentile(x, 10):+.2f}, p90 {np.percentile(x, 90):+.2f}, n {x.size})" if x.size else "n/a"  # noqa: E731
+  for name, m in who.items():
+    print(f"{name}: {m.sum() * 0.05 / 60:.0f} min on well-seen lanes")
+    for lo, hi in ((8.0, 15.0), (15.0, 25.0), (25.0, 45.0)):
+      band = m & (d["v"] >= lo) & (d["v"] < hi)
+      print(f"  {lo:.0f}-{hi:.0f} m/s straight (|a_lat| < 0.3): left of centre {q(d['center'][band & (np.abs(a_lat) < 0.3)])}")
+    for lo, hi in ((0.5, 1.0), (1.0, 2.0), (2.0, 10.0)):
+      band = m & (np.abs(a_lat) >= lo) & (np.abs(a_lat) < hi)
+      print(f"  curve {lo:.1f}-{hi:.1f} m/s^2: toward the inside {q(inside[band])}")
+
+
 def register(sub):
   for name, fn, default, help_text in (
     ("torque", _torque, "hysteresis", "MoonpilotSteerHysteresis: torque reversals per second"),
     ("smooth", _smooth, "smooth", "MoonpilotPathSmooth: request lag behind the model's action"),
+    ("lane-position", _lane_position, "lanes", "where in the lane the car sits: openpilot steering against the driver"),
   ):
     p = sub.add_parser(name, help=help_text, description=help_text)
     p.add_argument("--routes", nargs="+", default=[default], help=f"route names or sets: {', '.join(ROUTE_SETS)}")
