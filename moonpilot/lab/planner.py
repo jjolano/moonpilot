@@ -857,6 +857,7 @@ def _module_at(commit, path="moonpilot/longitudinal.py"):
   with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as f:
     f.write(source)
   spec = importlib.util.spec_from_file_location(f"moonpilot_longitudinal_{commit}", f.name)
+  assert spec is not None and spec.loader is not None
   module = importlib.util.module_from_spec(spec)
   spec.loader.exec_module(module)
   return module
