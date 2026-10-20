@@ -72,7 +72,7 @@ hiccup would silently kill the correction — the prior's freshness comes from t
 which is the stricter test anyway.
 
 The consumer is `MoonpilotLongitudinalPlanner.update`, one line: `v_ego` gains the correction before
-anything else reads it, so the spacing regulator, the time-to-collision approach term, the cruise
+anything else reads it, so the spacing regulator, the arrival and stopping-floor terms, the cruise
 term and the published rollout all plan from the corrected speed — not one candidate, since every
 one of them starts from `v_ego`. Trust is scaled by `1 / (1 + corrStd)` and never amplified, `a_ego` is
 untouched, and absent, invalid, stale or dead-publisher all give zero, which is exactly the planner

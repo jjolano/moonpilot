@@ -20,7 +20,7 @@ import math
 # lead one frame of its -0.5 onset), and `ENTER_LEAD` stays below `RELEASE` so a press cannot end and
 # restart on the same ask. The planner bounds the result by `cruise_cap`, so with throttle denied the
 # coast accel stays a ceiling. Replayed through the planner (15 routes) and those switching rates,
-# re-lights within 2 s go 0.94 -> 0.80 /min; docs/longitudinal.md has the rest. TTC, the stopping floor
+# re-lights within 2 s go 0.94 -> 0.80 /min; docs/longitudinal.md has the rest. The stopping floor
 # and real braking are deeper than `ENTER` and pass untouched.
 MOONPILOT_BRAKE_BAND_FLOOR = -0.10  # m/s^2
 MOONPILOT_BRAKE_BAND_ENTER = -0.40  # m/s^2

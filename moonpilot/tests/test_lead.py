@@ -222,7 +222,7 @@ class TestLeadAccelEstimator(unittest.TestCase):
 
   def test_the_onset_window_can_only_deepen_the_estimate(self):
     """The property the policy rests on. `moonpilot/longitudinal.py` only ever uses `a_lead` to add
-    braking (`min(a_lead, 0.0)` in the preview, and the floor/TTC terms key off the resulting closing
+    braking (`min(a_lead, 0.0)` in the preview, and the stopping floor keys off the resulting closing
     rate), so a deeper estimate is more braking and a shallower one is less — which makes "may only
     deepen" the direction that cannot cost safety. It is also rare on a signal with no real onset:
     22 of 600 frames of a 0.05 m/s random walk on the fifteen-sample window, the deepest of them 2.12 m/s^2.

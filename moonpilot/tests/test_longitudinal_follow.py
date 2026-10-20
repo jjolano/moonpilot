@@ -82,7 +82,7 @@ class TestFollowPolicy(unittest.TestCase):
     18.8 s while the gap to a 42 kph lead closed from 119 m to 34 m, the plan asking 0.0 m/s² the
     whole way, then -1.09 m/s² actual with the car 1.1 m inside the 17 m target while still closing,
     and 2.5 s of braking at the settled gap — the brake lights while following. The regulator's
-    negative window does not open until 31.5 m there, TTC and the stopping floor are both past their
+    negative window does not open until 31.5 m there, the then time-to-collision term and the stopping floor were past their
     admission gates by less than they ask, so cruise held set speed and nothing else spoke.
 
     The arrival term is what replaces it, and this is the before/after on the same harness: it coasts
@@ -207,7 +207,7 @@ class TestFollowPolicy(unittest.TestCase):
     def ask(v_ego, v_lead, gap=7.0):
       return policy(v_ego, [(source, gap, v_lead, 0.0)], 8.0, t_follow, False, None, 0.0, cp, -0.3, True)[0]
 
-    # No step as the lead's speed tapers through the reserve (at 9 m, clear of the TTC admission step
+    # No step as the lead's speed tapers through the reserve (at 9 m, clear of the floor's admission band
     # the former law also takes nearer in), nor as ego crosses the creep taper and the time-gap
     # crossover. At 8.5 m, outside the floor: a deficit there steps at creep through the follow
     # speed floor's own hard `v_ego > CREEP_SPEED` gate, which predates the reserve.
