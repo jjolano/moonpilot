@@ -199,7 +199,7 @@ def _smooth(args):
 
 
 def _lane_build(segs: list[str]) -> dict[str, np.ndarray]:
-  """Per modelV2: the ego lane's centre and width from laneLines 1/2 at x = 0 (y right-positive, so a positive centre is
+  """Per modelV2: the ego lane's center and width from laneLines 1/2 at x = 0 (y right-positive, so a positive center is
   the ego left of it), the weaker line's prob, the path's curvature, speed, and who steered."""
   rows, lat, cs = [], False, (0.0, False)
   for m in LogReader(segs, sort_by_time=True):
@@ -219,7 +219,7 @@ def _lane_build(segs: list[str]) -> dict[str, np.ndarray]:
 
 def _lane_position(args):
   """Where in the lane the car sits, openpilot steering (hands off) against the driver, on well-seen lanes above 8 m/s:
-  offset left of the lane centre on straights, and toward the inside of curves (by the path's lateral accel). Both
+  offset left of the lane center on straights, and toward the inside of curves (by the path's lateral accel). Both
   classes share the camera mount, so its offset cancels in the comparison."""
   parts = []
   for r in expand(args.routes, ROUTE_SETS):
@@ -237,7 +237,7 @@ def _lane_position(args):
     print(f"{name}: {m.sum() * 0.05 / 60:.0f} min on well-seen lanes")
     for lo, hi in ((8.0, 15.0), (15.0, 25.0), (25.0, 45.0)):
       band = m & (d["v"] >= lo) & (d["v"] < hi)
-      print(f"  {lo:.0f}-{hi:.0f} m/s straight (|a_lat| < 0.3): left of centre {q(d['center'][band & (np.abs(a_lat) < 0.3)])}")
+      print(f"  {lo:.0f}-{hi:.0f} m/s straight (|a_lat| < 0.3): left of center {q(d['center'][band & (np.abs(a_lat) < 0.3)])}")
     for lo, hi in ((0.5, 1.0), (1.0, 2.0), (2.0, 10.0)):
       band = m & (np.abs(a_lat) >= lo) & (np.abs(a_lat) < hi)
       print(f"  curve {lo:.1f}-{hi:.1f} m/s^2: toward the inside {q(inside[band])}")
