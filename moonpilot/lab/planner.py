@@ -815,7 +815,7 @@ def _manual_decel(args):
   # A lead that leaves within 5 s (radar lead gone, or its gap jumping 5 m in a frame: another object) is one the
   # driver may already be passing or watching turn off; the ratios below are on the leads that stay.
   leaves = np.zeros(len(v), dtype=bool)
-  for i in np.flatnonzero(approach & (need <= -0.2)):
+  for i in np.flatnonzero(approach):
     ahead = slice(i, min(i + round(5.0 / DT_MDL), len(v)))
     same = d["route"][ahead] == d["route"][i]
     leaves[i] = not (d["lead"][ahead][same] > 0).all() or bool((np.abs(np.diff(gap[ahead][same])) > 5.0).any())
@@ -845,7 +845,7 @@ def _manual_decel(args):
     print(f"Settled following above 8 m/s ({follow.sum() * DT_MDL / 60:.1f} min, speeds within 0.3 m/s, lead steady): headway median "
           + f"{np.median(headway):.2f} s, p10 {np.percentile(headway, 10):.2f}, p90 {np.percentile(headway, 90):.2f}; the law's is {t_follow} s")
   if args.previous:
-    _manual_vs_laws(args.previous, d, approach & ~leaves, need, t_follow)
+    _manual_vs_laws(args, d, approach & ~leaves, need, t_follow)
 
 
 def _module_at(commit, path="moonpilot/longitudinal.py"):
@@ -856,38 +856,45 @@ def _module_at(commit, path="moonpilot/longitudinal.py"):
   source = subprocess.run(["git", "show", f"{commit}:{path}"], capture_output=True, text=True, check=True).stdout
   with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as f:
     f.write(source)
-  spec = importlib.util.spec_from_file_location(f"moonpilot_longitudinal_{commit}", f.name)
+  spec = importlib.util.spec_from_file_location(f"{path[:-3].replace('/', '_')}_{commit}", f.name)
   assert spec is not None and spec.loader is not None
   module = importlib.util.module_from_spec(spec)
   spec.loader.exec_module(module)
   return module
 
 
-def _manual_vs_laws(previous, d, mask, need, t_follow):
-  """The shipped lead law and `previous`'s, as `policy` asks them (engine-coast RAV4, cruise at the ego's speed, before
-  the brake band), beside the unified requirement and the driver's aEgo on the same manual approach frames."""
+def _manual_vs_laws(args, d, mask, need, t_follow):
+  """The shipped lead law, `--previous`'s and (with `--prototype`) the retired `unified_lead_accel` run on its own commit's
+  planner, as `policy` asks them (engine-coast RAV4, cruise at the ego's speed, before the brake band), beside the raw
+  requirement (today's `stopping_decel` to the time-gap target) and the driver's aEgo on the same manual approach frames."""
+  from unittest import mock
   import moonpilot.longitudinal as now
   from opendbc.car.toyota.interface import CarInterface
   from opendbc.car.toyota.values import CAR, ToyotaFlags
-  old = _module_at(previous)
+  old = _module_at(args.previous)
   CP = CarInterface.get_non_essential_params(CAR.TOYOTA_RAV4_TSS2)
   CP.openpilotLongitudinalControl = True
   CP.flags |= ToyotaFlags.MOONPILOT_ENGINE_COAST.value
   src = now.LongitudinalPlanSource.lead0
 
-  def ask(module, i, extra):
+  def ask(module, i, extra=()):
     lead = (src, d["gap"][i], d["v_lead"][i], d["a_lead"][i], *extra)
     return module.policy(d["v"][i], [lead], d["v"][i], t_follow, False, None, 0.0, CP, -0.3, True)[0]
 
   idx = np.flatnonzero(mask)
   laws = {
     "now": np.array([ask(now, i, (now.brake_sustain(d["a_lead"][i]),)) for i in idx]),
-    previous[:9]: np.array([ask(old, i, ()) for i in idx]),
-    "unified": need[idx],
+    args.previous[:9]: np.array([ask(old, i) for i in idx]),
   }
+  if args.prototype:
+    proto = _module_at(args.prototype, "moonpilot/lab/unified.py")
+    proto.L = _module_at(args.prototype)  # the planner the prototype was written against
+    with mock.patch.object(proto.L, "lead_accel", proto.unified_lead_accel):
+      laws["prototype"] = np.array([ask(proto.L, i) for i in idx])
+  laws["requirement"] = need[idx]
   a, v, req = d["a"][idx], d["v"][idx], need[idx]
   names = tuple(laws)
-  print(f"\nLead laws against the driver on the same {idx.size * DT_MDL / 60:.1f} min (leads that stay), binned by the unified requirement: "
+  print(f"\nLead laws against the driver on the same {idx.size * DT_MDL / 60:.1f} min (leads that stay 5 s), binned by the raw requirement: "
         + "frames, driver median aEgo, then each law's median ask; per band, median |ask - aEgo| and where now and previous differ")
   for lo, hi in ((2.0, 8.0), (8.0, 15.0), (15.0, 45.0)):
     band = (v >= lo) & (v < hi)
@@ -1087,6 +1094,7 @@ def _register_manual(sub):
   parser.add_argument("--routes", nargs="+", default=["manual-approach"], help=f"route names or sets: {', '.join(ROUTE_SETS)}")
   parser.add_argument("--t-follow", type=float, default=1.45, help="the target's time gap, s (standard personality's 1.45)")
   parser.add_argument("--previous", help="also compare the shipped lead law with this commit's on the same frames")
+  parser.add_argument("--prototype", help="with --previous, also the retired unified_lead_accel at this commit (4a23d0368)")
   parser.set_defaults(fn=_manual_decel)
   sub.add_parser("hard-brake", help="lead braking hard from a follow: upstream vs fork vs ideal, with and without lag").set_defaults(fn=_hard_brake)
   parser = sub.add_parser("sustain", help="the lead-brake sustain horizon: fixed vs scaled, hard brakes, taps, drives")
