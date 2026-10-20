@@ -355,6 +355,13 @@ MOONPILOT_LEAD_BRAKE_SUSTAIN_T = 2.0  # s; how long `stopping_decel` assumes a b
 #           2.88 m on the -5 case; 3.0 s holds the margins but puts the tap back at -1.86.
 # A lead braking at -8 from either geometry contacts at every horizon including infinity: the ego
 # needs more than ACCEL_MIN there, which is physics rather than this constant.
+MOONPILOT_LEAD_BRAKE_SUSTAIN_PER_A = 1.0  # s per m/s^2; a harder brake is believed longer: the
+# horizon is max(SUSTAIN_T, PER_A * |a_lead|), so 2 s up to -2. `python -m moonpilot.lab sustain`
+# (RAV4, 0.2 s dead time + 0.25 s lag): 30 m/s behind a lead braking -3.5 to rest from the 1.45 s
+# follow went from contact (-5.26 m) to 5.89 m, matching the to-rest horizon; -5 still contacts at
+# every horizon there (reaction-limited). Over 12 engaged drives it deepens 99 of 55k frames by more
+# than 0.05 (one -1.03 on 00000408, else <= 0.22) where a fixed 3.0 s deepened 418. The cost is a hard
+# *tap*: -5 for 0.5 s at 30 m/s from 60 m peaks -2.96 against -0.82 at a fixed 2.0 s.
 MOONPILOT_A_LEAD_MIN = -10.0  # m/s^2; bounds on a lead's accel estimate, upstream's (long_mpc.process_lead)
 MOONPILOT_A_LEAD_MAX = 5.0
 MOONPILOT_OUT_OF_PATH_T_FOLLOW = 0.7  # time-gap scale for a lead predicted to leave the path
@@ -641,11 +648,17 @@ def cruise_accel(v_ego, v_cruise, e2e, steer_angle_deg, CP, accel_coast, allow_t
   return float(a)
 
 
-def stopping_decel(v_ego, v_lead, a_lead, slack, sustain=MOONPILOT_LEAD_BRAKE_SUSTAIN_T) -> float:
+def brake_sustain(a_lead) -> float:
+  """How long `stopping_decel` believes a braking lead keeps braking: longer for a harder brake."""
+  return max(MOONPILOT_LEAD_BRAKE_SUSTAIN_T, -min(float(a_lead), 0.0) * MOONPILOT_LEAD_BRAKE_SUSTAIN_PER_A)
+
+
+def stopping_decel(v_ego, v_lead, a_lead, slack, sustain=None) -> float:
   """The constant decel that keeps `slack` meters of gap, in the frame the gap actually closes in.
 
   One law, relative frame throughout, against the speed the lead is *predicted* to hold: it keeps
-  its current braking for at most `MOONPILOT_LEAD_BRAKE_SUSTAIN_T` and never past its own rest,
+  its current braking for at most `sustain` (default `brake_sustain(a_lead)`; the planner passes it
+  from the estimator's measured accel, so a decayed projection cannot shorten it) and never past its own rest,
   then holds whatever speed that left it at. The lead's travel beyond a lead permanently at that
   speed cancels analytically and leaves ``0.5 * |a_lead| * t^2`` of extra room, so the whole thing
   is one expression with no case split at the horizon.
@@ -668,7 +681,7 @@ def stopping_decel(v_ego, v_lead, a_lead, slack, sustain=MOONPILOT_LEAD_BRAKE_SU
   `inf` instead, because FCW is a worst-case warning behind its own -4 m/s^2 gate and costs nothing
   when it is early: at v_ego 30 behind a lead doing 28 at 25 m and braking at -6, the unbounded
   horizon reads -5.00 (fires, and contact is genuinely unavoidable — 90.1 m of room needs more than
-  ACCEL_MIN) where the 2 s bound reads -2.67 and says nothing.
+  ACCEL_MIN) where a fixed 2 s bound read -2.67 and said nothing.
 
   Both of those are the *late* crossing, where the ego is still faster than the lead when the
   lead's braking ends. Where it is not — where the ego matches the lead's speed while the lead is
@@ -693,6 +706,8 @@ def stopping_decel(v_ego, v_lead, a_lead, slack, sustain=MOONPILOT_LEAD_BRAKE_SU
     # speed measurement caught up. `required_decel(20, 20, 20, -8)` is -4.47 with the lead
     # predicted to rest and -0.0 with such a gate. The early-crossing test below is false for a
     # non-positive `closing`, so those states take the prediction branch, which handles them.
+    if sustain is None:
+      sustain = brake_sustain(a_lead)
     t = min(sustain, v_lead / -a_lead)
     if 2.0 * slack <= closing * t:  # the ego matches it before its braking ends
       return -(-a_lead + closing**2 / (2.0 * slack))
@@ -782,7 +797,7 @@ def arrival_accel(closing, slack, a_lead) -> float:
   return max(-(closing**2) / (2.0 * max(slack, closing * MOONPILOT_ARRIVAL_MIN_T)), -MOONPILOT_APPROACH_DECEL) + max(float(a_lead), 0.0)
 
 
-def lead_accel(v_ego, gap, v_lead, a_lead, t_follow, catch_up_accel=0.0, catch_up_coast=0.0, coast=MOONPILOT_BRAKE_BAND_FLOOR) -> float:
+def lead_accel(v_ego, gap, v_lead, a_lead, t_follow, catch_up_accel=0.0, catch_up_coast=0.0, coast=MOONPILOT_BRAKE_BAND_FLOOR, sustain=None) -> float:
   """The spacing regulator and one relative-speed approach for every slower lead.
 
   The spacing regulator holds the larger of the time gap and a low-speed rest floor: STOP_DISTANCE plus
@@ -888,7 +903,7 @@ def lead_accel(v_ego, gap, v_lead, a_lead, t_follow, catch_up_accel=0.0, catch_u
   arrival_slack = gap - max(moving_rest, t_follow * v_lead_arrive)
   a_arrive = arrival_accel(max(v_ego - v_lead_arrive, 1e-6), arrival_slack, a_comfort)
   # Coast budget: slack - closing**2 / (2 * COAST_DECEL) for a steady lead; braking only shrinks it.
-  bound = stopping_decel(v_ego, v_lead_eff, a_lead, max(arrival_slack, 0.1))
+  bound = stopping_decel(v_ego, v_lead_eff, a_lead, max(arrival_slack, 0.1), sustain)
   coast_time = max(arrival_slack, 0.0) * (1.0 + bound / MOONPILOT_ARRIVAL_COAST_DECEL) / closing
   w_coast = min(max(coast_time / MOONPILOT_ARRIVAL_COAST_T, 0.0), 1.0)
   # Small closing finishes on the original soft law; a stopped lead keeps its tuned approach.
@@ -910,16 +925,16 @@ def lead_accel(v_ego, gap, v_lead, a_lead, t_follow, catch_up_accel=0.0, catch_u
   # Only inside MOONPILOT_MIN_SLACK does its denominator stop shrinking, so the exact standstill point is
   # not chased with increasing crawl-speed braking.
   anchor = MOONPILOT_STOP_REST + min(MOONPILOT_STOP_TAPER_T * v_ego, MOONPILOT_STOP_DISTANCE - MOONPILOT_STOP_REST)
-  a_stop = stopping_decel(v_ego, v_lead_eff, a_lead, max(gap - anchor - MOONPILOT_STOP_LAG_T * closing, MOONPILOT_MIN_SLACK))
+  a_stop = stopping_decel(v_ego, v_lead_eff, a_lead, max(gap - anchor - MOONPILOT_STOP_LAG_T * closing, MOONPILOT_MIN_SLACK), sustain)
   admission = float(np.interp(v_ego, MOONPILOT_FLOOR_ADMISSION_BP, MOONPILOT_FLOOR_ADMISSION_V))
   a += min(max((-a_stop - admission) / MOONPILOT_FLOOR_ADMISSION_BAND + 1.0, 0.0), 1.0) * min(a_stop - a, 0.0)
   # Crawl stop: spend the rest gap toward MOONPILOT_CRAWL_REST before braking past the driver's peak.
-  cap = min(stopping_decel(v_ego, v_lead_eff, a_lead, max(gap - MOONPILOT_CRAWL_REST - MOONPILOT_MIN_SLACK, 0.05)), -MOONPILOT_CRAWL_STOP_DECEL)
+  cap = min(stopping_decel(v_ego, v_lead_eff, a_lead, max(gap - MOONPILOT_CRAWL_REST - MOONPILOT_MIN_SLACK, 0.05), sustain), -MOONPILOT_CRAWL_STOP_DECEL)
   return a + float(np.interp(v_ego, MOONPILOT_SOFT_STOP_V, [1.0, 0.0])) * max(cap - a, 0.0)
 
 
 def lead_braking(lead_states) -> bool:
-  return any(a_lead < MOONPILOT_JERK_ONSET_LEAD_A for _, _, _, a_lead in lead_states)
+  return any(a_lead < MOONPILOT_JERK_ONSET_LEAD_A for _, _, _, a_lead, *_ in lead_states)
 
 
 def jerk_limit(a_cmd, a_prev, dt, v_ego, comfort_scale=1.0, lead_braking=False) -> float:
@@ -1070,7 +1085,7 @@ def policy(
 ):
   """The smallest of the candidates, and which one it was.
 
-  `leads` is a sequence of (source, gap, v_lead, a_lead) for the leads that are present, in
+  `leads` is a sequence of (source, gap, v_lead, a_lead[, sustain]) for the leads that are present, in
   radarState order, each carrying the slot it came from so that an absent leadOne does not make
   leadTwo report itself as lead0. The model's own accel goes last, so an upstream change that lets a
   NaN through the model cannot win the comparison and land in the plan.
@@ -1104,7 +1119,7 @@ def policy(
   catch_up = min(a_cruise_raw, a_curve, slow) if v_ego < v_cruise else 0.0
   if a_cruise > slow and v_cruise > v_ego:
     a_open = a_cruise
-    for _, gap, v_lead, a_lead in leads:
+    for _, gap, v_lead, a_lead, *_ in leads:
       if v_lead >= v_cruise or a_lead >= MOONPILOT_FAST_CRAWL:
         continue
       target = max(MOONPILOT_STOP_DISTANCE, t_follow * max(v_ego, v_lead))
@@ -1120,8 +1135,8 @@ def policy(
   lead_asks = []
   engine = engine_floor(CP, v_ego)  # moonpilot/engine_coast.py; None leaves the default
   floor = MOONPILOT_BRAKE_BAND_FLOOR if engine is None else engine
-  for source, gap, v_lead, a_lead in leads:
-    ask = lead_accel(v_ego, gap, v_lead, a_lead, t_follow, catch_up, MOONPILOT_CATCH_UP_COAST_FRACTION * coast, floor)
+  for source, gap, v_lead, a_lead, *sustain in leads:
+    ask = lead_accel(v_ego, gap, v_lead, a_lead, t_follow, catch_up, MOONPILOT_CATCH_UP_COAST_FRACTION * coast, floor, *sustain)
     if engine is not None:
       ask = coast_budget(ask, v_ego, gap, v_lead, a_lead, engine, MOONPILOT_APPROACH_DECEL, MOONPILOT_FOLLOW_SPEED_FLOOR_HEADWAY_T, MOONPILOT_STOP_DISTANCE)
     if (
@@ -1477,7 +1492,8 @@ class MoonpilotLongitudinalPlanner:
     lead_states = []
     for source, lead, a_lead, a_lead_tau in leads:
       age = self._lead_age(lead, lead_age)
-      lead_states.append((source, *lead_state_at(lead, self.action_t + age, x_pred + v_ego * age, a_lead, a_lead_tau)))
+      # The sustain is the measured braking's, not the decayed projection's: radar age must not shorten it.
+      lead_states.append((source, *lead_state_at(lead, self.action_t + age, x_pred + v_ego * age, a_lead, a_lead_tau), brake_sustain(a_lead)))
     a_cmd, source = policy(
       v_pred,
       lead_states,
@@ -1584,7 +1600,7 @@ class MoonpilotLongitudinalPlanner:
     # 0.3 and a < 0.1` — precisely the creeping-behind-a-lead state the `trailing` gate above exists
     # to keep out of `LongControlState.stopping`, so admitting it here would undo that fix from the
     # other side.
-    trailing = v_ego > MOONPILOT_SHOULD_STOP_SPEED and any(s == source and v_lead > MOONPILOT_SHOULD_STOP_SPEED for s, _, v_lead, _ in lead_states)
+    trailing = v_ego > MOONPILOT_SHOULD_STOP_SPEED and any(s == source and v_lead > MOONPILOT_SHOULD_STOP_SPEED for s, _, v_lead, *_ in lead_states)
     model_stop = not e2e and self.model_braking and not leads and v_ego <= MOONPILOT_MODEL_STOP_ENTER_SPEED and a_target < 0.0
     self.output_should_stop = (should_stop(v_ego, a_target) and not trailing) or (e2e and sm['modelV2'].action.shouldStop) or model_stop
     self.output_a_target = a_target
@@ -1681,10 +1697,10 @@ class MoonpilotLongitudinalPlanner:
     v, a, x, t_prev = v_ego, a_target, 0.0, 0.0
     for i, t_idx in enumerate(MOONPILOT_CONTROL_T_IDX):
       t = float(t_idx)
-      states = [
-        (source, *lead_state_at(lead, t + self._lead_age(lead, lead_age), x + v_ego * self._lead_age(lead, lead_age), a_lead, a_lead_tau))
-        for source, lead, a_lead, a_lead_tau in leads
-      ]
+      states = []
+      for source, lead, a_lead, a_lead_tau in leads:
+        age = self._lead_age(lead, lead_age)
+        states.append((source, *lead_state_at(lead, t + age, x + v_ego * age, a_lead, a_lead_tau), brake_sustain(a_lead)))
       a_cmd, _ = policy(
         v,
         states,

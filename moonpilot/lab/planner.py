@@ -922,13 +922,13 @@ def _hard_brake(args):
               + "  ".join(f"{g:7.2f} {pk:5.2f} {d:5.2f} {w:5.2f}{' X' if g < 0.4 else '  '}" for g, pk, d, w in cells))
 
 
-SUSTAIN_RULES = {  # sustain(v_lead, a_lead, braking_s): braking_s is how long the planner's lead accel has read <= -1.0
-  "2.0 s": lambda v, a, b: 2.0,
-  "3.0 s": lambda v, a, b: 3.0,
-  "to rest": lambda v, a, b: math.inf,
-  "|a| s": lambda v, a, b: max(2.0, -a),
-  "2 s+braking": lambda v, a, b: 2.0 + b,
-  "2 s+2x braking": lambda v, a, b: 2.0 + 2.0 * b,
+SUSTAIN_RULES = {  # sustain(v_lead, a_lead, braking_s, shipped): braking_s is how long the planner's lead accel has read <= -1.0
+  "2.0 s": lambda v, a, b, s: 2.0,
+  "3.0 s": lambda v, a, b, s: 3.0,
+  "to rest": lambda v, a, b, s: math.inf,
+  "|a| s": lambda v, a, b, s: s,  # shipped: brake_sustain of the measured accel (None: of the one given)
+  "2 s+braking": lambda v, a, b, s: 2.0 + b,
+  "2 s+2x braking": lambda v, a, b, s: 2.0 + 2.0 * b,
 }
 
 
@@ -942,11 +942,11 @@ def _sustain_rule(rule):
   original, update = longitudinal.stopping_decel, MoonpilotLongitudinalPlanner.update
   state = {"deepest": 0.0, "braking": 0.0}
 
-  def decel(v_ego, v_lead, a_lead, slack, sustain=longitudinal.MOONPILOT_LEAD_BRAKE_SUSTAIN_T):
-    if math.isinf(sustain):
+  def decel(v_ego, v_lead, a_lead, slack, sustain=None):
+    if sustain is not None and math.isinf(sustain):
       return original(v_ego, v_lead, a_lead, slack, sustain)
     state["deepest"] = min(state["deepest"], float(a_lead))
-    return original(v_ego, v_lead, a_lead, slack, rule(v_lead, float(a_lead), state["braking"]))
+    return original(v_ego, v_lead, a_lead, slack, rule(v_lead, float(a_lead), state["braking"], sustain))
 
   def tick(self, sm):
     state["braking"] = state["braking"] + DT_MDL if state["deepest"] <= -1.0 else 0.0
@@ -990,7 +990,8 @@ def _sustain_drives(args, names):
   print("engaged drives replayed: frames deeper than 2.0 s by > 0.05 m/s^2 (of engaged), deepest delta")
   for route in expand(args.routes, ROUTE_SETS):
     data = extract(route, args.root)
-    base, _, active, _ = replay(route, data, args.root)
+    with _sustain_rule(SUSTAIN_RULES["2.0 s"]):
+      base, _, active, _ = replay(route, data, args.root)
     if _skip_no_engaged(route, active):
       continue
     cells = []
@@ -1005,7 +1006,7 @@ def _sustain_drives(args, names):
 def _sustain(args):
   """How long `stopping_decel` assumes a braking lead keeps braking: the fixed 2.0 s against longer and scaled horizons,
   on the hard brakes it must survive, the taps it must not over-answer, and the engaged drives' own commands."""
-  names = tuple(SUSTAIN_RULES)
+  names = ("2.0 s", *(n for n in args.rules if n != "2.0 s"))
   if args.part != "drives":
     _sustain_flights(names)
   if args.part != "flights":
@@ -1026,6 +1027,7 @@ def _register_manual(sub):
   parser = sub.add_parser("sustain", help="the lead-brake sustain horizon: fixed vs scaled, hard brakes, taps, drives")
   parser.add_argument("--routes", nargs="+", default=["longitudinal"], help=f"route names or sets: {', '.join(ROUTE_SETS)}")
   parser.add_argument("--part", choices=("all", "flights", "drives"), default="all", help="flown scenarios, replayed drives or both")
+  parser.add_argument("--rules", nargs="+", choices=tuple(SUSTAIN_RULES), default=list(SUSTAIN_RULES), help="horizons beside the fixed 2.0 s")
   parser.set_defaults(fn=_sustain)
 
 

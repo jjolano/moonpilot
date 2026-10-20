@@ -86,6 +86,7 @@ from moonpilot.longitudinal import (
   MOONPILOT_T_FOLLOW_SLEW_DOWN,
   MOONPILOT_T_FOLLOW_SLEW_UP,
   MoonpilotLongitudinalPlanner,
+  brake_sustain,
   coast_accel,
   crawl_accel,
   cruise_accel,
@@ -709,25 +710,25 @@ class TestPolicyFunctions(unittest.TestCase):
         self.assertGreater(s["min_gap"], MOONPILOT_CRAWL_REST - 0.2)
         self.assertLess(s["v"][-1], 0.05)
     # and the direct assertion: at matched speed the prediction branch, not the match, is what binds
-    self.assertAlmostEqual(stopping_decel(20.0, 20.0, -5.0, 23.0), -1.5151515151515151, delta=1e-9)
     self.assertLess(stopping_decel(20.0, 20.0, -5.0, 23.0), -MOONPILOT_APPROACH_DECEL)
 
-  def test_a_tap_does_not_buy_a_sustain_stop(self):
-    """The bound's other direction: a lead tapping -5 m/s^2 for 0.5 s at 30 m/s from 60 m costs
-    -1.00 m/s^2 of peak command, below the absolute-frame law's -1.89 and the unbounded sustain's
-    -3.50, for an end gap of ~40 m either way. That tap peak is the same trade that capped
-    `MOONPILOT_LEAD_PREVIEW_T` at 0.5 s (3.36 there on the same scenario), so this is the number the
-    2.0 s horizon was sized to hold under. -0.43 was the scheduled floor admission (1.6 at 30 m/s:
-    the tap's -1.00 no longer admits it); the arrival term supplies the peak as the ego starts
-    shedding the closing the tap opens. It reads -0.64 since the onset window needs four consecutive
-    frames (`MOONPILOT_LEAD_ACCEL_FAST_STREAK`), so a half-second tap is credited for 0.1 s less of
-    its length — -0.80 on the two-frame streak — and still inside that -1.00 budget either way.
-    """
-    s = _fly(30.0, 108.0, 60.0, 30.0, lambda t: -5.0 if 1 < t < 1.5 else 0.0, 20.0)
-    self.assertAlmostEqual(s["peak"], -0.64, delta=0.05)
-    self.assertGreater(s["peak"], -MOONPILOT_APPROACH_DECEL)  # the arrival term's own ceiling
+  def test_a_moderate_tap_does_not_buy_a_sustain_stop(self):
+    """The bound's other direction: a lead tapping -2 m/s^2 for 1.5 s in front of a 20 m/s follow is
+    answered at the approach decel, where predicting it to rest asks about -2. Up to -2 the horizon
+    is the fixed `MOONPILOT_LEAD_BRAKE_SUSTAIN_T`; a harder tap is believed longer, which is the cost
+    the next test buys (`python -m moonpilot.lab sustain`)."""
+    s = _fly(20.0, 80.0, 29.0, 20.0, lambda t: -2.0 if 1 < t < 2.5 else 0.0, 20.0)
+    self.assertGreater(s["peak"], -MOONPILOT_APPROACH_DECEL - 0.05)
     self.assertFalse(s["contact"])
-    self.assertGreater(s["end_gap"], 40.0)
+
+  def test_a_hard_brake_is_believed_for_longer(self):
+    """`MOONPILOT_LEAD_BRAKE_SUSTAIN_PER_A`: from a 1.45 s follow, a lead braking -3.5 to rest at 30 m/s
+    left 0.45 m on a fixed 2 s horizon and -5 at 25 m/s made contact; scaled with the braking, both
+    stop clear."""
+    s = _fly(30.0, 118.0, 43.5, 30.0, lambda t: -3.5 if t > 1 else 0.0, 25.0)
+    self.assertGreater(s["min_gap"], MOONPILOT_CRAWL_REST - 0.2)
+    s = _fly(25.0, 100.0, 36.25, 25.0, lambda t: -5.0 if t > 1 else 0.0, 25.0)
+    self.assertFalse(s["contact"])
 
   def test_the_early_crossing_branch_is_exact_and_continuous(self):
     """Where the ego matches the lead's speed while the lead is still braking, the late form credits
@@ -998,12 +999,13 @@ class TestStalenessScope(unittest.TestCase):
   Where the floor does read it (`a_lead < 0`), the aged lead carries a decayed `a_traj`
   (`exp(-a_lead_tau * t^2 / 2)`), i.e. weaker predicted braking and a longer predicted lead travel,
   so the requirement can read genuinely shallower — the physically correct direction, and the reason
-  the old absolute-frame form was monotone there (it ignored `a_lead` entirely). That half is
-  bounded, not strict: worst rise on this grid is +0.010 m/s^2 at (0.2 s, v_ego 20, gap 90, v_lead 20,
-  a_lead -6.0), fresh -1.2966 against aged -1.2866, both sustain-law bound; the full sweep goes
-  non-zero only at ages this pipeline does not produce (1,218 states at 0.2 s, 7,563 at 0.5 s), all
-  of it -1.0-gate admission flicker at 160-300 m. The `differ` counter below is over the strict half
-  only, so the bound means something where it is claimed.
+  the old absolute-frame form was monotone there (it ignored `a_lead` entirely). The sustain horizon
+  is the measured braking's (`brake_sustain`, as `update` passes it), so age cannot shorten it, but
+  the magnitude over it is still the decayed one. That half is bounded, not strict: 0 rise at the 46 ms
+  median age; at the 0.2 s stress age the worst is +0.053 m/s^2 at (v_ego 12, gap 45, v_lead 12,
+  a_lead -3), a coast-level ask (fresh -0.151, aged -0.098), and +0.024 on a real brake (-2.174 against
+  -2.149). The `differ` counter below is over the strict half only, so the bound means something where
+  it is claimed.
   """
 
   AGES = (0.046, 0.2)
@@ -1012,7 +1014,7 @@ class TestStalenessScope(unittest.TestCase):
   V_LEAD = (0.0, 5.0, 12.0, 20.0)
   A_LEAD = (-6.0, -3.0, -1.0, 0.0)
   ACTION_T = 0.2  # the test CP's longitudinalActuatorDelay + DT_MDL, as the planner computes it
-  RISE_BOUND = 0.02  # twice the worst measured rise on this grid (+0.010), for the a_lead < 0 half
+  RISE_BOUND = {0.046: 0.02, 0.2: 0.06}  # per age, for the a_lead < 0 half: strict where the pipeline lives
 
   def test_the_correction_never_reads_optimistic_where_the_ego_is_closing(self):
     CP = _cp()
@@ -1028,10 +1030,11 @@ class TestStalenessScope(unittest.TestCase):
               lead = _lead(gap, v_lead, a_lead=a_lead)
               fresh = lead_state_at(lead, self.ACTION_T, v_ego * self.ACTION_T, a_lead, MOONPILOT_LEAD_ACCEL_TAU)
               aged = lead_state_at(lead, self.ACTION_T + age, v_ego * (self.ACTION_T + age), a_lead, MOONPILOT_LEAD_ACCEL_TAU)
-              a_fresh = lead_accel(v_ego, *fresh, t_follow)
-              a_aged = lead_accel(v_ego, *aged, t_follow)
-              p_fresh = policy(v_ego, [(Source.lead0, *fresh)], 30.0, t_follow, False, None, 0.0, CP, -0.3, True)[0]
-              p_aged = policy(v_ego, [(Source.lead0, *aged)], 30.0, t_follow, False, None, 0.0, CP, -0.3, True)[0]
+              sustain = brake_sustain(a_lead)  # as `update` passes it: the measured braking's, for both arms
+              a_fresh = lead_accel(v_ego, *fresh, t_follow, sustain=sustain)
+              a_aged = lead_accel(v_ego, *aged, t_follow, sustain=sustain)
+              p_fresh = policy(v_ego, [(Source.lead0, *fresh, sustain)], 30.0, t_follow, False, None, 0.0, CP, -0.3, True)[0]
+              p_aged = policy(v_ego, [(Source.lead0, *aged, sustain)], 30.0, t_follow, False, None, 0.0, CP, -0.3, True)[0]
               if a_lead == 0.0:
                 self.assertLessEqual(
                   a_aged, a_fresh + 1e-9, f"the lead candidate rose with the age at v_ego {v_ego}, gap {gap}, v_lead {v_lead}, a_lead {a_lead}"
@@ -1039,10 +1042,9 @@ class TestStalenessScope(unittest.TestCase):
                 self.assertLessEqual(p_aged, p_fresh + 1e-9)
                 differ += a_aged < a_fresh - 1e-9
               else:
-                self.assertLessEqual(
-                  a_aged, a_fresh + self.RISE_BOUND, f"the lead candidate rose past the bound at v_ego {v_ego}, gap {gap}, v_lead {v_lead}, a_lead {a_lead}"
-                )
-                self.assertLessEqual(p_aged, p_fresh + self.RISE_BOUND)
+                bound = self.RISE_BOUND[age]
+                self.assertLessEqual(a_aged, a_fresh + bound, f"rose past the bound at v_ego {v_ego}, gap {gap}, v_lead {v_lead}, a_lead {a_lead}")
+                self.assertLessEqual(p_aged, p_fresh + bound)
     self.assertGreater(differ, 0)  # the arms are not identical over this grid, so the bound means something
 
 
