@@ -724,7 +724,8 @@ class TestPolicyFunctions(unittest.TestCase):
   def test_a_hard_brake_is_believed_for_longer(self):
     """`MOONPILOT_LEAD_BRAKE_SUSTAIN_PER_A`: from a 1.45 s follow, a lead braking -3.5 to rest at 30 m/s
     left 0.45 m on a fixed 2 s horizon and -5 at 25 m/s made contact; scaled with the braking, both
-    stop clear."""
+    stop clear. This plant integrates ego travel on the updated speed (~0.75 m optimistic from 30 m/s);
+    on the trapezoid the fixed horizon contacts in both (`python -m moonpilot.lab sustain`)."""
     s = _fly(30.0, 118.0, 43.5, 30.0, lambda t: -3.5 if t > 1 else 0.0, 25.0)
     self.assertGreater(s["min_gap"], MOONPILOT_CRAWL_REST - 0.2)
     s = _fly(25.0, 100.0, 36.25, 25.0, lambda t: -5.0 if t > 1 else 0.0, 25.0)
@@ -989,32 +990,21 @@ class TestCoastGrade(unittest.TestCase):
 class TestStalenessScope(unittest.TestCase):
   """The scope of `lead_age`'s safety claim, which the AGENTS.md bullet states.
 
-  Partitioned, and stated as such. Where the floor does not read the lead's accel (`a_lead == 0`
-  here), ageing the lead shrinks the gap by `(v_lead - v_ego) * age` and lowers the lead's predicted
-  speed under the decay, so the closing rate rises and `a_track` and `a_stop` are each
-  non-increasing — and `min`, with the clip the command passes through, preserves that. That half
-  is strict: 0 violations on all 170 in-scope cells at 46 ms and 0.2 s, and 0 on the 78,260-state
-  full sweep at 46 ms, the measured median lead age.
-
-  Where the floor does read it (`a_lead < 0`), the aged lead carries a decayed `a_traj`
-  (`exp(-a_lead_tau * t^2 / 2)`), i.e. weaker predicted braking and a longer predicted lead travel,
-  so the requirement can read genuinely shallower — the physically correct direction, and the reason
-  the old absolute-frame form was monotone there (it ignored `a_lead` entirely). The sustain horizon
-  is the measured braking's (`brake_sustain`, as `update` passes it), so age cannot shorten it, but
-  the magnitude over it is still the decayed one. That half is bounded, not strict: 0 rise at the 46 ms
-  median age; at the 0.2 s stress age the worst is +0.053 m/s^2 at (v_ego 12, gap 45, v_lead 12,
-  a_lead -3), a coast-level ask (fresh -0.151, aged -0.098), and +0.024 on a real brake (-2.174 against
-  -2.149). The `differ` counter below is over the strict half only, so the bound means something where
-  it is claimed.
+  Ageing a lead shrinks the gap by `(v_lead - v_ego) * age` and adds the lead's travel over the age,
+  but not decay: `update` decays the lead's accel over `action_t` only (`lead_state_at`'s `t_decay`)
+  and takes the sustain horizon from the measured accel (`brake_sustain`). So for a lead not faster
+  than the ego and not accelerating the closing rate only rises with age and the candidate never
+  reads shallower. Strict at every age here: 46 ms is the median message age, 0.176 s that plus the
+  learned radar latency `_lead_age` adds on this car (~0.13 s), 0.5 s past anything `commIssue`
+  allows. Decaying over the age as well read up to +0.056 m/s^2 shallower at 0.176 s.
   """
 
-  AGES = (0.046, 0.2)
+  AGES = (0.046, 0.176, 0.5)
   V_EGO = (5.0, 12.0, 20.0, 30.0, 40.0)
   GAPS = (8.0, 20.0, 45.0, 90.0, 200.0)
   V_LEAD = (0.0, 5.0, 12.0, 20.0)
   A_LEAD = (-6.0, -3.0, -1.0, 0.0)
   ACTION_T = 0.2  # the test CP's longitudinalActuatorDelay + DT_MDL, as the planner computes it
-  RISE_BOUND = {0.046: 0.02, 0.2: 0.06}  # per age, for the a_lead < 0 half: strict where the pipeline lives
 
   def test_the_correction_never_reads_optimistic_where_the_ego_is_closing(self):
     CP = _cp()
@@ -1028,24 +1018,18 @@ class TestStalenessScope(unittest.TestCase):
               continue  # a lead faster than the ego is pulling away, and is not the case this claims
             for a_lead in self.A_LEAD:
               lead = _lead(gap, v_lead, a_lead=a_lead)
-              fresh = lead_state_at(lead, self.ACTION_T, v_ego * self.ACTION_T, a_lead, MOONPILOT_LEAD_ACCEL_TAU)
-              aged = lead_state_at(lead, self.ACTION_T + age, v_ego * (self.ACTION_T + age), a_lead, MOONPILOT_LEAD_ACCEL_TAU)
-              sustain = brake_sustain(a_lead)  # as `update` passes it: the measured braking's, for both arms
+              # as `update` builds them: decay over action_t only, the measured braking's sustain
+              fresh = lead_state_at(lead, self.ACTION_T, v_ego * self.ACTION_T, a_lead, MOONPILOT_LEAD_ACCEL_TAU, self.ACTION_T)
+              aged = lead_state_at(lead, self.ACTION_T + age, v_ego * (self.ACTION_T + age), a_lead, MOONPILOT_LEAD_ACCEL_TAU, self.ACTION_T)
+              sustain = brake_sustain(a_lead)
               a_fresh = lead_accel(v_ego, *fresh, t_follow, sustain=sustain)
               a_aged = lead_accel(v_ego, *aged, t_follow, sustain=sustain)
               p_fresh = policy(v_ego, [(Source.lead0, *fresh, sustain)], 30.0, t_follow, False, None, 0.0, CP, -0.3, True)[0]
               p_aged = policy(v_ego, [(Source.lead0, *aged, sustain)], 30.0, t_follow, False, None, 0.0, CP, -0.3, True)[0]
-              if a_lead == 0.0:
-                self.assertLessEqual(
-                  a_aged, a_fresh + 1e-9, f"the lead candidate rose with the age at v_ego {v_ego}, gap {gap}, v_lead {v_lead}, a_lead {a_lead}"
-                )
-                self.assertLessEqual(p_aged, p_fresh + 1e-9)
-                differ += a_aged < a_fresh - 1e-9
-              else:
-                bound = self.RISE_BOUND[age]
-                self.assertLessEqual(a_aged, a_fresh + bound, f"rose past the bound at v_ego {v_ego}, gap {gap}, v_lead {v_lead}, a_lead {a_lead}")
-                self.assertLessEqual(p_aged, p_fresh + bound)
-    self.assertGreater(differ, 0)  # the arms are not identical over this grid, so the bound means something
+              self.assertLessEqual(a_aged, a_fresh + 1e-9, f"rose with the age {age} at v_ego {v_ego}, gap {gap}, v_lead {v_lead}, a_lead {a_lead}")
+              self.assertLessEqual(p_aged, p_fresh + 1e-9)
+              differ += a_aged < a_fresh - 1e-9
+    self.assertGreater(differ, 0)  # the arms are not identical over this grid, so the claim means something
 
 
 class TestPlanner(unittest.TestCase):

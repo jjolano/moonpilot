@@ -357,11 +357,11 @@ MOONPILOT_LEAD_BRAKE_SUSTAIN_T = 2.0  # s; how long `stopping_decel` assumes a b
 # needs more than ACCEL_MIN there, which is physics rather than this constant.
 MOONPILOT_LEAD_BRAKE_SUSTAIN_PER_A = 1.0  # s per m/s^2; a harder brake is believed longer: the
 # horizon is max(SUSTAIN_T, PER_A * |a_lead|), so 2 s up to -2. `python -m moonpilot.lab sustain`
-# (RAV4, 0.2 s dead time + 0.25 s lag): 30 m/s behind a lead braking -3.5 to rest from the 1.45 s
-# follow went from contact (-5.26 m) to 5.89 m, matching the to-rest horizon; -5 still contacts at
-# every horizon there (reaction-limited). Over 12 engaged drives it deepens 99 of 55k frames by more
-# than 0.05 (one -1.03 on 00000408, else <= 0.22) where a fixed 3.0 s deepened 418. The cost is a hard
-# *tap*: -5 for 0.5 s at 30 m/s from 60 m peaks -2.96 against -0.82 at a fixed 2.0 s.
+# (RAV4, 0.2 s dead time + 0.25 s lag, both cars on the trapezoid): 30 m/s behind a lead braking -3.5 to
+# rest from the 1.45 s follow went from contact (-5.95 m) to 5.29 m; -5 still contacts at every horizon
+# there (reaction-limited). Over 12 engaged drives it deepens 92 of 55k frames by more than 0.05 (one
+# -1.02 on 00000408, else <= 0.22). The cost is a hard *tap*: -5 for 0.5 s at 30 m/s from 60 m peaks
+# -2.96 against -0.82 at a fixed 2.0 s.
 MOONPILOT_A_LEAD_MIN = -10.0  # m/s^2; bounds on a lead's accel estimate, upstream's (long_mpc.process_lead)
 MOONPILOT_A_LEAD_MAX = 5.0
 MOONPILOT_OUT_OF_PATH_T_FOLLOW = 0.7  # time-gap scale for a lead predicted to leave the path
@@ -969,10 +969,11 @@ def lead_accel_estimate(a_lead: float) -> float:
   return min(max(float(a_lead), MOONPILOT_A_LEAD_MIN), MOONPILOT_A_LEAD_MAX)
 
 
-def lead_state_at(lead, t, x_ego, a_lead, a_lead_tau) -> tuple[float, float, float]:
+def lead_state_at(lead, t, x_ego, a_lead, a_lead_tau, t_decay=None) -> tuple[float, float, float]:
   """Gap, lead speed and lead accel at time t, given the ego's own travel x_ego by then.
 
-  Lead accel decays as exp(-aLeadTau t^2 / 2) — radard's own decay model — and the lead's travel is
+  Lead accel decays as exp(-aLeadTau t_decay^2 / 2) — radard's own decay model, over `t` unless the
+  caller says otherwise — and the lead's travel is
   the integral of its *clamped* speed: a lead that brakes to a stop inside the horizon has covered
   its stopping distance, where the unclamped integral walked it backwards and then clamped the travel
   to zero. Exact whenever aLeadTau == 0, which is what the estimator reports for anything braking
@@ -988,7 +989,7 @@ def lead_state_at(lead, t, x_ego, a_lead, a_lead_tau) -> tuple[float, float, flo
   the published plan, not the command.
   """
   a_lead = lead_accel_estimate(a_lead)
-  a_traj = a_lead * math.exp(-a_lead_tau * t**2 / 2.0)
+  a_traj = a_lead * math.exp(-a_lead_tau * (t if t_decay is None else t_decay) ** 2 / 2.0)
   a_avg = 0.5 * (a_lead + a_traj)
   v_lead = max(0.0, float(lead.vLead))
   v_end = v_lead + a_avg * t
@@ -1492,8 +1493,9 @@ class MoonpilotLongitudinalPlanner:
     lead_states = []
     for source, lead, a_lead, a_lead_tau in leads:
       age = self._lead_age(lead, lead_age)
-      # The sustain is the measured braking's, not the decayed projection's: radar age must not shorten it.
-      lead_states.append((source, *lead_state_at(lead, self.action_t + age, x_pred + v_ego * age, a_lead, a_lead_tau), brake_sustain(a_lead)))
+      # The radar age adds travel, not decay, and the sustain is the measured braking's: an older radar
+      # lead never reads as braking less (`TestStalenessScope`).
+      lead_states.append((source, *lead_state_at(lead, self.action_t + age, x_pred + v_ego * age, a_lead, a_lead_tau, self.action_t), brake_sustain(a_lead)))
     a_cmd, source = policy(
       v_pred,
       lead_states,
@@ -1700,7 +1702,7 @@ class MoonpilotLongitudinalPlanner:
       states = []
       for source, lead, a_lead, a_lead_tau in leads:
         age = self._lead_age(lead, lead_age)
-        states.append((source, *lead_state_at(lead, t + age, x + v_ego * age, a_lead, a_lead_tau), brake_sustain(a_lead)))
+        states.append((source, *lead_state_at(lead, t + age, x + v_ego * age, a_lead, a_lead_tau, t), brake_sustain(a_lead)))
       a_cmd, _ = policy(
         v,
         states,

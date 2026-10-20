@@ -899,9 +899,9 @@ def _hard_brake_run(kind, v0, a_brake, lag, onset=5.0, T=30.0):
     fcw.append(warned)
     a = plant.step(cmd) if plant else cmd
     v_next = max(0.0, v_lead + (a_brake * DT_MDL if t >= onset else 0.0))
-    v = max(0.0, v + a * DT_MDL)
-    gap += (0.5 * (v_lead + v_next) - v) * DT_MDL
-    v_lead = v_next
+    v_ego_next = max(0.0, v + a * DT_MDL)
+    gap += (0.5 * (v_lead + v_next) - 0.5 * (v + v_ego_next)) * DT_MDL  # both cars on the trapezoid
+    v, v_lead = v_ego_next, v_next
     gaps.append(gap)
   deep, warn = np.flatnonzero(np.asarray(cmds) <= -3.0), np.flatnonzero(fcw)
   return min(gaps), min(cmds), (deep[0] * DT_MDL - onset) if deep.size else math.nan, (warn[0] * DT_MDL - onset) if warn.size else math.nan
@@ -987,20 +987,23 @@ def _sustain_flights(names):
 
 
 def _sustain_drives(args, names):
-  print("engaged drives replayed: frames deeper than 2.0 s by > 0.05 m/s^2 (of engaged), deepest delta")
+  print("engaged drives replayed: replay vs logged p95 (current code), then frames deeper than 2.0 s by > 0.05 m/s^2, deepest delta")
   for route in expand(args.routes, ROUTE_SETS):
     data = extract(route, args.root)
-    with _sustain_rule(SUSTAIN_RULES["2.0 s"]):
-      base, _, active, _ = replay(route, data, args.root)
+    shipped, logged, active, _ = replay(route, data, args.root)
     if _skip_no_engaged(route, active):
       continue
+    m = active & np.isfinite(logged)
+    with _sustain_rule(SUSTAIN_RULES["2.0 s"]):
+      base = replay(route, data, args.root)[0]
     cells = []
     for n in names[1:]:
       with _sustain_rule(SUSTAIN_RULES[n]):
         cmd = replay(route, data, args.root)[0]
       delta = (cmd - base)[active]
       cells.append(f"{n} {int((delta < -0.05).sum()):4d} {delta.min():6.2f}")
-    print(f"{route} ({int(active.sum())} engaged): " + "  ".join(cells), flush=True)
+    err = float(np.percentile(np.abs(shipped - logged)[m], 95)) if m.any() else math.nan
+    print(f"{route} ({int(active.sum())} engaged, p95 {err:.4f}): " + "  ".join(cells), flush=True)
 
 
 def _sustain(args):
