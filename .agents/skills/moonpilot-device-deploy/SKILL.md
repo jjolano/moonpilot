@@ -49,6 +49,13 @@ release scripts use — is always the right answer, not a workaround.
 
 ## Update an already-deployed device
 
+Only offroad. Require `IsOffroad` to read `1` first — manager writes it (`manager.py`); this tree has
+no `IsOnroad` param, so a missing or empty value is not evidence of anything:
+
+```bash
+ssh moonpilot 'test "$(cat /data/params/d/IsOffroad 2>/dev/null)" = 1' && echo offroad || echo "NOT offroad: stop"
+```
+
 ```bash
 SHA=$(git rev-parse HEAD)
 ssh moonpilot "cd /data/openpilot && git fetch origin && git reset --hard $SHA \

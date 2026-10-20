@@ -799,15 +799,12 @@ def _manual_decel(args):
   """The unified approach requirement against the driver's own longitudinal: `stopping_decel` (the lead's braking held
   for up to its sustain, positive lead accel ignored) to the arrival target, max(moving rest, t_follow * v_lead), on
   manual frames behind a radar lead; then where the driver actually ends up — rest gaps and settled headways."""
-  from moonpilot.longitudinal import (MOONPILOT_CREEP_SPEED, MOONPILOT_MOVING_STOP_RESERVE, MOONPILOT_STOP_DISTANCE, MOONPILOT_STOP_REST,
-                                      lead_accel_estimate, stopping_decel)
+  from moonpilot.longitudinal import MOONPILOT_STOP_REST, lead_accel_estimate, stopping_decel
   t_follow = args.t_follow
   routes = expand(args.routes, ROUTE_SETS)
   d = _pooled_manual(routes, args.root)
   v, v_lead, gap = d["v"], d["v_lead"], d["gap"]
-  reserve = MOONPILOT_STOP_DISTANCE - MOONPILOT_STOP_REST + MOONPILOT_MOVING_STOP_RESERVE
-  rest = MOONPILOT_STOP_REST + reserve * np.clip(v_lead / MOONPILOT_CREEP_SPEED, 0.0, 1.0)
-  target = np.maximum(rest, t_follow * v_lead)
+  target = _arrival_target(v_lead, t_follow)
   lead = (d["manual"] > 0) & (d["lead"] > 0)
   a_lead = np.array([lead_accel_estimate(x) for x in d["a_lead"]])
   need = np.array([stopping_decel(*x) if m else 0.0 for m, x in zip(lead, zip(v, v_lead, a_lead, np.maximum(gap - target, 0.1), strict=True), strict=True)])
@@ -863,34 +860,45 @@ def _module_at(commit, path="moonpilot/longitudinal.py"):
   return module
 
 
-def _manual_vs_laws(args, d, mask, need, t_follow):
-  """The shipped lead law, `--previous`'s and (with `--prototype`) the retired `unified_lead_accel` run on its own commit's
-  planner, as `policy` asks them (engine-coast RAV4, cruise at the ego's speed, before the brake band), beside the raw
-  requirement (today's `stopping_decel` to the time-gap target) and the driver's aEgo on the same manual approach frames."""
-  from unittest import mock
+def _arrival_target(v_lead, t_follow):
+  """The arrival law's target gap: max(the moving rest, t_follow * v_lead)."""
+  from moonpilot.longitudinal import MOONPILOT_CREEP_SPEED, MOONPILOT_MOVING_STOP_RESERVE, MOONPILOT_STOP_DISTANCE, MOONPILOT_STOP_REST
+  reserve = MOONPILOT_STOP_DISTANCE - MOONPILOT_STOP_REST + MOONPILOT_MOVING_STOP_RESERVE
+  return np.maximum(MOONPILOT_STOP_REST + reserve * np.clip(v_lead / MOONPILOT_CREEP_SPEED, 0.0, 1.0), t_follow * v_lead)
+
+
+def _lead_laws(args, t_follow):
+  """name -> ask(v, gap, v_lead, a_lead): the shipped lead law, `--previous`'s and (with `--prototype`) the retired
+  `unified_lead_accel` on its own commit's planner, as `policy` asks them for the engine-coast RAV4 with cruise at the
+  ego's speed, before the brake band."""
   import moonpilot.longitudinal as now
   from opendbc.car.toyota.interface import CarInterface
   from opendbc.car.toyota.values import CAR, ToyotaFlags
-  old = _module_at(args.previous)
   CP = CarInterface.get_non_essential_params(CAR.TOYOTA_RAV4_TSS2)
   CP.openpilotLongitudinalControl = True
   CP.flags |= ToyotaFlags.MOONPILOT_ENGINE_COAST.value
   src = now.LongitudinalPlanSource.lead0
 
-  def ask(module, i, extra=()):
-    lead = (src, d["gap"][i], d["v_lead"][i], d["a_lead"][i], *extra)
-    return module.policy(d["v"][i], [lead], d["v"][i], t_follow, False, None, 0.0, CP, -0.3, True)[0]
+  def law(module, sustain=None):
+    def ask(v, gap, v_lead, a_lead):
+      extra = (sustain(a_lead),) if sustain else ()
+      return module.policy(v, [(src, gap, v_lead, a_lead, *extra)], v, t_follow, False, None, 0.0, CP, -0.3, True)[0]
+    return ask
 
-  idx = np.flatnonzero(mask)
-  laws = {
-    "now": np.array([ask(now, i, (now.brake_sustain(d["a_lead"][i]),)) for i in idx]),
-    args.previous[:9]: np.array([ask(old, i) for i in idx]),
-  }
+  laws = {"now": law(now, now.brake_sustain), args.previous[:9]: law(_module_at(args.previous))}
   if args.prototype:
     proto = _module_at(args.prototype, "moonpilot/lab/unified.py")
-    proto.L = _module_at(args.prototype)  # the planner the prototype was written against
-    with mock.patch.object(proto.L, "lead_accel", proto.unified_lead_accel):
-      laws["prototype"] = np.array([ask(proto.L, i) for i in idx])
+    proto.L = _module_at(args.prototype)  # a private copy of the planner the prototype was written against
+    proto.L.lead_accel = proto.unified_lead_accel  # its `policy` calls the law by global name
+    laws["prototype"] = law(proto.L)
+  return laws
+
+
+def _manual_vs_laws(args, d, mask, need, t_follow):
+  """`_lead_laws` beside the raw requirement (today's `stopping_decel` to the time-gap target) and the driver's aEgo on
+  the same manual approach frames."""
+  idx = np.flatnonzero(mask)
+  laws = {n: np.array([f(d["v"][i], d["gap"][i], d["v_lead"][i], d["a_lead"][i]) for i in idx]) for n, f in _lead_laws(args, t_follow).items()}
   laws["requirement"] = need[idx]
   a, v, req = d["a"][idx], d["v"][idx], need[idx]
   names = tuple(laws)
@@ -912,6 +920,85 @@ def _manual_vs_laws(args, d, mask, need, t_follow):
       if m.sum() >= 20:
         asks = "  ".join(f"{n} {np.median(x[m]):6.2f}" for n, x in laws.items())
         print(f"    [{b_lo:6.2f}, {b_hi:5.2f})  {m.sum():5d}  driver {np.median(a[m]):6.2f}  {asks}")
+
+
+def _approach_runs(t, route, ok, gap, target, lead_in=10.0, min_s=3.0):
+  """Runs of `ok` frames (one route, the gap moving under 5 m a frame) lasting `min_s`, starting `lead_in` m past the target."""
+  runs, start = [], None
+  for i in range(len(ok) + 1):
+    if i < len(ok) and ok[i] and start is not None and route[i] == route[i - 1] and abs(gap[i] - gap[i - 1]) < 5.0:
+      continue
+    if start is not None and t[i - 1] - t[start] >= min_s and gap[start] - target[start] >= lead_in:
+      runs.append((start, i))
+    start = i if i < len(ok) and ok[i] else None
+  return runs
+
+
+def _onset(x, threshold, hold=1):
+  """First index where `x` stays at or below `threshold` for `hold` frames, or None."""
+  below = np.convolve(x <= threshold, np.ones(hold), mode="valid") >= hold
+  return int(np.argmax(below)) if below.any() else None
+
+
+def _onset_report(label, runs, t, v, gap, target, closing, series):
+  """Per start-speed band: for each actor, how many runs reach -0.05 / -0.3 and the median time to the target (gap past the
+  target over the closing) when they do; for every actor but the first, how often and by how much it starts before it."""
+  first = next(iter(series))
+  print(f"\n{label}: {len(runs)} approaches. Per actor, reached -0.05 (n, median s to target there) | reached -0.3 (same)")
+  for lo, hi in ((5.0, 12.0), (12.0, 20.0), (20.0, 45.0)):
+    band = [(s, e) for s, e in runs if lo <= v[s] < hi]
+    if not band:
+      continue
+    print(f"  {lo:.0f}-{hi:.0f} m/s at the start: {len(band)} approaches, gap {np.median([gap[s] for s, _ in band]):.0f} m, "
+          + f"closing {np.median([closing[s] for s, _ in band]):.1f} m/s (medians)")
+    onsets = {n: [[None if (k := _onset(x[s:e], thr, hold)) is None else s + k for s, e in band] for thr in (-0.05, -0.3)]
+              for n, (x, hold) in series.items()}
+    for n, (soft, firm) in onsets.items():
+      cells = []
+      for found in (soft, firm):
+        ttt = [(gap[i] - target[i]) / max(closing[i], 0.1) for i in found if i is not None]
+        cells.append(f"{len(ttt):3d} {np.median(ttt):5.1f} s" if ttt else "  0     -  ")
+      lead = ""
+      if n != first:
+        pairs = [(t[a] - t[b]) for a, b in zip(onsets[first][0], soft, strict=True) if a is not None and b is not None]
+        if pairs:
+          earlier = [p for p in pairs if p > 0.0]
+          lead = f"   starts before {first} in {len(earlier)}/{len(pairs)}" + (f", median {np.median(earlier):.1f} s earlier" if earlier else "")
+      print(f"    {n:12s} {cells[0]} | {cells[1]}{lead}")
+
+
+def _approach_onsets(args):
+  """Where approaches to a slower radar lead start slowing. Manual drives: the driver (aEgo held 0.5 s past the threshold)
+  against each `_lead_laws` law asked open-loop on the driver's own states. Engaged drives (`--engaged`): the logged
+  command against today's planner replayed on them. Open-loop is exact up to the earlier onset — until then both saw
+  the same states — so 'starts before' is the clean statistic; a later onset is measured on a trajectory already slowed."""
+  t_follow = args.t_follow
+  d = _pooled_manual(expand(args.routes, ROUTE_SETS), args.root)
+  v, gap, v_lead = d["v"], d["gap"], d["v_lead"]
+  target, closing = _arrival_target(v_lead, t_follow), v - v_lead
+  ok = (d["manual"] > 0) & (d["lead"] > 0) & (v > 5.0) & (closing > 1.0) & (gap > target)
+  runs = _approach_runs(d["t"], d["route"], ok, gap, target)
+  idx = np.unique(np.concatenate([np.arange(s, e) for s, e in runs])) if runs else np.array([], dtype=int)
+  series = {"driver": (d["a"], round(0.5 / DT_MDL))}
+  for n, f in _lead_laws(args, t_follow).items():
+    x = np.zeros(len(v))
+    x[idx] = [f(v[i], gap[i], v_lead[i], d["a_lead"][i]) for i in idx]
+    series[n] = (x, 1)
+  _onset_report("Manual approaches, laws open-loop on the driver's states", runs, d["t"], v, gap, target, closing, series)
+
+  for route in expand(args.engaged, ROUTE_SETS):
+    commit, _ = drive_config(route, args.root)
+    details = []
+    replayed, logged, active, _ = replay(route, extract(route, args.root), args.root, details_out=details)
+    e = _details_arrays(details)
+    lead = e["lead_present"] & e["radar_present"]
+    target_e, closing_e = _arrival_target(e["v_lead"], t_follow), e["v_ego"] - e["v_lead"]
+    ok_e = active & lead & (e["v_ego"] > 5.0) & (closing_e > 1.0) & (e["d_rel"] > target_e)
+    runs_e = _approach_runs(e["t"], np.zeros(len(ok_e)), ok_e, e["d_rel"], target_e)
+    m = active & np.isfinite(logged)
+    p95 = float(np.percentile(np.abs(replayed - logged)[m], 95)) if m.any() else math.nan
+    _onset_report(f"Engaged {route} (ran {commit[:9]}; replay vs logged p95 {p95:.3f})", runs_e, e["t"], e["v_ego"], e["d_rel"], target_e, closing_e,
+                  {"logged": (np.nan_to_num(logged), 1), "now": (replayed, 1)})
 
 
 def _plant_inputs(v, a, gap, v_lead, a_lead, v_cruise):
@@ -1096,6 +1183,13 @@ def _register_manual(sub):
   parser.add_argument("--previous", help="also compare the shipped lead law with this commit's on the same frames")
   parser.add_argument("--prototype", help="with --previous, also the retired unified_lead_accel at this commit (4a23d0368)")
   parser.set_defaults(fn=_manual_decel)
+  parser = sub.add_parser("approach-onsets", help="where approaches to a slower lead start slowing: driver vs lead laws, logged vs now")
+  parser.add_argument("--routes", nargs="+", default=["manual-approach"], help=f"manual route names or sets: {', '.join(ROUTE_SETS)}")
+  parser.add_argument("--engaged", nargs="+", default=[], help="engaged drives to replay: logged command against today's planner")
+  parser.add_argument("--t-follow", type=float, default=1.45, help="the target's time gap, s")
+  parser.add_argument("--previous", default="dcc538d78", help="the previous lead law's commit")
+  parser.add_argument("--prototype", help="also the retired unified_lead_accel at this commit (4a23d0368)")
+  parser.set_defaults(fn=_approach_onsets)
   sub.add_parser("hard-brake", help="lead braking hard from a follow: upstream vs fork vs ideal, with and without lag").set_defaults(fn=_hard_brake)
   parser = sub.add_parser("sustain", help="the lead-brake sustain horizon: fixed vs scaled, hard brakes, taps, drives")
   parser.add_argument("--routes", nargs="+", default=["longitudinal"], help=f"route names or sets: {', '.join(ROUTE_SETS)}")
