@@ -9,7 +9,7 @@ the band would have produced.
 """
 import math
 from collections import deque
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 
 import numpy as np
@@ -922,6 +922,96 @@ def _hard_brake(args):
               + "  ".join(f"{g:7.2f} {pk:5.2f} {d:5.2f} {w:5.2f}{' X' if g < 0.4 else '  '}" for g, pk, d, w in cells))
 
 
+SUSTAIN_RULES = {  # sustain(v_lead, a_lead, braking_s): braking_s is how long the planner's lead accel has read <= -1.0
+  "2.0 s": lambda v, a, b: 2.0,
+  "3.0 s": lambda v, a, b: 3.0,
+  "to rest": lambda v, a, b: math.inf,
+  "|a| s": lambda v, a, b: max(2.0, -a),
+  "2 s+braking": lambda v, a, b: 2.0 + b,
+  "2 s+2x braking": lambda v, a, b: 2.0 + 2.0 * b,
+}
+
+
+@contextmanager
+def _sustain_rule(rule):
+  """Every comfort-horizon `stopping_decel` call takes `rule`'s sustain (FCW's `inf` passes through). The braking time is
+  counted per planner update from the deepest lead accel the previous update's calls saw, so it reads only what the
+  planner itself observed."""
+  from unittest import mock
+  import moonpilot.longitudinal as longitudinal
+  original, update = longitudinal.stopping_decel, MoonpilotLongitudinalPlanner.update
+  state = {"deepest": 0.0, "braking": 0.0}
+
+  def decel(v_ego, v_lead, a_lead, slack, sustain=longitudinal.MOONPILOT_LEAD_BRAKE_SUSTAIN_T):
+    if math.isinf(sustain):
+      return original(v_ego, v_lead, a_lead, slack, sustain)
+    state["deepest"] = min(state["deepest"], float(a_lead))
+    return original(v_ego, v_lead, a_lead, slack, rule(v_lead, float(a_lead), state["braking"]))
+
+  def tick(self, sm):
+    state["braking"] = state["braking"] + DT_MDL if state["deepest"] <= -1.0 else 0.0
+    state["deepest"] = 0.0
+    return update(self, sm)
+
+  with mock.patch.object(longitudinal, "stopping_decel", decel), mock.patch.object(MoonpilotLongitudinalPlanner, "update", tick):
+    yield
+
+
+def _sustain_flights(names):
+  from moonpilot.tests.test_longitudinal import _fly
+  print("hard brake to rest from a 1.45 s follow (fork, RAV4): min gap m, contact < 0.4")
+  print(f"{'plant':5s} {'v0':>4s} {'lead a':>6s}  " + "  ".join(f"{n:>14s}" for n in names))
+  for lag in (False, True):
+    for v0 in (20.0, 25.0, 30.0):
+      for a_brake in (-3.5, -5.0):
+        gaps = []
+        for n in names:
+          with _sustain_rule(SUSTAIN_RULES[n]):
+            gaps.append(_hard_brake_run("fork", v0, a_brake, lag)[0])
+        print(f"{'lag' if lag else 'none':5s} {v0:4.0f} {a_brake:6.1f}  " + "  ".join(f"{g:12.2f}{' X' if g < 0.4 else '  '}" for g in gaps))
+  taps = (  # (label, v0, gap0, lead brake, tap length s)
+    ("30 m/s, 60 m, -5 x 0.5 s", 30.0, 60.0, -5.0, 0.5),
+    ("25 m/s follow, -3.5 x 1 s", 25.0, 36.25, -3.5, 1.0),
+    ("20 m/s follow, -2 x 1.5 s", 20.0, 29.0, -2.0, 1.5),
+    ("15 m/s follow, -3 x 1 s", 15.0, 21.75, -3.0, 1.0),
+  )
+  print("\nlead taps then holds speed: peak command m/s^2 (end gap m); the brake band presses below -0.40")
+  print(f"{'scenario':28s}  " + "  ".join(f"{n:>14s}" for n in names))
+  for label, v0, gap0, brake, length in taps:
+    cells = []
+    for n in names:
+      with _sustain_rule(SUSTAIN_RULES[n]):
+        s = _fly(v0, v0 * 3.6 + 10.0, gap0, v0, lambda t, b=brake, n_=length: b if 1.0 < t < 1.0 + n_ else 0.0, 20.0)
+      cells.append(f"{s['peak']:6.2f} ({s['end_gap']:5.1f})")
+    print(f"{label:28s}  " + "  ".join(f"{c:>14s}" for c in cells))
+
+
+def _sustain_drives(args, names):
+  print("engaged drives replayed: frames deeper than 2.0 s by > 0.05 m/s^2 (of engaged), deepest delta")
+  for route in expand(args.routes, ROUTE_SETS):
+    data = extract(route, args.root)
+    base, _, active, _ = replay(route, data, args.root)
+    if _skip_no_engaged(route, active):
+      continue
+    cells = []
+    for n in names[1:]:
+      with _sustain_rule(SUSTAIN_RULES[n]):
+        cmd = replay(route, data, args.root)[0]
+      delta = (cmd - base)[active]
+      cells.append(f"{n} {int((delta < -0.05).sum()):4d} {delta.min():6.2f}")
+    print(f"{route} ({int(active.sum())} engaged): " + "  ".join(cells), flush=True)
+
+
+def _sustain(args):
+  """How long `stopping_decel` assumes a braking lead keeps braking: the fixed 2.0 s against longer and scaled horizons,
+  on the hard brakes it must survive, the taps it must not over-answer, and the engaged drives' own commands."""
+  names = tuple(SUSTAIN_RULES)
+  if args.part != "drives":
+    _sustain_flights(names)
+  if args.part != "flights":
+    _sustain_drives(args, names)
+
+
 def _register_manual(sub):
   parser = sub.add_parser("lead-hold", help="engine-coast arrival hold: driver bins, replayed drive, lagged/noisy flights")
   parser.add_argument("--routes", nargs="+", default=["manual-approach"], help=f"route names or sets: {', '.join(ROUTE_SETS)}")
@@ -933,6 +1023,10 @@ def _register_manual(sub):
   parser.add_argument("--t-follow", type=float, default=1.45, help="the target's time gap, s (standard personality's 1.45)")
   parser.set_defaults(fn=_manual_decel)
   sub.add_parser("hard-brake", help="lead braking hard from a follow: upstream vs fork vs ideal, with and without lag").set_defaults(fn=_hard_brake)
+  parser = sub.add_parser("sustain", help="the lead-brake sustain horizon: fixed vs scaled, hard brakes, taps, drives")
+  parser.add_argument("--routes", nargs="+", default=["longitudinal"], help=f"route names or sets: {', '.join(ROUTE_SETS)}")
+  parser.add_argument("--part", choices=("all", "flights", "drives"), default="all", help="flown scenarios, replayed drives or both")
+  parser.set_defaults(fn=_sustain)
 
 
 def register(sub):
