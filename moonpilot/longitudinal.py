@@ -209,6 +209,13 @@ MOONPILOT_LEAD_ACCEL_COMFORT_NOISE = 0.2  # m/s^2; faded to zero below, whole at
 MOONPILOT_FOLLOW_COAST_HEADWAY_FADE_T = 0.2  # s
 MOONPILOT_FOLLOW_COAST_CLOSING = [0.6, 1.2]  # m/s; whole at or below the first, gone at the second
 MOONPILOT_FOLLOW_COAST_LEAD_A = [-0.8, -0.5]  # m/s^2; gone at or below the first, whole above the second
+# A braking lead is matched at the driver's share of its accel: whole inside 1 s of headway, half over 1.5-2.5 s
+# (manual frames, |closing| < 1.5 m/s: median aEgo / a_lead 0.40-0.56), gone by 4 s, so a far lead is still
+# approached; in as the coast cushion leaves (FOLLOW_COAST_LEAD_A: estimate noise stays a coast), never past
+# APPROACH_DECEL, in over SOFT_STOP_V, out as the lead pulls away. `python -m moonpilot.lab decel-peaks`.
+MOONPILOT_MIRROR_HEADWAY = [1.0, 1.5, 2.5, 4.0]  # s
+MOONPILOT_MIRROR_GAIN = [1.0, 0.5, 0.5, 0.0]
+MOONPILOT_MIRROR_OPEN_V = 1.5  # m/s of lead speed over the ego that ends it
 # The positive side's authority: a multiplier on the regulator's output, and only on the output, and
 # only where it is already positive. 1.0 at and below 20 m/s, so the whole low-speed follow law — every
 # approach, every stop, every maneuver this fork has already been driven on — is bit-identical to what
@@ -901,6 +908,11 @@ def lead_accel(v_ego, gap, v_lead, a_lead, t_follow, catch_up_accel=0.0, catch_u
   a_track = soft_stop(a_track, v_ego, gap, v_lead_eff)
   if a_track > 0.0 and v_ego > v_lead_match and gap > gap_target:
     a_track *= min(1.0, (gap - gap_target) / MOONPILOT_FOLLOW_TAPER_M)
+  mirror = float(np.interp(gap / max(v_ego, 0.1), MOONPILOT_MIRROR_HEADWAY, MOONPILOT_MIRROR_GAIN)) * float(np.interp(v_ego, MOONPILOT_SOFT_STOP_V, [0.0, 1.0]))
+  mirror *= a_lead * float(np.interp(a_lead, MOONPILOT_FOLLOW_COAST_LEAD_A, [1.0, 0.0]))
+  mirror *= float(np.interp(v_lead - v_ego, [0.0, MOONPILOT_MIRROR_OPEN_V], [1.0, 0.0]))
+  if mirror < 0.0:
+    a_track = min(a_track, max(mirror, -MOONPILOT_APPROACH_DECEL))
   closing = v_ego - v_lead_eff
   if closing <= 0.0:
     return a_track  # not closing: nothing to brake for

@@ -1186,6 +1186,91 @@ def _sustain(args):
     _sustain_drives(args, names)
 
 
+PEAK_DECEL_A, PEAK_LEAD_IN_S, PEAK_TAIL_S = -0.3, 4.0, 4.0  # a decel: aEgo over 0.5 s below this; flown this much either side
+
+
+def _fly_logged_lead(job):
+  """The engine-coast RAV4 planner on the lagged plant from a logged start, behind the logged lead's own path; the cruise
+  speed is held at the start's, so only the lead terms brake."""
+  from moonpilot.tests.test_engine_coast import _planner
+  from moonpilot.tests.test_longitudinal import _inputs, _lead
+  v_log, gap_log, v_lead, a0 = job
+  s_lead = np.r_[0.0, np.cumsum(v_log[:-1] * DT_MDL)] + gap_log
+  planner, plant = _planner(True), _LaggedPlant()
+  plant.a, plant.queue = a0, deque([a0] * len(plant.queue))
+  v, s, out = v_log[0], 0.0, {"v": [], "a": [], "gap": []}
+  for i in range(len(v_log)):
+    planner.update(_inputs(v_ego=v, v_cruise_kph=v_log[0] * 3.6, a_ego=plant.a, lead=_lead(max(s_lead[i] - s, 0.0), max(v_lead[i], 0.0)),
+                           standstill=v < 0.05, personality=1))
+    for k, x in zip(out, (v, plant.a, s_lead[i] - s), strict=True):
+      out[k].append(x)
+    v_new = max(0.0, v + plant.step(float(planner.output_a_target)) * DT_MDL)
+    s, v = s + 0.5 * (v + v_new) * DT_MDL, v_new
+  return {k: np.asarray(x) for k, x in out.items()}
+
+
+def _decel_peaks(args):
+  """The driver's share of a slowing lead's accel by headway (`MOONPILOT_MIRROR_*`'s source), then every manual decel a
+  radar lead caused, flown from the same start behind the same logged lead with the mirror on and off: peak decel (aEgo
+  over 0.5 s, above 2 m/s) and the minimum gap against the driver's; the hard brakes; engaged drives' press time."""
+  from concurrent.futures import ProcessPoolExecutor
+  from unittest import mock
+  import moonpilot.longitudinal as longitudinal
+  from moonpilot.lab.model_braking import episodes
+  d = _pooled_manual(expand(args.routes, ROUTE_SETS), args.root)
+  v, gap, v_lead = d["v"], d["gap"], d["v_lead"]
+  a_s = np.concatenate([np.convolve(d["a"][d["route"] == r], np.ones(10) / 10, mode="same") for r in np.unique(d["route"])])
+  near = (d["manual"] > 0) & (d["lead"] > 0) & (v > 5.0) & (np.abs(v - v_lead) < 1.5)
+  print("Driver, lead slowing, |closing| < 1.5 m/s, above 5 m/s: median aEgo / aLead by headway (n)")
+  for lo_a, hi_a in ((-0.6, -0.2), (-1.0, -0.6), (-1.6, -1.0)):
+    cells = []
+    for lo, hi in ((0.5, 1.0), (1.0, 1.5), (1.5, 2.0), (2.0, 2.5), (2.5, 3.0), (3.0, 4.0), (4.0, 6.0)):
+      m = near & (d["a_lead"] >= lo_a) & (d["a_lead"] < hi_a) & (gap >= lo * v) & (gap < hi * v)
+      cells.append(f"{lo:.1f}-{hi:.1f} s {np.median(d['a'][m] / d['a_lead'][m]):5.2f} ({m.sum()})" if m.sum() >= 40 else f"{lo:.1f}-{hi:.1f} s   -")
+    print(f"  aLead [{lo_a}, {hi_a}): " + "  ".join(cells))
+
+  n_in, n_tail = round(PEAK_LEAD_IN_S / DT_MDL), round(PEAK_TAIL_S / DT_MDL)
+  jobs, drv = [], []
+  for sl in episodes((a_s < PEAK_DECEL_A) & (d["manual"] > 0), d["t"], d["route"], 0.5):
+    w = slice(sl.start - n_in, min(sl.stop + n_tail, len(v)))
+    if d["t"][sl.stop - 1] - d["t"][sl.start] < 2.0 or v[sl.start] < 4.0 or v[sl.start] - v[sl.stop - 1] < 2.0 or w.start < 0:
+      continue
+    vw, gw, lw = v[w], gap[w], v_lead[w]
+    if (d["route"][w] != d["route"][sl.start]).any() or not (d["manual"][w] > 0).all() or not (d["lead"][w] > 0).all() or gw[n_in] > 80.0:
+      continue
+    if np.max(np.abs(np.diff(gw) - (lw[:-1] - vw[:-1]) * DT_MDL)) > 1.0:  # one radar track throughout
+      continue
+    if lw[n_in] < vw[n_in] - 0.5 or gw[-1] < 15.0:  # the lead's doing: slower at the onset, or close at the end
+      jobs.append((vw, gw, lw, d["a"][w][0]))
+      drv.append((vw[n_in], a_s[w][vw > 2.0].min(), gw.min()))
+  drv = np.asarray(drv)
+  print(f"\n{len(jobs)} manual decels a radar lead caused, flown (engine-coast RAV4, {HOLD_FLY_DEAD_S} s dead time + {HOLD_FLY_TAU_S} s lag). "
+        + "Median peak decel and minimum gap; 'deeper' = planner peak past the driver's by more than 0.5:")
+  off = mock.patch.object(longitudinal, "MOONPILOT_MIRROR_GAIN", [0.0] * len(longitudinal.MOONPILOT_MIRROR_GAIN))
+  for name, ctx in (("mirror off", off), ("mirror on", nullcontext())):
+    with ctx, ProcessPoolExecutor(4) as pool:
+      flown = list(pool.map(_fly_logged_lead, jobs))
+    peak = np.asarray([np.convolve(f["a"], np.ones(10) / 10, mode="same")[f["v"] > 2.0].min() for f in flown])
+    min_gap = np.asarray([f["gap"].min() for f in flown])
+    print(f"  {name}: closest {min_gap.min():.1f} m")
+    for lo, hi in ((4, 10), (10, 16), (16, 40)):
+      b = (drv[:, 0] >= lo) & (drv[:, 0] < hi)
+      print(f"    from {lo:2d}-{hi:2d} m/s (n {b.sum():2d}): peak driver {np.median(drv[b, 1]):5.2f} planner {np.median(peak[b]):5.2f}, "
+            + f"deeper in {np.mean(peak[b] < drv[b, 1] - 0.5) * 100:3.0f}%; min gap driver {np.median(drv[b, 2]):4.1f} planner {np.median(min_gap[b]):4.1f} m")
+    with ctx:
+      hard = [_hard_brake_run("fork+engine", v0, a, lag)[0] for lag in (False, True) for v0 in (20.0, 25.0, 30.0) for a in (-3.5, -5.0)]
+    print("    hard-brake min gap (20/25/30 m/s x -3.5/-5, then lagged): " + " ".join(f"{g:5.1f}" for g in hard))
+
+  for route in expand(args.engaged, ROUTE_SETS):
+    data = extract(route, args.root)
+    with off:
+      base, logged, active, _ = replay(route, data, args.root)
+    now, _, _, _ = replay(route, data, args.root)
+    m = active & np.isfinite(logged)
+    print(f"{route}: {m.sum()} engaged frames, {np.sum(m & (now < base - 0.05))} deeper by > 0.05; ask < -0.4 for "
+          + f"{np.sum(m & (base < -0.4)) * DT_MDL:.1f} s off, {np.sum(m & (now < -0.4)) * DT_MDL:.1f} s on; peak {base[m].min():.2f} / {now[m].min():.2f}")
+
+
 def _register_manual(sub):
   parser = sub.add_parser("lead-hold", help="engine-coast arrival hold: driver bins, replayed drive, lagged/noisy flights")
   parser.add_argument("--routes", nargs="+", default=["manual-approach"], help=f"route names or sets: {', '.join(ROUTE_SETS)}")
@@ -1212,6 +1297,11 @@ def _register_manual(sub):
   parser.add_argument("--part", choices=("all", "flights", "drives"), default="all", help="flown scenarios, replayed drives or both")
   parser.add_argument("--rules", nargs="+", choices=tuple(SUSTAIN_RULES), default=list(SUSTAIN_RULES), help="horizons beside the fixed 2.0 s")
   parser.set_defaults(fn=_sustain)
+  parser = sub.add_parser("decel-peaks", help="manual lead-caused decels flown with the lead mirror on and off: peaks, gaps, hard brakes")
+  parser.add_argument("--routes", nargs="+", default=["manual-approach", "0000044e", "0000044f", "00000450", "00000451"],
+                      help=f"manual route names or sets: {', '.join(ROUTE_SETS)}")
+  parser.add_argument("--engaged", nargs="+", default=[], help="engaged drives to replay with the mirror on and off")
+  parser.set_defaults(fn=_decel_peaks)
 
 
 def register(sub):

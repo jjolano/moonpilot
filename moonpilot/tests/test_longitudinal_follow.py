@@ -542,6 +542,24 @@ class TestFollowPolicy(unittest.TestCase):
           off = lead_accel(v_low, gap_low, v_low, 0.0, t_follow)
         self.assertEqual(lead_accel(v_low, gap_low, v_low, 0.0, t_follow), off)
 
+  def test_a_braking_lead_is_answered_at_the_drivers_share_by_headway(self):
+    """Flown behind the logged leads of 57 manual decels (`python -m moonpilot.lab decel-peaks`), the planner peaked
+    -2.39 against the driver's -1.76 from 10-16 m/s: it coasted while the gap closed, then the stopping floor braked
+    hard. The driver answers a braking lead at about half its accel over 1.5-2.5 s of headway and lets a far one close,
+    so a lead braking -1 is answered at least that much there; from 4 s out, or pulling away, nothing is added."""
+    t_follow, v = MOONPILOT_T_FOLLOW[int(Personality.standard)], 15.0
+    off = mock.patch.object(longitudinal, "MOONPILOT_MIRROR_GAIN", [0.0] * len(longitudinal.MOONPILOT_MIRROR_GAIN))
+    for headway in (1.5, 2.0, 2.5):
+      with self.subTest(headway=headway):
+        with off:
+          self.assertGreater(lead_accel(v, headway * v, v, -1.0, t_follow), -0.5)  # without it, mostly a coast
+        self.assertLessEqual(lead_accel(v, headway * v, v, -1.0, t_follow), -0.5 + 1e-9)
+    for gap, v_lead in ((4.5 * v, v), (2.0 * v, v + 2.0)):
+      with self.subTest(gap=gap, v_lead=v_lead):
+        with off:
+          base = lead_accel(v, gap, v_lead, -1.0, t_follow)
+        self.assertEqual(lead_accel(v, gap, v_lead, -1.0, t_follow), base)
+
   def test_the_arrival_term_neither_taps_at_the_target_nor_switches_on_a_far_leads_accel(self):
     """Two route 000003f8 faults of the arrival term, one per end of the approach.
 
