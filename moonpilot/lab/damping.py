@@ -2,6 +2,7 @@
 
   python -m moonpilot.lab damping   # D's share of the command, the turn build-up and release (AGENTS.md, The lateral controller)
   python -m moonpilot.lab weave     # the wheel-motion and rate-sensor measurements beside it
+  python -m moonpilot.lab release   # where a low-speed turn's release comes from: car, request, torque, the command's terms
 
 The windows follow the analyses that produced the claims: 6 s of data every 3 s; curve windows are hands-off
 and all-active at a mean 3-17 m/s with at least 1 m/s^2 of lateral acceleration (device yaw x speed); turns
@@ -314,10 +315,55 @@ def _weave(args):
           + f"r {float(np.nanmedian(corrs)):.2f} (n={len(lags)} curve windows, replay vs logged p99 |err| median {fid:.4f})")
 
 
+def _release(args):
+  """Where a low-speed turn's release comes from, on recorded turns peaking at 3-10 m/s: the steepest release / peak of
+  the car's lateral accel by hand and with openpilot steering, and of the model's action, the request, the logged
+  torque and the wheel angle on the openpilot turns; then the replayed command's change over the 0.4 s after its own
+  peak, by term, as a share of that peak, beside the request's, the setpoint's and the car's over the same 0.4 s."""
+  from moonpilot.lab.lateral import action
+  shapes = {k: [] for k in ("manual car", "openpilot car", "model action", "request", "torque", "wheel angle")}
+  terms = {k: [] for k in ("command", "p", "i", "d", "friction", "request", "setpoint", "car")}
+  for name in expand(args.routes, ROUTE_SETS):
+    got = _load(name, args.root)
+    if got is None:
+      continue
+    d, la, masks, cfg, z = got
+    t, v, level = d["t"], d["v_ego"], MOONPILOT_DAMPING_T.index(cfg.damping_t)
+    las, request = _smooth(la), d["curvature"] * v ** 2
+    p, i, dd, f, sp = (z[k][level] for k in ("p", "i", "d", "f", "setpoint"))
+    command = p + i + dd + f
+    series = {"model action": np.abs(action(d) * v ** 2), "request": np.abs(request), "torque": np.abs(d["torque"]), "wheel angle": np.abs(d["angle"])}
+    series = {n: _smooth(x) for n, x in series.items()}
+    for cls in ("manual", "op"):
+      for k in _turns(las, masks[cls]):
+        if not 3 <= v[k] < 10 or (s := _shape(las, t, k, 1, masks[cls])) is None:
+          continue
+        shapes["manual car" if cls == "manual" else "openpilot car"].append(s)
+        if cls == "manual":
+          continue
+        for n, x in series.items():
+          w = slice(max(k - 100, 0), k + 101)
+          if (sh := _shape(x, t, w.start + int(np.argmax(x[w])), 1, masks[cls])) is not None:
+            shapes[n].append(sh)
+        sign = np.sign(command[k])
+        w = slice(max(k - 150, 0), k + 50)
+        top = w.start + int(np.argmax(sign * command[w]))
+        j, peak = min(top + 40, len(t) - 1), sign * command[top]
+        if peak > 0.2:
+          for n, x in (("command", command), ("p", p), ("i", i), ("d", dd), ("friction", f - request), ("request", request), ("setpoint", sp)):
+            terms[n].append(sign * (x[j] - x[top]) / peak)
+          terms["car"].append((las[j] - las[top]) / peak)
+  print("steepest release / peak at 3-10 m/s, median (n): " + ", ".join(f"{n} {np.median(x):.2f} ({len(x)})" for n, x in shapes.items() if x))
+  if terms["command"]:
+    print(f"openpilot turns ({len(terms['command'])}), 0.4 s after the command's peak, change as a share of it: "
+          + ", ".join(f"{n} {np.median(x):+.2f}" for n, x in terms.items()))
+
+
 def register(sub):
   for name, fn, help_ in (
     ("damping", _damping, "per damping level: D/P in the weave band, command buzz, turn build-up and release"),
     ("weave", _weave, "the wheel spectrum, P's flutter and the rate sensor's lag the damping band was written against"),
+    ("release", _release, "where a low-speed turn's release comes from: driver vs openpilot, request, torque and the command's terms"),
   ):
     p = sub.add_parser(name, help=help_)
     p.add_argument("--routes", nargs="+", default=["curve"], help="route names or sets: curve (routes 3f8-410)")
