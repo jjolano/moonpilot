@@ -292,7 +292,8 @@ MOONPILOT_MOVING_STOP_RESERVE = 2.0  # m
 # The stopping floor's slack holds back this much closing: the distance a constant-decel stop owes at
 # its end for closing it did not see (actuator lag, radar latency). It replaced a time-to-collision term
 # that carried that margin by braking harder mid-approach: without either, a 144 kph stop behind a
-# stopped lead rested at 3.98 m; with the term 4.28 m (peak 2.50); with this 4.58 m (peak 2.14).
+# stopped lead rested at 3.98 m; with the term 4.28 m (peak 2.50); with this 4.58 m (peak 2.14), 4.15 m
+# once MOONPILOT_COMFORT_STOP_DECEL spends the rest gap below 16 m/s.
 MOONPILOT_STOP_LAG_T = 0.15  # s
 MOONPILOT_MIN_SLACK = 1.0  # m; the standstill target is soft inside this final meter: the exact
 # kinematic floor gives way to the regulator profile there, while higher-speed stops still bind
@@ -358,7 +359,7 @@ MOONPILOT_LEAD_BRAKE_SUSTAIN_T = 2.0  # s; how long `stopping_decel` assumes a b
 MOONPILOT_LEAD_BRAKE_SUSTAIN_PER_A = 1.0  # s per m/s^2; a harder brake is believed longer: the
 # horizon is max(SUSTAIN_T, PER_A * |a_lead|), so 2 s up to -2. `python -m moonpilot.lab sustain`
 # (RAV4, 0.2 s dead time + 0.25 s lag, both cars on the trapezoid): 30 m/s behind a lead braking -3.5 to
-# rest from the 1.45 s follow went from contact (-5.95 m) to 5.29 m; -5 still contacts at every horizon
+# rest from the 1.45 s follow went from contact (-5.95 m) to 4.95 m; -5 still contacts at every horizon
 # there (reaction-limited). Over 12 engaged drives it deepens 92 of 55k frames by more than 0.05 (one
 # -1.02 on 00000408, else <= 0.22). The cost is a hard *tap*: -5 for 0.5 s at 30 m/s from 60 m peaks
 # -2.96 against -0.82 at a fixed 2.0 s.
@@ -475,6 +476,11 @@ MOONPILOT_JERK_ONSET_A = -1.0  # m/s^2
 MOONPILOT_JERK_ONSET_LEAD_A = -0.2  # m/s^2; a lead slowing past this keeps JERK_DOWN
 MOONPILOT_CRAWL_REST = 4.0  # m
 MOONPILOT_CRAWL_STOP_DECEL = 1.5  # m/s^2; the driver's crawl-stop peak
+# From 5 m/s up, braking past this spends the rest gap toward CRAWL_REST first; faded out over COMFORT_STOP_V.
+# Route 00000451 at 175 s: a lead braking -3.5 m/s^2 14 m ahead at 7 m/s drew -2.88 to rest 5 m back; capped,
+# -2.44 to rest nearer 3 m (`python -m moonpilot.lab hard-brake`: -3.5 margins 0.3-0.5 m smaller, no new contact).
+MOONPILOT_COMFORT_STOP_DECEL = 2.0  # m/s^2
+MOONPILOT_COMFORT_STOP_V = [12.0, 16.0]  # m/s: whole below, gone above
 MOONPILOT_BRAKE_EXIT_A = -0.5  # m/s^2; braking past this holds the positive ask, as curve braking does
 MOONPILOT_BRAKE_EXIT_JERK = 0.5  # m/s^3; its rebuild with the wheel straight, above the launch band
 MOONPILOT_ALLOW_THROTTLE_THRESHOLD = 0.4
@@ -928,9 +934,11 @@ def lead_accel(v_ego, gap, v_lead, a_lead, t_follow, catch_up_accel=0.0, catch_u
   a_stop = stopping_decel(v_ego, v_lead_eff, a_lead, max(gap - anchor - MOONPILOT_STOP_LAG_T * closing, MOONPILOT_MIN_SLACK), sustain)
   admission = float(np.interp(v_ego, MOONPILOT_FLOOR_ADMISSION_BP, MOONPILOT_FLOOR_ADMISSION_V))
   a += min(max((-a_stop - admission) / MOONPILOT_FLOOR_ADMISSION_BAND + 1.0, 0.0), 1.0) * min(a_stop - a, 0.0)
-  # Crawl stop: spend the rest gap toward MOONPILOT_CRAWL_REST before braking past the driver's peak.
-  cap = min(stopping_decel(v_ego, v_lead_eff, a_lead, max(gap - MOONPILOT_CRAWL_REST - MOONPILOT_MIN_SLACK, 0.05), sustain), -MOONPILOT_CRAWL_STOP_DECEL)
-  return a + float(np.interp(v_ego, MOONPILOT_SOFT_STOP_V, [1.0, 0.0])) * max(cap - a, 0.0)
+  # Spend the rest gap toward MOONPILOT_CRAWL_REST before braking past a comfort decel: the driver's crawl-stop
+  # peak at a crawl, rising to MOONPILOT_COMFORT_STOP_DECEL by 5 m/s, faded out over MOONPILOT_COMFORT_STOP_V.
+  comfort = float(np.interp(v_ego, MOONPILOT_SOFT_STOP_V, [MOONPILOT_CRAWL_STOP_DECEL, MOONPILOT_COMFORT_STOP_DECEL]))
+  cap = min(stopping_decel(v_ego, v_lead_eff, a_lead, max(gap - MOONPILOT_CRAWL_REST - MOONPILOT_MIN_SLACK, 0.05), sustain), -comfort)
+  return a + float(np.interp(v_ego, MOONPILOT_COMFORT_STOP_V, [1.0, 0.0])) * max(cap - a, 0.0)
 
 
 def lead_braking(lead_states) -> bool:

@@ -521,10 +521,10 @@ class TestPolicyFunctions(unittest.TestCase):
 
   def test_the_approach_stops_behind_a_stopped_lead_at_every_reachable_speed(self):
     """The safety property: the fork's car can reach V_CRUISE_MAX on openpilot longitudinal, and it
-    must stop behind a stopped lead from every reachable speed with the soft rest gap kept. The
-    maneuver suite's fastest stopped-lead approach is 25 m/s, so it is pinned closed-loop here. A
-    constant-decel stop aimed at a fixed point owes any unseen closing at its end: with no margin at
-    all the 144 kph stop rested at 3.98 m, inside this bound; `MOONPILOT_STOP_LAG_T` keeps it at 4.58.
+    must stop behind a stopped lead from every reachable speed. The maneuver suite's fastest
+    stopped-lead approach is 25 m/s, so it is pinned closed-loop here. A constant-decel stop aimed at
+    a fixed point owes any unseen closing at its end (`MOONPILOT_STOP_LAG_T`), and below
+    `MOONPILOT_COMFORT_STOP_V` the comfort cap may spend the rest gap toward `MOONPILOT_CRAWL_REST`.
     """
     for v0_kph in (90.0, 118.8, 129.6, 144.0):
       planner = _planner()
@@ -537,11 +537,11 @@ class TestPolicyFunctions(unittest.TestCase):
         gap = max(0.0, gap - v_ego * DT_MDL)
         if v_ego < 0.05 and abs(planner.output_a_target) < 0.05:
           break
-      # Safety braking remains inside the actuator budget, and the soft rest gap retains at least
-      # the stopping floor's one-meter slack allowance below its preferred rest point.
+      # Safety braking remains inside the actuator budget, and the rest gap keeps the comfort cap's
+      # one-meter slack allowance below MOONPILOT_CRAWL_REST.
       self.assertLess(peak, abs(ACCEL_MIN), f"{v0_kph} kph used the whole actuator limit")
       self.assertLess(v_ego, 0.5)  # it stopped
-      self.assertGreater(gap, MOONPILOT_STOP_REST - MOONPILOT_MIN_SLACK)
+      self.assertGreater(gap, MOONPILOT_CRAWL_REST - MOONPILOT_MIN_SLACK)
 
   def test_regulator_never_brakes_harder_than_the_approach_decel(self):
     """Where the stopping floor is not admitted at all, the spacing gain and arrival cannot command
@@ -556,7 +556,8 @@ class TestPolicyFunctions(unittest.TestCase):
         for v_lead in (0.0, 5.0, 15.0, 25.0):
           a_stop, weight = _floor(v_ego, gap, v_lead) if v_ego > v_lead else (0.0, 0.0)
           for t_follow in MOONPILOT_T_FOLLOW.values():
-            a = lead_accel(v_ego, gap, v_lead, 0.0, t_follow)
+            with mock.patch("moonpilot.longitudinal.MOONPILOT_COMFORT_STOP_V", [-2.0, -1.0]):  # the cap has its own test
+              a = lead_accel(v_ego, gap, v_lead, 0.0, t_follow)
             if weight == 0.0:
               self.assertGreaterEqual(a, -MOONPILOT_APPROACH_DECEL)
               checked += 1
@@ -565,7 +566,8 @@ class TestPolicyFunctions(unittest.TestCase):
               self.assertLessEqual(a, max(a_stop, ACCEL_MIN) + 1e-9)  # the moving reserve and coast-first never soften it
               boarded += 1
             else:
-              with mock.patch("moonpilot.longitudinal.MOONPILOT_FLOOR_ADMISSION_V", [np.inf, np.inf]):
+              with mock.patch("moonpilot.longitudinal.MOONPILOT_FLOOR_ADMISSION_V", [np.inf, np.inf]), \
+                   mock.patch("moonpilot.longitudinal.MOONPILOT_COMFORT_STOP_V", [-2.0, -1.0]):
                 free = lead_accel(v_ego, gap, v_lead, 0.0, t_follow)
               self.assertLessEqual(a, free + 1e-9)
               self.assertGreaterEqual(a, min(free, a_stop) - 1e-9)
@@ -583,6 +585,21 @@ class TestPolicyFunctions(unittest.TestCase):
       tail = [a for v, a in zip(s["v"], s["cmd"], strict=True) if 0.3 < v < 4.0]
       self.assertLess(max(earlier - later for earlier, later in zip(tail, tail[1:], strict=False)), 0.02)
 
+  def test_a_close_hard_brake_spends_the_rest_gap_before_braking_past_comfort(self):
+    """Route 00000451 at 175 s: 6.5 m/s, 12.8 m behind a lead at 4.4 m/s braking -2.65 m/s^2. Below
+    `MOONPILOT_COMFORT_STOP_V` the lead ask is softer than the floor's own, yet never softer than the stop
+    that rests one `MOONPILOT_MIN_SLACK` short of `MOONPILOT_CRAWL_REST`; above the fade the floor stands."""
+    v_ego, gap, v_lead, a_lead = 6.53, 12.8, 4.40, -2.65
+    capped = lead_accel(v_ego, gap, v_lead, a_lead, 1.45)
+    with mock.patch("moonpilot.longitudinal.MOONPILOT_COMFORT_STOP_V", [-2.0, -1.0]):
+      floor = lead_accel(v_ego, gap, v_lead, a_lead, 1.45)
+    self.assertLess(floor, capped - 0.2)
+    rest = stopping_decel(v_ego, v_lead + a_lead * MOONPILOT_LEAD_PREVIEW_T, a_lead, gap - MOONPILOT_CRAWL_REST - MOONPILOT_MIN_SLACK)
+    self.assertLessEqual(capped, rest + 1e-9)
+    fast = (20.0, 20.0, 15.0, -2.65)  # above the fade the floor's own ask stands
+    with mock.patch("moonpilot.longitudinal.MOONPILOT_COMFORT_STOP_V", [-2.0, -1.0]):
+      floor_fast = lead_accel(*fast, 1.45)
+    self.assertEqual(lead_accel(*fast, 1.45), floor_fast)
 
   def test_an_oversized_gap_never_accelerates_at_or_above_set_speed(self):
     """A larger gap may remain; recovering it never buys acceleration beyond the set speed."""
@@ -706,8 +723,8 @@ class TestPolicyFunctions(unittest.TestCase):
       with self.subTest(brake=brake):
         s = _fly(20.0, 72.0, 29.0, 20.0, lambda t, b=brake: b if t > 1 else 0.0, 25.0)
         self.assertFalse(s["contact"])
-        # The crawl cap may spend the rest gap down toward MOONPILOT_CRAWL_REST at the end (3.91 m at -5.0).
-        self.assertGreater(s["min_gap"], MOONPILOT_CRAWL_REST - 0.2)
+        # The comfort cap may spend the rest gap toward MOONPILOT_CRAWL_REST, keeping its one-meter allowance.
+        self.assertGreater(s["min_gap"], MOONPILOT_CRAWL_REST - MOONPILOT_MIN_SLACK)
         self.assertLess(s["v"][-1], 0.05)
     # and the direct assertion: at matched speed the prediction branch, not the match, is what binds
     self.assertLess(stopping_decel(20.0, 20.0, -5.0, 23.0), -MOONPILOT_APPROACH_DECEL)
@@ -727,7 +744,7 @@ class TestPolicyFunctions(unittest.TestCase):
     stop clear. This plant integrates ego travel on the updated speed (~0.75 m optimistic from 30 m/s);
     on the trapezoid the fixed horizon contacts in both (`python -m moonpilot.lab sustain`)."""
     s = _fly(30.0, 118.0, 43.5, 30.0, lambda t: -3.5 if t > 1 else 0.0, 25.0)
-    self.assertGreater(s["min_gap"], MOONPILOT_CRAWL_REST - 0.2)
+    self.assertGreater(s["min_gap"], MOONPILOT_CRAWL_REST - MOONPILOT_MIN_SLACK)
     s = _fly(25.0, 100.0, 36.25, 25.0, lambda t: -5.0 if t > 1 else 0.0, 25.0)
     self.assertFalse(s["contact"])
 
