@@ -49,24 +49,14 @@ against it upstream of the actuator clip, so no safety term is weakened. The fla
 and missing pose or experimental mode leaves this feature inert.
 
 
-Two things are deliberately not upstream's:
+Two things are deliberately not upstream's (docs/longitudinal.md has the measurements):
 
-  - delay compensation is done by predicting the state at the actuator delay and evaluating the
-    policy there, not by inverting the published plan through ``get_accel_from_plan``. That inverse
-    divides by the delay, so a step in the plan comes out amplified by ``action_t / dt`` — measured
-    at 45 m/s^3 and instant ACCEL_MIN saturation in simulation. The delay itself is measured onroad
-    by ``moonpilot.latency``: ``action_t`` is ``max(CP.longitudinalActuatorDelay, that estimate) +
-    the planner's own period`` (DT_MDL in production), since upstream's constant is a cookie-cutter
-    default and a measured value may only lengthen the projection. The model path is the third stale
-    stream that prediction has to re-reference: its ``position.x`` is measured from the frame the
-    model saw, so the curve candidate reads it ``v_ego * (logMonoTime - timestampEof)`` of the way in,
-    the same instant the lead pair is evaluated at.
-
-  - the lead's acceleration is the fork's own estimate — the least-squares slope of ``vLead`` over
-    ``moonpilot.lead.LeadAccelEstimator``'s window — because radard's ``aLeadK`` is a Kalman filter
-    with a 0.49 s time constant, and a lead braking at -3.5 m/s^2 from a settled follow reached
-    -2.0 m/s^2 of command 0.65 s later through it than through the slope (1.15 s against 0.50).
-    ``aLeadK`` stays as the fallback.
+  - delay compensation predicts the state at ``action_t`` (``max(CP.longitudinalActuatorDelay,
+    moonpilot.latency's estimate) + DT_MDL``) and evaluates the policy there, rather than inverting the
+    published plan through ``get_accel_from_plan``, which amplifies a plan step by ``action_t / dt``;
+    the model path is re-referenced to the same instant;
+  - the lead's acceleration is ``moonpilot.lead.LeadAccelEstimator``'s least-squares slope of
+    ``vLead``, not radard's 0.49 s Kalman ``aLeadK``, which stays as the fallback.
 
 The planner is picked once, at construction, so the toggle needs a restart, and it only exists on a
 car with ``openpilotLongitudinalControl`` — cars whose stock ACC owns acceleration never reach the
@@ -209,12 +199,13 @@ MOONPILOT_LEAD_ACCEL_COMFORT_NOISE = 0.2  # m/s^2; faded to zero below, whole at
 MOONPILOT_FOLLOW_COAST_HEADWAY_FADE_T = 0.2  # s
 MOONPILOT_FOLLOW_COAST_CLOSING = [0.6, 1.2]  # m/s; whole at or below the first, gone at the second
 MOONPILOT_FOLLOW_COAST_LEAD_A = [-0.8, -0.5]  # m/s^2; gone at or below the first, whole above the second
-# A braking lead is matched at the driver's share of its accel: whole inside 1 s of headway, half over 1.5-2.5 s
-# (manual frames, |closing| < 1.5 m/s: median aEgo / a_lead 0.40-0.56), gone by 4 s, so a far lead is still
-# approached; in as the coast cushion leaves (FOLLOW_COAST_LEAD_A: estimate noise stays a coast), never past
-# APPROACH_DECEL, in over SOFT_STOP_V, out as the lead pulls away. `python -m moonpilot.lab decel-peaks`.
-MOONPILOT_MIRROR_HEADWAY = [1.0, 1.5, 2.5, 4.0]  # s
-MOONPILOT_MIRROR_GAIN = [1.0, 0.5, 0.5, 0.0]
+# A slowing lead is answered at the driver's share of its accel (manual frames, |closing| < 1.5 m/s: median aEgo /
+# a_lead 0.40-0.56 over 1.5-2.5 s of headway): whole inside 1 s, half from 1.5 s, gone by 4 s so a far lead is still
+# approached, never past APPROACH_DECEL, every fade a blend weight. `python -m moonpilot.lab decel-peaks`.
+MOONPILOT_MIRROR_SHARE_T = [1.0, 1.5]  # s of headway
+MOONPILOT_MIRROR_SHARE = [1.0, 0.5]
+MOONPILOT_MIRROR_FADE_T = [2.5, 4.0]  # s of headway; whole inside the first, gone past the second
+MOONPILOT_MIRROR_LEAD_A = [-0.4, -0.2]  # m/s^2 of slow accel; whole at or below the first, gone above the second
 MOONPILOT_MIRROR_OPEN_V = 1.5  # m/s of lead speed over the ego that ends it
 # The positive side's authority: a multiplier on the regulator's output, and only on the output, and
 # only where it is already positive. 1.0 at and below 20 m/s, so the whole low-speed follow law — every
@@ -810,7 +801,8 @@ def arrival_accel(closing, slack, a_lead) -> float:
   return max(-(closing**2) / (2.0 * max(slack, closing * MOONPILOT_ARRIVAL_MIN_T)), -MOONPILOT_APPROACH_DECEL) + max(float(a_lead), 0.0)
 
 
-def lead_accel(v_ego, gap, v_lead, a_lead, t_follow, catch_up_accel=0.0, catch_up_coast=0.0, coast=MOONPILOT_BRAKE_BAND_FLOOR, sustain=None) -> float:
+def lead_accel(v_ego, gap, v_lead, a_lead, t_follow, catch_up_accel=0.0, catch_up_coast=0.0, coast=MOONPILOT_BRAKE_BAND_FLOOR, sustain=None,
+               a_slow=0.0) -> float:
   """The spacing regulator and one relative-speed approach for every slower lead.
 
   The spacing regulator holds the larger of the time gap and a low-speed rest floor: STOP_DISTANCE plus
@@ -826,6 +818,9 @@ def lead_accel(v_ego, gap, v_lead, a_lead, t_follow, catch_up_accel=0.0, catch_u
   acceleration. Exact speed-match equilibrium stays at the nominal gap, and the cushion tapers out
   with the time-gap headroom so it can never move the target inside `STOP_DISTANCE`. This changes
   only the spacing regulator; arrival and the stopping floor below still read the physical gap.
+
+  `a_slow`, the estimator's low-passed accel, blends in the driver's share of a slowing lead's braking
+  (`MOONPILOT_MIRROR_*`, with a raw brake past the coast cushion's gate) before arrival and the floor.
 
   Arrival matches the lead's braking-previewed speed at the larger of its time gap and the soft rest
   point (plus the moving-lead reserve). Behind a moving lead it coasts while its braking budget lasts
@@ -908,11 +903,13 @@ def lead_accel(v_ego, gap, v_lead, a_lead, t_follow, catch_up_accel=0.0, catch_u
   a_track = soft_stop(a_track, v_ego, gap, v_lead_eff)
   if a_track > 0.0 and v_ego > v_lead_match and gap > gap_target:
     a_track *= min(1.0, (gap - gap_target) / MOONPILOT_FOLLOW_TAPER_M)
-  mirror = float(np.interp(gap / max(v_ego, 0.1), MOONPILOT_MIRROR_HEADWAY, MOONPILOT_MIRROR_GAIN)) * float(np.interp(v_ego, MOONPILOT_SOFT_STOP_V, [0.0, 1.0]))
-  mirror *= a_lead * float(np.interp(a_lead, MOONPILOT_FOLLOW_COAST_LEAD_A, [1.0, 0.0]))
-  mirror *= float(np.interp(v_lead - v_ego, [0.0, MOONPILOT_MIRROR_OPEN_V], [1.0, 0.0]))
-  if mirror < 0.0:
-    a_track = min(a_track, max(mirror, -MOONPILOT_APPROACH_DECEL))
+  # The slow accel answers a gentle slowing; the raw estimate, past the coast cushion's gate, a brake without that lag.
+  a_answer = min(a_slow, a_lead * float(np.interp(a_lead, MOONPILOT_FOLLOW_COAST_LEAD_A, [1.0, 0.0])))
+  t_gap = gap / max(v_ego, 0.1)
+  w = float(np.interp(t_gap, MOONPILOT_MIRROR_FADE_T, [1.0, 0.0])) * float(np.interp(v_ego, MOONPILOT_SOFT_STOP_V, [0.0, 1.0]))
+  w *= float(np.interp(a_answer, MOONPILOT_MIRROR_LEAD_A, [1.0, 0.0])) * float(np.interp(v_lead - v_ego, [0.0, MOONPILOT_MIRROR_OPEN_V], [1.0, 0.0]))
+  mirror = max(float(np.interp(t_gap, MOONPILOT_MIRROR_SHARE_T, MOONPILOT_MIRROR_SHARE)) * a_answer, -MOONPILOT_APPROACH_DECEL)
+  a_track += w * min(mirror - a_track, 0.0)
   closing = v_ego - v_lead_eff
   if closing <= 0.0:
     return a_track  # not closing: nothing to brake for
@@ -1156,8 +1153,8 @@ def policy(
   lead_asks = []
   engine = engine_floor(CP, v_ego)  # moonpilot/engine_coast.py; None leaves the default
   floor = MOONPILOT_BRAKE_BAND_FLOOR if engine is None else engine
-  for source, gap, v_lead, a_lead, *sustain in leads:
-    ask = lead_accel(v_ego, gap, v_lead, a_lead, t_follow, catch_up, MOONPILOT_CATCH_UP_COAST_FRACTION * coast, floor, *sustain)
+  for source, gap, v_lead, a_lead, *extra in leads:  # extra: the sustain, then the slow accel
+    ask = lead_accel(v_ego, gap, v_lead, a_lead, t_follow, catch_up, MOONPILOT_CATCH_UP_COAST_FRACTION * coast, floor, *extra)
     if engine is not None:
       ask = coast_budget(ask, v_ego, gap, v_lead, a_lead, engine, MOONPILOT_APPROACH_DECEL, MOONPILOT_FOLLOW_SPEED_FLOOR_HEADWAY_T, MOONPILOT_STOP_DISTANCE)
     if (
@@ -1399,12 +1396,12 @@ class MoonpilotLongitudinalPlanner:
     ):
       a_lead, a_lead_tau = estimator.update(lead)  # every frame, present or not: that is what resets the window
       if lead.present:
-        leads.append((source, lead, a_lead, a_lead_tau))
+        leads.append((source, lead, a_lead, a_lead_tau, estimator.a_slow))
     # FCW keeps both slots: the dedupe below picks a candidate for the plan, and radard's two matches of
     # one car can carry different `modelProb`, so dropping one could drop the only one over the FCW bar.
     # A held track's `modelProb` is zero, so slots alone are every lead FCW could ever fire on.
     fcw_leads = list(leads)
-    one, two = (lead for _, lead, _, _ in leads) if len(leads) == 2 else (None, None)
+    one, two = (lead for _, lead, *_ in leads) if len(leads) == 2 else (None, None)
     if one is not None and one.radar and two.radar and same_car(one, two):
       # radard matches both model leads to the nearest radar track, so a stopped car often fills both
       # slots, on two tracks of its own. One vehicle is one candidate: two noisy readings of it under
@@ -1511,11 +1508,12 @@ class MoonpilotLongitudinalPlanner:
         exit_jerk = float(np.interp(v_ego, [MOONPILOT_JERK_LAUNCH_SPEED, 2 * MOONPILOT_JERK_LAUNCH_SPEED], [MOONPILOT_JERK_LAUNCH, MOONPILOT_BRAKE_EXIT_JERK]))
       self.curve_exit_cap = min(self.curve_exit_cap + exit_jerk * self.dt, ACCEL_MAX)
     lead_states = []
-    for source, lead, a_lead, a_lead_tau in leads:
+    for source, lead, a_lead, a_lead_tau, a_slow in leads:
       age = self._lead_age(lead, lead_age)
       # The radar age adds travel, not decay, and the sustain is the measured braking's: an older radar
       # lead never reads as braking less (`TestStalenessScope`).
-      lead_states.append((source, *lead_state_at(lead, self.action_t + age, x_pred + v_ego * age, a_lead, a_lead_tau, self.action_t), brake_sustain(a_lead)))
+      lead_states.append((source, *lead_state_at(lead, self.action_t + age, x_pred + v_ego * age, a_lead, a_lead_tau, self.action_t),
+                          brake_sustain(a_lead), a_slow))
     a_cmd, source = policy(
       v_pred,
       lead_states,
@@ -1580,7 +1578,7 @@ class MoonpilotLongitudinalPlanner:
 
     crash = any(
       lead.modelProb > MOONPILOT_FCW_MODEL_PROB and required_decel(v_ego, lead.dRel, lead.vLead, a_lead) < MOONPILOT_FCW_DECEL
-      for _, lead, a_lead, _ in fcw_leads
+      for _, lead, a_lead, *_ in fcw_leads
     )
     self.crash_cnt = self.crash_cnt + 1 if crash else 0
     fcw = self.crash_cnt > MOONPILOT_FCW_COUNT and not CS.standstill
@@ -1720,9 +1718,9 @@ class MoonpilotLongitudinalPlanner:
     for i, t_idx in enumerate(MOONPILOT_CONTROL_T_IDX):
       t = float(t_idx)
       states = []
-      for source, lead, a_lead, a_lead_tau in leads:
+      for source, lead, a_lead, a_lead_tau, a_slow in leads:
         age = self._lead_age(lead, lead_age)
-        states.append((source, *lead_state_at(lead, t + age, x + v_ego * age, a_lead, a_lead_tau, t), brake_sustain(a_lead)))
+        states.append((source, *lead_state_at(lead, t + age, x + v_ego * age, a_lead, a_lead_tau, t), brake_sustain(a_lead), a_slow))
       a_cmd, _ = policy(
         v,
         states,
@@ -1758,7 +1756,7 @@ class MoonpilotLongitudinalPlanner:
     FCW never fires on a held track, and the current lead stays in `leads` beside it, so `min` takes
     whichever brakes more."""
     if lead.present and lead.radar:
-      a_lead, a_lead_tau = next((a, tau) for s, _, a, tau in leads if s == LongitudinalPlanSource.lead0)
+      a_lead, a_lead_tau = next((a, tau) for s, _, a, tau, _ in leads if s == LongitudinalPlanSource.lead0)
       snapshot = SimpleNamespace(dRel=float(lead.dRel), vLead=float(lead.vLead), radar=True, modelProb=0.0)
       self.radar_hold = (snapshot, a_lead, a_lead_tau, 0.0, 0.0)
       return []
@@ -1772,7 +1770,8 @@ class MoonpilotLongitudinalPlanner:
       self.radar_hold = None
       return []
     self.radar_hold = (snapshot, a_lead, a_lead_tau, held, travel)
-    return [(LongitudinalPlanSource.lead0, SimpleNamespace(dRel=gap, vLead=v_lead, radar=True, modelProb=0.0), a_now, a_lead_tau)]
+    # A held track is a fallback for braking, not something to answer early: no slow accel.
+    return [(LongitudinalPlanSource.lead0, SimpleNamespace(dRel=gap, vLead=v_lead, radar=True, modelProb=0.0), a_now, a_lead_tau, 0.0)]
 
   def _lead_age(self, lead, lead_age):
     """How old a lead's `dRel` is at this tick: the message's age, and a radar lead's own sensor

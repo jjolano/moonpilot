@@ -28,7 +28,7 @@ EXTRACT_VERSION = 2
 LAMP_VERSION = 1
 LAMP_ADDRESS = 0x320  # VSC1S07: the skid-control ECU's own frame, where BRKON is the brake-lamp proxy
 CONTROL_VERSION = 1  # one row per carControl frame: the rate the acceleration controller is written for
-MANUAL_VERSION = 1
+MANUAL_VERSION = 2
 ROUTE_SETS = {
   # Engaged local drives. 0000042c/42d/42e have zero longActive frames and are skipped by the commands.
   "longitudinal": ("000003f8", "000003fe", "00000400", "00000401", "00000408", "0000040d", "0000040e", "00000410", "00000414", "0000043e", "0000043f"),
@@ -643,8 +643,9 @@ def _manual_frames(route, root=DEFAULT_ROOT):
       cs, cc, lead = read("carState").carState, read("carControl").carControl, read("radarState").radarState.leadOne
       a_lead, _ = estimator.update(lead)
       manual = not cc.longActive and not cs.cruiseState.enabled and cs.gearShifter == car.CarState.GearShifter.drive
-      rows.append((row[0] * 1e-9, manual, cs.vEgo, cs.aEgo, cs.gasPressed, cs.brakePressed, lead.present and lead.radar, lead.dRel, lead.vLead, a_lead))
-    keys = ("t", "manual", "v", "a", "gas", "brake", "lead", "gap", "v_lead", "a_lead")
+      rows.append((row[0] * 1e-9, manual, cs.vEgo, cs.aEgo, cs.gasPressed, cs.brakePressed, lead.present and lead.radar, lead.dRel, lead.vLead,
+                   a_lead, estimator.a_slow))
+    keys = ("t", "manual", "v", "a", "gas", "brake", "lead", "gap", "v_lead", "a_lead", "a_slow")
     return {k: np.asarray(col, dtype=float) for k, col in zip(keys, zip(*rows, strict=True), strict=True)}
 
   return cached(route, "manual", MANUAL_VERSION, root, build)
@@ -1189,14 +1190,34 @@ def _sustain(args):
 PEAK_DECEL_A, PEAK_LEAD_IN_S, PEAK_TAIL_S = -0.3, 4.0, 4.0  # a decel: aEgo over 0.5 s below this; flown this much either side
 
 
+def _advance(s, v, v_new):
+  """One tick of travel on the trapezoid: the logged lead path and the flown ego both step with this, so flying the
+  logged speeds recovers the logged `dRel` exactly."""
+  return s + 0.5 * (v + v_new) * DT_MDL
+
+
+def _calibration(route, root):
+  """The learned horizons a drive's initData recorded — longitudinal lag and radar latency — as planner params."""
+  import json
+  cfg, out = drive_config(route, root)[1], {}
+  for key, kind in (("MoonpilotLongLag", float), ("MoonpilotLongLagBlocks", int), ("MoonpilotLongLagHistory", json.loads),
+                    ("MoonpilotRadarLatency", float), ("MoonpilotRadarLatencySamples", int)):
+    if cfg.get(key):
+      out[key] = kind(cfg[key])
+  return out
+
+
 def _fly_logged_lead(job):
-  """The engine-coast RAV4 planner on the lagged plant from a logged start, behind the logged lead's own path; the cruise
-  speed is held at the start's, so only the lead terms brake."""
+  """The engine-coast RAV4 planner, seeded with `calibration`, on the lagged plant from a logged start behind the logged
+  lead's own path; the cruise speed is held at the start's, so only the lead terms brake."""
   from moonpilot.tests.test_engine_coast import _planner
   from moonpilot.tests.test_longitudinal import _inputs, _lead
-  v_log, gap_log, v_lead, a0 = job
-  s_lead = np.r_[0.0, np.cumsum(v_log[:-1] * DT_MDL)] + gap_log
-  planner, plant = _planner(True), _LaggedPlant()
+  v_log, gap_log, v_lead, a0, calibration = job
+  s_ego = [0.0]
+  for v0, v1 in zip(v_log[:-1], v_log[1:], strict=True):
+    s_ego.append(_advance(s_ego[-1], v0, v1))
+  s_lead = np.asarray(s_ego) + gap_log
+  planner, plant = _planner(True, calibration), _LaggedPlant()
   plant.a, plant.queue = a0, deque([a0] * len(plant.queue))
   v, s, out = v_log[0], 0.0, {"v": [], "a": [], "gap": []}
   for i in range(len(v_log)):
@@ -1205,16 +1226,27 @@ def _fly_logged_lead(job):
     for k, x in zip(out, (v, plant.a, s_lead[i] - s), strict=True):
       out[k].append(x)
     v_new = max(0.0, v + plant.step(float(planner.output_a_target)) * DT_MDL)
-    s, v = s + 0.5 * (v + v_new) * DT_MDL, v_new
+    s, v = _advance(s, v, v_new), v_new
   return {k: np.asarray(x) for k, x in out.items()}
+
+
+def _centered_slope(v, half):
+  """The least-squares slope of `v` over `half` samples either side, NaN where the window does not fit."""
+  n = 2 * half + 1
+  out = np.full(len(v), np.nan)
+  if len(v) >= n:
+    out[half:-half] = np.convolve(v, ((np.arange(n) - half) * (12.0 / (DT_MDL * n * (n * n - 1))))[::-1], mode="valid")
+  return out
 
 
 def _decel_peaks(args):
   """The driver's share of a slowing lead's accel by headway (`MOONPILOT_MIRROR_*`'s source), then every manual decel a
-  radar lead caused, flown from the same start behind the same logged lead with the mirror on and off: peak decel (aEgo
-  over 0.5 s, above 2 m/s) and the minimum gap against the driver's; the hard brakes; engaged drives' press time."""
+  radar lead caused, flown from the same start behind the same logged lead with the mirror on and off, seeded with the
+  calibration `--calibration`'s drive recorded: peak decel (aEgo over 0.5 s, above 2 m/s) and the minimum gap against
+  the driver's; the hard brakes (`hard-brake`'s default calibration); engaged drives' press time."""
   from concurrent.futures import ProcessPoolExecutor
   from unittest import mock
+  from moonpilot.tests.test_engine_coast import _planner
   import moonpilot.longitudinal as longitudinal
   from moonpilot.lab.model_braking import episodes
   d = _pooled_manual(expand(args.routes, ROUTE_SETS), args.root)
@@ -1228,6 +1260,22 @@ def _decel_peaks(args):
       m = near & (d["a_lead"] >= lo_a) & (d["a_lead"] < hi_a) & (gap >= lo * v) & (gap < hi * v)
       cells.append(f"{lo:.1f}-{hi:.1f} s {np.median(d['a'][m] / d['a_lead'][m]):5.2f} ({m.sum()})" if m.sum() >= 40 else f"{lo:.1f}-{hi:.1f} s   -")
     print(f"  aLead [{lo_a}, {hi_a}): " + "  ".join(cells))
+
+  # The estimate on leads steady over +-3 s (centered slope under 0.1, speed within 0.6 m/s) and on a -0.3..-0.8 slowing
+  # (centered +-1 s slope), raw and low-passed (`LeadAccelEstimator.a_slow`).
+  ref1, ref3, spread = np.full(len(v), np.nan), np.full(len(v), np.nan), np.full(len(v), np.nan)
+  cut = np.r_[True, (np.abs(np.diff(v_lead)) > 2.5) | (np.diff(d["route"]) != 0)]
+  for r in runs((d["lead"] > 0) & ~cut):
+    if r.stop - r.start > 121:
+      vl = v_lead[r]
+      ref1[r], ref3[r] = _centered_slope(vl, 20), _centered_slope(vl, 60)
+      spread[r.start + 60:r.stop - 60] = np.ptp(np.lib.stride_tricks.sliding_window_view(vl, 121), axis=1)
+  moving = (d["lead"] > 0) & (v_lead > 3.0)
+  steady, slowing = moving & (np.abs(ref3) < 0.1) & (spread < 0.6), moving & (ref1 > -0.8) & (ref1 < -0.3)
+  print(f"\nLead accel on {steady.sum() * DT_MDL / 60:.1f} min of leads steady over +-3 s, and {slowing.sum() * DT_MDL / 60:.1f} min slowing at -0.3..-0.8:")
+  for name, x in (("estimate", d["a_lead"]), ("slow", d["a_slow"])):
+    print(f"  {name:8s} steady: below -0.2 on {np.mean(x[steady] < -0.2) * 100:5.2f} %, below -0.3 on {np.mean(x[steady] < -0.3) * 100:5.2f} %, "
+          + f"min {x[steady].min():5.2f}; slowing reads {np.median(x[slowing] / ref1[slowing]):.2f} of itself")
 
   n_in, n_tail = round(PEAK_LEAD_IN_S / DT_MDL), round(PEAK_TAIL_S / DT_MDL)
   jobs, drv = [], []
@@ -1244,9 +1292,13 @@ def _decel_peaks(args):
       jobs.append((vw, gw, lw, d["a"][w][0]))
       drv.append((vw[n_in], a_s[w][vw > 2.0].min(), gw.min()))
   drv = np.asarray(drv)
-  print(f"\n{len(jobs)} manual decels a radar lead caused, flown (engine-coast RAV4, {HOLD_FLY_DEAD_S} s dead time + {HOLD_FLY_TAU_S} s lag). "
+  calibration = _calibration(args.calibration, args.root) if args.calibration != "none" else {}
+  seeded = _planner(True, calibration)
+  jobs = [(*job, calibration) for job in jobs]
+  print(f"\n{len(jobs)} manual decels a radar lead caused, flown (engine-coast RAV4, {HOLD_FLY_DEAD_S} s dead time + {HOLD_FLY_TAU_S} s lag; "
+        + f"calibration {args.calibration}: action_t {seeded.action_t:.3f} s, radar latency {seeded.radar_latency.applied():.3f} s). "
         + "Median peak decel and minimum gap; 'deeper' = planner peak past the driver's by more than 0.5:")
-  off = mock.patch.object(longitudinal, "MOONPILOT_MIRROR_GAIN", [0.0] * len(longitudinal.MOONPILOT_MIRROR_GAIN))
+  off = mock.patch.object(longitudinal, "MOONPILOT_MIRROR_FADE_T", [-2.0, -1.0])  # gone at every headway
   for name, ctx in (("mirror off", off), ("mirror on", nullcontext())):
     with ctx, ProcessPoolExecutor(4) as pool:
       flown = list(pool.map(_fly_logged_lead, jobs))
@@ -1259,7 +1311,7 @@ def _decel_peaks(args):
             + f"deeper in {np.mean(peak[b] < drv[b, 1] - 0.5) * 100:3.0f}%; min gap driver {np.median(drv[b, 2]):4.1f} planner {np.median(min_gap[b]):4.1f} m")
     with ctx:
       hard = [_hard_brake_run("fork+engine", v0, a, lag)[0] for lag in (False, True) for v0 in (20.0, 25.0, 30.0) for a in (-3.5, -5.0)]
-    print("    hard-brake min gap (20/25/30 m/s x -3.5/-5, then lagged): " + " ".join(f"{g:5.1f}" for g in hard))
+    print("    hard-brake min gap, default calibration (20/25/30 m/s x -3.5/-5, then lagged): " + " ".join(f"{g:5.1f}" for g in hard))
 
   for route in expand(args.engaged, ROUTE_SETS):
     data = extract(route, args.root)
@@ -1301,6 +1353,7 @@ def _register_manual(sub):
   parser.add_argument("--routes", nargs="+", default=["manual-approach", "0000044e", "0000044f", "00000450", "00000451"],
                       help=f"manual route names or sets: {', '.join(ROUTE_SETS)}")
   parser.add_argument("--engaged", nargs="+", default=[], help="engaged drives to replay with the mirror on and off")
+  parser.add_argument("--calibration", default="00000451", help="drive whose recorded lag and radar latency seed the flights, or none")
   parser.set_defaults(fn=_decel_peaks)
 
 

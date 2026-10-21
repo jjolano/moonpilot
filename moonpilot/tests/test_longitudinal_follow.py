@@ -542,23 +542,37 @@ class TestFollowPolicy(unittest.TestCase):
           off = lead_accel(v_low, gap_low, v_low, 0.0, t_follow)
         self.assertEqual(lead_accel(v_low, gap_low, v_low, 0.0, t_follow), off)
 
-  def test_a_braking_lead_is_answered_at_the_drivers_share_by_headway(self):
+  def test_a_slowing_lead_is_answered_at_the_drivers_share_and_fades_without_a_step(self):
     """Flown behind the logged leads of 57 manual decels (`python -m moonpilot.lab decel-peaks`), the planner peaked
-    -2.39 against the driver's -1.76 from 10-16 m/s: it coasted while the gap closed, then the stopping floor braked
-    hard. The driver answers a braking lead at about half its accel over 1.5-2.5 s of headway and lets a far one close,
-    so a lead braking -1 is answered at least that much there; from 4 s out, or pulling away, nothing is added."""
+    -2.31 against the driver's -1.76 from 10-16 m/s: it coasted while the gap closed, then the stopping floor braked
+    hard. The driver answers a slowing lead at about half its accel from 1.5 s of headway and lets a far one close: a
+    brake on the raw estimate and a gentle slowing on the slow one are answered at least that much there, and the raw
+    estimate's steady-lead noise, inside the coast cushion's gate, not at all. Every fade is a blend: where the base ask
+    is positive (a faster lead, a wide gap) the far-headway and pulling-away edges ease it in, not step it to the mirror."""
     t_follow, v = MOONPILOT_T_FOLLOW[int(Personality.standard)], 15.0
-    off = mock.patch.object(longitudinal, "MOONPILOT_MIRROR_GAIN", [0.0] * len(longitudinal.MOONPILOT_MIRROR_GAIN))
+    off = mock.patch.object(longitudinal, "MOONPILOT_MIRROR_FADE_T", [-2.0, -1.0])
     for headway in (1.5, 2.0, 2.5):
       with self.subTest(headway=headway):
-        with off:
-          self.assertGreater(lead_accel(v, headway * v, v, -1.0, t_follow), -0.5)  # without it, mostly a coast
         self.assertLessEqual(lead_accel(v, headway * v, v, -1.0, t_follow), -0.5 + 1e-9)
+        self.assertLessEqual(lead_accel(v, headway * v, v, -0.45, t_follow, a_slow=-0.6), -0.3 + 1e-9)
+        with off:
+          noise = lead_accel(v, headway * v, v, -0.45, t_follow)
+        self.assertEqual(lead_accel(v, headway * v, v, -0.45, t_follow), noise)
     for gap, v_lead in ((4.5 * v, v), (2.0 * v, v + 2.0)):
       with self.subTest(gap=gap, v_lead=v_lead):
         with off:
           base = lead_accel(v, gap, v_lead, -1.0, t_follow)
-        self.assertEqual(lead_accel(v, gap, v_lead, -1.0, t_follow), base)
+        self.assertEqual(lead_accel(v, gap, v_lead, -1.0, t_follow, a_slow=-1.0), base)
+    v = 10.0
+    edges = (
+      [(g, 11.0) for g in np.linspace(3.9 * v, 4.1 * v, 201)],  # the headway fade's far edge, behind a faster lead
+      [(30.0, v + dv) for dv in np.linspace(1.4, 1.6, 201)],  # the lead pulling away
+    )
+    for points in edges:
+      asks = [lead_accel(v, g, vl, -1.0, t_follow, a_slow=-1.0) for g, vl in points]
+      with self.subTest(first=points[0]):
+        self.assertGreater(max(asks), 0.0)  # a positive base ask is what a step would drop
+        self.assertLess(max(abs(np.diff(asks))), 0.02)
 
   def test_the_arrival_term_neither_taps_at_the_target_nor_switches_on_a_far_leads_accel(self):
     """Two route 000003f8 faults of the arrival term, one per end of the approach.

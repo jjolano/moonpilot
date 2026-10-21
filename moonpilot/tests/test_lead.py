@@ -41,7 +41,7 @@ from moonpilot.lead import (
   normalize_lead,
   resample,
 )
-from moonpilot.longitudinal import MOONPILOT_OUT_OF_PATH_ENTER, MOONPILOT_OUT_OF_PATH_LEAVE
+from moonpilot.longitudinal import MOONPILOT_MIRROR_LEAD_A, MOONPILOT_OUT_OF_PATH_ENTER, MOONPILOT_OUT_OF_PATH_LEAVE
 from moonpilot.tests.fakes import _params
 
 STRAIGHT_PATH_X = list(np.linspace(0.0, 60.0, 33))
@@ -259,6 +259,21 @@ class TestLeadAccelEstimator(unittest.TestCase):
     estimates = np.array([estimator.update(FusedLead(35.0, 0.0, v_lead=20.0 + rng.normal(0.0, 0.05)))[0] for _ in range(200)])
     self.assertLess(float(np.abs(estimates).max()), 0.6)
     self.assertLess(float(estimates[MOONPILOT_LEAD_ACCEL_MIN_SAMPLES:].std()), 0.25)
+
+  def test_the_slow_accel_ignores_a_steady_leads_noise_and_follows_a_slowing(self):
+    """`a_slow` is the lead mirror's input: on a steady radar lead with 0.05 m/s of `vLead` noise it stays where the
+    mirror adds nothing, 3 s of a -0.5 m/s^2 slowing reach it, and a new vehicle starts it from zero."""
+    estimator, rng = LeadAccelEstimator(), np.random.default_rng(0)
+    slow = []
+    for _ in range(400):
+      estimator.update(FusedLead(35.0, 0.0, v_lead=20.0 + rng.normal(0.0, 0.05), radar=True))
+      slow.append(estimator.a_slow)
+    self.assertGreater(min(slow), MOONPILOT_MIRROR_LEAD_A[1])
+    for i in range(60):
+      estimator.update(FusedLead(35.0, 0.0, v_lead=20.0 - 0.5 * i * DT_MDL, radar=True))
+    self.assertLess(estimator.a_slow, -0.4)
+    estimator.update(FusedLead(80.0, 3.0, v_lead=10.0, radar=True, track_id=99))
+    self.assertEqual(estimator.a_slow, 0.0)
 
   def test_a_vision_lead_keeps_the_model_accel(self):
     """Only a radar-matched lead has a speed history to fit; the model's own accel is already there."""

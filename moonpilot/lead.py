@@ -126,6 +126,11 @@ MOONPILOT_LEAD_ACCEL_FAST_STREAK = 4  # consecutive frames the margin must hold 
 MOONPILOT_LEAD_ACCEL_TAU = 1.5  # s; the decay a lead believed to be holding its accel gets
 MOONPILOT_LEAD_ACCEL_TAU_RC = 0.45  # s; time constant of the filter that gives that belief up
 MOONPILOT_LEAD_ACCEL_TAU_RESET = 0.5  # m/s^2; |a| above this is braking, not a transient
+# The lead's accel for comfort answers only (`moonpilot/longitudinal.py`'s MOONPILOT_MIRROR_*), never a safety term's:
+# the estimate low-passed. On 10 min of leads steady over +-3 s (`python -m moonpilot.lab decel-peaks`) the estimate read
+# below -0.2 m/s^2 on 6.30 % of frames and below -0.3 on 1.43 % (min -1.63); low-passed, 0.07 % and none (min -0.24),
+# while a -0.3..-0.8 slowing reads 0.76 of itself. Zero on a new lead, so its answer builds with the window.
+MOONPILOT_LEAD_ACCEL_SLOW_RC = 1.0  # s
 
 LEAD_T_IDXS = ModelConstants.LEAD_T_IDXS
 LEAD_T_OFFSETS = ModelConstants.LEAD_T_OFFSETS
@@ -202,11 +207,18 @@ class LeadAccelEstimator:
     self._last = None  # the previous frame's lead, snapshotted, for `same_car` across a track change
     self._fast_streak = 0
     self._tau = FirstOrderFilter(MOONPILOT_LEAD_ACCEL_TAU, MOONPILOT_LEAD_ACCEL_TAU_RC, dt)
+    self._slow = FirstOrderFilter(0.0, MOONPILOT_LEAD_ACCEL_SLOW_RC, dt)
     self.a_lead_tau = MOONPILOT_LEAD_ACCEL_TAU
+    self.a_slow = 0.0  # MOONPILOT_LEAD_ACCEL_SLOW_RC's estimate, zero while the slot is empty
     # slope = sum(w_i * v_i) for a uniform grid: w_i = 12 (i - (n-1)/2) / (dt n (n^2 - 1)).
     self._weights = {n: (np.arange(n) - (n - 1) / 2.0) * (12.0 / (dt * n * (n * n - 1))) for n in range(MOONPILOT_LEAD_ACCEL_MIN_SAMPLES, window + 1)}
 
   def update(self, lead) -> tuple[float, float]:
+    a_lead, a_lead_tau = self._estimate(lead)
+    self.a_slow = self._slow.update(a_lead) if lead.present else 0.0
+    return a_lead, a_lead_tau
+
+  def _estimate(self, lead) -> tuple[float, float]:
     track = (bool(lead.present), bool(lead.radar), int(lead.radarTrackId))
     v_lead = float(lead.vLead)
     same = track[:2] == (True, True) and self._track is not None and self._track[:2] == track[:2] and self._last is not None and same_car(self._last, lead)
@@ -218,6 +230,7 @@ class LeadAccelEstimator:
       # accel holds for a length the previous lead earned. A new track on the same vehicle is not a new
       # lead, so it keeps both.
       self._tau.x = MOONPILOT_LEAD_ACCEL_TAU
+      self._slow.x = 0.0
     self._track = track
     self._last = SimpleNamespace(dRel=float(lead.dRel), yRel=float(lead.yRel), vLead=v_lead)
 

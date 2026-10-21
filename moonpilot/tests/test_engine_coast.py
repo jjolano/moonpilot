@@ -22,12 +22,12 @@ from moonpilot.tests.test_longitudinal import DT_MDL, _inputs, _lead
 FLAG = int(ToyotaFlags.MOONPILOT_ENGINE_COAST)
 
 
-def _planner(flag: bool) -> MoonpilotLongitudinalPlanner:
+def _planner(flag: bool, overrides: dict | None = None) -> MoonpilotLongitudinalPlanner:
   CP = CarInterface.get_non_essential_params(CAR.TOYOTA_RAV4_TSS2)
   CP.openpilotLongitudinalControl = True
   if flag:
     CP.flags |= FLAG
-  fake = _params(on=True)
+  fake = _params(on=True, overrides=overrides)
   with mock.patch("moonpilot.longitudinal.Params", lambda: fake):
     planner = MoonpilotLongitudinalPlanner(CP)
   planner.params = fake
