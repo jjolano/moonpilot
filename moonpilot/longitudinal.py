@@ -477,8 +477,8 @@ MOONPILOT_JERK_ONSET_LEAD_A = -0.2  # m/s^2; a lead slowing past this keeps JERK
 MOONPILOT_CRAWL_REST = 4.0  # m
 MOONPILOT_CRAWL_STOP_DECEL = 1.5  # m/s^2; the driver's crawl-stop peak
 # From 5 m/s up, braking past this spends the rest gap toward CRAWL_REST first; faded out over COMFORT_STOP_V.
-# Route 00000451 at 175 s: a lead braking -3.5 m/s^2 14 m ahead at 7 m/s drew -2.88 to rest 5 m back; capped,
-# -2.44 to rest nearer 3 m (`python -m moonpilot.lab hard-brake`: -3.5 margins 0.3-0.5 m smaller, no new contact).
+# Route 00000451 at 175 s: a lead braking -3.5 m/s^2 14 m ahead at 7 m/s drew -2.88; capped, -2.44 (open-loop
+# on the logged trajectory). `python -m moonpilot.lab hard-brake`: -3.5 margins 0.3-0.5 m smaller, no new contact.
 MOONPILOT_COMFORT_STOP_DECEL = 2.0  # m/s^2
 MOONPILOT_COMFORT_STOP_V = [12.0, 16.0]  # m/s: whole below, gone above
 MOONPILOT_BRAKE_EXIT_A = -0.5  # m/s^2; braking past this holds the positive ask, as curve braking does
