@@ -219,8 +219,8 @@ def _lane_build(segs: list[str]) -> dict[str, np.ndarray]:
 
 def _lane_position(args):
   """Where in the lane the car sits, openpilot steering (hands off) against the driver, on well-seen lanes above 8 m/s:
-  offset left of the lane center on straights, and toward the inside of curves (by the path's lateral accel). Both
-  classes share the camera mount, so its offset cancels in the comparison."""
+  offset left of the lane center on straights, and toward the inside of curves (by the path's lateral accel), left and
+  right turns apart: the camera mount's own offset adds to one direction's inside and takes from the other's."""
   parts = []
   for r in expand(args.routes, ROUTE_SETS):
     try:
@@ -239,8 +239,9 @@ def _lane_position(args):
       band = m & (d["v"] >= lo) & (d["v"] < hi)
       print(f"  {lo:.0f}-{hi:.0f} m/s straight (|a_lat| < 0.3): left of center {q(d['center'][band & (np.abs(a_lat) < 0.3)])}")
     for lo, hi in ((0.5, 1.0), (1.0, 2.0), (2.0, 10.0)):
-      band = m & (np.abs(a_lat) >= lo) & (np.abs(a_lat) < hi)
-      print(f"  curve {lo:.1f}-{hi:.1f} m/s^2: toward the inside {q(inside[band])}")
+      for side, s in (("left", -1.0), ("right", 1.0)):
+        band = m & (np.abs(a_lat) >= lo) & (np.abs(a_lat) < hi) & (np.sign(d["curv"]) == s)
+        print(f"  {side:5s} curve {lo:.1f}-{hi:.1f} m/s^2: toward the inside {q(inside[band])}")
 
 
 def register(sub):

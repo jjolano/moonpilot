@@ -209,6 +209,12 @@ def _damping(args):
     las = _smooth(la)
     i_as = MOONPILOT_DAMPING_T.index(cfg.damping_t)
     active = d["lat_active"]
+    for cls in ("manual", "op"):  # before the guard: an all-manual drive still counts toward the driver's release
+      for k in _turns(las, masks[cls]):
+        if 3 <= d["v_ego"][k] < 10:
+          shape = _shape(las, d["t"], k, 1, masks[cls])
+          if shape is not None:
+            release[cls].append(shape)
     if not active.any():
       print(f"{name}: skipped, no steering frames")
       continue
@@ -232,12 +238,6 @@ def _damping(args):
           continue
         for level, t in enumerate(MOONPILOT_DAMPING_T):
           (entry if side == "entry" else exit_)[t].append(float(np.sum(turn * z["d"][level][sl]) / push))
-    for cls in ("manual", "op"):
-      for k in _turns(las, masks[cls]):
-        if 3 <= d["v_ego"][k] < 10:
-          shape = _shape(las, d["t"], k, 1, masks[cls])
-          if shape is not None:
-            release[cls].append(shape)
   off = float(np.median(buzz[0.0]))
   for t in MOONPILOT_DAMPING_T:
     med_entry = 100 * float(np.median(entry[t])) if entry[t] else float("nan")
@@ -318,11 +318,12 @@ def _weave(args):
 def _release(args):
   """Where a low-speed turn's release comes from, on recorded turns peaking at 3-10 m/s: the steepest release / peak of
   the car's lateral accel by hand and with openpilot steering, and of the model's action, the request, the logged
-  torque and the wheel angle on the openpilot turns; then the replayed command's change over the 0.4 s after its own
-  peak, by term, as a share of that peak, beside the request's, the setpoint's and the car's over the same 0.4 s."""
+  torque and the wheel angle on the openpilot turns; then the replayed PID sum's change (p + i + d + f, before the
+  PID's clip, the torque map and hysteresis, so not the delivered torque) over the 0.4 s after its own peak, by term,
+  as a share of that peak, beside the request's, the setpoint's and the car's over the same 0.4 s."""
   from moonpilot.lab.lateral import action
   shapes = {k: [] for k in ("manual car", "openpilot car", "model action", "request", "torque", "wheel angle")}
-  terms = {k: [] for k in ("command", "p", "i", "d", "friction", "request", "setpoint", "car")}
+  terms = {k: [] for k in ("pid sum", "p", "i", "d", "friction", "request", "setpoint", "car")}
   for name in expand(args.routes, ROUTE_SETS):
     got = _load(name, args.root)
     if got is None:
@@ -350,12 +351,12 @@ def _release(args):
         top = w.start + int(np.argmax(sign * command[w]))
         j, peak = min(top + 40, len(t) - 1), sign * command[top]
         if peak > 0.2:
-          for n, x in (("command", command), ("p", p), ("i", i), ("d", dd), ("friction", f - request), ("request", request), ("setpoint", sp)):
+          for n, x in (("pid sum", command), ("p", p), ("i", i), ("d", dd), ("friction", f - request), ("request", request), ("setpoint", sp)):
             terms[n].append(sign * (x[j] - x[top]) / peak)
           terms["car"].append((las[j] - las[top]) / peak)
   print("steepest release / peak at 3-10 m/s, median (n): " + ", ".join(f"{n} {np.median(x):.2f} ({len(x)})" for n, x in shapes.items() if x))
-  if terms["command"]:
-    print(f"openpilot turns ({len(terms['command'])}), 0.4 s after the command's peak, change as a share of it: "
+  if terms["pid sum"]:
+    print(f"openpilot turns ({len(terms['pid sum'])}), 0.4 s after the PID sum's peak, change as a share of it: "
           + ", ".join(f"{n} {np.median(x):+.2f}" for n, x in terms.items()))
 
 
