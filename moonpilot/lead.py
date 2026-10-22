@@ -215,7 +215,10 @@ class LeadAccelEstimator:
 
   def update(self, lead) -> tuple[float, float]:
     a_lead, a_lead_tau = self._estimate(lead)
-    self.a_slow = self._slow.update(a_lead) if lead.present else 0.0
+    if lead.present and math.isfinite(a_lead):
+      self.a_slow = self._slow.update(a_lead)
+    else:  # an empty slot, or a vision lead's NaN `aLeadK`: start over rather than carry a NaN forward
+      self._slow.x = self.a_slow = 0.0
     return a_lead, a_lead_tau
 
   def _estimate(self, lead) -> tuple[float, float]:

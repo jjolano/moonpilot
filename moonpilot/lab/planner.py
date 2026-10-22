@@ -194,6 +194,7 @@ def replay(route, data, root=DEFAULT_ROOT, overrides=None, details_out=None):
           "logged_should_stop": bool(plan_reader.shouldStop) if plan_reader is not None else False,
           "logged_allow_throttle": bool(plan_reader.allowThrottle) if plan_reader is not None else False,
           "logged_accel": float(cc.actuators.accel),
+          "band_pressing": bool(planner.brake_band.pressing),
         })
   finally:
     longitudinal.Params, longitudinal.time = original_params, original_time
@@ -1219,11 +1220,11 @@ def _fly_logged_lead(job):
   s_lead = np.asarray(s_ego) + gap_log
   planner, plant = _planner(True, calibration), _LaggedPlant()
   plant.a, plant.queue = a0, deque([a0] * len(plant.queue))
-  v, s, out = v_log[0], 0.0, {"v": [], "a": [], "gap": []}
+  v, s, out = v_log[0], 0.0, {"v": [], "a": [], "gap": [], "pressing": []}
   for i in range(len(v_log)):
     planner.update(_inputs(v_ego=v, v_cruise_kph=v_log[0] * 3.6, a_ego=plant.a, lead=_lead(max(s_lead[i] - s, 0.0), max(v_lead[i], 0.0)),
                            standstill=v < 0.05, personality=1))
-    for k, x in zip(out, (v, plant.a, s_lead[i] - s), strict=True):
+    for k, x in zip(out, (v, plant.a, s_lead[i] - s, planner.brake_band.pressing), strict=True):
       out[k].append(x)
     v_new = max(0.0, v + plant.step(float(planner.output_a_target)) * DT_MDL)
     s, v = _advance(s, v, v_new), v_new
@@ -1312,15 +1313,34 @@ def _decel_peaks(args):
     with ctx:
       hard = [_hard_brake_run("fork+engine", v0, a, lag)[0] for lag in (False, True) for v0 in (20.0, 25.0, 30.0) for a in (-3.5, -5.0)]
     print("    hard-brake min gap, default calibration (20/25/30 m/s x -3.5/-5, then lagged): " + " ".join(f"{g:5.1f}" for g in hard))
+  # Brake-band press edges (`BrakeBand.pressing` rising) flown through 30 s stretches of every manual follow behind one
+  # radar track, the lead's real (correlated) estimate noise included, and those starting while the lead is steady
+  # over +-3 s: what the mirror adds where nothing is slowing.
+  win, follows = round(30.0 / DT_MDL), []
+  for r in runs((d["manual"] > 0) & (d["lead"] > 0) & (v > 5.0) & ~cut):
+    for s0 in range(r.start, r.stop - win + 1, win):
+      w = slice(s0, s0 + win)
+      if np.max(np.abs(np.diff(gap[w]) - (v_lead[w][:-1] - v[w][:-1]) * DT_MDL)) <= 1.0:
+        follows.append(w)
+  print(f"\nBrake-band press edges flown through {len(follows) * 30.0 / 60:.0f} min of manual follows (30 s stretches):")
+  for name, ctx in (("mirror off", off), ("mirror on", nullcontext())):
+    with ctx, ProcessPoolExecutor(4) as pool:
+      flown = list(pool.map(_fly_logged_lead, [(v[w], gap[w], v_lead[w], d["a"][w][0], calibration) for w in follows]))
+    edges = [np.flatnonzero(np.diff(np.asarray(f["pressing"], dtype=int)) > 0) + 1 for f in flown]
+    quiet = sum(int(steady[w][e].sum()) for w, e in zip(follows, edges, strict=True))
+    print(f"  {name}: {sum(len(e) for e in edges)} presses, {quiet} of them while the lead was steady")
 
   for route in expand(args.engaged, ROUTE_SETS):
     data = extract(route, args.root)
+    base_d, now_d = [], []
     with off:
-      base, logged, active, _ = replay(route, data, args.root)
-    now, _, _, _ = replay(route, data, args.root)
+      base, logged, active, _ = replay(route, data, args.root, details_out=base_d)
+    now, _, _, _ = replay(route, data, args.root, details_out=now_d)
     m = active & np.isfinite(logged)
+    presses = [int(np.sum(m[1:] & (np.diff(np.asarray([r["band_pressing"] for r in ds], dtype=int)) > 0))) for ds in (base_d, now_d)]
     print(f"{route}: {m.sum()} engaged frames, {np.sum(m & (now < base - 0.05))} deeper by > 0.05; ask < -0.4 for "
-          + f"{np.sum(m & (base < -0.4)) * DT_MDL:.1f} s off, {np.sum(m & (now < -0.4)) * DT_MDL:.1f} s on; peak {base[m].min():.2f} / {now[m].min():.2f}")
+          + f"{np.sum(m & (base < -0.4)) * DT_MDL:.1f} s off, {np.sum(m & (now < -0.4)) * DT_MDL:.1f} s on; band presses {presses[0]} off, {presses[1]} on; "
+          + f"peak {base[m].min():.2f} / {now[m].min():.2f}")
 
 
 def _register_manual(sub):

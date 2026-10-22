@@ -275,6 +275,15 @@ class TestLeadAccelEstimator(unittest.TestCase):
     estimator.update(FusedLead(80.0, 3.0, v_lead=10.0, radar=True, track_id=99))
     self.assertEqual(estimator.a_slow, 0.0)
 
+  def test_the_slow_accel_recovers_from_a_non_finite_sample_on_the_same_track(self):
+    """A vision lead forwards the model's `a[0]` as `aLeadK`; one NaN there must not stay in the filter for the rest of
+    the track, or every later frame's mirror ask would be NaN too."""
+    estimator = LeadAccelEstimator()
+    for a_lead in (-0.5, float("nan"), -0.5, -0.5):
+      estimator.update(FusedLead(35.0, 0.0, v_lead=20.0, a_lead=a_lead, radar=False))
+    self.assertTrue(np.isfinite(estimator.a_slow))
+    self.assertLess(estimator.a_slow, 0.0)
+
   def test_a_vision_lead_keeps_the_model_accel(self):
     """Only a radar-matched lead has a speed history to fit; the model's own accel is already there."""
     estimator = LeadAccelEstimator()
