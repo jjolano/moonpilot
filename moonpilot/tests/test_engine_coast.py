@@ -12,7 +12,7 @@ from opendbc.car.toyota.values import CAR, ToyotaFlags
 import moonpilot.longitudinal as longitudinal
 from moonpilot.brake_band import MOONPILOT_BRAKE_BAND_FLOOR
 from moonpilot.engage import car_unavailable_reason, moonpilot_engage_safety_param
-from moonpilot.engine_coast import MOONPILOT_ENGINE_COAST_LEAD_T, coast_margin
+from moonpilot.engine_coast import MOONPILOT_ENGINE_COAST_LEAD_T, MOONPILOT_ENGINE_COAST_MARGIN, coast_budget, coast_margin
 from moonpilot.features import ENGINE_COAST
 from moonpilot.longitudinal import MOONPILOT_ARRIVAL_HOLD_FULL, MOONPILOT_COASTING_BP, MOONPILOT_COASTING_V, MoonpilotLongitudinalPlanner, lead_accel
 from moonpilot.tests.fakes import _params
@@ -127,6 +127,24 @@ class TestEngineCoast(unittest.TestCase):
     asks = np.array([ask(gap) for gap in np.arange(130.0, 40.0, -0.05)])
     self.assertLessEqual(np.diff(asks).max(), 0.0)  # never eases as the gap closes
     self.assertLess(np.abs(np.diff(asks)).max(), 0.01)  # and never steps
+
+  def test_the_coast_budget_is_a_blend_not_a_switch(self):
+    """As a switch a steady -1.0 ask stepped to the coast and back with the margin's noise. Blended, the output never
+    leaves [ask, coast], is the ask where the coast does not fit and the coast past MOONPILOT_ENGINE_COAST_MARGIN of
+    margin, and moves continuously with the gap and the ask (halving the step halves the largest change)."""
+    floor = engine_coast_floor(15.0)
+
+    def budget(ask, gap):
+      return coast_budget(ask, 15.0, gap, 14.0, -0.3, floor, 1.0, 1.0, 4.0)
+    margins = [coast_margin(15.0, gap, 14.0, -0.3, floor, 1.0, 4.0) for gap in (10.0, 60.0)]
+    self.assertLess(margins[0], 0.0)
+    self.assertGreater(margins[1], MOONPILOT_ENGINE_COAST_MARGIN)
+    self.assertEqual(budget(-1.0, 10.0), -1.0)
+    self.assertAlmostEqual(budget(-1.0, 60.0), floor, places=9)
+    for sweep, lo, hi in ((lambda x: budget(-1.0, x), 10.0, 60.0), (lambda x: budget(x, 60.0), -1.5, floor)):
+      outs = [[sweep(x) for x in np.linspace(lo, hi, n)] for n in (201, 401)]
+      self.assertTrue(all(-1.5 - 1e-9 <= o <= floor + 1e-9 for o in outs[1]))
+      self.assertLess(np.abs(np.diff(outs[1])).max(), 0.6 * np.abs(np.diff(outs[0])).max())
 
   def test_the_flag_means_nothing_on_another_brand(self):
     """Bit 20 belongs to `ToyotaFlags` only; the same bit on another brand's flags is that brand's own."""

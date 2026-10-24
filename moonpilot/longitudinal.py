@@ -207,6 +207,12 @@ MOONPILOT_MIRROR_SHARE = [1.0, 0.5]
 MOONPILOT_MIRROR_FADE_T = [2.5, 4.0]  # s of headway; whole inside the first, gone past the second
 MOONPILOT_MIRROR_LEAD_A = [-0.4, -0.2]  # m/s^2 of slow accel; whole at or below the first, gone above the second
 MOONPILOT_MIRROR_OPEN_V = 1.5  # m/s of lead speed over the ego that ends it
+# Behind a lead the driver follows its accel, not the gap: over 378 manual lead-minutes (hw < 6 s) his accel's p75 is
+# 0.075 + 0.04 * dv+ + 0.9 * a_slow+, and the gap excess adds nothing, where the spring asked +1..+2 at 1.5-6 s of
+# headway. The lead's positive ask is held to that, faded out over FOLLOW_ACCEL_T and in over SOFT_STOP_V.
+# `python -m moonpilot.lab driver-follow`.
+MOONPILOT_FOLLOW_ACCEL = [0.075, 0.04, 0.9]  # m/s^2 base, per m/s of lead speed over the ego, per m/s^2 of slow accel
+MOONPILOT_FOLLOW_ACCEL_T = [6.0, 9.0]  # s of headway; whole inside the first, gone past the second
 # The positive side's authority: a multiplier on the regulator's output, and only on the output, and
 # only where it is already positive. 1.0 at and below 20 m/s, so the whole low-speed follow law — every
 # approach, every stop, every maneuver this fork has already been driven on — is bit-identical to what
@@ -339,21 +345,9 @@ MOONPILOT_LEAD_PREVIEW_T = 0.5  # s of a lead's own accel credited into the spee
 # the estimator's accel reaches the terms one other way — the delay match rather than a credit — `update` hands the
 # policy `lead_state_at`'s speed at `action_t + lead_age`, which carries ~0.25 s of it. This
 # constant is the extra prediction on top of that.
-MOONPILOT_LEAD_BRAKE_SUSTAIN_T = 2.0  # s; how long `stopping_decel` assumes a braking lead keeps
-# braking. It is the one dial between the two ways that term can be wrong, and both ends were flown
-# through this planner (closed loop, `_planner`/`_inputs`, contact = gap < 0.4 m):
-#   0 s   — no prediction at all, the plain relative-frame match. Contacts a lead braking -3.5 or -5
-#           to rest from the 1.45 s follow gap at 20 m/s, and a 15 m cut-in that then brakes at -4.
-#   inf   — the lead is predicted all the way to rest. Safe, but it turns a lead *tapping* -5 for
-#           half a second at 30 m/s from 60 m into a -3.50 m/s^2 command where the absolute-frame
-#           law it replaced asked -1.89 and the end gap is ~40 m either way. That is deeper than the
-#           3.36 that capped `MOONPILOT_LEAD_PREVIEW_T` at 0.5 s, on that same scenario.
-#   2.0 s — the tap costs -1.00 m/s^2, below both, while the sustained end gaps hold: 5.00 m at
-#           -3.5 to rest (5.09 before), 5.70 m at -5 (5.51), 4.91 m on the cut-in (4.97), and the
-#           four pinned stopped-lead approaches are bit-identical. 1.5 s was measured too and gives
-#           2.88 m on the -5 case; 3.0 s holds the margins but puts the tap back at -1.86.
-# A lead braking at -8 from either geometry contacts at every horizon including infinity: the ego
-# needs more than ACCEL_MIN there, which is physics rather than this constant.
+MOONPILOT_LEAD_BRAKE_SUSTAIN_T = 2.0  # s; how long `stopping_decel` assumes a braking lead keeps braking: the one dial
+# between no prediction (contacts a -3.5/-5 brake from a 1.45 s follow) and prediction to rest (a -5 tap commanded -3.5).
+# Both ends flown: docs/longitudinal.md, the sustain bullet, and `python -m moonpilot.lab sustain`.
 MOONPILOT_LEAD_BRAKE_SUSTAIN_PER_A = 1.0  # s per m/s^2; a harder brake is believed longer: the
 # horizon is max(SUSTAIN_T, PER_A * |a_lead|), so 2 s up to -2. `python -m moonpilot.lab sustain`
 # (RAV4, 0.2 s dead time + 0.25 s lag, both cars on the trapezoid): 30 m/s behind a lead braking -3.5 to
@@ -903,9 +897,14 @@ def lead_accel(v_ego, gap, v_lead, a_lead, t_follow, catch_up_accel=0.0, catch_u
   a_track = soft_stop(a_track, v_ego, gap, v_lead_eff)
   if a_track > 0.0 and v_ego > v_lead_match and gap > gap_target:
     a_track *= min(1.0, (gap - gap_target) / MOONPILOT_FOLLOW_TAPER_M)
+  t_gap = gap / max(v_ego, 0.1)
+  # The driver's follow envelope (MOONPILOT_FOLLOW_ACCEL): the lead's own accel, not the gap, sets how hard to follow it.
+  base, per_dv, per_a = MOONPILOT_FOLLOW_ACCEL
+  follow = base + per_dv * max(v_lead_match - v_ego, 0.0) + per_a * max(a_slow, 0.0)
+  w = float(np.interp(t_gap, MOONPILOT_FOLLOW_ACCEL_T, [1.0, 0.0])) * float(np.interp(v_ego, MOONPILOT_SOFT_STOP_V, [0.0, 1.0]))
+  a_track += w * min(follow - a_track, 0.0)
   # The slow accel answers a gentle slowing; the raw estimate, past the coast cushion's gate, a brake without that lag.
   a_answer = min(a_slow, a_lead * float(np.interp(a_lead, MOONPILOT_FOLLOW_COAST_LEAD_A, [1.0, 0.0])))
-  t_gap = gap / max(v_ego, 0.1)
   w = float(np.interp(t_gap, MOONPILOT_MIRROR_FADE_T, [1.0, 0.0])) * float(np.interp(v_ego, MOONPILOT_SOFT_STOP_V, [0.0, 1.0]))
   w *= float(np.interp(a_answer, MOONPILOT_MIRROR_LEAD_A, [1.0, 0.0])) * float(np.interp(v_lead - v_ego, [0.0, MOONPILOT_MIRROR_OPEN_V], [1.0, 0.0]))
   mirror = max(float(np.interp(t_gap, MOONPILOT_MIRROR_SHARE_T, MOONPILOT_MIRROR_SHARE)) * a_answer, -MOONPILOT_APPROACH_DECEL)
@@ -1156,7 +1155,9 @@ def policy(
   for source, gap, v_lead, a_lead, *extra in leads:  # extra: the sustain, then the slow accel
     ask = lead_accel(v_ego, gap, v_lead, a_lead, t_follow, catch_up, MOONPILOT_CATCH_UP_COAST_FRACTION * coast, floor, *extra)
     if engine is not None:
-      ask = coast_budget(ask, v_ego, gap, v_lead, a_lead, engine, MOONPILOT_APPROACH_DECEL, MOONPILOT_FOLLOW_SPEED_FLOOR_HEADWAY_T, MOONPILOT_STOP_DISTANCE)
+      # On the slow accel: the raw estimate's noise moved the proof's margin by meters a frame (route-flown, -1.0 <-> -0.33).
+      a_budget = extra[1] if len(extra) > 1 else a_lead
+      ask = coast_budget(ask, v_ego, gap, v_lead, a_budget, engine, MOONPILOT_APPROACH_DECEL, MOONPILOT_FOLLOW_SPEED_FLOOR_HEADWAY_T, MOONPILOT_STOP_DISTANCE)
     if (
       v_lead < v_ego <= MOONPILOT_LEAD_COAST_MAX_V
       and gap <= MOONPILOT_LEAD_COAST_MAX_GAP

@@ -1210,21 +1210,22 @@ def _calibration(route, root):
 
 def _fly_logged_lead(job):
   """The engine-coast RAV4 planner, seeded with `calibration`, on the lagged plant from a logged start behind the logged
-  lead's own path; the cruise speed is held at the start's, so only the lead terms brake."""
+  lead's own path. The set speed is the start's unless a sixth element gives one, so by default only the lead terms brake."""
   from moonpilot.tests.test_engine_coast import _planner
   from moonpilot.tests.test_longitudinal import _inputs, _lead
-  v_log, gap_log, v_lead, a0, calibration = job
+  v_log, gap_log, v_lead, a0, calibration, *cruise = job
+  v_cruise_kph = cruise[0] if cruise else v_log[0] * 3.6
   s_ego = [0.0]
   for v0, v1 in zip(v_log[:-1], v_log[1:], strict=True):
     s_ego.append(_advance(s_ego[-1], v0, v1))
   s_lead = np.asarray(s_ego) + gap_log
   planner, plant = _planner(True, calibration), _LaggedPlant()
   plant.a, plant.queue = a0, deque([a0] * len(plant.queue))
-  v, s, out = v_log[0], 0.0, {"v": [], "a": [], "gap": [], "pressing": []}
+  v, s, out = v_log[0], 0.0, {"v": [], "a": [], "gap": [], "pressing": [], "cmd": []}
   for i in range(len(v_log)):
-    planner.update(_inputs(v_ego=v, v_cruise_kph=v_log[0] * 3.6, a_ego=plant.a, lead=_lead(max(s_lead[i] - s, 0.0), max(v_lead[i], 0.0)),
+    planner.update(_inputs(v_ego=v, v_cruise_kph=v_cruise_kph, a_ego=plant.a, lead=_lead(max(s_lead[i] - s, 0.0), max(v_lead[i], 0.0)),
                            standstill=v < 0.05, personality=1))
-    for k, x in zip(out, (v, plant.a, s_lead[i] - s, planner.brake_band.pressing), strict=True):
+    for k, x in zip(out, (v, plant.a, s_lead[i] - s, planner.brake_band.pressing, float(planner.output_a_target)), strict=True):
       out[k].append(x)
     v_new = max(0.0, v + plant.step(float(planner.output_a_target)) * DT_MDL)
     s, v = _advance(s, v, v_new), v_new
@@ -1240,6 +1241,29 @@ def _centered_slope(v, half):
   return out
 
 
+def _decel_jobs(d, a_s):
+  """Every manual decel a radar lead caused (aEgo over 0.5 s, `a_s`, past PEAK_DECEL_A for 2 s, shedding 2 m/s from 4 m/s,
+  one radar track throughout), as flight jobs from PEAK_LEAD_IN_S before to PEAK_TAIL_S after, and the driver's (onset
+  speed, peak decel above 2 m/s, minimum gap) on each."""
+  from moonpilot.lab.model_braking import episodes
+  v, gap, v_lead = d["v"], d["gap"], d["v_lead"]
+  n_in, n_tail = round(PEAK_LEAD_IN_S / DT_MDL), round(PEAK_TAIL_S / DT_MDL)
+  jobs, drv = [], []
+  for sl in episodes((a_s < PEAK_DECEL_A) & (d["manual"] > 0), d["t"], d["route"], 0.5):
+    w = slice(sl.start - n_in, min(sl.stop + n_tail, len(v)))
+    if d["t"][sl.stop - 1] - d["t"][sl.start] < 2.0 or v[sl.start] < 4.0 or v[sl.start] - v[sl.stop - 1] < 2.0 or w.start < 0:
+      continue
+    vw, gw, lw = v[w], gap[w], v_lead[w]
+    if (d["route"][w] != d["route"][sl.start]).any() or not (d["manual"][w] > 0).all() or not (d["lead"][w] > 0).all() or gw[n_in] > 80.0:
+      continue
+    if np.max(np.abs(np.diff(gw) - (lw[:-1] - vw[:-1]) * DT_MDL)) > 1.0:  # one radar track throughout
+      continue
+    if lw[n_in] < vw[n_in] - 0.5 or gw[-1] < 15.0:  # the lead's doing: slower at the onset, or close at the end
+      jobs.append((vw, gw, lw, d["a"][w][0]))
+      drv.append((vw[n_in], a_s[w][vw > 2.0].min(), gw.min()))
+  return jobs, np.asarray(drv)
+
+
 def _decel_peaks(args):
   """The driver's share of a slowing lead's accel by headway (`MOONPILOT_MIRROR_*`'s source), then every manual decel a
   radar lead caused, flown from the same start behind the same logged lead with the mirror on and off, seeded with the
@@ -1249,7 +1273,6 @@ def _decel_peaks(args):
   from unittest import mock
   from moonpilot.tests.test_engine_coast import _planner
   import moonpilot.longitudinal as longitudinal
-  from moonpilot.lab.model_braking import episodes
   d = _pooled_manual(expand(args.routes, ROUTE_SETS), args.root)
   v, gap, v_lead = d["v"], d["gap"], d["v_lead"]
   a_s = np.concatenate([np.convolve(d["a"][d["route"] == r], np.ones(10) / 10, mode="same") for r in np.unique(d["route"])])
@@ -1278,21 +1301,7 @@ def _decel_peaks(args):
     print(f"  {name:8s} steady: below -0.2 on {np.mean(x[steady] < -0.2) * 100:5.2f} %, below -0.3 on {np.mean(x[steady] < -0.3) * 100:5.2f} %, "
           + f"min {x[steady].min():5.2f}; slowing reads {np.median(x[slowing] / ref1[slowing]):.2f} of itself")
 
-  n_in, n_tail = round(PEAK_LEAD_IN_S / DT_MDL), round(PEAK_TAIL_S / DT_MDL)
-  jobs, drv = [], []
-  for sl in episodes((a_s < PEAK_DECEL_A) & (d["manual"] > 0), d["t"], d["route"], 0.5):
-    w = slice(sl.start - n_in, min(sl.stop + n_tail, len(v)))
-    if d["t"][sl.stop - 1] - d["t"][sl.start] < 2.0 or v[sl.start] < 4.0 or v[sl.start] - v[sl.stop - 1] < 2.0 or w.start < 0:
-      continue
-    vw, gw, lw = v[w], gap[w], v_lead[w]
-    if (d["route"][w] != d["route"][sl.start]).any() or not (d["manual"][w] > 0).all() or not (d["lead"][w] > 0).all() or gw[n_in] > 80.0:
-      continue
-    if np.max(np.abs(np.diff(gw) - (lw[:-1] - vw[:-1]) * DT_MDL)) > 1.0:  # one radar track throughout
-      continue
-    if lw[n_in] < vw[n_in] - 0.5 or gw[-1] < 15.0:  # the lead's doing: slower at the onset, or close at the end
-      jobs.append((vw, gw, lw, d["a"][w][0]))
-      drv.append((vw[n_in], a_s[w][vw > 2.0].min(), gw.min()))
-  drv = np.asarray(drv)
+  jobs, drv = _decel_jobs(d, a_s)
   calibration = _calibration(args.calibration, args.root) if args.calibration != "none" else {}
   seeded = _planner(True, calibration)
   jobs = [(*job, calibration) for job in jobs]

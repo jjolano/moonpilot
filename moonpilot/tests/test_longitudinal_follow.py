@@ -23,6 +23,7 @@ from moonpilot.longitudinal import (
   MOONPILOT_CRAWL_REST,
   MOONPILOT_FAST_ACCEL_BP,
   MOONPILOT_FAST_ACCEL_V,
+  MOONPILOT_FOLLOW_ACCEL,
   MOONPILOT_FOLLOW_SPEED_FLOOR_FADE_V,
   MOONPILOT_FOLLOW_SPEED_FLOOR_HEADWAY_T,
   MOONPILOT_FOLLOW_SPEED_FLOOR_MIN_A_LEAD,
@@ -63,19 +64,45 @@ class TestFollowPolicy(unittest.TestCase):
 
     self.assertGreater(fast, slow)
     self.assertEqual(ask([]), fast)
-    self.assertEqual(ask([(source.lead0, 200.0, v_ego, 0.0)]), fast)
-    self.assertEqual(ask([(source.lead0, 40.0, v_ego, 0.0)]), slow)
-    self.assertEqual(ask([(source.lead0, 40.0, v_ego, 1.0)]), fast)  # opening runway
-    self.assertTrue(slow < ask([(source.lead0, 65.0, v_ego, 0.0)]) < fast)
+    self.assertEqual(ask([(source.lead0, 200.0, v_ego, 0.0)]), fast)  # past the follow envelope's headway
+    # Inside it a matched lead is followed, not chased (`MOONPILOT_FOLLOW_ACCEL`): the lead's own accel opens the
+    # throttle, a wider gap does not.
+    matched = ask([(source.lead0, 40.0, v_ego, 0.0)])
+    self.assertLess(matched, slow)
+    self.assertAlmostEqual(ask([(source.lead0, 65.0, v_ego, 0.0)]), matched, places=9)
+    self.assertGreater(ask([(source.lead0, 40.0, v_ego, 1.0, None, 1.0)]), slow)
     # Same runway, more closing: below set speed, the arrival term may take a gentle catch-up while
     # coasting still has room to arrive. It remains below the slow rung, not the cruise fast rung.
     closing = ask([(source.lead0, 65.0, v_ego - 2.0, 0.0)])
     self.assertGreater(closing, lead_accel(v_ego, 65.0, v_ego - 2.0, 0.0, t_follow))
     self.assertLess(closing, slow)
-    self.assertEqual(ask([(source.lead0, 200.0, v_ego, 0.0), (source.lead1, 40.0, v_ego, 0.0)]), slow)
+    self.assertEqual(ask([(source.lead0, 200.0, v_ego, 0.0), (source.lead1, 40.0, v_ego, 0.0)]), matched)
 
     braking = (source.lead0, 20.0, 15.0, 0.0)
     self.assertEqual(ask([braking]), lead_accel(v_ego, 20.0, 15.0, 0.0, t_follow))
+
+  def test_a_lead_is_followed_by_its_accel_not_chased_by_the_gap(self):
+    """Over 378 manual lead-minutes the driver's accel behind a lead (headway under 6 s) has its p75 at
+    `MOONPILOT_FOLLOW_ACCEL` — the lead's speed excess and slow accel, not the gap — where the spring asked +1..+2
+    m/s^2 at 1.5-6 s and the car surged at the lead (`python -m moonpilot.lab driver-follow`). The lead's positive ask is
+    held there, a wider gap buys nothing, a lead that accelerates opens it, and the hold blends out past 9 s of headway
+    and below 5 m/s without a step."""
+    t_follow, v = MOONPILOT_T_FOLLOW[int(Personality.standard)], 15.0
+    base, per_dv, per_a = MOONPILOT_FOLLOW_ACCEL
+    for headway in (2.0, 4.0, 6.0):
+      for dv in (0.0, 1.0, 3.0):
+        with self.subTest(headway=headway, dv=dv):
+          self.assertLessEqual(lead_accel(v, headway * v, v + dv, 0.0, t_follow), base + per_dv * dv + 1e-9)
+    self.assertGreater(lead_accel(v, 3.0 * v, v + 1.0, 1.0, t_follow, a_slow=1.0), base + per_a * 0.9)
+    with mock.patch.object(longitudinal, "MOONPILOT_FOLLOW_ACCEL_T", [-2.0, -1.0]):
+      spring = lead_accel(v, 3.0 * v, v + 1.0, 0.0, t_follow)
+    self.assertGreater(spring, 1.0)  # what the gap alone asked
+    # Continuous across both fades: halving the step halves the largest change, where a step would not shrink.
+    for edge in (lambda x: (v, x * v, v + 1.0), lambda x: (x, 4.0 * x, x + 1.0)):
+      lo, hi = (5.5, 9.5) if edge(1.0)[0] == v else (2.5, 5.5)
+      steps = [max(abs(np.diff([lead_accel(*edge(x), 0.0, t_follow) for x in np.linspace(lo, hi, n)]))) for n in (201, 401)]
+      with self.subTest(lo=lo):
+        self.assertLess(steps[1], 0.6 * steps[0])
 
   def test_a_closing_approach_coasts_to_the_target_instead_of_holding_set_speed(self):
     """Route 000003e4 segments 7-8, flown closed loop: 16.1 m/s held at a 58 kph set speed for
@@ -358,7 +385,7 @@ class TestFollowPolicy(unittest.TestCase):
     self.assertGreater(raw, rung)  # the pre-gain law did reach it
 
     for v_ego, gap_err, v_err in ((24.2, 1.5, 0.9), (25.0, 0.0, 1.0), (30.0, 1.5, 0.9)):
-      with self.subTest(v_ego=v_ego):
+      with self.subTest(v_ego=v_ego), mock.patch.object(longitudinal, "MOONPILOT_FOLLOW_ACCEL_T", [-2.0, -1.0]):  # the regulator alone
         a = lead_accel(v_ego, _gap_target(v_ego, t_follow) + gap_err, v_ego + v_err, 0.0, t_follow)
         self.assertAlmostEqual(a, pos_authority(v_ego) * (MOONPILOT_K_GAP * gap_err + MOONPILOT_K_V * v_err), delta=1e-9)
         self.assertLess(a, rung, "the positive side reached the cruise ladder's rung")
@@ -475,7 +502,7 @@ class TestFollowPolicy(unittest.TestCase):
     # the decay state, and the three gates that must not let it brake. At 25 m/s the ego is 1 m/s the
     # faster car at 1.2 s of headway: the floor is out of it, and the coast cushion is a third in.
     for v_ego, gap, expected in ((26.0, 30.0, -1.00), (25.0, 30.0, -0.70), (24.0, 30.0, 0.00), (23.5, 30.0, 0.30), (23.0, 28.0, 0.60)):
-      with self.subTest(v_ego=v_ego, gap=gap):
+      with self.subTest(v_ego=v_ego, gap=gap), mock.patch.object(longitudinal, "MOONPILOT_FOLLOW_ACCEL_T", [-2.0, -1.0]):  # the regulator alone
         self.assertAlmostEqual(lead_accel(v_ego, gap, v_lead, 0.0, t_follow), expected, delta=1e-9)
     # a lead that is slowing keeps the brake, however the speeds compare
     for a_lead in (-0.1, -0.5, -3.5):

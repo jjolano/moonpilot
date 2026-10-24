@@ -474,6 +474,7 @@ class TestPolicyFunctions(unittest.TestCase):
 
     # the regulator reads the acceleration credit, one-sided, and this state is the early return's —
     # the lead is faster than the ego, so there is nothing to brake for and `a_track` is the output
+    # (the follow envelope, which would hold it, has its own test)
     gap_target = max(MOONPILOT_STOP_DISTANCE, t_follow * 10.0)
     a_track_free = MOONPILOT_K_GAP * (20.0 - gap_target) + MOONPILOT_K_V * 2.0
     for a_lead, expected in (
@@ -481,7 +482,8 @@ class TestPolicyFunctions(unittest.TestCase):
       (2.0, a_track_free + MOONPILOT_K_V * MOONPILOT_LEAD_PREVIEW_T * 2.0),
       (-2.0, a_track_free),  # a braking lead adds nothing to what the car matches
     ):
-      self.assertAlmostEqual(lead_accel(10.0, 20.0, 12.0, a_lead, t_follow), expected, places=9)
+      with mock.patch("moonpilot.longitudinal.MOONPILOT_FOLLOW_ACCEL_T", [-2.0, -1.0]):
+        self.assertAlmostEqual(lead_accel(10.0, 20.0, 12.0, a_lead, t_follow), expected, places=9)
 
     # And the ordering is the safety direction at every state: the acceleration credit can only ever
     # raise the command, the braking credit can only ever lower it, and neither can cross the other.

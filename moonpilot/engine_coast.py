@@ -6,8 +6,8 @@ lamps on and off. The driver's own lift-off is -0.33 at speed with no brakes at 
 the forked Toyota carcontroller (`opendbc/car/moonpilot/engine_coast.py`) holds PERMIT_BRAKING off while
 the request stays at that engine coast, and the planner coasts to it: the brake band's thresholds shift
 down by the difference, the follow cushion targets it, a lead ask down to the approach decel is
-raised to it whenever coasting there provably keeps the floor headway until speeds match
-(`coast_budget`), and a far arrival holds speed until its ask passes 0.45 of it
+raised toward it as far as coasting there provably keeps the floor headway until speeds match
+(`coast_budget`, blended over its margin), and a far arrival holds speed until its ask passes 0.45 of it
 (`MOONPILOT_ARRIVAL_HOLD_*` in `moonpilot/longitudinal.py`). Off, or on any other car, the planner is
 bit-identical to the default.
 
@@ -21,6 +21,11 @@ from opendbc.car.moonpilot.engine_coast import ENGINE_COAST_MIN_SPEED, engine_co
 from opendbc.car.toyota.values import ToyotaFlags
 
 MOONPILOT_ENGINE_COAST_LEAD_T = 1.0  # s a lead's current braking is assumed to hold in `coast_budget`
+# The budget blends in over this much margin and fades out over this much ask past the approach decel, on the lead's
+# slow accel: as a switch on the raw estimate it stepped a steady -1.0 ask to the coast and back with the estimate's
+# noise. Flown through 57 manual decels it adds no brake pumps (`python -m moonpilot.lab driver-decel`).
+MOONPILOT_ENGINE_COAST_MARGIN = 3.0  # m
+MOONPILOT_ENGINE_COAST_ASK_FADE = 0.3  # m/s^2
 
 
 def engine_floor(CP, v_ego: float) -> float | None:
@@ -62,7 +67,10 @@ def coast_margin(v_ego, gap, v_lead, a_lead, coast, headway_t, stop_distance) ->
 
 
 def coast_budget(ask, v_ego, gap, v_lead, a_lead, coast, approach_decel, headway_t, stop_distance) -> float:
-  """A lead ask between the approach decel and the coast, raised to the coast when it provably fits."""
-  if -approach_decel <= ask < coast and coast_margin(v_ego, max(gap, 0.0), max(v_lead, 0.0), a_lead, coast, headway_t, stop_distance) >= 0.0:
-    return coast
-  return ask
+  """A lead ask down to the approach decel, raised toward the coast as far as it provably fits: whole from
+  `MOONPILOT_ENGINE_COAST_MARGIN` of margin, faded out over `MOONPILOT_ENGINE_COAST_ASK_FADE` past the approach decel."""
+  if not -approach_decel - MOONPILOT_ENGINE_COAST_ASK_FADE < ask < coast:
+    return ask
+  margin = coast_margin(v_ego, max(gap, 0.0), max(v_lead, 0.0), a_lead, coast, headway_t, stop_distance)
+  w = min(max(margin / MOONPILOT_ENGINE_COAST_MARGIN, 0.0), 1.0) * min((ask + approach_decel) / MOONPILOT_ENGINE_COAST_ASK_FADE + 1.0, 1.0)
+  return ask + w * (coast - ask)
