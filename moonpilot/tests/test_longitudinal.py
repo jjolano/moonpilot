@@ -106,9 +106,9 @@ COAST_DESCENT_PITCH = -0.1
 COAST_CLIMB_PITCH = 0.1
 COAST_SET_SPEED = 30.0
 COAST_SUBTHRESHOLD_PITCH = 0.06  # ~6 %: the latest route's moderate grade, below the high-grade gate
-# A stop behind a stopped lead aims at the floor's rest anchor and lands within its slack allowance of it, twice over for the
-# jerk-limited onset and the lag: the nearest a safe stop may rest, well clear of the 0.4 m contact bar.
-MIN_REST_GAP = MOONPILOT_STOP_REST - 2 * MOONPILOT_MIN_SLACK
+# A stop behind a stopped lead lands inside the band's rest edge, not on it: measured, 4.32 / 3.77 / 3.55 m from
+# 5 / 12 / 20 m/s, so 3.4 m is the nearest any of them rests, with a guard, and well clear of the 0.4 m contact bar.
+MIN_REST_GAP = 3.4
 
 
 def _admission(v_ego):
