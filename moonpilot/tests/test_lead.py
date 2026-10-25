@@ -41,7 +41,7 @@ from moonpilot.lead import (
   normalize_lead,
   resample,
 )
-from moonpilot.longitudinal import MOONPILOT_MIRROR_LEAD_A, MOONPILOT_OUT_OF_PATH_ENTER, MOONPILOT_OUT_OF_PATH_LEAVE
+from moonpilot.longitudinal import MOONPILOT_OUT_OF_PATH_ENTER, MOONPILOT_OUT_OF_PATH_LEAVE
 from moonpilot.tests.fakes import _params
 
 STRAIGHT_PATH_X = list(np.linspace(0.0, 60.0, 33))
@@ -261,14 +261,15 @@ class TestLeadAccelEstimator(unittest.TestCase):
     self.assertLess(float(estimates[MOONPILOT_LEAD_ACCEL_MIN_SAMPLES:].std()), 0.25)
 
   def test_the_slow_accel_ignores_a_steady_leads_noise_and_follows_a_slowing(self):
-    """`a_slow` is the lead mirror's input: on a steady radar lead with 0.05 m/s of `vLead` noise it stays where the
-    mirror adds nothing, 3 s of a -0.5 m/s^2 slowing reach it, and a new vehicle starts it from zero."""
+    """`a_slow` is the lead law's prediction input: on a steady radar lead with 0.05 m/s of `vLead` noise it stays
+    above -0.2 m/s^2, where the prediction moves the lead's speed by under 0.2 m/s, 3 s of a -0.5 m/s^2 slowing reach it,
+    and a new vehicle starts it from zero."""
     estimator, rng = LeadAccelEstimator(), np.random.default_rng(0)
     slow = []
     for _ in range(400):
       estimator.update(FusedLead(35.0, 0.0, v_lead=20.0 + rng.normal(0.0, 0.05), radar=True))
       slow.append(estimator.a_slow)
-    self.assertGreater(min(slow), MOONPILOT_MIRROR_LEAD_A[1])
+    self.assertGreater(min(slow), -0.2)
     for i in range(60):
       estimator.update(FusedLead(35.0, 0.0, v_lead=20.0 - 0.5 * i * DT_MDL, radar=True))
     self.assertLess(estimator.a_slow, -0.4)
@@ -277,7 +278,7 @@ class TestLeadAccelEstimator(unittest.TestCase):
 
   def test_the_slow_accel_recovers_from_a_non_finite_sample_on_the_same_track(self):
     """A vision lead forwards the model's `a[0]` as `aLeadK`; one NaN there must not stay in the filter for the rest of
-    the track, or every later frame's mirror ask would be NaN too."""
+    the track, or every later frame's predicted lead speed would be NaN too."""
     estimator = LeadAccelEstimator()
     for a_lead in (-0.5, float("nan"), -0.5, -0.5):
       estimator.update(FusedLead(35.0, 0.0, v_lead=20.0, a_lead=a_lead, radar=False))

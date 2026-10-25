@@ -3,7 +3,6 @@ import glob
 import math
 import os
 import sys
-from contextlib import nullcontext
 from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
@@ -455,76 +454,120 @@ def _pumps(cmd, dt=DT):
 
 
 def _fly_stages(job):
-  """`_fly_logged_lead` with the first lead ask and engine-coast budget output of each planner tick recorded."""
+  """`_fly_logged_lead` with the first lead ask of each planner tick recorded as stage 'lead'."""
   import moonpilot.longitudinal as longitudinal
   from moonpilot.lab.planner import _fly_logged_lead
-  frame, stages = {}, {"lead": [], "budget": []}
-  lead_accel, coast_budget, update = longitudinal.lead_accel, longitudinal.coast_budget, longitudinal.MoonpilotLongitudinalPlanner.update
+  frame, lead = {}, []
+  lead_accel, update = longitudinal.lead_accel, longitudinal.MoonpilotLongitudinalPlanner.update
 
-  def record(name, fn):
-    def wrapped(*a, **k):
-      out = fn(*a, **k)
-      frame.setdefault(name, out)
-      return out
-    return wrapped
+  def wrapped(*a, **k):
+    out = lead_accel(*a, **k)
+    frame.setdefault("lead", out)
+    return out
 
   def tick(self, sm):
     frame.clear()
     update(self, sm)
-    for k in stages:
-      stages[k].append(frame.get(k, frame.get("lead", math.nan)))
-  longitudinal.lead_accel, longitudinal.coast_budget = record("lead", lead_accel), record("budget", coast_budget)
+    lead.append(frame.get("lead", math.nan))
+  longitudinal.lead_accel = wrapped  # ty: ignore[invalid-assignment]  # the stage recorder, same signature
   longitudinal.MoonpilotLongitudinalPlanner.update = tick
   try:
     out = _fly_logged_lead(job)
   finally:
-    longitudinal.lead_accel, longitudinal.coast_budget, longitudinal.MoonpilotLongitudinalPlanner.update = lead_accel, coast_budget, update
-  out.update({k: np.nan_to_num(np.asarray(x, dtype=float)) for k, x in stages.items()})
+    longitudinal.lead_accel, longitudinal.MoonpilotLongitudinalPlanner.update = lead_accel, update
+  out["lead"] = np.nan_to_num(np.asarray(lead, dtype=float))
   return out
 
 
-def _decel(args):
-  """The planner flown through every manual decel a radar lead caused (`decel-peaks`' episodes): brake pumps — an ease
-  of 0.15 m/s^2 re-deepened by 0.15 within 2 s — in the lead ask, after the engine-coast budget and in the command,
-  the command's jitter about its 1 s mean, brake-band presses, the 10-16 m/s peak and the closest gap, with each of
-  this law's comfort terms off in turn; the hard brakes alongside."""
-  from unittest import mock
-  import moonpilot.longitudinal as longitudinal
-  from moonpilot.lab.planner import ROUTE_SETS, _calibration, _decel_jobs, _hard_brake_run, _pooled_manual
+def _jitter(cmd):
+  """The command's standard deviation about its own 1 s mean."""
+  return float(np.std(cmd - np.convolve(cmd, np.ones(20) / 20, mode="same")))
+
+
+def _presses(f):
+  return int(np.sum(np.diff(np.asarray(f["pressing"], dtype=int)) > 0))
+
+
+def _hard_gaps():
+  """Minimum gap of `hard-brake`'s default-calibration fork+engine flights: 20/25/30 m/s x -3.5/-5, unlagged then lagged."""
+  from moonpilot.lab.planner import _hard_brake_run
+  return [_hard_brake_run("fork+engine", v0, a, lag)[0] for lag in (False, True) for v0 in (20.0, 25.0, 30.0) for a in (-3.5, -5.0)]
+
+
+def _decel_flights(args):
+  """Every manual decel a radar lead caused (`decel-peaks`' episodes) flown through the current planner with the first lead
+  ask recorded: (flights, the driver's (onset speed, peak decel, minimum gap) rows)."""
+  from moonpilot.lab.planner import ROUTE_SETS, _calibration, _decel_jobs, _pooled_manual
   from moonpilot.lab import expand
   d = _pooled_manual(expand(["manual-approach", "0000044e", "0000044f", "00000450", "00000451"], ROUTE_SETS), args.root)
   a_s = np.concatenate([np.convolve(d["a"][d["route"] == r], np.ones(10) / 10, mode="same") for r in np.unique(d["route"])])
   jobs, drv = _decel_jobs(d, a_s)
   calibration = _calibration(args.calibration, args.root)
-  jobs = [(*job, calibration) for job in jobs]
   band = (drv[:, 0] >= 10) & (drv[:, 0] < 16)
   print(f"{len(jobs)} manual decels a radar lead caused, calibration {args.calibration}; the driver's 10-16 m/s peak {np.median(drv[band, 1]):.2f}")
-  variants = (
-    ("current", nullcontext()),
-    ("engine-coast budget off", mock.patch.object(longitudinal, "coast_budget", lambda ask, *_: ask)),
-    ("mirror off", mock.patch.object(longitudinal, "MOONPILOT_MIRROR_FADE_T", [-2.0, -1.0])),
-    ("follow envelope off", mock.patch.object(longitudinal, "MOONPILOT_FOLLOW_ACCEL_T", [-2.0, -1.0])),
-  )
-  for name, ctx in variants:
-    with ctx, ProcessPoolExecutor(6) as pool:
-      flown = list(pool.map(_fly_stages, jobs))
-    with ctx:
-      hard = [_hard_brake_run("fork+engine", v0, a, lag)[0] for lag in (False, True) for v0 in (20.0, 25.0, 30.0) for a in (-3.5, -5.0)]
-    peak = np.asarray([np.convolve(f["a"], np.ones(10) / 10, mode="same")[f["v"] > 2.0].min() for f in flown])
-    jitter = [np.std(f["cmd"] - np.convolve(f["cmd"], np.ones(20) / 20, mode="same")) for f in flown]
-    presses = sum(int(np.sum(np.diff(np.asarray(f["pressing"], dtype=int)) > 0)) for f in flown)
-    print(f"  {name:24s} pumps lead {sum(_pumps(f['lead']) for f in flown):3d} / budget {sum(_pumps(f['budget']) for f in flown):3d} / "
-          + f"command {sum(_pumps(f['cmd']) for f in flown):3d}  jitter {np.median(jitter):.3f}  presses {presses:3d}  "
-          + f"10-16 peak {np.median(peak[band]):5.2f}  closest {min(f['gap'].min() for f in flown):4.1f} m")
-    print(f"    hard-brake min gap, default calibration (20/25/30 m/s x -3.5/-5, then lagged): {' '.join(f'{g:5.1f}' for g in hard)}")
+  with ProcessPoolExecutor(6) as pool:
+    flown = list(pool.map(_fly_stages, [(*job, calibration) for job in jobs]))
+  return flown, drv
+
+
+def _decel_line(flown, drv):
+  """Brake pumps in the lead ask and in the command, the command's jitter, brake-band presses, the 10-16 m/s peak decel
+  against the driver's, and the minimum gap."""
+  band = (drv[:, 0] >= 10) & (drv[:, 0] < 16)
+  peak = np.asarray([np.convolve(f["a"], np.ones(10) / 10, mode="same")[f["v"] > 2.0].min() for f in flown])
+  gaps = np.asarray([f["gap"].min() for f in flown])
+  return (f"pumps lead {sum(_pumps(f['lead']) for f in flown):3d} / command {sum(_pumps(f['cmd']) for f in flown):3d}  "
+          + f"jitter {np.median([_jitter(f['cmd']) for f in flown]):.3f}  presses {sum(_presses(f) for f in flown):3d}  "
+          + f"10-16 peak {np.median(peak[band]):5.2f} (driver {np.median(drv[band, 1]):5.2f}), all p10 {np.percentile(peak, 10):5.2f}  "
+          + f"min gap median {np.median(gaps):4.1f} closest {gaps.min():4.1f} m")
+
+
+def _decel(args):
+  """The planner flown through every manual decel a radar lead caused (`decel-peaks`' episodes): brake pumps — an ease
+  of 0.15 m/s^2 re-deepened by 0.15 within 2 s — in the lead ask and in the command, the command's jitter about its 1 s
+  mean, brake-band presses, the 10-16 m/s peak and the closest gap; the hard brakes alongside."""
+  flown, drv = _decel_flights(args)
+  print("  " + _decel_line(flown, drv))
+  print(f"    hard-brake min gap, default calibration (20/25/30 m/s x -3.5/-5, then lagged): {' '.join(f'{g:5.1f}' for g in _hard_gaps())}")
+
+
+def _follow_stretches(d, calibration):
+  """Every 30 s of manual following behind one radar track as a flight job (set speed 3 m/s over the driver's highest), and the
+  driver's own stretch: (jobs, rows of accel p90, p99, bursts, median headway, closest gap, accel p1)."""
+  v, gap, v_lead = d["v"], d["gap"], d["v_lead"]
+  win, jobs, drv = round(30.0 / DT), [], []
+  cut = np.r_[True, (np.diff(d["route_id"]) != 0) | (np.abs(np.diff(v_lead)) > 2.5)]
+  for r in runs((d["manual"] > 0) & (d["lead"] > 0) & (d["lead_radar"] > 0) & (v > 4.0) & ~cut):
+    for s0 in range(r.start, r.stop - win + 1, win):
+      w = slice(s0, s0 + win)
+      if np.max(np.abs(np.diff(gap[w]) - (v_lead[w][:-1] - v[w][:-1]) * DT)) > 1.0 or gap[w].max() > 9.0 * max(v[w].min(), 1.0):
+        continue
+      jobs.append((v[w], gap[w], v_lead[w], d["a"][w][0], calibration, (v[w].max() + 3.0) * 3.6))
+      a_s = np.convolve(d["a"][w], np.ones(10) / 10, mode="same")
+      drv.append((np.percentile(a_s, 90), np.percentile(a_s, 99), _bursts(a_s), np.median(gap[w] / np.maximum(v[w], 0.1)), gap[w].min(), np.percentile(a_s, 1)))
+  return jobs, np.asarray(drv)
+
+
+def _stretch_rows(flown):
+  """`_follow_stretches`' driver columns for flights, then the command's jitter and the brake-band presses."""
+  return np.asarray([(np.percentile(f["a"], 90), np.percentile(f["a"], 99), _bursts(f["a"]), np.median(f["gap"] / np.maximum(f["v"], 0.1)), f["gap"].min(),
+                      np.percentile(f["a"], 1), _jitter(f["cmd"]), _presses(f)) for f in flown])
+
+
+def _follow_line(name, rows, minutes):
+  """Medians over stretches of accel p90 / p99 / p1, bursts per minute, headway (p10, p90 over stretches), closest gap; flights add jitter and presses."""
+  line = (f"  {name:8s} p90/p99/p1 {np.median(rows[:, 0]):5.2f}/{np.median(rows[:, 1]):5.2f}/{np.median(rows[:, 5]):5.2f}  "
+          + f"bursts {rows[:, 2].sum() / minutes:5.2f}/min  hw {np.median(rows[:, 3]):4.2f} s (p10 {np.percentile(rows[:, 3], 10):4.2f} "
+          + f"p90 {np.percentile(rows[:, 3], 90):4.2f})  closest {rows[:, 4].min():4.1f} m")
+  if rows.shape[1] > 6:
+    line += f"  jitter {np.median(rows[:, 6]):.3f}  presses {rows[:, 7].sum() / minutes:4.2f}/min"
+  return line
 
 
 def _follow(args):
   """The driver's accel behind a lead, by headway, lead-minus-ego speed and lead accel; its p50/p75 envelope on the
   lead's speed excess and slow accel; then the planner flown through every 30 s of manual following behind one radar
-  track (set speed 3 m/s over the driver's highest), the follow envelope off and on, against the driver's own stretch."""
-  from unittest import mock
-  import moonpilot.longitudinal as longitudinal
+  track (set speed 3 m/s over the driver's highest), against the driver's own stretch."""
   from moonpilot.lab.planner import _calibration, _fly_logged_lead
   d = _load(args.root, ("t", "manual", "v", "a", "lead", "lead_radar", "gap", "v_lead", "a_lead", "a_slow"))
   v, gap, v_lead, a_next = d["v"], d["gap"], d["v_lead"], d["a_next"]
@@ -546,31 +589,60 @@ def _follow(args):
       c0, kdv, ka = _pinball_fit(a_next[idx], np.clip(rel[idx], 0, 6), np.clip(d["a_slow"][idx], 0, 3), q)
       print(f"  q{q:.2f} at {vlo}-{vhi} m/s, hw < 6 s: a = {c0:+.3f} + {kdv:.2f} * dv+ + {ka:.2f} * a_slow+  (n {m.sum()})")
 
-  win, jobs, drv = round(30.0 / DT), [], []
-  cut = np.r_[True, (np.diff(d["route_id"]) != 0) | (np.abs(np.diff(v_lead)) > 2.5)]
-  calibration = _calibration(args.calibration, args.root)
-  for r in runs((d["manual"] > 0) & (d["lead"] > 0) & (d["lead_radar"] > 0) & (v > 4.0) & ~cut):
-    for s0 in range(r.start, r.stop - win + 1, win):
-      w = slice(s0, s0 + win)
-      if np.max(np.abs(np.diff(gap[w]) - (v_lead[w][:-1] - v[w][:-1]) * DT)) > 1.0 or gap[w].max() > 9.0 * max(v[w].min(), 1.0):
-        continue
-      jobs.append((v[w], gap[w], v_lead[w], d["a"][w][0], calibration, (v[w].max() + 3.0) * 3.6))
-      a_s = np.convolve(d["a"][w], np.ones(10) / 10, mode="same")
-      drv.append((np.percentile(a_s, 90), np.percentile(a_s, 99), _bursts(a_s), np.median(gap[w] / np.maximum(v[w], 0.1)), gap[w].min(), np.percentile(a_s, 1)))
-  drv = np.asarray(drv)
+  jobs, drv = _follow_stretches(d, _calibration(args.calibration, args.root))
   minutes = len(jobs) * 30.0 / 60
   print(f"\nFlown through {len(jobs)} stretches ({minutes:.0f} min) of manual following, calibration {args.calibration}: accel p90 / p99 / p1 (median "
         + "over stretches), positive bursts per minute (a rise of 0.4 m/s^2 in 1 s ending over +0.3), median headway, closest gap")
-  print(f"  driver:        {np.median(drv[:, 0]):5.2f} / {np.median(drv[:, 1]):5.2f} / {np.median(drv[:, 5]):5.2f}  "
-        + f"bursts {drv[:, 2].sum() / minutes:5.2f}/min  headway {np.median(drv[:, 3]):4.2f} s  closest {drv[:, 4].min():4.1f} m")
-  off = mock.patch.object(longitudinal, "MOONPILOT_FOLLOW_ACCEL_T", [-2.0, -1.0])  # gone at every headway
-  for name, ctx in (("envelope off", off), ("envelope on", nullcontext())):
-    with ctx, ProcessPoolExecutor(6) as pool:
-      flown = list(pool.map(_fly_logged_lead, jobs))
-    pl = np.asarray([(np.percentile(f["a"], 90), np.percentile(f["a"], 99), _bursts(f["a"]), np.median(f["gap"] / np.maximum(f["v"], 0.1)), f["gap"].min(),
-                      np.percentile(f["a"], 1)) for f in flown])
-    print(f"  {name:13s}: {np.median(pl[:, 0]):5.2f} / {np.median(pl[:, 1]):5.2f} / {np.median(pl[:, 5]):5.2f}  bursts {pl[:, 2].sum() / minutes:5.2f}/min  "
-          + f"headway {np.median(pl[:, 3]):4.2f} s  closest {pl[:, 4].min():4.1f} m")
+  print(_follow_line("driver", drv, minutes))
+  with ProcessPoolExecutor(6) as pool:
+    flown = list(pool.map(_fly_logged_lead, jobs))
+  print(_follow_line("planner", _stretch_rows(flown), minutes))
+
+
+def _synthetic():
+  """Synthetic flights through the lagged plant (`_fly_lagged`), clean and with radar noise on three seeds."""
+  from moonpilot.lab.planner import _fly_lagged
+  scenarios = {  # (v0, set kph, gap0, v_lead0, lead accel (t, v_lead), seconds)
+    "closing 16->11.7 @119m": (16.0, 58.0, 119.0, 11.7, lambda t, v: 0.0, 60.0),
+    "far slow 12->3 @80m": (12.0, 43.2, 80.0, 3.0, lambda t, v: 0.0, 60.0),
+    "stopped lead 20 @120m": (20.0, 72.0, 120.0, 0.0, lambda t, v: 0.0, 40.0),
+    "launch behind lead": (0.0, 60.0, 6.0, 0.0, lambda t, v: 1.5 if v < 15.0 else 0.0, 30.0),
+    "lead -1.5 to 8 @22m 15": (15.0, 70.0, 22.0, 15.0, lambda t, v: -1.5 if (t > 3.0 and v > 8.0) else 0.0, 30.0),
+  }
+  for name, s in scenarios.items():
+    r, noisy = _fly_lagged(*s), [_fly_lagged(*s, seed=k) for k in range(3)]
+    jerk = np.abs(np.diff(r["cmd"])) / 0.05
+    print(f"  {name:24s} peak {r['cmd'].min():5.2f} max {r['cmd'].max():5.2f}  min gap {r['gap'].min():5.1f} end gap {r['gap'][-1]:5.1f} "
+          + f"end dv {r['v'][-1] - r['v_lead'][-1]:+5.2f}  jerk p95 {np.percentile(jerk, 95):4.2f}  "
+          + f"noisy pumps {sum(_pumps(x['cmd']) for x in noisy)} jitter {np.mean([_jitter(x['cmd']) for x in noisy]):.3f}")
+
+
+def _intent(args):
+  """The claims of the lead law's intent design, flown through the current planner: manual following, manual lead-caused
+  decels, hard brakes, continuity at zero closing, and synthetic scenarios with and without radar noise."""
+  from moonpilot.lab.planner import _calibration, _fly_logged_lead
+  from moonpilot.longitudinal import lead_accel
+  d = _load(args.root, ("t", "manual", "v", "a", "lead", "lead_radar", "gap", "v_lead"))
+  jobs, drv = _follow_stretches(d, _calibration(args.calibration, args.root))
+  minutes = len(jobs) * 30.0 / 60
+  print(f"(a) {len(jobs)} stretches ({minutes:.0f} min) of manual following, calibration {args.calibration}: accel p90 / p99 / p1 (median over "
+        + "stretches), positive bursts per minute, median headway, closest gap, command jitter about its 1 s mean, brake-band presses per minute")
+  print(_follow_line("driver", drv, minutes))
+  with ProcessPoolExecutor(6) as pool:
+    flown = list(pool.map(_fly_logged_lead, jobs))
+  print(_follow_line("planner", _stretch_rows(flown), minutes))
+
+  print("\n(b) manual decels a radar lead caused:")
+  flown, drv = _decel_flights(args)
+  print("  planner " + _decel_line(flown, drv))
+
+  print("\n(c) hard-brake min gap, fork+engine (20/25/30 m/s x -3.5/-5 m/s^2, unlagged then lagged): " + " ".join(f"{g:5.1f}" for g in _hard_gaps()))
+
+  step = max(abs(np.diff([lead_accel(15.0, 60.0, 15.0 + dv, 0.0, 1.45, a_slow=1.0) for dv in np.linspace(-0.05, 0.05, 101)])))
+  print(f"\n(d) zero-closing sweep (closing -0.05..+0.05 m/s in 101 steps): max |step| {step:.3f} m/s^2")
+
+  print("\n(e) synthetic flights, clean (peak, max, gaps, dv, jerk) and over 3 radar-noise seeds (pumps summed, jitter mean):")
+  _synthetic()
 
 
 def register(sub):
@@ -582,3 +654,6 @@ def register(sub):
   parser = sub.add_parser("driver-decel", help="brake pumps, jitter and presses of the planner flown through the driver's lead-caused decels")
   parser.add_argument("--calibration", default="00000451", help="drive whose recorded lag and radar latency seed the flights")
   parser.set_defaults(fn=_decel)
+  parser = sub.add_parser("intent", help="the lead law's claims: manual following, lead-caused decels, hard brakes, continuity, synthetic flights")
+  parser.add_argument("--calibration", default="00000451", help="drive whose recorded lag and radar latency seed the flights")
+  parser.set_defaults(fn=_intent)

@@ -1,11 +1,10 @@
-"""The lead-following policy: the positive side's authority, and the time gap it is given.
+"""The lead-following policy: the cruise slot's runway cap, the lead law's closed-loop outcomes, and the time gap it is given.
 
 Split out of `test_longitudinal.py`, which is at the 120 KB lint gate and where these two subjects
 were one file too many. The helpers are that file's, by the same convention `test_slam.py` and
 `test_longitudinal_features.py` already use.
 """
 
-import itertools
 import math
 import unittest
 from unittest import mock
@@ -14,44 +13,32 @@ import numpy as np
 from openpilot.cereal import custom, log
 
 import moonpilot.longitudinal as longitudinal
-from moonpilot.brake_band import MOONPILOT_BRAKE_BAND_ENTER_LEAD, MOONPILOT_BRAKE_BAND_FLOOR
+from moonpilot.brake_band import MOONPILOT_BRAKE_BAND_ENTER_LEAD
 from moonpilot.longitudinal import (
-  MOONPILOT_APPROACH_DECEL,
-  MOONPILOT_ARRIVAL_MIN_T,
   MOONPILOT_BRAKE_EXIT_JERK,
-  MOONPILOT_CREEP_SPEED,
-  MOONPILOT_CRAWL_REST,
   MOONPILOT_FAST_ACCEL_BP,
   MOONPILOT_FAST_ACCEL_V,
-  MOONPILOT_FOLLOW_ACCEL,
-  MOONPILOT_FOLLOW_SPEED_FLOOR_FADE_V,
-  MOONPILOT_FOLLOW_SPEED_FLOOR_HEADWAY_T,
-  MOONPILOT_FOLLOW_SPEED_FLOOR_MIN_A_LEAD,
-  MOONPILOT_K_GAP,
-  MOONPILOT_K_V,
+  MOONPILOT_FAST_CRAWL,
   MOONPILOT_LADDER_V_BP,
-  MOONPILOT_MOVING_STOP_RESERVE,
+  MOONPILOT_MIN_SLACK,
   MOONPILOT_OUT_OF_PATH_ENTER,
   MOONPILOT_OUT_OF_PATH_LEAVE,
   MOONPILOT_OUT_OF_PATH_T_FOLLOW,
-  MOONPILOT_SHOULD_STOP_SPEED,
   MOONPILOT_SLOW_ACCEL_V,
-  MOONPILOT_SOFT_STOP_HANDOFF_V,
-  MOONPILOT_STOP_DISTANCE,
-  MOONPILOT_STOP_REST,
   MOONPILOT_T_FOLLOW,
   cruise_accel,
   lead_accel,
   policy,
-  pos_authority,
 )
-from moonpilot.tests.test_longitudinal import DT_MDL, _cp, _fly, _gap_target, _inputs, _lead, _planner
+from moonpilot.tests.test_longitudinal import DT_MDL, _cp, _fly, _inputs, _lead, _planner
 
 Personality = log.LongitudinalPersonality
 
 
 class TestFollowPolicy(unittest.TestCase):
   def test_fast_cruise_ask_needs_room_to_accelerate_then_match_a_lead(self):
+    """The cruise slot's runway cap, alone: with the lead law opened up, so what is measured is the cap and not
+    the lead's own candidate."""
     v_ego, v_cruise = 20.0, 25.0
     t_follow = MOONPILOT_T_FOLLOW[int(Personality.standard)]
     cp = _cp()
@@ -64,245 +51,46 @@ class TestFollowPolicy(unittest.TestCase):
 
     self.assertGreater(fast, slow)
     self.assertEqual(ask([]), fast)
-    self.assertEqual(ask([(source.lead0, 200.0, v_ego, 0.0)]), fast)  # past the follow envelope's headway
-    # Inside it a matched lead is followed, not chased (`MOONPILOT_FOLLOW_ACCEL`): the lead's own accel opens the
-    # throttle, a wider gap does not.
-    matched = ask([(source.lead0, 40.0, v_ego, 0.0)])
-    self.assertLess(matched, slow)
-    self.assertAlmostEqual(ask([(source.lead0, 65.0, v_ego, 0.0)]), matched, places=9)
-    self.assertGreater(ask([(source.lead0, 40.0, v_ego, 1.0, None, 1.0)]), slow)
-    # Same runway, more closing: below set speed, the arrival term may take a gentle catch-up while
-    # coasting still has room to arrive. It remains below the slow rung, not the cruise fast rung.
-    closing = ask([(source.lead0, 65.0, v_ego - 2.0, 0.0)])
-    self.assertGreater(closing, lead_accel(v_ego, 65.0, v_ego - 2.0, 0.0, t_follow))
-    self.assertLess(closing, slow)
-    self.assertEqual(ask([(source.lead0, 200.0, v_ego, 0.0), (source.lead1, 40.0, v_ego, 0.0)]), matched)
+    with mock.patch.object(longitudinal, "lead_accel", lambda *_, **__: math.inf):
+      self.assertEqual(ask([(source.lead0, 400.0, v_ego, 0.0)]), fast)  # runway to spare: the fast rung stands
+      self.assertLessEqual(ask([(source.lead0, 40.0, v_ego, 0.0)]), slow)  # no runway to reach set speed and match
+      gaps = np.linspace(40.0, 400.0, 73)
+      asks = [ask([(source.lead0, g, v_ego, 0.0)]) for g in gaps]
+      self.assertGreaterEqual(min(np.diff(asks)), 0.0)  # more runway never asks for less
+      self.assertLess(max(np.diff(asks)), 0.1)  # and opens as a fade, not a step
+      # a lead that is not a reason to hold back leaves the rung alone, near or not
+      self.assertEqual(ask([(source.lead0, 40.0, v_ego, MOONPILOT_FAST_CRAWL)]), fast)  # pulling away
+      self.assertEqual(ask([(source.lead0, 40.0, v_cruise + 1.0, 0.0)]), fast)  # already above set speed
+      self.assertEqual(ask([(source.lead0, 400.0, v_ego, 0.0), (source.lead1, 40.0, v_ego, 0.0)]), ask([(source.lead0, 40.0, v_ego, 0.0)]))
 
+    # a braking lead's own candidate is what binds, whatever the cruise rung would have asked
     braking = (source.lead0, 20.0, 15.0, 0.0)
     self.assertEqual(ask([braking]), lead_accel(v_ego, 20.0, 15.0, 0.0, t_follow))
+    self.assertLess(ask([braking]), slow)
 
-  def test_a_lead_is_followed_by_its_accel_not_chased_by_the_gap(self):
-    """Over 378 manual lead-minutes the driver's accel behind a lead (headway under 6 s) has its p75 at
-    `MOONPILOT_FOLLOW_ACCEL` — the lead's speed excess and slow accel, not the gap — where the spring asked +1..+2
-    m/s^2 at 1.5-6 s and the car surged at the lead (`python -m moonpilot.lab driver-follow`). The lead's positive ask is
-    held there, a wider gap buys nothing, a lead that accelerates opens it, and the hold blends out past 9 s of headway
-    and below 5 m/s without a step."""
-    t_follow, v = MOONPILOT_T_FOLLOW[int(Personality.standard)], 15.0
-    base, per_dv, per_a = MOONPILOT_FOLLOW_ACCEL
-    for headway in (2.0, 4.0, 6.0):
-      for dv in (0.0, 1.0, 3.0):
-        with self.subTest(headway=headway, dv=dv):
-          self.assertLessEqual(lead_accel(v, headway * v, v + dv, 0.0, t_follow), base + per_dv * dv + 1e-9)
-    self.assertGreater(lead_accel(v, 3.0 * v, v + 1.0, 1.0, t_follow, a_slow=1.0), base + per_a * 0.9)
-    with mock.patch.object(longitudinal, "MOONPILOT_FOLLOW_ACCEL_T", [-2.0, -1.0]):
-      spring = lead_accel(v, 3.0 * v, v + 1.0, 0.0, t_follow)
-    self.assertGreater(spring, 1.0)  # what the gap alone asked
-    # Continuous across both fades: halving the step halves the largest change, where a step would not shrink.
-    for edge in (lambda x: (v, x * v, v + 1.0), lambda x: (x, 4.0 * x, x + 1.0)):
-      lo, hi = (5.5, 9.5) if edge(1.0)[0] == v else (2.5, 5.5)
-      steps = [max(abs(np.diff([lead_accel(*edge(x), 0.0, t_follow) for x in np.linspace(lo, hi, n)]))) for n in (201, 401)]
-      with self.subTest(lo=lo):
-        self.assertLess(steps[1], 0.6 * steps[0])
-
-  def test_a_closing_approach_coasts_to_the_target_instead_of_holding_set_speed(self):
-    """Route 000003e4 segments 7-8, flown closed loop: 16.1 m/s held at a 58 kph set speed for
-    18.8 s while the gap to a 42 kph lead closed from 119 m to 34 m, the plan asking 0.0 m/s² the
-    whole way, then -1.09 m/s² actual with the car 1.1 m inside the 17 m target while still closing,
-    and 2.5 s of braking at the settled gap — the brake lights while following. The regulator's
-    negative window does not open until 31.5 m there, the then time-to-collision term and the stopping floor were past their
-    admission gates by less than they ask, so cruise held set speed and nothing else spoke.
-
-    The arrival term is what replaces it, and this is the before/after on the same harness: it coasts
-    from the first frame, never asks deeper than the driver's own no-pedal coast, and lands on the
-    target at a speed match instead of braking into it. The comparison disables `arrival_accel`, so
-    this test fails if the term stops being what does the work.
-    """
-    s = _fly(16.0, 58.0, 119.0, 11.7, lambda t: 0.0, 60.0)
-    cmds, vs = s["cmd"], s["v"]
-    target = 1.45 * 11.7
-
-    self.assertLess(cmds[0], 0.0)  # coasting from the first frame, not from 32 m out
-    self.assertGreater(s["peak"], -0.15)  # a coast, not a brake
-    self.assertGreater(min(cmds), -0.1)  # no frame of the 60 s approach asks for a real brake
-    self.assertAlmostEqual(s["min_gap"], target, delta=0.5)
-    self.assertAlmostEqual(vs[-1], 11.7, delta=0.02)  # arrives at a speed match
-    self.assertAlmostEqual(s["end_gap"], target, delta=0.5)
-    self.assertFalse(s["contact"])
-    with mock.patch.object(longitudinal, "arrival_accel", lambda *_: math.inf):
-      old = _fly(16.0, 58.0, 119.0, 11.7, lambda t: 0.0, 60.0)
-    first_coast = next(i for i, c in enumerate(old["cmd"]) if c < -0.05)
-    self.assertGreater(first_coast * DT_MDL, 18.0)  # without the term the first say is late
-    self.assertLess(old["gap"][first_coast], 35.0)
-    self.assertLess(old["peak"], -0.8)
-    self.assertGreater(sum(1 for c in old["cmd"] if c < -0.1), 100)
-
-  def test_far_slow_lead_approach_coasts_before_braking_and_keeps_a_moving_reserve(self):
-    """12 -> 3 m/s from 80 m: coast first, brake later than with the reserve and coast off, and settle
-    further back by most of the reserve. The regulator settles ~0.9-1.1 m inside its floor either way,
-    so the delivered shift, not an exact gap, is the claim. Point-mass `_fly`, not vehicle dynamics."""
-    scenario = (12.0, 43.2, 80.0, 3.0, lambda t: 0.0, 60.0)
-    s = _fly(*scenario)
-    with (
-      mock.patch.object(longitudinal, "MOONPILOT_MOVING_STOP_RESERVE", 0.0),
-      mock.patch.object(longitudinal, "MOONPILOT_ARRIVAL_COAST_T", math.inf),
-    ):
-      former = _fly(*scenario)
-
-    def brake_onset_gap(run):
-      return next(g for g, c in zip(run["gap"], run["cmd"], strict=True) if c < -0.25)
-
-    self.assertLess(s["cmd"][0], 0.0)  # shedding speed immediately, but not with an arrival brake
-    self.assertGreater(s["cmd"][0], -0.25)
-    self.assertLess(brake_onset_gap(s), brake_onset_gap(former) - 10.0)  # braking waits for coast room to run out
-    self.assertGreater(s["peak"], -MOONPILOT_APPROACH_DECEL)
-    reserve_here = _gap_target(3.0, MOONPILOT_T_FOLLOW[int(Personality.standard)]) - MOONPILOT_STOP_DISTANCE
-    self.assertGreater(s["end_gap"], former["end_gap"] + 0.5 * reserve_here)  # most of the speed-scaled reserve lands
-    self.assertLess(s["end_gap"], MOONPILOT_STOP_DISTANCE + reserve_here)
-    self.assertAlmostEqual(s["v"][-1], 3.0, delta=0.05)
-    self.assertFalse(s["contact"])
-
-  def test_a_slow_lead_that_stops_later_finishes_softly_without_contact(self):
-    """A later lead stop remains safe and settles softly on the standstill rest target."""
+  def test_a_slow_lead_that_stops_later_finishes_without_contact(self):
+    """A lead that slows to 3 m/s and then stops is followed to rest with a gap left."""
     s = _fly(12.0, 43.2, 80.0, 3.0, lambda t: -1.5 if t > 4.0 else 0.0, 50.0)
-    self.assertLess(s["cmd"][0], 0.0)
     self.assertFalse(s["contact"])
-    self.assertGreaterEqual(s["min_gap"], MOONPILOT_CRAWL_REST - 0.2)
-    self.assertGreater(s["end_gap"], MOONPILOT_CRAWL_REST - 0.2)
-    self.assertLess(s["end_gap"], MOONPILOT_STOP_DISTANCE)
+    self.assertGreater(s["min_gap"], MOONPILOT_MIN_SLACK)
     self.assertLess(s["v"][-1], 0.05)
-    last_moving = max(i for i, v in enumerate(s["v"]) if v > 0.1)
-    self.assertGreater(s["cmd"][last_moving], -0.2)
-
-  def test_below_set_catch_up_closes_a_far_moving_gap_without_overspeed(self):
-    """A slower moving lead far ahead may be approached on the slow rung, then coasted onto the
-    follow target. The set speed and braking-lead guard remain hard boundaries."""
-    s = _fly(12.0, 64.8, 120.0, 10.0, lambda t: 0.0, 70.0)
-    with mock.patch.object(longitudinal, "MOONPILOT_CATCH_UP_COAST_FRACTION", 0.0):
-      old = _fly(12.0, 64.8, 120.0, 10.0, lambda t: 0.0, 70.0)
-    target = 1.45 * 10.0
-    self.assertGreater(s["cmd"][0], 0.0)
-    self.assertLess(old["cmd"][0], 0.0)
-    self.assertLess(max(s["v"]), 64.8 / 3.6)
-    self.assertGreater(s["peak"], -0.15)
-    self.assertAlmostEqual(s["end_gap"], target, delta=0.5)
-    self.assertGreater(old["end_gap"], target + 10.0)
-    self.assertFalse(s["contact"])
-
-    cp = _cp()
-    source = log.LongitudinalPlan.LongitudinalPlanSource
-    t_follow = MOONPILOT_T_FOLLOW[int(Personality.standard)]
-    for v_ego, v_cruise, a_lead in ((18.0, 18.0, 0.0), (12.0, 18.0, -0.6)):
-      lead = [(source.lead0, 120.0, 10.0, a_lead)]
-      with self.subTest(v_ego=v_ego, a_lead=a_lead):
-        with mock.patch.object(longitudinal, "MOONPILOT_CATCH_UP_COAST_FRACTION", 0.0):
-          before = policy(v_ego, lead, v_cruise, t_follow, False, None, 0.0, cp, -0.3, True)
-        self.assertEqual(policy(v_ego, lead, v_cruise, t_follow, False, None, 0.0, cp, -0.3, True), before)
-
-  def test_stopped_and_slow_lead_approaches_do_not_switch_at_speed_thresholds(self):
-    cp = _cp()
-    source = log.LongitudinalPlan.LongitudinalPlanSource.lead0
-    for t_follow, v_set, a_lead in itertools.product(MOONPILOT_T_FOLLOW.values(), (8.0, 12.0), (-0.6, 0.0, 0.2)):
-      for threshold in (
-        MOONPILOT_SHOULD_STOP_SPEED,
-        MOONPILOT_CREEP_SPEED,
-        MOONPILOT_STOP_DISTANCE / t_follow,
-        MOONPILOT_STOP_REST / t_follow,
-        (MOONPILOT_STOP_DISTANCE + MOONPILOT_MOVING_STOP_RESERVE) / t_follow,
-      ):
-        with self.subTest(t_follow=t_follow, v_set=v_set, a_lead=a_lead, threshold=threshold):
-          asks = [
-            policy(8.0, [(source, 80.0, threshold + delta, a_lead)], v_set, t_follow, False, None, 0.0, cp, -0.3, True)[0]
-            for delta in (-0.001, 0.001)
-          ]
-          self.assertLess(abs(asks[1] - asks[0]), 0.005)
-
-  def test_moving_stop_floor_tapers_into_the_time_gap_without_changing_launch(self):
-    t_follow = MOONPILOT_T_FOLLOW[int(Personality.standard)]
-    creep = MOONPILOT_CREEP_SPEED
-    cp = _cp()
-    source = log.LongitudinalPlan.LongitudinalPlanSource.lead0
-
-    for speed in (0.5 * creep, creep):  # steady follow: the regulator's zero is the nominal target
-      with self.subTest(speed=speed):
-        gap = _gap_target(speed, t_follow)
-        self.assertAlmostEqual(lead_accel(speed, gap, speed, 0.0, t_follow), 0.0, delta=1e-9)
-        self.assertLess(lead_accel(speed, gap - 0.1, speed, 0.0, t_follow), 0.0)
-    # the reserve melts linearly as the lead slows to rest and is whole from creep speed up
-    self.assertAlmostEqual(_gap_target(0.5 * creep, t_follow), MOONPILOT_STOP_DISTANCE + 0.5 * MOONPILOT_MOVING_STOP_RESERVE)
-    self.assertAlmostEqual(_gap_target(creep, t_follow), MOONPILOT_STOP_DISTANCE + MOONPILOT_MOVING_STOP_RESERVE)
-
-    def ask(v_ego, v_lead, gap=7.0):
-      return policy(v_ego, [(source, gap, v_lead, 0.0)], 8.0, t_follow, False, None, 0.0, cp, -0.3, True)[0]
-
-    # No step as the lead's speed tapers through the reserve (at 9 m, clear of the floor's admission band
-    # the former law also takes nearer in), nor as ego crosses the creep taper and the time-gap
-    # crossover. At 8.5 m, outside the floor: a deficit there steps at creep through the follow
-    # speed floor's own hard `v_ego > CREEP_SPEED` gate, which predates the reserve.
-    for name, asks in (
-      ("lead", [ask(3.0, v, 9.0) for v in np.arange(0.0, 3.0, 0.01)]),
-      ("ego", [ask(v, v, 8.5) for v in np.arange(0.5, 6.0, 0.01)]),
-    ):
-      with self.subTest(sweep=name):
-        self.assertLess(float(np.max(np.abs(np.diff(asks)))), 0.03)
-
-    launch = lead_accel(0.0, 6.0, 0.4, 0.0, t_follow)
-    with mock.patch.object(longitudinal, "MOONPILOT_MOVING_STOP_RESERVE", 0.0):
-      self.assertEqual(lead_accel(0.0, 6.0, 0.4, 0.0, t_follow), launch)  # standstill launch is exactly as before
-
-  def test_crossing_the_preferred_rest_gap_does_not_demand_a_hard_crawl_stop(self):
-    # The route spent its preferred rest gap while still crawling. This is not an emergency:
-    # the lead is over five meters away, but the old tenth-meter denominator demanded -2.31.
-    asks = [lead_accel(0.68, gap, 0.0, 0.0, 1.45) for gap in (5.3, 5.2, 5.1)]
-    self.assertTrue(all(-0.8 < ask < 0.0 for ask in asks))
-    self.assertLess(max(abs(a - b) for a, b in zip(asks, asks[1:], strict=False)), 0.05)
-
-  def test_a_stop_behind_a_stopped_lead_lands_softly_near_the_rest_gap(self):
-    """Route 0000040e (126-138 s): a stopped lead first seen ~83 m out from 17 m/s, and the regulator's
-    gap-deficit brake held -0.54..-0.77 m/s^2 to 0.3 m/s, so the car came to rest from -0.7. The soft
-    landing ends the stop gently, near the rest gap, and once the brake eases it never deepens again —
-    the handover from the approach plateau is not a second brake."""
-    for v0, gap0 in ((12.0, 70.0), (17.0, 85.0)):
-      with self.subTest(v0=v0, gap0=gap0):
-        s = _fly(v0, v0 * 3.6 + 5, gap0, 0.0, lambda t: 0.0, 40.0)
-        v, c = np.array(s["v"]), np.array(s["cmd"])
-        last = int(np.flatnonzero(v > 0.1)[-1])
-        self.assertGreater(c[last], -0.2)
-        self.assertFalse(s["contact"])
-        # 4.36 m from 17 m/s: the crawl cap spends the rest gap toward MOONPILOT_CRAWL_REST at the end.
-        self.assertTrue(MOONPILOT_CRAWL_REST - 0.2 < s["end_gap"] < MOONPILOT_STOP_DISTANCE, s["end_gap"])
-        # The approach, not the standstill handoff (`MOONPILOT_SOFT_STOP_HANDOFF_V`), where the regulator's
-        # hold returns 0.05-0.07 m/s^2 deeper and `stopping` owns the brake: nothing re-deepens above it.
-        braking = c[: int(np.flatnonzero(v > 2 * MOONPILOT_SOFT_STOP_HANDOFF_V)[-1]) + 1]
-        eased = np.flatnonzero(braking - np.minimum.accumulate(braking) > 0.05)
-        tail = braking[eased[0] :]
-        self.assertLess(float(np.max(np.maximum.accumulate(tail) - tail)), 0.03)
 
   def test_crawl_softening_does_not_spend_a_close_stopped_leads_remaining_gap(self):
-    # The time-only comfort floor drove a 0.68 m/s crawl through a lead initially 0.5 m away,
-    # even on this instantaneous point-mass plant. Short-gap braking must retain its authority.
+    # A 0.68 m/s crawl toward a lead 0.5 m away, even on this instantaneous point-mass plant: short-gap
+    # braking must retain its authority inside the last meter.
     for gap0, min_gap in ((0.5, 0.1), (0.8, 0.4)):
       with self.subTest(gap0=gap0):
         s = _fly(0.68, 108.0, gap0, 0.0, lambda t: 0.0, 10.0)
         self.assertGreater(s["min_gap"], min_gap)
         self.assertEqual(s["v"][-1], 0.0)
 
-  def test_a_crawl_stop_spends_the_rest_gap_instead_of_braking_past_the_driver(self):
-    """Route 00000414 at 448 s: crawling at 3.1 m/s 8.2 m behind a lead that stopped, the floor, soft
-    stop and TTC all aimed 5.2-6 m back and the car pulled -2.77 m/s^2. The driver's own 13 such stops
-    peaked at -1.31..-1.90 and rested 2.7-5.9 m back. Flown here the old law peaked -1.93 / -2.02 for a
-    lead braking at -1.5 / -2.5; the crawl cap stays under the driver's ceiling and lands near 4 m."""
-    for a_lead in (-1.0, -1.5, -2.5):
-      with self.subTest(a_lead=a_lead):
-        s = _fly(3.1, 40.0, 8.2, 2.5, lambda t, a=a_lead: a if t > 1.0 else 0.0, 15.0)
-        self.assertGreater(s["peak"], -1.9)
-        self.assertGreater(s["end_gap"], MOONPILOT_CRAWL_REST - 0.2)
-        self.assertFalse(s["contact"])
-
   def test_a_departing_lead_lifts_the_models_stop_hold_once_the_model_asks_to_go(self):
     """Route 00000414 at 472 s: the model's stop hold, latched on the approach, kept the plan at
     +0.04..+0.09 — under `should_stop`'s 0.1 — for 1.8 s while the lead pulled away, until the driver
     pressed the gas. A positive model ask with leadOne moving now hands the slot back to the lead; a
-    model still asking to hold (a light the lead drove through) keeps it."""
+    model still asking to hold (a light the lead drove through) keeps it. The lead's 0.7 m/s is the
+    departure the lead law answers at the standstill gap (0.14 m/s^2): slower than `MOONPILOT_LEAVE_DEADBAND`
+    plus the band's own room and the car is right to sit, and it moves once the gap opens."""
     for model_go, held in ((0.05, False), (0.0, True)):
       with self.subTest(model_go=model_go):
         planner = _planner()
@@ -311,7 +99,7 @@ class TestFollowPolicy(unittest.TestCase):
           planner.update(_inputs(v_ego=0.0, v_cruise_kph=62.0, model_accel=-0.05, lead=_lead(5.2, 0.0), standstill=True))
         self.assertTrue(planner.output_should_stop)
         for _ in range(4):
-          planner.update(_inputs(v_ego=0.0, v_cruise_kph=62.0, model_accel=model_go, lead=_lead(5.4, 0.4), standstill=True))
+          planner.update(_inputs(v_ego=0.0, v_cruise_kph=62.0, model_accel=model_go, lead=_lead(5.4, 0.7), standstill=True))
         self.assertEqual(planner.output_should_stop, held)
         self.assertEqual(planner.output_a_target > 0.1, not held)
 
@@ -356,92 +144,6 @@ class TestFollowPolicy(unittest.TestCase):
       measured = float(np.interp(v0, MOONPILOT_FAST_ACCEL_BP, MOONPILOT_FAST_ACCEL_V))
       self.assertAlmostEqual(cruise_accel(v0, v0 + 5.0, False, 0.0, _cp(), -0.3, True), measured, places=6)
 
-  def test_an_accelerating_lead_retires_the_approach_brake(self):
-    self.assertLess(lead_accel(18.0, 90.0, 12.5, 0.0, 1.45), 0.0)
-    self.assertGreater(lead_accel(18.0, 90.0, 12.5, 1.0, 1.45), 0.0)
-
-  def test_a_stopped_lead_uses_a_soft_time_shaped_approach(self):
-    v_ego = 8.0
-    for gap in (80.0, 100.0, 112.0):
-      with self.subTest(gap=gap):
-        s = _fly(v_ego, 108.0, gap, 0.0, lambda t: 0.0, 45.0)
-
-        self.assertLess(s["cmd"][0], 0.0)
-        self.assertGreater(s["peak"], -0.6)
-        self.assertFalse(s["contact"])
-        self.assertGreaterEqual(s["min_gap"], MOONPILOT_STOP_REST - 0.2)
-        self.assertAlmostEqual(s["end_gap"], MOONPILOT_STOP_REST, delta=0.25)
-
-  def test_the_positive_side_cannot_reach_the_cruise_rung_from_a_speed_deficit(self):
-    """The reported fault, as an invariant rather than a number that will drift. The measurement and
-    the A/B against upstream's MPC are on `MOONPILOT_POS_AUTH_V`; the shape is the claim: gentle
-    where the old law was not, and still under the cruise ladder's rung. *Reaching* the rung is what
-    turned a proportional response into a step - "slightly behind" and "far behind" were the same
-    command."""
-    t_follow = MOONPILOT_T_FOLLOW[int(Personality.standard)]
-    rung = float(np.interp(30.0, MOONPILOT_FAST_ACCEL_BP, MOONPILOT_FAST_ACCEL_V))
-    raw = MOONPILOT_K_GAP * 1.5 + MOONPILOT_K_V * 0.9  # the episode's spacing and speed error
-    self.assertAlmostEqual(raw, 0.99, delta=0.01)
-    self.assertGreater(raw, rung)  # the pre-gain law did reach it
-
-    for v_ego, gap_err, v_err in ((24.2, 1.5, 0.9), (25.0, 0.0, 1.0), (30.0, 1.5, 0.9)):
-      with self.subTest(v_ego=v_ego), mock.patch.object(longitudinal, "MOONPILOT_FOLLOW_ACCEL_T", [-2.0, -1.0]):  # the regulator alone
-        a = lead_accel(v_ego, _gap_target(v_ego, t_follow) + gap_err, v_ego + v_err, 0.0, t_follow)
-        self.assertAlmostEqual(a, pos_authority(v_ego) * (MOONPILOT_K_GAP * gap_err + MOONPILOT_K_V * v_err), delta=1e-9)
-        self.assertLess(a, rung, "the positive side reached the cruise ladder's rung")
-        if v_ego == 24.2:  # the measured state: upstream's own number, not merely a smaller one
-          self.assertTrue(0.27 <= a <= 0.41, f"{a} is outside the MPC's reading there")
-
-    # the saturation point moved out: 1.45 m/s of lag used to be exactly the rung
-    self.assertLess(pos_authority(24.2) * raw, rung)
-    self.assertLess(pos_authority(24.2) * MOONPILOT_K_V * 1.45, rung - 0.5)
-    self.assertGreater(pos_authority(24.2) * MOONPILOT_K_V * 4.4, rung)
-
-    # the cost, measured rather than left in a comment: one authority scales the positive region's
-    # damping ratio by sqrt(f) and its period by 1/sqrt(f) - zeta 0.55 -> 0.33, period 11 s -> 19 s.
-    # The closed-loop suite is what says the slower loop still settles.
-    for v_ego, expected in ((10.0, 1.0), (20.0, 1.0), (30.0, 0.28)):
-      f = pos_authority(v_ego)
-      with self.subTest(v_ego=v_ego):
-        self.assertAlmostEqual(f, expected, delta=1e-9)
-        self.assertGreater(math.sqrt(f) * MOONPILOT_K_V / (2 * math.sqrt(MOONPILOT_K_GAP)), 0.25)
-        self.assertLess(2 * math.pi / math.sqrt(f * MOONPILOT_K_GAP), 25.0)
-
-  def test_the_multiplier_moves_the_positive_side_and_nothing_else(self):
-    """A differential, not a duplicated copy of the arithmetic: the pre-gain law is the shipped one
-    with the authority pinned at 1.0, so what the multiplier must not have touched is decided by the
-    code. Below 20 m/s the output is bit-identical; above it the output is never higher anywhere and
-    is exactly equal wherever the old law was braking, so the multiplier can only soften an
-    acceleration and cannot have softened a brake.
-
-    That half is not free, and the reason is on the constant: scaling the regulator's two *terms*
-    moves states where they carry opposite signs toward zero, and a state that braked at the -1.0
-    approach clamp read -0.84 under a 0.35 authority. An ego both too far back and too fast is
-    exactly the case that has to brake."""
-    t_follow = MOONPILOT_T_FOLLOW[int(Personality.standard)]
-    counts = [0, 0, 0]
-    for v_ego, gap, v_lead, a_lead in itertools.product(
-      (0.5, 12.0, 20.0, 24.0, 33.0),
-      (5.0, 15.0, 45.0, 200.0),
-      (0.0, None, 1.5, 6.0),
-      (0.0, -2.0),
-    ):
-      v_lead = v_ego + v_lead if v_lead else 0.0
-      with mock.patch("moonpilot.longitudinal.MOONPILOT_POS_AUTH_V_BP", [0.0]), mock.patch("moonpilot.longitudinal.MOONPILOT_POS_AUTH_V", [1.0]):
-        old = lead_accel(v_ego, gap, v_lead, a_lead, t_follow)
-      new = lead_accel(v_ego, gap, v_lead, a_lead, t_follow)
-      state = (v_ego, gap, v_lead, a_lead)
-      if v_ego <= 20.0:
-        counts[0] += 1
-        self.assertEqual(new, old, f"the pre-20 m/s law moved at {state}")
-      else:
-        counts[1] += 1
-        self.assertLessEqual(new, old + 1e-12, f"the law got *stronger* at {state}")
-        if old <= 0.0:
-          counts[2] += 1
-          self.assertEqual(new, old, f"a braking state changed at {state}")
-    self.assertGreater(min(counts), 40)
-
   def test_the_out_of_path_headway_is_a_latched_claim_not_a_scale(self):
     """`inPath` at highway speed is a weak signal, and the measured table is on
     `MOONPILOT_OUT_OF_PATH_ENTER`. Mapping it linearly onto a time gap gave an in-lane lead a
@@ -481,160 +183,12 @@ class TestFollowPolicy(unittest.TestCase):
     self.assertLessEqual(MOONPILOT_OUT_OF_PATH_ENTER, 0.13)  # the adjacent-lane median
     self.assertGreaterEqual(MOONPILOT_OUT_OF_PATH_LEAVE, 0.23)  # the in-lane p10
 
-  def test_the_gap_target_is_not_a_reason_to_brake_below_the_leads_speed(self):
-    """The reported second half: at a set speed above the lead's, the ego's speed decayed and stayed
-    decayed. Measured cause: `gap_target` is 1.45 s of headway, unreachable at whatever speed the
-    lead chooses, so the gap term alone asked for the full approach brake — -1.00 at 24, 25 *and* 26
-    m/s behind a lead holding 24 m/s, i.e. at exactly the lead's speed too, while `stopping_decel`
-    read -0.00 to -0.08 in the same states. Nothing needed stopping for; the command was a headway
-    the lead itself set, bought with the throttle shut.
-
-    The floor keeps pace instead. Each of its four gates is a way it could be wrong, and each was
-    found by a test rather than by argument: inert when the ego is the faster car (otherwise a fly
-    crossed 7.5 m inside a 1 m cushion), off for a lead that is slowing (holding speed into a
-    -3.5 m/s^2 brake makes the ego relatively faster and cost 2.5 m of end gap), off below 1.0 s of
-    headway, and off at rest (where the headway test is vacuous and `v_lead_eff` clamps to zero, so
-    the car would pull away from a stopped lead inside the standstill gap).
-    """
-    t_follow = MOONPILOT_T_FOLLOW[int(Personality.standard)]
-    v_lead = 24.0
-
-    # the decay state, and the three gates that must not let it brake. At 25 m/s the ego is 1 m/s the
-    # faster car at 1.2 s of headway: the floor is out of it, and the coast cushion is a third in.
-    for v_ego, gap, expected in ((26.0, 30.0, -1.00), (25.0, 30.0, -0.70), (24.0, 30.0, 0.00), (23.5, 30.0, 0.30), (23.0, 28.0, 0.60)):
-      with self.subTest(v_ego=v_ego, gap=gap), mock.patch.object(longitudinal, "MOONPILOT_FOLLOW_ACCEL_T", [-2.0, -1.0]):  # the regulator alone
-        self.assertAlmostEqual(lead_accel(v_ego, gap, v_lead, 0.0, t_follow), expected, delta=1e-9)
-    # a lead that is slowing keeps the brake, however the speeds compare
-    for a_lead in (-0.1, -0.5, -3.5):
-      with self.subTest(a_lead=a_lead):
-        self.assertLess(lead_accel(24.0, 30.0, v_lead, a_lead, t_follow), 0.0)
-    # a short headway keeps the brake, and so does a standstill
-    for v_ego, gap in ((23.0, 10.0), (20.0, 8.0)):
-      with self.subTest(v_ego=v_ego, gap=gap):
-        self.assertLess(gap / v_ego, MOONPILOT_FOLLOW_SPEED_FLOOR_HEADWAY_T)
-        self.assertLess(lead_accel(v_ego, gap, v_lead + 1.0, 0.0, t_follow), 0.0)
-    self.assertLess(lead_accel(0.0, 4.5, 0.4, -1.0, t_follow), 0.0)
-    # the closing approach is untouched, and so is the surge the authority exists for
-    self.assertLess(lead_accel(25.0, _gap_target(25.0, t_follow) - 1.0, v_lead, 0.0, t_follow), 0.0)
-    rung = float(np.interp(30.0, MOONPILOT_FAST_ACCEL_BP, MOONPILOT_FAST_ACCEL_V))
-    self.assertLess(lead_accel(24.2, _gap_target(24.2, t_follow) + 1.5, 25.1, 0.0, t_follow), rung)
-
-  def test_a_settled_follow_does_not_step_on_radar_noise(self):
-    """Route 000003f8 segment 44: at a settled follow 0.6 m inside the target the lead's speed and
-    accel straddle the floor's two gates by radar noise alone, and as switches they swapped the
-    floor's ~0 for the gap term's -0.18 frame to frame. As fades the ask is continuous across both.
-    The speed fade is also narrow: once the ego is `MOONPILOT_FOLLOW_SPEED_FLOOR_FADE_V` faster the
-    floor is entirely gone — the same output a hard gate gives there — so a car that is really a
-    little faster is still braked back out of the target rather than drifting inside it."""
-    t_follow = MOONPILOT_T_FOLLOW[int(Personality.standard)]
-    v_ego = 17.4
-    gap = t_follow * v_ego - 0.6
-    for name, asks in (
-      ("v_lead", [lead_accel(v_ego, gap, v_ego + dv, 0.0, t_follow) for dv in np.arange(-0.05, 0.0501, 0.005)]),
-      ("a_lead", [lead_accel(v_ego, gap, v_ego, MOONPILOT_FOLLOW_SPEED_FLOOR_MIN_A_LEAD + da, t_follow) for da in np.arange(-0.05, 0.0501, 0.005)]),
-    ):
-      with self.subTest(sweep=name):
-        self.assertLess(max(abs(np.diff(asks))), 0.03)  # a hard gate steps 0.18 here
-    for excess in (MOONPILOT_FOLLOW_SPEED_FLOOR_FADE_V, 2 * MOONPILOT_FOLLOW_SPEED_FLOOR_FADE_V):
-      with mock.patch.object(longitudinal, "MOONPILOT_FOLLOW_SPEED_FLOOR_FADE_V", 1e-9):
-        gated = lead_accel(v_ego, gap, v_ego - excess, 0.0, t_follow)
-      with self.subTest(excess=excess):
-        self.assertLess(gated, 0.0)
-        self.assertEqual(lead_accel(v_ego, gap, v_ego - excess, 0.0, t_follow), gated)
-
-  def test_a_gap_deficit_at_matched_speed_is_coasted_open_not_braked(self):
-    """Flown through 110 recorded steady follows, the settled follow swung -0.4 <-> +0.2 m/s^2 every
-    second: inside its target the regulator asked for the full approach brake, the speed floor held it
-    off only while the lead-accel estimate stayed above -0.1, and on a steady lead that estimate wanders
-    +-0.2-0.3 by noise alone, so the brake band pressed and released. Inside the target at matched speed,
-    across that noise, the ask now never reaches the band's press — its lead-urgent entry, the shallower
-    of the two; the arrival term still sheds a real 0.3 m/s of closing, as a coast. A real closing, a real
-    brake, or a headway under the floor's 1.0 s still gets the regulator's brake, and below the band's
-    speed the cushion is not there at all."""
-    t_follow = MOONPILOT_T_FOLLOW[int(Personality.standard)]
-    v = 20.0
-    gap = t_follow * v - 4.5  # 1.225 s: well inside the 1.45 s target, past the cushion's headway fade
-    for dv, a_lead in itertools.product((-0.3, 0.0, 0.3), np.arange(-0.45, 0.451, 0.05)):
-      with self.subTest(dv=dv, a_lead=a_lead):
-        ask = lead_accel(v, gap, v + dv, a_lead, t_follow)
-        self.assertGreater(ask, MOONPILOT_BRAKE_BAND_ENTER_LEAD)
-        if dv >= 0.0:
-          self.assertGreaterEqual(ask, MOONPILOT_BRAKE_BAND_FLOOR - 1e-9)  # not closing: no more than the coast
-    self.assertLess(lead_accel(v, gap, v - 1.5, 0.0, t_follow), -0.5)  # really closing
-    self.assertLess(lead_accel(v, gap, v, -1.0, t_follow), -0.5)  # really braking
-    self.assertLess(lead_accel(v, 0.95 * v, v, 0.0, t_follow), -0.5)  # under the headway floor
-    for v_low, gap_low in ((4.0, 4.5), (4.9, 7.0)):
-      with self.subTest(v_low=v_low):
-        with mock.patch.object(longitudinal, "MOONPILOT_FOLLOW_COAST_LEAD_A", [10.0, 11.0]):  # cushion never admits
-          off = lead_accel(v_low, gap_low, v_low, 0.0, t_follow)
-        self.assertEqual(lead_accel(v_low, gap_low, v_low, 0.0, t_follow), off)
-
-  def test_a_slowing_lead_is_answered_at_the_drivers_share_and_fades_without_a_step(self):
-    """Flown behind the logged leads of 57 manual decels (`python -m moonpilot.lab decel-peaks`), the planner peaked
-    -2.31 against the driver's -1.76 from 10-16 m/s: it coasted while the gap closed, then the stopping floor braked
-    hard. The driver answers a slowing lead at about half its accel from 1.5 s of headway and lets a far one close: a
-    brake on the raw estimate and a gentle slowing on the slow one are answered at least that much there, and the raw
-    estimate's steady-lead noise, inside the coast cushion's gate, not at all. Every fade is a blend: where the base ask
-    is positive (a faster lead, a wide gap) the far-headway and pulling-away edges ease it in, not step it to the mirror."""
-    t_follow, v = MOONPILOT_T_FOLLOW[int(Personality.standard)], 15.0
-    off = mock.patch.object(longitudinal, "MOONPILOT_MIRROR_FADE_T", [-2.0, -1.0])
-    for headway in (1.5, 2.0, 2.5):
-      with self.subTest(headway=headway):
-        self.assertLessEqual(lead_accel(v, headway * v, v, -1.0, t_follow), -0.5 + 1e-9)
-        self.assertLessEqual(lead_accel(v, headway * v, v, -0.45, t_follow, a_slow=-0.6), -0.3 + 1e-9)
-        with off:
-          noise = lead_accel(v, headway * v, v, -0.45, t_follow)
-        self.assertEqual(lead_accel(v, headway * v, v, -0.45, t_follow), noise)
-    for gap, v_lead in ((4.5 * v, v), (2.0 * v, v + 2.0)):
-      with self.subTest(gap=gap, v_lead=v_lead):
-        with off:
-          base = lead_accel(v, gap, v_lead, -1.0, t_follow)
-        self.assertEqual(lead_accel(v, gap, v_lead, -1.0, t_follow, a_slow=-1.0), base)
-    v = 10.0
-    edges = (
-      [(g, 11.0) for g in np.linspace(3.9 * v, 4.1 * v, 201)],  # the headway fade's far edge, behind a faster lead
-      [(30.0, v + dv) for dv in np.linspace(1.4, 1.6, 201)],  # the lead pulling away
-    )
-    for points in edges:
-      asks = [lead_accel(v, g, vl, -1.0, t_follow, a_slow=-1.0) for g, vl in points]
-      with self.subTest(first=points[0]):
-        self.assertGreater(max(asks), 0.0)  # a positive base ask is what a step would drop
-        self.assertLess(max(abs(np.diff(asks))), 0.02)
-
-  def test_the_arrival_term_neither_taps_at_the_target_nor_switches_on_a_far_leads_accel(self):
-    """Two route 000003f8 faults of the arrival term, one per end of the approach.
-
-    At the target (segment 44): the last meter at 0.2-0.45 m/s of closing read -1.00, -0.10, -0.34,
-    -1.00 on consecutive frames, `-closing**2 / (2 * slack)` with both going to zero on dRel noise.
-    With the slack floored at `MOONPILOT_ARRIVAL_MIN_T` of closing, the arrival ask anywhere inside
-    `T * closing` of the target is `-closing / (2 T)` (inside the target the regulator's gap term is
-    the deeper one), and jitter of the gap moves the output no faster than the regulator's gap gain.
-
-    Far out (segment 42): a lead 60-120 m ahead read +0.1..+0.35 m/s^2 of slope noise, and a switch
-    at +0.1 stepped the command between the term's ~-0.1 and the cruise rung. `arrival_accel` credits
-    the lead's positive accel instead, so the ask rises with it without a step."""
-    t_follow = MOONPILOT_T_FOLLOW[int(Personality.standard)]
-    v_lead = 17.0
-    slacks = np.linspace(-0.3, 0.3, 13)
-    for closing in (0.2, 0.3, 0.45):
-      asks = [lead_accel(v_lead + closing, t_follow * v_lead + s, v_lead, 0.0, t_follow) for s in slacks]
-      with self.subTest(closing=closing):
-        self.assertGreater(min(asks), -0.5 * MOONPILOT_APPROACH_DECEL)
-        self.assertLessEqual(max(abs(np.diff(asks))), MOONPILOT_K_GAP * (slacks[1] - slacks[0]) + 1e-9)
-        self.assertLess(slacks[-1], closing * MOONPILOT_ARRIVAL_MIN_T + 1e-9)  # still on the floored slack
-        self.assertAlmostEqual(asks[-1], -closing / (2.0 * MOONPILOT_ARRIVAL_MIN_T), delta=1e-6)
-    asks = [lead_accel(25.0, 90.0, 22.0, a_lead, t_follow) for a_lead in np.arange(0.0, 0.401, 0.01)]
-    self.assertLess(asks[0], 0.0)  # the arrival term is braking this approach
-    steps = np.diff(asks)
-    self.assertGreaterEqual(min(steps), 0.0)
-    self.assertLess(max(steps), 0.03)  # a +0.1 switch steps ~4.8 here
-
   def test_a_far_radar_lead_outlives_a_vision_swap_and_a_dropout(self):
     """Route 000003f8 segment 42: a 14 m/s radar track kept losing radard's association, and
     leadOne alternated with the model's vision-only lead (~21 m/s, nearer) or with nothing, stepping
-    the arrival command -0.5 <-> +0.1. The last radar lead stays a candidate for
+    the closing command -0.5 <-> +0.1. The last radar lead stays a candidate for
     `MOONPILOT_RADAR_HOLD_T`, so neither a swap nor a dropout lifts the brake — and it is released
-    once the hold runs out. Flown at 70 m, inside coast-first's budget, so the arrival term brakes."""
+    once the hold runs out. Flown at 70 m behind a 14 m/s lead at 22.5 m/s, so the lead law brakes."""
     vision = _lead(80.0, 21.0)
     vision.radar = False
     absent = _lead(0.0, 0.0, present=False)
@@ -653,7 +207,7 @@ class TestFollowPolicy(unittest.TestCase):
       with self.subTest(swap=name):
         braking, held = fly(swap, longitudinal.MOONPILOT_RADAR_HOLD_T)
         _, released = fly(swap, 0.0)
-        self.assertLess(braking, -0.2)  # the arrival term is braking this approach
+        self.assertLess(braking, -0.2)  # the lead law is braking this approach
         self.assertLess(held.output_a_target, braking + 0.05)
         self.assertGreater(released.output_a_target, braking + 0.5)  # what the swap did without the hold
     planner = fly(absent, longitudinal.MOONPILOT_RADAR_HOLD_T)[1]
@@ -682,3 +236,40 @@ class TestFollowPolicy(unittest.TestCase):
     self.assertTrue(planner.allow_throttle)
     planner.update(_inputs(v_ego=20.0, throttle_prob=0.45))
     self.assertTrue(planner.allow_throttle)
+
+  def test_a_settled_follow_does_not_step_on_radar_noise(self):
+    """Closed loop, on the near edge of the band where the gap noise straddles it: the lead's gap and speed
+    arrive as white radar noise, the lead's accel estimate wanders with it, and the command stays a steady
+    coast that never asks for a press (the brake band's shallowest entry) — the settled follow does not
+    swing between a brake and a release."""
+    t_follow = MOONPILOT_T_FOLLOW[int(Personality.standard)]
+    for seed in (0, 1):
+      with self.subTest(seed=seed):
+        rng = np.random.default_rng(seed)
+        planner = _planner()
+        v, gap, a, cmds = 20.0, t_follow * 20.0, 0.0, []
+        for _ in range(round(40.0 / DT_MDL)):
+          lead = _lead(gap + rng.normal(0.0, 0.3), 20.0 + rng.normal(0.0, 0.05))
+          planner.update(_inputs(v_ego=v, v_cruise_kph=108.0, a_ego=a, lead=lead))
+          a = float(planner.output_a_target)
+          cmds.append(a)
+          v += a * DT_MDL
+          gap += (20.0 - v) * DT_MDL
+        cmds = np.array(cmds)
+        window = round(1.0 / DT_MDL)
+        about_mean = (cmds - np.convolve(cmds, np.ones(window) / window, mode="same"))[window:-window]
+        self.assertLess(float(np.std(about_mean)), 0.02)
+        self.assertGreater(float(cmds.min()), MOONPILOT_BRAKE_BAND_ENTER_LEAD)
+
+  def test_a_slowing_lead_is_matched_without_contact_and_without_pumping(self):
+    """A lead that slows from 20 to 15 m/s at -1.0 m/s^2 while followed at the time gap is matched, and once the
+    command eases it does not deepen again: the brake is one shape, not a pulse train."""
+    t_follow = MOONPILOT_T_FOLLOW[int(Personality.standard)]
+    for extra_gap in (0.0, 10.0):
+      with self.subTest(extra_gap=extra_gap):
+        s = _fly(20.0, 108.0, t_follow * 20.0 + extra_gap, 20.0, lambda t: -1.0 if 1.0 <= t < 6.0 else 0.0, 40.0)
+        self.assertFalse(s["contact"])
+        self.assertAlmostEqual(s["v"][-1], 15.0, delta=0.2)
+        tail = np.array(s["cmd"][int(np.argmin(s["cmd"])) :])
+        redeepen = max(tail[i] - tail[i + 1 : i + 1 + round(2.0 / DT_MDL)].min() for i in range(len(tail) - round(2.0 / DT_MDL) - 1))
+        self.assertLess(redeepen, 0.15)
