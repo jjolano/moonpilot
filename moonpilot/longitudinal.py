@@ -378,11 +378,11 @@ MOONPILOT_MODEL_BRAKE_THRESHOLD = -0.5  # m/s^2; outside experimental mode the m
 # exactly experimental mode's stop contract: held while the model's ask is under 0.1.
 MOONPILOT_MODEL_STOP_SPEED = 5.0  # m/s
 MOONPILOT_MODEL_STOP_RELEASE = 0.1  # m/s^2; `should_stop`'s threshold
-# Behind a lead the release sits shallower than the -0.5 entry, so an ask dithering on the entry cannot cycle the slot:
-# replayed through six engaged drives the slot's own state ran 24 times (13 under 2 s, 8 re-admitted within 2 s) and
-# runs 18 (6 under 2 s, 1 re-admission) with the separation, holding a shallow ask 9.2 s against 1.8 s. It is gated on
-# the lead because on a clear road the same separation is a ratchet against the cruise term, where the band is held
-# 1.1 s either way.
+# Behind a lead the release sits shallower than the -0.5 entry, so an ask dithering on the entry cannot cycle the slot.
+# Replayed through six engaged drives, the slot's own state: entry=release 24 runs (13 under 2 s, 8 re-admitted within
+# 2 s), lead-gated -0.25 18 runs (6 under 2 s, 1 re-admission), holding a shallow ask 9.2 s against 1.8 s. It is gated
+# on the lead because on a clear road the same separation is a ratchet against the cruise term: -0.25 everywhere holds
+# the [ -0.5, -0.25] band 2.3 s on a clear road against 1.1 s, and a settled -0.3 ask would hold it indefinitely.
 MOONPILOT_MODEL_BRAKE_RELEASE = -0.25  # m/s^2; an admitted model gives the slot back above this
 MOONPILOT_MODEL_BRAKE_FADE_T = 0.5  # s; an admitted model ask blends in from the other candidates over this
 MOONPILOT_MODEL_BRAKE_FULL = -2.0  # m/s^2; an ask this deep goes in whole at once, and shallower ones in proportion
@@ -757,7 +757,9 @@ def model_release(v_ego, lead_present: bool = False) -> float:
   18, 6 and 1 with the separation), and the lead law governs the command anyway. On a clear road the same
   separation would be a one-way ratchet against the cruise term — a model that once crossed the entry and then settled
   at -0.3 would hold the car below the set speed for as long as it stayed there, which is exactly what the deadband
-  exists to prevent."""
+  exists to prevent; unguarded, the band is held 2.3 s on a clear road against 1.1 s gated. Reading `lead_present` raw
+  adds a release path, a lead dropout flipping the threshold back: measured, 0 of 12 slot releases on three drives
+  happened with the ask in the band and no lead, so it needs no latch."""
   held = MOONPILOT_MODEL_BRAKE_RELEASE if lead_present else MOONPILOT_MODEL_BRAKE_THRESHOLD
   return float(np.interp(v_ego, [MOONPILOT_CREEP_SPEED, MOONPILOT_MODEL_STOP_SPEED], [MOONPILOT_MODEL_STOP_RELEASE, held]))
 

@@ -1975,14 +1975,20 @@ class TestModelBraking(unittest.TestCase):
         for _ in range(frames):
           planner.update(_inputs(v_ego=20.0, v_cruise_kph=108.0, model_accel=ask, lead=lead if with_lead else None))
       return planner
-    held = run(((-1.5, 20), (-0.4, 80)), with_lead=True)
+    # The baseline is the same scene with a model that never braked: whatever the slot does, the command it gives
+    # back has to be exactly that, and a held slot may only ever be deeper than it (the model is additive).
+    lead_baseline = run(((0.0, 100),), with_lead=True)
+    clear_baseline = run(((0.0, 100),), with_lead=False)
+    held = run((((-1.5, 20), (-0.4, 80))), with_lead=True)
     self.assertTrue(held.model_braking)  # the shallow ask keeps the slot behind a lead
+    self.assertLessEqual(held.output_a_target, lead_baseline.output_a_target + 1e-12)
     clear = run(((-1.5, 20), (-0.4, 80)), with_lead=False)
     self.assertFalse(clear.model_braking)  # and gives it back on a clear road
-    # With the slot released the clear road matches a model that never braked: no ratchet below the set speed.
-    self.assertAlmostEqual(clear.output_a_target, self._run(model_accel=-0.4).output_a_target, delta=1e-12)
+    # With the slot released both scenes match the model that never braked: no ratchet below the set speed.
+    self.assertAlmostEqual(clear.output_a_target, clear_baseline.output_a_target, delta=1e-12)
     released = run(((-1.5, 20), (-0.2, 80)), with_lead=True)
     self.assertFalse(released.model_braking)
+    self.assertAlmostEqual(released.output_a_target, lead_baseline.output_a_target, delta=1e-12)
 
   def test_the_feature_row_matches_the_params_default(self):
     feature = next(f for f in FEATURES if f.key == "MoonpilotModelBraking")
