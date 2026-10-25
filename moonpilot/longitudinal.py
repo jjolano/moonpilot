@@ -378,6 +378,11 @@ MOONPILOT_MODEL_BRAKE_THRESHOLD = -0.5  # m/s^2; outside experimental mode the m
 # exactly experimental mode's stop contract: held while the model's ask is under 0.1.
 MOONPILOT_MODEL_STOP_SPEED = 5.0  # m/s
 MOONPILOT_MODEL_STOP_RELEASE = 0.1  # m/s^2; `should_stop`'s threshold
+# The release sits shallower than the -0.5 entry, so an ask dithering on the entry threshold cannot cycle the slot.
+# Measured over 717 s of engaged lead-following (6 routes): 21 admissions, 12 of them under 2 s, 8 re-admitted within
+# 2 s of a release, and the command swung a median 0.167 m/s^2 (p90 0.303) across that cycle — an ease and re-brake
+# from the model alone, since `model_release` returned the entry threshold at speed.
+MOONPILOT_MODEL_BRAKE_RELEASE = -0.25  # m/s^2; an admitted model gives the slot back above this
 MOONPILOT_MODEL_BRAKE_FADE_T = 0.5  # s; an admitted model ask blends in from the other candidates over this
 MOONPILOT_MODEL_BRAKE_FULL = -2.0  # m/s^2; an ask this deep goes in whole at once, and shallower ones in proportion
 MOONPILOT_MODEL_STOP_ENTER_SPEED = 1.5  # m/s
@@ -743,9 +748,10 @@ def model_candidate(model, e2e, allowed, threshold=MOONPILOT_MODEL_BRAKE_THRESHO
 
 
 def model_release(v_ego) -> float:
-  """The ask an admitted model has to rise past to give its slot back: the entry deadband at speed,
-  `should_stop`'s 0.1 in the crawl band, so the model holds a stop it is finishing until it asks to go."""
-  return float(np.interp(v_ego, [MOONPILOT_CREEP_SPEED, MOONPILOT_MODEL_STOP_SPEED], [MOONPILOT_MODEL_STOP_RELEASE, MOONPILOT_MODEL_BRAKE_THRESHOLD]))
+  """The ask an admitted model has to rise past to give its slot back: `MOONPILOT_MODEL_BRAKE_RELEASE` at speed, a
+  quarter of an m/s^2 shallower than the entry deadband so the slot cannot cycle on it, and `should_stop`'s 0.1 in the
+  crawl band, so the model holds a stop it is finishing until it asks to go."""
+  return float(np.interp(v_ego, [MOONPILOT_CREEP_SPEED, MOONPILOT_MODEL_STOP_SPEED], [MOONPILOT_MODEL_STOP_RELEASE, MOONPILOT_MODEL_BRAKE_RELEASE]))
 
 
 def policy(

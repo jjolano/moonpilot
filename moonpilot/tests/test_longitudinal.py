@@ -68,6 +68,7 @@ from moonpilot.longitudinal import (
   MOONPILOT_LADDER_V_BP,
   MOONPILOT_LEAD_PREVIEW_T,
   MOONPILOT_MIN_SLACK,
+  MOONPILOT_MODEL_BRAKE_RELEASE,
   MOONPILOT_MODEL_BRAKE_THRESHOLD,
   MOONPILOT_MODEL_STOP_RELEASE,
   MOONPILOT_MODEL_STOP_SPEED,
@@ -1954,18 +1955,28 @@ class TestModelBraking(unittest.TestCase):
     self.assertFalse(planner.output_should_stop)
     self.assertEqual(planner.source, Source.cruise)
 
-  def test_the_hold_on_the_slot_is_a_low_speed_hysteresis_only(self):
-    """At speed the release is the entry deadband itself, so a model that braked and then relaxed to
-    -0.4 hands back to cruise exactly as a model that never braked — no ratchet below the set speed."""
-    self.assertEqual(model_release(MOONPILOT_MODEL_STOP_SPEED), MOONPILOT_MODEL_BRAKE_THRESHOLD)
+  def test_the_slot_holds_a_shallow_model_ask_and_releases_above_it(self):
+    """The release sits shallower than the entry deadband (`MOONPILOT_MODEL_BRAKE_RELEASE` −0.25 against entry −0.5),
+    so an ask relaxing back toward the entry cannot cycle the slot: over 717 s of engaged lead-following the old
+    equal-threshold release gave 12 admissions under 2 s and 8 re-admissions within 2 s of a release, a median
+    0.167 m/s^2 of ease-and-re-brake from the model alone. Relaxing to −0.4 keeps the slot and the command follows;
+    relaxing past −0.25 hands back to cruise exactly as a model that never braked."""
+    self.assertEqual(model_release(MOONPILOT_MODEL_STOP_SPEED), MOONPILOT_MODEL_BRAKE_RELEASE)
+    self.assertGreater(MOONPILOT_MODEL_BRAKE_RELEASE, MOONPILOT_MODEL_BRAKE_THRESHOLD)
     self.assertEqual(model_release(0.0), MOONPILOT_MODEL_STOP_RELEASE)
     braked = _planner()
     # 80 frames: the brake-exit ramp (`MOONPILOT_BRAKE_EXIT_JERK`) has to finish before the two meet.
     for ask, frames in ((-1.5, 20), (-0.4, 80)):
       for _ in range(frames):
         braked.update(_inputs(v_ego=20.0, v_cruise_kph=108.0, model_accel=ask))
-    self.assertEqual(braked.source, Source.cruise)
-    self.assertAlmostEqual(braked.output_a_target, self._run(model_accel=-0.4).output_a_target, delta=1e-12)
+    self.assertEqual(braked.source, Source.e2e)  # the shallow ask keeps the slot
+    self.assertAlmostEqual(braked.output_a_target, -0.4, delta=1e-6)  # float32 through the plan
+    released = _planner()
+    for ask, frames in ((-1.5, 20), (-0.2, 80)):
+      for _ in range(frames):
+        released.update(_inputs(v_ego=20.0, v_cruise_kph=108.0, model_accel=ask))
+    self.assertEqual(released.source, Source.cruise)
+    self.assertAlmostEqual(released.output_a_target, self._run(model_accel=-0.4).output_a_target, delta=1e-12)
 
   def test_the_feature_row_matches_the_params_default(self):
     feature = next(f for f in FEATURES if f.key == "MoonpilotModelBraking")
