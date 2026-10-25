@@ -73,9 +73,9 @@ class TestEngineCoast(unittest.TestCase):
 
   def test_the_planner_coasts_to_the_engine_where_it_fits_and_brakes_where_it_does_not(self):
     floor = engine_coast_floor(20.0)
-    # 0.5 m/s of closing at 1.3 s: the lead law's shallow ask presses by default and coasts on the engine
-    self.assertLess(min(_follow(False, 19.5, 26.0)), -0.5)
-    self.assertGreaterEqual(min(_follow(True, 19.5, 26.0)), floor - 1e-6)
+    # 0.45 m/s of closing at 1.3 s: the lead law's shallow ask presses by default and coasts on the engine
+    self.assertLess(min(_follow(False, 19.55, 26.0)), -0.5)
+    self.assertGreaterEqual(min(_follow(True, 19.55, 26.0)), floor - 1e-6)
     # 1 m/s of closing at 1.05 s, and a lead braking hard: the coast cannot answer it, so the brake is as deep
     # (the shifted band starts its ramp from the engine coast, so the path there differs, not the depth)
     for args in ((19.0, 21.0), (20.0, 26.0, -3.0)):

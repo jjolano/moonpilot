@@ -1155,12 +1155,14 @@ class TestPlanner(unittest.TestCase):
     to a crawl the car settles inside the band rather than hanging back beyond it, matching its speed to within
     0.05 m/s: the headway is not bought by shedding speed.
     """
-    s = _fly(17.0, 61.2, 90.0, 17.0, lambda t: -3.5 if 2 <= t < 5 else 0.0, 70.0)
+    s = _fly(17.0, 61.2, 90.0, 17.0, lambda t: -3.5 if 2 <= t < 5 else 0.0, 140.0)
     self.assertTrue(any((v - vl) > 0.0 and 4.0 <= (g - MOONPILOT_STOP_DISTANCE) / (v - vl) <= 7.0 for v, vl, g in zip(s["v"], s["vl"], s["gap"], strict=False)))
     self.assertGreater(s["min_gap"], MOONPILOT_STOP_DISTANCE + 1.0)  # clear of the standstill floor
     near = max(MOONPILOT_STOP_REST, MOONPILOT_T_FOLLOW[int(Personality.standard)] * s["vl"][-1])
+    # The catch-up closes at MOONPILOT_CATCH_UP_CLOSING, so the settle takes ~2 min from the slack; the flight
+    # runs long enough to land inside the band, which is the claim.
     self.assertGreaterEqual(s["end_gap"], near)  # never inside the band's near edge
-    self.assertLess(s["end_gap"], near + MOONPILOT_FOLLOW_BAND_T * s["vl"][-1] + MOONPILOT_CATCH_UP_SLACK)  # not beyond the band's slack
+    self.assertLessEqual(s["end_gap"], near + MOONPILOT_FOLLOW_BAND_T * s["vl"][-1])  # and inside its far edge
     # the resting speed is the lead's, not a little under it: that is the invariant this floor holds
     self.assertAlmostEqual(s["v"][-1], s["vl"][-1], delta=0.1)
     self.assertFalse(s["contact"])

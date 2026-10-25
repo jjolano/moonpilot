@@ -176,9 +176,14 @@ class TestPlannerWiring(unittest.TestCase):
     """The seeded lag reaches the command through the projection and nothing else.
 
     A single frame cannot show it: from the planner's zero baseline the jerk limit allows 0.1 m/s^2,
-    so two first-frame commands are the same clamped value whatever the delay. Held for 80 frames,
-    the seeded projection carries the in-flight brake 0.30 s further, so the regulator sees more of
-    the closing already shed and asks for less than the stock horizon does.
+    so two first-frame commands are the same clamped value whatever the delay. `action_t` is the
+    wiring itself — 0.50 s against 0.20 s here. What the projection then does to the command is much
+    smaller than it was under the regulator (which multiplied the relative speed by 0.6 and so read a
+    longer horizon directly): the lead law is a band behind the lead's *predicted* speed, and
+    projecting the ego and the lead by the same time leaves that band's geometry nearly alone, so on
+    this state the ask deepens by 0.004 m/s^2. The invariant kept here is the direction: a longer
+    projection puts the ego deeper into the band at the instant it is planned for, so the ask may
+    deepen and never shallow.
     """
     unseeded_planner, unseeded = self._commands(None)
     seeded_planner, seeded = self._commands(0.45)
@@ -187,7 +192,7 @@ class TestPlannerWiring(unittest.TestCase):
     self.assertAlmostEqual(seeded_planner.action_t, 0.45 + DT_MDL, delta=1e-9)
 
     self.assertLess(min(unseeded), -0.5)
-    self.assertGreater(min(seeded), min(unseeded) + 0.03)
+    self.assertLessEqual(min(seeded), min(unseeded) + 1e-9)
 
   def test_the_gate_follows_the_long_control_state(self):
     """Nothing is learned while the planner's command is not what moves the car. An unengaged car is
