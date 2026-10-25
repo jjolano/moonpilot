@@ -154,14 +154,27 @@ class TestLongLagEstimator(unittest.TestCase):
 
 
 class TestPlannerWiring(unittest.TestCase):
-  # A 20 m/s follow closing on an 18 m/s lead at 29 m: the spacing regulator governs, and it reads
-  # the projected speed, so the in-flight command carried over a longer delay changes its answer.
+  # A 20 m/s follow closing on an 18 m/s lead at 29 m. The class comment used to say the spacing
+  # regulator governs here and reads the projected speed; under the lead law the projection nearly
+  # cancels at this state (0.004 m/s^2), so the reach is pinned on a heavier closing below.
   ONSET = {"v_ego": 20.0, "v_cruise_kph": 72.0, "d_rel": 29.0, "v_lead": 18.0}
 
   @classmethod
-  def _commands(cls, seed, frames=80):
+  def _commands_at(cls, seed, v_ego, v_lead, d_rel, frames=80):
     """Held at one state — the fork's own open-loop pattern — so both planners reach their level:
     `jerk_limit` moves at most 0.1 m/s^2 per frame from a zero baseline."""
+    planner = _planner()
+    if seed is not None:
+      planner.long_lag.restore([seed] * MOONPILOT_LAG_BLOCKS_NEEDED)
+    sm = _inputs(v_ego=v_ego, v_cruise_kph=108.0, lead=_lead(d_rel, v_lead))
+    commands = []
+    for _ in range(frames):
+      planner.update(sm)
+      commands.append(planner.output_a_target)
+    return commands
+
+  @classmethod
+  def _commands(cls, seed, frames=80):
     planner = _planner()
     if seed is not None:
       planner.long_lag.restore([seed] * MOONPILOT_LAG_BLOCKS_NEEDED)
@@ -177,13 +190,11 @@ class TestPlannerWiring(unittest.TestCase):
 
     A single frame cannot show it: from the planner's zero baseline the jerk limit allows 0.1 m/s^2,
     so two first-frame commands are the same clamped value whatever the delay. `action_t` is the
-    wiring itself — 0.50 s against 0.20 s here. What the projection then does to the command is much
-    smaller than it was under the regulator (which multiplied the relative speed by 0.6 and so read a
-    longer horizon directly): the lead law is a band behind the lead's *predicted* speed, and
-    projecting the ego and the lead by the same time leaves that band's geometry nearly alone, so on
-    this state the ask deepens by 0.004 m/s^2. The invariant kept here is the direction: a longer
-    projection puts the ego deeper into the band at the instant it is planned for, so the ask may
-    deepen and never shallow.
+    wiring itself — 0.50 s against 0.20 s here — and the command has to move with it, so a second
+    state is flown where the projection has room to act: closing 6 m/s at 16 m/s, where the extra
+    0.30 s of horizon moves the settled ask by 0.32 m/s^2. On the settled approach it nearly
+    cancels (0.004 m/s^2, deeper), because the projection shrinks the gap and the closing together,
+    which is why the reach is pinned on the state that shows it and not on the direction.
     """
     unseeded_planner, unseeded = self._commands(None)
     seeded_planner, seeded = self._commands(0.45)
@@ -192,7 +203,11 @@ class TestPlannerWiring(unittest.TestCase):
     self.assertAlmostEqual(seeded_planner.action_t, 0.45 + DT_MDL, delta=1e-9)
 
     self.assertLess(min(unseeded), -0.5)
-    self.assertLessEqual(min(seeded), min(unseeded) + 1e-9)
+    self.assertNotEqual(seeded, unseeded)
+    for state in ((16.0, 10.0, 18.0), (20.0, 15.0, 24.0)):
+      with self.subTest(state=state):
+        deltas = [abs(min(self._commands_at(seed, *state)) - min(self._commands_at(None, *state))) for seed in (0.45,)]
+        self.assertGreater(deltas[0], 0.05)
 
   def test_the_gate_follows_the_long_control_state(self):
     """Nothing is learned while the planner's command is not what moves the car. An unengaged car is
