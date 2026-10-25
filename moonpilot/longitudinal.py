@@ -378,10 +378,11 @@ MOONPILOT_MODEL_BRAKE_THRESHOLD = -0.5  # m/s^2; outside experimental mode the m
 # exactly experimental mode's stop contract: held while the model's ask is under 0.1.
 MOONPILOT_MODEL_STOP_SPEED = 5.0  # m/s
 MOONPILOT_MODEL_STOP_RELEASE = 0.1  # m/s^2; `should_stop`'s threshold
-# The release sits shallower than the -0.5 entry, so an ask dithering on the entry threshold cannot cycle the slot.
-# Measured over 717 s of engaged lead-following (6 routes): 21 admissions, 12 of them under 2 s, 8 re-admitted within
-# 2 s of a release, and the command swung a median 0.167 m/s^2 (p90 0.303) across that cycle — an ease and re-brake
-# from the model alone, since `model_release` returned the entry threshold at speed.
+# Behind a lead the release sits shallower than the -0.5 entry, so an ask dithering on the entry cannot cycle the slot:
+# replayed through six engaged drives the slot's own state ran 24 times (13 under 2 s, 8 re-admitted within 2 s) and
+# runs 18 (6 under 2 s, 1 re-admission) with the separation, holding a shallow ask 9.2 s against 1.8 s. It is gated on
+# the lead because on a clear road the same separation is a ratchet against the cruise term, where the band is held
+# 1.1 s either way.
 MOONPILOT_MODEL_BRAKE_RELEASE = -0.25  # m/s^2; an admitted model gives the slot back above this
 MOONPILOT_MODEL_BRAKE_FADE_T = 0.5  # s; an admitted model ask blends in from the other candidates over this
 MOONPILOT_MODEL_BRAKE_FULL = -2.0  # m/s^2; an ask this deep goes in whole at once, and shallower ones in proportion
@@ -747,11 +748,18 @@ def model_candidate(model, e2e, allowed, threshold=MOONPILOT_MODEL_BRAKE_THRESHO
   return a
 
 
-def model_release(v_ego) -> float:
-  """The ask an admitted model has to rise past to give its slot back: `MOONPILOT_MODEL_BRAKE_RELEASE` at speed, a
-  quarter of an m/s^2 shallower than the entry deadband so the slot cannot cycle on it, and `should_stop`'s 0.1 in the
-  crawl band, so the model holds a stop it is finishing until it asks to go."""
-  return float(np.interp(v_ego, [MOONPILOT_CREEP_SPEED, MOONPILOT_MODEL_STOP_SPEED], [MOONPILOT_MODEL_STOP_RELEASE, MOONPILOT_MODEL_BRAKE_RELEASE]))
+def model_release(v_ego, lead_present: bool = False) -> float:
+  """The ask an admitted model has to rise past to give its slot back: `should_stop`'s 0.1 in the crawl band, then
+  `MOONPILOT_MODEL_BRAKE_RELEASE` behind a lead and the entry deadband on a clear road.
+
+  The separation is only where the evidence is. Behind a lead the equal thresholds let an ask dithering on the entry
+  cycle the slot every second or so (measured on six engaged drives: 24 runs, 13 under 2 s, 8 re-admitted within 2 s;
+  18, 6 and 1 with the separation), and the lead law governs the command anyway. On a clear road the same
+  separation would be a one-way ratchet against the cruise term — a model that once crossed the entry and then settled
+  at -0.3 would hold the car below the set speed for as long as it stayed there, which is exactly what the deadband
+  exists to prevent."""
+  held = MOONPILOT_MODEL_BRAKE_RELEASE if lead_present else MOONPILOT_MODEL_BRAKE_THRESHOLD
+  return float(np.interp(v_ego, [MOONPILOT_CREEP_SPEED, MOONPILOT_MODEL_STOP_SPEED], [MOONPILOT_MODEL_STOP_RELEASE, held]))
 
 
 def policy(
@@ -998,7 +1006,7 @@ class MoonpilotLongitudinalPlanner:
     # The model's stop hold yields to a departing leadOne once the model asks to go.
     one = sm['radarState'].leadOne
     go = one.present and one.vLead > MOONPILOT_SHOULD_STOP_SPEED and sm['modelV2'].action.desiredAcceleration > 0.0
-    threshold = model_release(v_ego) if self.model_braking and not go else MOONPILOT_MODEL_BRAKE_THRESHOLD
+    threshold = model_release(v_ego, one.present) if self.model_braking and not go else MOONPILOT_MODEL_BRAKE_THRESHOLD
     model_accel = model_candidate(sm['modelV2'], e2e, enabled(MODEL_BRAKING, self.params), threshold)
     self.model_braking = model_accel is not None and not e2e
     self.model_fade = min(self.model_fade + self.dt / MOONPILOT_MODEL_BRAKE_FADE_T, 1.0) if self.model_braking else 0.0

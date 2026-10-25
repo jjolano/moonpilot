@@ -195,6 +195,8 @@ def replay(route, data, root=DEFAULT_ROOT, overrides=None, details_out=None):
           "logged_allow_throttle": bool(plan_reader.allowThrottle) if plan_reader is not None else False,
           "logged_accel": float(cc.actuators.accel),
           "band_pressing": bool(planner.brake_band.pressing),
+          "model_slot": bool(planner.model_braking),
+          "source": int(planner.source),
         })
   finally:
     longitudinal.Params, longitudinal.time = original_params, original_time
