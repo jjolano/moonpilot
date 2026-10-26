@@ -80,7 +80,8 @@ from moonpilot.longitudinal import (
   MOONPILOT_STOP_LAG_T,
   MOONPILOT_STOP_REST,
   MOONPILOT_STOP_TAPER_T,
-  MOONPILOT_TRACK_BRAKE,
+  MOONPILOT_TRACK_BRAKE_BP,
+  MOONPILOT_TRACK_BRAKE_V,
   MOONPILOT_TRACK_BRAKE_T,
   MOONPILOT_T_FOLLOW,
   MOONPILOT_T_FOLLOW_SLEW_DOWN,
@@ -716,7 +717,8 @@ class TestLeadLaw(unittest.TestCase):
     """The deadline is the law's `when`: a closing lead whose near edge is more than `MOONPILOT_ARRIVE_T` of
     closing time away is not braked for at all, and once the edge is inside `MOONPILOT_ARRIVE_T -
     MOONPILOT_ARRIVE_RAMP_T` the ask is the constant decel that arrives there speed-matched, plus
-    `MOONPILOT_TRACK_BRAKE` of a slowing lead's accel, no more than sheds its predicted speed in `MOONPILOT_TRACK_BRAKE_T`.
+    the headway-scheduled `MOONPILOT_TRACK_BRAKE_V` share of a slowing lead's accel, no more than sheds its predicted speed in
+    `MOONPILOT_TRACK_BRAKE_T`.
 
     The states are chosen where the stopping floor is not admitted — the closing is small against a moving lead —
     so the arrival is the whole of the ask.
@@ -733,7 +735,8 @@ class TestLeadLaw(unittest.TestCase):
       whole = (MOONPILOT_ARRIVE_T - MOONPILOT_ARRIVE_RAMP_T) * closing
       for room in (MOONPILOT_ARRIVE_MIN_T * closing, 0.5 * whole, whole):
         with self.subTest(v_ego=v_ego, v_lead=v_lead, a_slow=a_slow, room=room):
-          a_track = MOONPILOT_TRACK_BRAKE * min(max(-a_slow, 0.0), v_pred / MOONPILOT_TRACK_BRAKE_T)
+          share = np.interp((near + room) / v_ego, MOONPILOT_TRACK_BRAKE_BP, MOONPILOT_TRACK_BRAKE_V)
+          a_track = share * min(max(-a_slow, 0.0), v_pred / MOONPILOT_TRACK_BRAKE_T)
           expected = -(closing**2 / (2.0 * room) + a_track)
           self.assertAlmostEqual(lead_accel(v_ego, near + room, v_lead, 0.0, self.T_FOLLOW, a_slow=a_slow), expected, delta=1e-9)
 

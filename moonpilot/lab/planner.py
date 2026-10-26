@@ -1411,6 +1411,69 @@ def _delay_cost(args):
           + f"| stop: ask {s_ask:+.2f} aEgo {s_felt:+.2f} closest {s_gap:.2f} m")
 
 
+def _shape_fly(job):
+  """One `stop-shape` flight, engine coast off as the device runs; `flat` flies the braking match's former flat 0.85."""
+  import moonpilot.longitudinal as longitudinal
+  flat, flight = job
+  scheduled = longitudinal.MOONPILOT_TRACK_BRAKE_V
+  longitudinal.MOONPILOT_TRACK_BRAKE_V = [0.85] * len(scheduled) if flat else scheduled
+  try:
+    return _fly_logged_lead(flight, engine_coast=False)
+  finally:
+    longitudinal.MOONPILOT_TRACK_BRAKE_V = scheduled
+
+
+def _shape(v, a, gap, cmd=None):
+  """A decel's shape over its braking (aEgo over 0.5 s past -0.3): peak, where in the braking it lands, the first and last
+  thirds' mean, closest gap, brake pumps."""
+  from moonpilot.lab.driver import _pumps
+  felt = np.convolve(a, np.ones(10) / 10, mode="same")
+  braking = np.flatnonzero(felt < -0.3)
+  seg = felt[braking[0]:braking[-1] + 1]
+  n = len(seg)
+  return (seg.min(), np.argmin(seg) / max(n - 1, 1), seg[:n // 3].mean(), seg[2 * n // 3:].mean(), gap.min(), _pumps(cmd) if cmd is not None else 0)
+
+
+def _stop_shape(args):
+  """Where a lead-caused decel's braking peaks: the 57 manual decels `decel-peaks` flies, split into stops (the driver
+  ends at rest) and slowdowns, the driver against today's headway-scheduled braking match and the flat 0.85 it replaced;
+  then one engaged stop flown with its own model ask (`engaged-fly`'s window)."""
+  from concurrent.futures import ProcessPoolExecutor
+  d = _pooled_manual(expand(args.routes, ROUTE_SETS), args.root)
+  a_s = np.concatenate([np.convolve(d["a"][d["route"] == r], np.ones(10) / 10, mode="same") for r in np.unique(d["route"])])
+  jobs, _ = _decel_jobs(d, a_s)
+  calibration = _calibration(args.calibration, args.root)
+  jobs = [(*job, calibration) for job in jobs]
+  stops = np.asarray([job[0][-1] < 0.5 for job in jobs], dtype=bool)
+  shapes = {"driver": [_shape(job[0], np.r_[np.diff(job[0]) / DT_MDL, 0.0], job[1]) for job in jobs]}
+  with ProcessPoolExecutor(4) as pool:
+    for name, flat in (("flat 0.85", True), ("today", False)):
+      shapes[name] = [_shape(f["v"], f["a"], f["gap"], f["cmd"]) for f in pool.map(_shape_fly, [(flat, job) for job in jobs])]
+  print(f"{len(jobs)} manual lead-caused decels (calibration {args.calibration}): median peak, where in the braking it lands, "
+        + "first / last third, closest gap, brake pumps")
+  for kind, mask in (("stops", stops), ("slowdowns", ~stops)):
+    print(f"  {kind} (n {mask.sum()}):")
+    for name, rows in shapes.items():
+      x = np.asarray(rows)[mask]
+      print(f"    {name:10s} peak {np.median(x[:, 0]):+.2f} at {np.median(x[:, 1]):4.0%}  thirds {np.median(x[:, 2]):+.2f} / {np.median(x[:, 3]):+.2f}  "
+            + f"closest {x[:, 4].min():4.1f} m  pumps {int(x[:, 5].sum()):3d}")
+
+  details = []
+  _, logged, _, _ = replay(args.route, extract(args.route, args.root), args.root, details_out=details)
+  m = _details_arrays(details)
+  t = m["t"] - m["t"][0]
+  w = (t >= args.start) & (t < args.end)
+  flight = (m["v_ego"][w], m["d_rel"][w], m["v_lead"][w], float(m["a_ego"][w][0]), _calibration(args.route, args.root),
+            float(np.nanmedian(m["v_cruise"][w])), m["model_accel"][w])
+  print(f"{args.route} {args.start:g}-{args.end:g} s: peak, where, thirds, s to rest, rest gap, pumps")
+  for name, f in (("car", {"v": m["v_ego"][w], "a": m["a_ego"][w], "gap": m["d_rel"][w], "cmd": logged[w]}),
+                  ("flat 0.85", _shape_fly((True, flight))), ("today", _shape_fly((False, flight)))):
+    peak, where, first, last, _, pumps = _shape(f["v"], f["a"], f["gap"], f["cmd"])
+    rest = np.flatnonzero(f["v"] < 0.3)
+    print(f"  {name:10s} peak {peak:+.2f} at {where:4.0%}  thirds {first:+.2f} / {last:+.2f}  "
+          + f"rest at {rest[0] * DT_MDL if len(rest) else float('nan'):4.1f} s, {f['gap'][-1]:.1f} m  pumps {pumps}")
+
+
 def _register_manual(sub):
   parser = sub.add_parser("manual-decel", help="the lead law's approach requirement against the driver's own longitudinal")
   parser.add_argument("--routes", nargs="+", default=["manual-approach"], help=f"route names or sets: {', '.join(ROUTE_SETS)}")
@@ -1448,6 +1511,14 @@ def _register_manual(sub):
   parser.add_argument("--start", type=float, default=183.0, help="s from the drive's first plan")
   parser.add_argument("--end", type=float, default=216.0, help="s from the drive's first plan")
   parser.set_defaults(fn=_delay_cost)
+  parser = sub.add_parser("stop-shape", help="where a lead-caused decel's braking peaks: driver vs the braking match, flat and headway-scheduled")
+  parser.add_argument("--routes", nargs="+", default=["manual-approach", "0000044e", "0000044f", "00000450", "00000451"],
+                      help=f"manual route names or sets: {', '.join(ROUTE_SETS)}")
+  parser.add_argument("--calibration", default="00000451", help="drive whose recorded lag and radar latency seed the flights")
+  parser.add_argument("--route", default="00000468--34a8e259a0", help="engaged drive whose stop is flown with its own model ask")
+  parser.add_argument("--start", type=float, default=597.0, help="s from the drive's first plan")
+  parser.add_argument("--end", type=float, default=623.0, help="s from the drive's first plan")
+  parser.set_defaults(fn=_stop_shape)
 
 
 def register(sub):
