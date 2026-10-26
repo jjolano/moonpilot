@@ -10,7 +10,8 @@ the band would have produced.
 import math
 from collections import deque
 from contextlib import contextmanager
-from types import SimpleNamespace
+from functools import cache
+from types import MethodType, SimpleNamespace
 
 import numpy as np
 from openpilot.cereal import messaging
@@ -20,6 +21,7 @@ from opendbc.car.structs import car
 from openpilot.common.constants import CV
 from openpilot.common.realtime import DT_CTRL, DT_MDL
 from openpilot.tools.lib.logreader import LogReader
+from moonpilot.latency import MOONPILOT_LAG_MAX
 from moonpilot.longitudinal import MoonpilotLongitudinalPlanner
 from moonpilot.longcontrol import MoonpilotLongControl
 from moonpilot.lab import DEFAULT_ROOT, cached, drive_config, expand, lag_s, param_index, runs
@@ -743,12 +745,13 @@ HOLD_FLY_DEAD_S, HOLD_FLY_TAU_S = 0.2, 0.25  # the plant: dead time, then a firs
 
 
 class _LaggedPlant:
-  """Acceleration following the command after `HOLD_FLY_DEAD_S` of dead time, then a first-order lag of
-  `HOLD_FLY_TAU_S`, exactly discretized at the tick: the command fed on frame i first moves `a` on frame i + dead/dt."""
+  """Acceleration following the command after `dead` s of dead time, then a first-order lag of `tau` s (by default
+  `HOLD_FLY_DEAD_S` and `HOLD_FLY_TAU_S`), exactly discretized at the tick: the command fed on frame i first moves `a` on
+  frame i + dead/dt."""
 
-  def __init__(self, dt=DT_MDL):
-    self.queue = deque([0.0] * round(HOLD_FLY_DEAD_S / dt))
-    self.alpha = 1.0 - math.exp(-dt / HOLD_FLY_TAU_S)
+  def __init__(self, dead=HOLD_FLY_DEAD_S, tau=HOLD_FLY_TAU_S, dt=DT_MDL):
+    self.queue = deque([0.0] * round(dead / dt))
+    self.alpha = 1.0 - math.exp(-dt / tau)
     self.a = 0.0
 
   def step(self, cmd):
@@ -1160,10 +1163,39 @@ def _calibration(route, root):
   return out
 
 
-def _fly_logged_lead(job):
-  """The engine-coast RAV4 planner, seeded with `calibration`, on the lagged plant from a logged start behind the logged
-  lead's own path. The set speed is the start's unless a sixth element gives one, so by default only the lead terms brake;
-  a seventh is the drive's model ask, frame by frame."""
+def _in_flight_speed(planner, v_ego, a_prev, standstill):
+  """The speed the car reaches over `action_t` on the commands still in flight — the last `action_t - dt` issued, oldest
+  first, one tick each — then `a_prev` for what is left: exact on a pure dead-time plant with the planner's delay."""
+  if not hasattr(planner, "issued"):
+    planner.issued = deque(maxlen=round(MOONPILOT_LAG_MAX / planner.dt) + 1)  # the first frame: nothing issued yet
+  else:
+    planner.issued.append(planner.output_a_target)
+  issued = [max(a, 0.0) for a in planner.issued] if standstill else list(planner.issued)
+  n = min(int(round((planner.action_t - planner.dt) / planner.dt, 6)), len(issued))
+  return max(0.0, v_ego + planner.dt * sum(issued[len(issued) - n:]) + (planner.action_t - n * planner.dt) * a_prev)
+
+
+@cache
+def _in_flight_update():
+  """`MoonpilotLongitudinalPlanner.update` with its ego projection — the latest ask spent over the whole delay — replaced
+  by `_in_flight_speed`. The variant `delay-cost` measures and rejects, kept here so the claim stays reproducible."""
+  import inspect
+  import textwrap
+  import moonpilot.longitudinal as longitudinal
+  line = "v_pred = max(0.0, v_ego + a_prev * self.action_t)"
+  source = textwrap.dedent(inspect.getsource(longitudinal.MoonpilotLongitudinalPlanner.update))
+  if source.count(line) != 1:
+    raise ValueError(f"the planner no longer projects with `{line}`: rebuild the in-flight variant against what it does now")
+  scope = dict(vars(longitudinal), _in_flight_speed=_in_flight_speed)
+  exec(compile(source.replace(line, "v_pred = _in_flight_speed(self, v_ego, a_prev, CS.standstill)"), longitudinal.__file__, "exec"), scope)
+  return scope["update"]
+
+
+def _fly_logged_lead(job, plant=(HOLD_FLY_DEAD_S, HOLD_FLY_TAU_S), engine_coast=True, delay=None, in_flight=False):
+  """The RAV4 planner (engine coast on unless `engine_coast` is False), seeded with `calibration`, on the lagged plant
+  (`plant`: dead time, first-order lag) from a logged start behind the logged lead's own path. The set speed is the
+  start's unless a sixth element gives one, so by default only the lead terms brake; a seventh is the drive's model ask,
+  frame by frame. `delay` replaces the delay the planner projects through, `in_flight` its projection (`delay-cost`)."""
   from moonpilot.tests.test_engine_coast import _planner
   from moonpilot.tests.test_longitudinal import _inputs, _lead
   v_log, gap_log, v_lead, a0, calibration, *extra = job
@@ -1173,7 +1205,11 @@ def _fly_logged_lead(job):
   for v0, v1 in zip(v_log[:-1], v_log[1:], strict=True):
     s_ego.append(_advance(s_ego[-1], v0, v1))
   s_lead = np.asarray(s_ego) + gap_log
-  planner, plant = _planner(True, calibration), _LaggedPlant()
+  planner, plant = _planner(engine_coast, calibration), _LaggedPlant(*plant)
+  if delay is not None:
+    planner.long_lag.applied_delay = lambda: delay  # ty: ignore[invalid-assignment]  # this flight's delay, same signature
+  if in_flight:
+    planner.update = MethodType(_in_flight_update(), planner)  # ty: ignore[invalid-assignment]  # the rejected variant, same signature
   plant.a, plant.queue = a0, deque([a0] * len(plant.queue))
   v, s, out = v_log[0], 0.0, {"v": [], "a": [], "gap": [], "pressing": [], "cmd": []}
   for i in range(len(v_log)):
@@ -1319,6 +1355,62 @@ def _engaged_fly(args):
   print(line("planner", flown["a"], flown["cmd"], flown["gap"], flown["v"]))
 
 
+# (name, plant dead time s, plant first-order lag s, the delay the planner projects or None for its learned one, in flight)
+DELAY_ARMS = (
+  ("instant car", DT_MDL, 1e-6, 0.0, False),
+  ("car model (today)", HOLD_FLY_DEAD_S, HOLD_FLY_TAU_S, None, False),
+  ("car model, not projected", HOLD_FLY_DEAD_S, HOLD_FLY_TAU_S, 0.0, False),
+  ("car model, asks in flight", HOLD_FLY_DEAD_S, HOLD_FLY_TAU_S, None, True),
+  ("slower car, 0.3 s dead", 0.3, HOLD_FLY_TAU_S, None, False),
+  ("dead time 0.35 s", 0.35, 1e-6, None, False),
+  ("dead time 0.35 s, in flight", 0.35, 1e-6, None, True),
+)
+
+
+def _delay_fly(job):
+  """One `DELAY_ARMS` flight, engine coast off as the device runs: the peak ask, the peak aEgo (0.5 s mean, above 2 m/s),
+  brake pumps and the closest gap."""
+  from moonpilot.lab.driver import _pumps
+  arm, flight = job
+  _, dead, tau, delay, in_flight = DELAY_ARMS[arm]
+  f = _fly_logged_lead(flight, plant=(dead, tau), engine_coast=False, delay=delay, in_flight=in_flight)
+  felt = np.convolve(f["a"], np.ones(10) / 10, mode="same")
+  return float(f["cmd"].min()), float(felt[f["v"] > 2.0].min()), _pumps(f["cmd"]), float(f["gap"].min())
+
+
+def _delay_cost(args):
+  """What the car's actuation delay costs at a stop's peak, and that projecting the ego better does not recover it: the
+  57 lead-caused manual decels (`intent` (b)) and one engaged stop flown on an instant car, on the lab's car model with
+  and without the planner's projection through its delay, with the commands still in flight projected instead of the
+  latest one (`_in_flight_update`), on a car slower than the delay it projects, and on a pure dead time, where that
+  in-flight projection is exact. The extra ask is each flight's peak against the same flight on the instant car."""
+  from concurrent.futures import ProcessPoolExecutor
+  d = _pooled_manual(expand(["manual-approach", "0000044e", "0000044f", "00000450", "00000451"], ROUTE_SETS), args.root)
+  a_s = np.concatenate([np.convolve(d["a"][d["route"] == r], np.ones(10) / 10, mode="same") for r in np.unique(d["route"])])
+  jobs, _ = _decel_jobs(d, a_s)
+  calibration = _calibration(args.calibration, args.root)
+  details = []
+  replay(args.route, extract(args.route, args.root), args.root, details_out=details)
+  m = _details_arrays(details)
+  t = m["t"] - m["t"][0]
+  w = (t >= args.start) & (t < args.end)
+  stop = (m["v_ego"][w], m["d_rel"][w], m["v_lead"][w], float(m["a_ego"][w][0]), _calibration(args.route, args.root),
+          float(np.nanmedian(m["v_cruise"][w])), m["model_accel"][w])
+  arms = range(len(DELAY_ARMS))
+  with ProcessPoolExecutor(4) as pool:
+    flown = [list(pool.map(_delay_fly, [(arm, (*job, calibration)) for job in jobs])) for arm in arms]
+    stops = list(pool.map(_delay_fly, [(arm, stop) for arm in arms]))
+  print(f"{len(jobs)} manual lead-caused decels, calibration {args.calibration}: peak ask median / p10, peak aEgo median / p10, "
+        + f"brake pumps, closest gap, extra peak ask over the instant car median / p90; then {args.route} {args.start:g}-{args.end:g} s")
+  instant = np.asarray([row[0] for row in flown[0]])
+  for (name, *_), rows, (s_ask, s_felt, _, s_gap) in zip(DELAY_ARMS, flown, stops, strict=True):
+    ask, felt, pumps, gap = (np.asarray([row[i] for row in rows]) for i in range(4))
+    extra = instant - ask
+    print(f"  {name:27s} ask {np.median(ask):+.2f} / {np.percentile(ask, 10):+.2f}  aEgo {np.median(felt):+.2f} / {np.percentile(felt, 10):+.2f}  "
+          + f"pumps {int(pumps.sum()):3d}  closest {gap.min():4.1f} m  extra {np.median(extra):.3f} / {np.percentile(extra, 90):.3f}  "
+          + f"| stop: ask {s_ask:+.2f} aEgo {s_felt:+.2f} closest {s_gap:.2f} m")
+
+
 def _register_manual(sub):
   parser = sub.add_parser("manual-decel", help="the lead law's approach requirement against the driver's own longitudinal")
   parser.add_argument("--routes", nargs="+", default=["manual-approach"], help=f"route names or sets: {', '.join(ROUTE_SETS)}")
@@ -1350,6 +1442,12 @@ def _register_manual(sub):
   parser.add_argument("--start", type=float, required=True, help="s from the drive's first plan")
   parser.add_argument("--end", type=float, required=True, help="s from the drive's first plan")
   parser.set_defaults(fn=_engaged_fly)
+  parser = sub.add_parser("delay-cost", help="what the actuation delay costs at a stop's peak, and the in-flight projection that did not recover it")
+  parser.add_argument("--calibration", default="00000451", help="drive whose recorded lag and radar latency seed the decel flights")
+  parser.add_argument("--route", default="0000045a--8c1d34e64d", help="engaged drive whose stop is flown with its own model ask")
+  parser.add_argument("--start", type=float, default=183.0, help="s from the drive's first plan")
+  parser.add_argument("--end", type=float, default=216.0, help="s from the drive's first plan")
+  parser.set_defaults(fn=_delay_cost)
 
 
 def register(sub):
