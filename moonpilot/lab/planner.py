@@ -552,8 +552,9 @@ def _brake_gain_route(job):
   k, half = max(int(round(lag / dt)), 1), int(round(0.5 / dt))
   change = np.full(len(c["t"]), np.inf)  # the target's change over the surrounding second
   change[half:-half] = np.abs(c["a_target"][2 * half:] - c["a_target"][:-2 * half])
-  felt = np.convolve(c["a_ego"], np.ones(half) / half, mode="same")  # the 0.5 s mean every lab peak is read on
-  return route, {"lag": lag, "dt": dt, "cmd": c["a_target"][:-k], "a": c["a_ego"][k:], "felt": felt[k:], "v": c["v_ego"][:-k],
+  mean = np.ones(half) / half  # the 0.5 s mean every lab peak is read on, applied to the ask and the response alike
+  felt, asked = np.convolve(c["a_ego"], mean, mode="same"), np.convolve(c["a_target"], mean, mode="same")
+  return route, {"lag": lag, "dt": dt, "cmd": c["a_target"][:-k], "asked": asked[:-k], "a": c["a_ego"][k:], "felt": felt[k:], "v": c["v_ego"][:-k],
                  "ok": ok[:-k] & ok[k:], "steady": change[:-k] < 0.3, "ec": param_index(drive_config(route, root)[1], "MoonpilotEngineCoast")}
 
 
@@ -561,7 +562,7 @@ def _brake_gain(args):
   """How hard the car brakes for what the planner asks: `carState.aEgo` against the published `aTarget`, aligned by the
   whole chain's own lag (controlsd, Toyota's carcontroller PID, the PCM). Steady frames — the target moving less than
   0.3 m/s^2 over the surrounding second — give the gain the chain settles at, by depth and speed; each brake episode
-  (target under -0.7 for 1 s) gives its deepest aEgo (0.5 s mean), up to 0.5 s past its end, against its deepest target.
+  (target under -0.7 for 1 s) gives its deepest aEgo, up to 0.5 s past its end, against its deepest target, both 0.5 s means.
   Engine-coast drives and drives whose lag sits on the search bound are listed but not pooled."""
   from concurrent.futures import ProcessPoolExecutor
   with ProcessPoolExecutor(4) as pool:
@@ -578,9 +579,9 @@ def _brake_gain(args):
     mine = []
     for run in runs(r["ok"] & (r["cmd"] < -0.7)):
       if (run.stop - run.start) * r["dt"] >= 1.0:
-        i = run.start + int(np.argmin(r["cmd"][run]))
+        i = run.start + int(np.argmin(r["asked"][run]))
         window = np.arange(run.start, min(run.stop + tail, len(r["a"])))
-        mine.append((r["cmd"][i], r["felt"][window[r["ok"][window]]].min(), r["v"][i]))
+        mine.append((r["asked"][i], r["felt"][window[r["ok"][window]]].min(), r["v"][i]))
     pooled = not r["ec"] and r["lag"] < 0.95
     if pooled:
       steady.append(np.column_stack((r["cmd"][s], r["a"][s], r["v"][s])))
@@ -599,7 +600,7 @@ def _brake_gain(args):
       m = (st[:, 0] >= lo) & (st[:, 0] < hi) & (st[:, 2] >= vlo) & (st[:, 2] < vhi)
       cells.append(f"{np.median(st[m, 1] / st[m, 0]):5.2f} ({m.sum():6d})" if m.sum() >= 50 else f"{'-':>5} ({m.sum():6d})")
     print(f"  {lo:5.1f}..{hi:5.1f}     " + "   ".join(cells))
-  print(f"\nbrake episodes: deepest aEgo against the deepest target, {len(ep)} episodes")
+  print(f"\nbrake episodes: deepest aEgo against the deepest target, both 0.5 s means, {len(ep)} episodes")
   for lo, hi in BRAKE_GAIN_DEPTHS[1:]:
     m = (ep[:, 0] >= lo) & (ep[:, 0] < hi)
     if m.any():
