@@ -22,7 +22,7 @@ from openpilot.common.realtime import DT_CTRL, DT_MDL
 from openpilot.tools.lib.logreader import LogReader
 from moonpilot.longitudinal import MoonpilotLongitudinalPlanner
 from moonpilot.longcontrol import MoonpilotLongControl
-from moonpilot.lab import DEFAULT_ROOT, cached, drive_config, expand, runs
+from moonpilot.lab import DEFAULT_ROOT, cached, drive_config, expand, lag_s, param_index, runs
 
 EXTRACT_VERSION = 2
 LAMP_VERSION = 1
@@ -36,6 +36,10 @@ ROUTE_SETS = {
   # The driver's own longitudinal behind radar leads; routes without such frames are counted as empty.
   "manual-approach": ("000003f8", "000003fe", "00000400", "00000401", "00000408", "0000040d", "0000040e", "00000410", "00000414",
                       "0000042b", "0000042c", "0000043e", "0000043f", "0000044d"),
+  # Every cached drive with engaged longitudinal frames.
+  "engaged": ("000003f8", "000003fe", "00000400", "00000401", "00000408", "0000040d", "0000040e", "0000040f", "00000410", "00000414",
+              "00000417", "0000041d", "00000424", "00000429", "0000042a", "0000042b", "00000439", "0000043a", "0000043e", "0000043f",
+              "0000044d", "00000450", "00000451", "0000045a", "0000045d", "0000045e"),
 }
 MESSAGES = ("carState", "controlsState", "carControl", "vehicleParameters", "radarState", "selfdriveState", "moonpilotState", "modelV2")
 ON_BY_DEFAULT = {"MoonpilotLongitudinal", "MoonpilotModelBraking", "MoonpilotBrakeBand", "MoonpilotCurveSpeed", "MoonpilotLeadLateral", "MoonpilotCoastGrade"}
@@ -450,7 +454,8 @@ def _control_build(segs):
   (`MoonpilotLongControl`'s jerk ramps and PID) sees the inputs and the cadence it was tuned at."""
   cp, latest = b"", {}
   rows = []
-  for msg in LogReader(segs, sort_by_time=True):
+  # One reader per segment, so each is freed once read: a LogReader over the whole route keeps every segment it has read.
+  for msg in (m for seg in segs for m in LogReader(seg, sort_by_time=True)):
     kind = msg.which()
     if kind == "carParams":
       cp = msg.carParams.as_builder().to_bytes()
@@ -529,6 +534,78 @@ def _longcontrol(args):
     print(f"  controller p95 vs logged accel: on the logged plan {err_logged:.4f} (isolates the controller),"
           + f" on the replayed plan {err_replayed:.4f} m/s^2 (that plus the planner's own {plan_err:.4f})")
 
+
+BRAKE_GAIN_DEPTHS = ((-0.7, -0.3), (-1.2, -0.7), (-2.0, -1.2), (-10.0, -2.0))  # m/s^2 of target
+BRAKE_GAIN_SPEEDS = ((2.0, 8.0), (8.0, 15.0), (15.0, 40.0))  # m/s
+
+
+def _brake_gain_route(job):
+  """One drive's target and lag-aligned aEgo over engaged frames above 2 m/s with no pedal and no stop, and whether it
+  ran engine coast, which holds the friction brakes off near the coast: a different plant for a shallow ask."""
+  route, root = job
+  c = extract_control(route, root)
+  dt = control_rate_dt(c["t"])
+  ok = c["long_active"] & (c["v_ego"] > 2.0) & ~c["brake_pressed"] & ~c["gas_pressed"] & ~c["should_stop"]
+  if np.sum(ok & (c["a_target"] < -0.3)) * dt < 5.0:
+    return route, None
+  lag = lag_s(c["a_target"], c["a_ego"], ok, dt=dt, max_lag=1.0)
+  k, half = max(int(round(lag / dt)), 1), int(round(0.5 / dt))
+  change = np.full(len(c["t"]), np.inf)  # the target's change over the surrounding second
+  change[half:-half] = np.abs(c["a_target"][2 * half:] - c["a_target"][:-2 * half])
+  felt = np.convolve(c["a_ego"], np.ones(half) / half, mode="same")  # the 0.5 s mean every lab peak is read on
+  return route, {"lag": lag, "dt": dt, "cmd": c["a_target"][:-k], "a": c["a_ego"][k:], "felt": felt[k:], "v": c["v_ego"][:-k],
+                 "ok": ok[:-k] & ok[k:], "steady": change[:-k] < 0.3, "ec": param_index(drive_config(route, root)[1], "MoonpilotEngineCoast")}
+
+
+def _brake_gain(args):
+  """How hard the car brakes for what the planner asks: `carState.aEgo` against the published `aTarget`, aligned by the
+  whole chain's own lag (controlsd, Toyota's carcontroller PID, the PCM). Steady frames — the target moving less than
+  0.3 m/s^2 over the surrounding second — give the gain the chain settles at, by depth and speed; each brake episode
+  (target under -0.7 for 1 s) gives its deepest aEgo (0.5 s mean), up to 0.5 s past its end, against its deepest target.
+  Engine-coast drives and drives whose lag sits on the search bound are listed but not pooled."""
+  from concurrent.futures import ProcessPoolExecutor
+  with ProcessPoolExecutor(4) as pool:
+    results = list(pool.map(_brake_gain_route, [(r, args.root) for r in expand(args.routes, ROUTE_SETS)]))
+  steady, episodes = [], []
+  print("drive: braking s (target < -0.3), lag, steady aEgo / target median, episodes, peak aEgo / peak target median")
+  for route, r in results:
+    if r is None:
+      print(f"  {route}: under 5 s of engaged braking, skipped")
+      continue
+    braking = r["ok"] & (r["cmd"] < -0.3)
+    s = braking & r["steady"]
+    tail = int(round(0.5 / r["dt"]))
+    mine = []
+    for run in runs(r["ok"] & (r["cmd"] < -0.7)):
+      if (run.stop - run.start) * r["dt"] >= 1.0:
+        i = run.start + int(np.argmin(r["cmd"][run]))
+        window = np.arange(run.start, min(run.stop + tail, len(r["a"])))
+        mine.append((r["cmd"][i], r["felt"][window[r["ok"][window]]].min(), r["v"][i]))
+    pooled = not r["ec"] and r["lag"] < 0.95
+    if pooled:
+      steady.append(np.column_stack((r["cmd"][s], r["a"][s], r["v"][s])))
+      episodes += mine
+    ratio = np.median(r["a"][s] / r["cmd"][s]) if s.any() else np.nan
+    peak = np.median([a / c for c, a, _ in mine]) if mine else np.nan
+    note = "" if pooled else "  (engine coast on: not pooled)" if r["ec"] else "  (lag on the search bound: not pooled)"
+    print(f"  {route}: {braking.sum() * r['dt']:6.1f} s  lag {r['lag']:.3f} s  steady {ratio:.2f} (n {s.sum():5d})  "
+          + f"episodes {len(mine):3d}  peak {peak:.2f}{note}")
+  st, ep = np.concatenate(steady), np.asarray(episodes)
+  print(f"\nsteady braking, aEgo / target median (n): {len(st)} frames of {len(steady)} drives")
+  print("  target \\ speed    " + "".join(f"{lo:4.0f}-{hi:<4.0f} m/s     " for lo, hi in BRAKE_GAIN_SPEEDS) + "all")
+  for lo, hi in BRAKE_GAIN_DEPTHS:
+    cells = []
+    for vlo, vhi in (*BRAKE_GAIN_SPEEDS, (0.0, 99.0)):
+      m = (st[:, 0] >= lo) & (st[:, 0] < hi) & (st[:, 2] >= vlo) & (st[:, 2] < vhi)
+      cells.append(f"{np.median(st[m, 1] / st[m, 0]):5.2f} ({m.sum():6d})" if m.sum() >= 50 else f"{'-':>5} ({m.sum():6d})")
+    print(f"  {lo:5.1f}..{hi:5.1f}     " + "   ".join(cells))
+  print(f"\nbrake episodes: deepest aEgo against the deepest target, {len(ep)} episodes")
+  for lo, hi in BRAKE_GAIN_DEPTHS[1:]:
+    m = (ep[:, 0] >= lo) & (ep[:, 0] < hi)
+    if m.any():
+      ratio, over = ep[m, 1] / ep[m, 0], ep[m, 1] - ep[m, 0]
+      print(f"  target {lo:5.1f}..{hi:5.1f} (n {m.sum():3d}): ratio median {np.median(ratio):.2f} p75 {np.percentile(ratio, 75):.2f} "
+            + f"p90 {np.percentile(ratio, 90):.2f}; aEgo past the target median {np.median(over):+.2f} p10 {np.percentile(over, 10):+.2f} m/s^2")
 
 
 def _approach_windows(mask, times, gaps, minimum_duration):
@@ -1264,6 +1341,9 @@ def _register_manual(sub):
   parser.add_argument("--engaged", nargs="+", default=[], help="engaged drives to replay")
   parser.add_argument("--calibration", default="00000451", help="drive whose recorded lag and radar latency seed the flights, or none")
   parser.set_defaults(fn=_decel_peaks)
+  parser = sub.add_parser("brake-gain", help="how hard the car brakes for what the planner asks, over every engaged drive")
+  parser.add_argument("--routes", nargs="+", default=["engaged"], help=f"route names or sets: {', '.join(ROUTE_SETS)}")
+  parser.set_defaults(fn=_brake_gain)
   parser = sub.add_parser("engaged-fly", help="an engaged window flown closed-loop through today's planner, with the drive's model ask")
   parser.add_argument("route", help="full route name, e.g. 0000045a--8c1d34e64d")
   parser.add_argument("--start", type=float, required=True, help="s from the drive's first plan")
