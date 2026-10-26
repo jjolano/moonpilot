@@ -109,8 +109,9 @@ root, never from inside `panda/`.
   the panda suite with the fork's opendbc on the path, and a build that proves the firmware links:
 
   ```bash
-  (cd opendbc_repo && .venv/bin/python opendbc/safety/tests/mutation.py)   # ~35 s, 3133 mutants
-  PYTHONPATH=opendbc_repo panda/.venv/bin/python -m unittest discover -s panda/tests
+  (cd opendbc_repo && .venv/bin/python opendbc/safety/tests/mutation.py)   # 3–6 min, 3096 mutants
+  CPPCHECK_DIR=$(opendbc_repo/.venv/bin/python -c "import cppcheck; print(cppcheck.DIR)") \
+    PYTHONPATH=opendbc_repo .venv/bin/python -m unittest discover -s panda/tests   # no CPPCHECK_DIR: MISRA case 0 fails, mutants falsely pass
   tools/op.sh build
   ```
 
