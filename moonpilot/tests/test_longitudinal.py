@@ -740,6 +740,26 @@ class TestLeadLaw(unittest.TestCase):
           expected = -(closing**2 / (2.0 * room) + a_track)
           self.assertAlmostEqual(lead_accel(v_ego, near + room, v_lead, 0.0, self.T_FOLLOW, a_slow=a_slow), expected, delta=1e-9)
 
+  def test_a_slowing_lead_is_matched_less_from_far_back_and_unchanged_close_in(self):
+    """The braking match falls with headway, so a stop from a follow is not braked like the lead from far back
+    (`python -m moonpilot.lab stop-shape`); close in it is the full share the hard brakes are decided at. Against the
+    same law with the share held flat at its close-in value, in the arrival test's floor-free states."""
+    v_ego, v_lead, a_slow = 20.0, 15.0, -2.0
+    near, _ = _lead_band(v_lead, a_slow=a_slow)
+    closing = v_ego - max(v_lead + a_slow * MOONPILOT_PREDICT_T, 0.0)
+    close_gap, far_gap = near + MOONPILOT_ARRIVE_MIN_T * closing, near + (MOONPILOT_ARRIVE_T - MOONPILOT_ARRIVE_RAMP_T) * closing
+    self.assertLessEqual(close_gap / v_ego, 1.5)
+    self.assertGreaterEqual(far_gap / v_ego, 3.0)
+
+    def asks():
+      return [lead_accel(v_ego, gap, v_lead, 0.0, self.T_FOLLOW, a_slow=a_slow) for gap in (close_gap, far_gap)]
+
+    scheduled = asks()
+    with mock.patch("moonpilot.longitudinal.MOONPILOT_TRACK_BRAKE_V", [MOONPILOT_TRACK_BRAKE_V[0]] * len(MOONPILOT_TRACK_BRAKE_V)):
+      flat = asks()
+    self.assertEqual(scheduled[0], flat[0])
+    self.assertGreater(scheduled[1], flat[1] + 0.5)  # far back: half a m/s^2 less braking at least
+
   def test_a_lead_predicted_at_rest_is_not_braked_for_again(self):
     """Its predicted speed already carries a slowing lead's braking to rest, so past that, how hard it was braking adds
     nothing to the arrival. Matching it on top anyway stopped route 0000045a's flight 13.5 m behind a lead that was still
