@@ -81,6 +81,7 @@ from moonpilot.longitudinal import (
   MOONPILOT_STOP_REST,
   MOONPILOT_STOP_TAPER_T,
   MOONPILOT_TRACK_BRAKE,
+  MOONPILOT_TRACK_BRAKE_T,
   MOONPILOT_T_FOLLOW,
   MOONPILOT_T_FOLLOW_SLEW_DOWN,
   MOONPILOT_T_FOLLOW_SLEW_UP,
@@ -575,8 +576,8 @@ class TestPolicyFunctions(unittest.TestCase):
         # long enough for the creep a stopped lead beyond the band is closed at to arrive and stop
         s = _fly(20.0, 72.0, 29.0, 20.0, lambda t, b=brake: b if t > 1 else 0.0, 70.0)
         self.assertFalse(s["contact"])
-        # the stop rests inside the floor's rest region, keeping its one-meter allowance
-        self.assertGreater(s["min_gap"], MOONPILOT_STOP_REST - MOONPILOT_MIN_SLACK)
+        # it rests where a stop behind a stopped lead does: past its rest the lead's braking is not matched again
+        self.assertGreater(s["min_gap"], MIN_REST_GAP)
         self.assertLess(s["v"][-1], 0.05)
     # and the direct assertion: at matched speed the prediction branch, not the match, is what binds
     self.assertLess(stopping_decel(20.0, 20.0, -5.0, 23.0), -MOONPILOT_APPROACH_DECEL)
@@ -597,7 +598,7 @@ class TestPolicyFunctions(unittest.TestCase):
     stop clear. This plant integrates ego travel on the updated speed (~0.75 m optimistic from 30 m/s);
     on the trapezoid the fixed horizon contacts in both (`python -m moonpilot.lab sustain`)."""
     s = _fly(30.0, 118.0, 43.5, 30.0, lambda t: -3.5 if t > 1 else 0.0, 25.0)
-    self.assertGreater(s["min_gap"], MOONPILOT_STOP_REST - MOONPILOT_MIN_SLACK)
+    self.assertGreater(s["min_gap"], MIN_REST_GAP)
     s = _fly(25.0, 100.0, 36.25, 25.0, lambda t: -5.0 if t > 1 else 0.0, 25.0)
     self.assertFalse(s["contact"])
 
@@ -715,14 +716,15 @@ class TestLeadLaw(unittest.TestCase):
     """The deadline is the law's `when`: a closing lead whose near edge is more than `MOONPILOT_ARRIVE_T` of
     closing time away is not braked for at all, and once the edge is inside `MOONPILOT_ARRIVE_T -
     MOONPILOT_ARRIVE_RAMP_T` the ask is the constant decel that arrives there speed-matched, plus
-    `MOONPILOT_TRACK_BRAKE` of a slowing lead's accel.
+    `MOONPILOT_TRACK_BRAKE` of a slowing lead's accel, no more than sheds its predicted speed in `MOONPILOT_TRACK_BRAKE_T`.
 
     The states are chosen where the stopping floor is not admitted — the closing is small against a moving lead —
     so the arrival is the whole of the ask.
     """
     for v_ego, v_lead, a_slow in ((25.0, 20.0, 0.0), (20.0, 15.0, -2.0)):
       near, far = _lead_band(v_lead, a_slow=a_slow)
-      closing = v_ego - max(v_lead + a_slow * MOONPILOT_PREDICT_T, 0.0)
+      v_pred = max(v_lead + a_slow * MOONPILOT_PREDICT_T, 0.0)
+      closing = v_ego - v_pred
       self.assertGreater(closing, 0.0)
       with self.subTest(v_ego=v_ego, v_lead=v_lead, a_slow=a_slow, phase="waiting"):
         gap = near + (MOONPILOT_ARRIVE_T + 2.0) * closing
@@ -731,8 +733,21 @@ class TestLeadLaw(unittest.TestCase):
       whole = (MOONPILOT_ARRIVE_T - MOONPILOT_ARRIVE_RAMP_T) * closing
       for room in (MOONPILOT_ARRIVE_MIN_T * closing, 0.5 * whole, whole):
         with self.subTest(v_ego=v_ego, v_lead=v_lead, a_slow=a_slow, room=room):
-          expected = -(closing**2 / (2.0 * room) + MOONPILOT_TRACK_BRAKE * max(-a_slow, 0.0))
+          a_track = MOONPILOT_TRACK_BRAKE * min(max(-a_slow, 0.0), v_pred / MOONPILOT_TRACK_BRAKE_T)
+          expected = -(closing**2 / (2.0 * room) + a_track)
           self.assertAlmostEqual(lead_accel(v_ego, near + room, v_lead, 0.0, self.T_FOLLOW, a_slow=a_slow), expected, delta=1e-9)
+
+  def test_a_lead_predicted_at_rest_is_not_braked_for_again(self):
+    """Its predicted speed already carries a slowing lead's braking to rest, so past that, how hard it was braking adds
+    nothing to the arrival. Matching it on top anyway stopped route 0000045a's flight 13.5 m behind a lead that was still
+    crawling, at a -2.31 m/s^2 peak, and then crept up to it."""
+    v_ego, gap, v_lead = 6.0, 14.0, 1.0
+    near, _ = _lead_band(v_lead, a_slow=-1.0)
+    self.assertLess((gap - near) / v_ego, MOONPILOT_ARRIVE_T - MOONPILOT_ARRIVE_RAMP_T)  # the arrival is wholly in
+    asks = [lead_accel(v_ego, gap, v_lead, 0.0, self.T_FOLLOW, a_slow=a_slow) for a_slow in (-1.0, -2.0, -4.0)]
+    self.assertLess(asks[0], 0.0)
+    self.assertEqual(asks[0], asks[1])
+    self.assertEqual(asks[1], asks[2])
 
   def test_beyond_the_band_the_closing_it_accelerates_to_is_bounded(self):
     """Far behind a lead, the law catches up at no more than `MOONPILOT_CATCH_UP_CLOSING`: at the bound and past

@@ -163,7 +163,8 @@ MOONPILOT_ARRIVE_T = 9.0  # s; an edge this far away at the current closing star
 MOONPILOT_ARRIVE_RAMP_T = 3.0  # s; ...wholly by this much sooner
 MOONPILOT_ARRIVE_MIN_T = 1.5  # s; the near edge's arrival never takes less than this much closing time
 MOONPILOT_LEAVE_MIN_T = 2.0  # s; nor the far edge's, a lead pulling away
-MOONPILOT_TRACK_BRAKE = 0.7  # share of a slowing lead's slow accel the ego also matches while arriving
+MOONPILOT_TRACK_BRAKE = 0.85  # share of a slowing lead's slow accel the ego also matches while arriving...
+MOONPILOT_TRACK_BRAKE_T = 3.0  # s; ...no more of it than sheds the predicted lead speed over this: none once it is at rest
 MOONPILOT_TRACK_ACCEL = 0.5  # share of an accelerating lead's
 MOONPILOT_RECOVER_T = 6.0  # s; outside the band its edge is closed in at the gap error over this...
 MOONPILOT_RESPONSE_T = 1.5  # s; ...with the speed error answered over this
@@ -586,7 +587,8 @@ def lead_accel(v_ego, gap, v_lead, a_lead, t_follow, sustain=None, a_slow=0.0) -
   it the plan holds speed: radar noise there moves nothing, and a lead's wander inside it is not chased.
 
   When: once the near edge is `MOONPILOT_ARRIVE_T` away at the current closing, the constant decel that arrives there
-  speed-matched, plus `MOONPILOT_TRACK_BRAKE` of a slowing lead's slow accel; once the far edge is that close at the
+  speed-matched, plus `MOONPILOT_TRACK_BRAKE` of a slowing lead's slow accel — no more than would shed its predicted
+  speed in `MOONPILOT_TRACK_BRAKE_T`, so a lead about to stop is not braked for twice; once the far edge is that close at the
   current opening, the constant accel that matches the lead before it, plus `MOONPILOT_TRACK_ACCEL` of an accelerating
   lead's. Both are kinematic predictions rather than reactions, and continuous through zero closing.
 
@@ -610,7 +612,8 @@ def lead_accel(v_ego, gap, v_lead, a_lead, t_follow, sustain=None, a_slow=0.0) -
   # Inside the last meters the arrival is spread over no more than the physical gap past the contact margin, less
   # MOONPILOT_REACH_LAG_T of closing: the jerk ramp and actuator lag a close stop spends before its decel is whole.
   reach = max(gap - MOONPILOT_CRASH_DISTANCE - MOONPILOT_REACH_LAG_T * max(closing, 0.0), 0.05)
-  a -= _arrive(gap - near, closing, MOONPILOT_ARRIVE_MIN_T, MOONPILOT_TRACK_BRAKE * max(-a_slow, 0.0), reach)
+  a_track = MOONPILOT_TRACK_BRAKE * min(max(-a_slow, 0.0), v_pred / MOONPILOT_TRACK_BRAKE_T)
+  a -= _arrive(gap - near, closing, MOONPILOT_ARRIVE_MIN_T, a_track, reach)
   a += min(gap - near, 0.0) / (MOONPILOT_RECOVER_T * MOONPILOT_RESPONSE_T)
   catch_up = min(max(gap - far - MOONPILOT_CATCH_UP_SLACK, 0.0) / MOONPILOT_RECOVER_T, MOONPILOT_CATCH_UP_CLOSING)
   a += max(catch_up - max(closing, 0.0), 0.0) / MOONPILOT_RESPONSE_T

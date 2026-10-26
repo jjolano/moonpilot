@@ -1084,11 +1084,13 @@ def _calibration(route, root):
 
 def _fly_logged_lead(job):
   """The engine-coast RAV4 planner, seeded with `calibration`, on the lagged plant from a logged start behind the logged
-  lead's own path. The set speed is the start's unless a sixth element gives one, so by default only the lead terms brake."""
+  lead's own path. The set speed is the start's unless a sixth element gives one, so by default only the lead terms brake;
+  a seventh is the drive's model ask, frame by frame."""
   from moonpilot.tests.test_engine_coast import _planner
   from moonpilot.tests.test_longitudinal import _inputs, _lead
-  v_log, gap_log, v_lead, a0, calibration, *cruise = job
-  v_cruise_kph = cruise[0] if cruise else v_log[0] * 3.6
+  v_log, gap_log, v_lead, a0, calibration, *extra = job
+  v_cruise_kph = extra[0] if extra else v_log[0] * 3.6
+  model = extra[1] if len(extra) > 1 else np.zeros(len(v_log))
   s_ego = [0.0]
   for v0, v1 in zip(v_log[:-1], v_log[1:], strict=True):
     s_ego.append(_advance(s_ego[-1], v0, v1))
@@ -1098,7 +1100,7 @@ def _fly_logged_lead(job):
   v, s, out = v_log[0], 0.0, {"v": [], "a": [], "gap": [], "pressing": [], "cmd": []}
   for i in range(len(v_log)):
     planner.update(_inputs(v_ego=v, v_cruise_kph=v_cruise_kph, a_ego=plant.a, lead=_lead(max(s_lead[i] - s, 0.0), max(v_lead[i], 0.0)),
-                           standstill=v < 0.05, personality=1))
+                           standstill=v < 0.05, personality=1, model_accel=float(model[i])))
     for k, x in zip(out, (v, plant.a, s_lead[i] - s, planner.brake_band.pressing, float(planner.output_a_target)), strict=True):
       out[k].append(x)
     v_new = max(0.0, v + plant.step(float(planner.output_a_target)) * DT_MDL)
@@ -1215,6 +1217,30 @@ def _decel_peaks(args):
     print(f"{route}: {m.sum()} engaged frames; ask < -0.4 for {np.sum(m & (now < -0.4)) * DT_MDL:.1f} s; band presses {presses}; peak {now[m].min():.2f}")
 
 
+def _engaged_fly(args):
+  """An engaged window flown closed-loop: today's planner on the lagged plant from the car's state at `--start`, behind
+  the logged lead's own path, fed the drive's model ask and set speed — against what the car did there. The model's ask
+  is open-loop (what it asked from where the car really was), so a flight that strays far from the car reads it less."""
+  details = []
+  _, logged, _, _ = replay(args.route, extract(args.route, args.root), args.root, details_out=details)
+  m = _details_arrays(details)
+  t = m["t"] - m["t"][0]
+  w = (t >= args.start) & (t < args.end)
+  v_cruise = float(np.nanmedian(m["v_cruise"][w]))
+  flown = _fly_logged_lead((m["v_ego"][w], m["d_rel"][w], m["v_lead"][w], float(m["a_ego"][w][0]), _calibration(args.route, args.root),
+                            v_cruise, m["model_accel"][w]))
+
+  def line(name, a, cmd, gap, v):
+    s = np.sign(np.where(np.abs(cmd) < 0.05, 0.0, cmd))
+    s = s[s != 0]
+    return (f"  {name:8s} peak aEgo {np.convolve(a, np.ones(10) / 10, mode='same').min():+.2f}  command {cmd.min():+.2f}  "
+            + f"sign flips {int(np.sum(s[1:] != s[:-1])):2d}  closest {gap.min():5.2f} m  ends {v[-1]:.2f} m/s at {gap[-1]:5.2f} m")
+
+  print(f"{args.route} {args.start:.1f}-{args.end:.1f} s, set speed {v_cruise:.0f} kph:")
+  print(line("car", m["a_ego"][w], logged[w], m["d_rel"][w], m["v_ego"][w]))
+  print(line("planner", flown["a"], flown["cmd"], flown["gap"], flown["v"]))
+
+
 def _register_manual(sub):
   parser = sub.add_parser("manual-decel", help="the lead law's approach requirement against the driver's own longitudinal")
   parser.add_argument("--routes", nargs="+", default=["manual-approach"], help=f"route names or sets: {', '.join(ROUTE_SETS)}")
@@ -1238,6 +1264,11 @@ def _register_manual(sub):
   parser.add_argument("--engaged", nargs="+", default=[], help="engaged drives to replay")
   parser.add_argument("--calibration", default="00000451", help="drive whose recorded lag and radar latency seed the flights, or none")
   parser.set_defaults(fn=_decel_peaks)
+  parser = sub.add_parser("engaged-fly", help="an engaged window flown closed-loop through today's planner, with the drive's model ask")
+  parser.add_argument("route", help="full route name, e.g. 0000045a--8c1d34e64d")
+  parser.add_argument("--start", type=float, required=True, help="s from the drive's first plan")
+  parser.add_argument("--end", type=float, required=True, help="s from the drive's first plan")
+  parser.set_defaults(fn=_engaged_fly)
 
 
 def register(sub):

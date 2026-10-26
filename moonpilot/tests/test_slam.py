@@ -374,12 +374,11 @@ class TestUpstreamManeuverWithCorrection(unittest.TestCase):
       self.assertAlmostEqual(logs[-1, 3], 0.0, delta=0.05)  # it still comes to rest
       self.assertGreater(logs[:, 6].min(), 2.0)  # and behind the lead, never through it
     # The correction's reach, and its ceiling. It moves the command trace by up to 0.5 m/s^2 (asserted
-    # above), but it does not move where the maneuver ends: the lead law's settle point is the band's
-    # rest edge and its silence inside the band, not an arrival slack the believed speed divides into,
-    # so the corrected run settles 6 mm nearer and peaks 0.016 m/s^2 shallower here. That is the
-    # measured statement, and it is the one to keep: a direction claim of "further back" was true of
-    # the regulator this replaced and is not true of a band.
-    self.assertAlmostEqual(corrected[-1, 6], base[-1, 6], delta=0.05, msg="the correction must not move where the maneuver settles")
+    # above), and it moves where the maneuver ends only the way the believed speed should: a stop is
+    # spread over `MOONPILOT_ARRIVE_MIN_T` of its closing, so a planner that believes itself 0.5 m/s
+    # faster arrives braking for that speed and settles further back — measured 0.56 m on this maneuver
+    # once a lead braking to rest stopped being matched past its rest — and never nearer.
+    self.assertGreater(corrected[-1, 6], base[-1, 6] - 0.05, msg="a correction toward more speed must not settle the car nearer")
     self.assertAlmostEqual(corrected[:, 5].min(), base[:, 5].min(), delta=0.1)
 
 
