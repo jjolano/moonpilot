@@ -109,8 +109,18 @@ print("flashed", fw, "| pin", pin[:8], "|",
 A fork build reports `DEV-<short-sha>-DEBUG`, the sha being panda's own HEAD when the firmware was
 built. A sha that is not the superproject's pin means the board is running someone else's safety
 layer: `controls_allowed_lateral` is never set, so `controlsAllowedLateral` stays false and
-half-engagement is inert no matter what the params say. (The status script reads
+half-engagement is inert no matter what the params say. (The status script's `built fw` line reads
 `panda/board/obj/gitversion.h` - what was *built*; this reads what is *flashed*.)
+
+**Offroad only.** `Panda()` is not a read: its `connect()` disables heartbeat checks, resets CAN
+communications and rewrites every bus's speed (`panda/python/__init__.py:235-249`). Onroad, read the
+boot's flash from swaglog instead - `pandad.py` refuses to start the daemon until the flashed
+signature equals `panda/board/obj/panda_h7.bin.signed`'s, so a running `pandad` plus this boot's
+lines prove the flashed image is the built one:
+
+```bash
+grep -rhE "firmware out of date|flashing panda|panda stuck in bootstub" /data/log
+```
 
 ## Do not
 

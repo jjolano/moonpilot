@@ -23,7 +23,7 @@ echo "  -- dirty files per submodule"
 git submodule foreach --recursive --quiet 'echo "  $displaypath $(git status --porcelain | wc -l)"'
 
 echo "== panda"
-sed -n 's/.*gitversion\[[0-9]*\] = "\(.*\)".*/firmware     \1/p' "$OP/panda/board/obj/gitversion.h" 2>/dev/null || echo "firmware     (not built)"
+sed -n 's/.*gitversion\[[0-9]*\] = "\(.*\)".*/built fw     \1/p' "$OP/panda/board/obj/gitversion.h" 2>/dev/null || echo "built fw     (not built)"
 
 echo "== params"
 for f in "$P"/Moonpilot*; do
