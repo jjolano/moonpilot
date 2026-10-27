@@ -1892,7 +1892,9 @@ def _accel_bursts(args):
     commanded = _burst_starts(logged, mask)
     for key, series in (("logged", logged), ("car", car), ("today (counterfactual)", replayed), ("today, far leads ignored", dropped)):
       totals[key] += len(_burst_starts(series, mask))
-    car_only += sum(not any(abs(c - k) <= n for k in commanded) for c in _burst_starts(car, mask))  # the car answers the logged command
+    # a measured burst with no logged-command burst start within BURST_T: unmatched, not a cause — a smaller or slower
+    # command ramp, a response delayed past the window, or aEgo noise reads the same
+    car_only += sum(not any(abs(c - k) <= n for k in commanded) for c in _burst_starts(car, mask))
     for i in commanded:
       if np.max(np.abs(replayed[i:i + n + 1] - logged[i:i + n + 1])) > BURST_REPRO_TOL or frames[i] is None or frames[i + n] is None:
         continue
@@ -1906,7 +1908,8 @@ def _accel_bursts(args):
   print(f"{len(routes)} drives, {minutes:.1f} engaged min above 5 m/s; today's replay vs the logged command |aTarget error| median "
         + f"{np.median(err):.4f} p95 {np.percentile(err, 95):.4f} m/s^2 — the drives' older code")
   print("bursts per engaged minute: " + ", ".join(f"{k} {v / max(minutes, 1e-9):.2f} ({v})" for k, v in totals.items()))
-  print(f"  of the car's {totals['car']}, {car_only} have no logged-command burst within {BURST_T:g} s: the car's own, not the plan's")
+  print(f"  of the car's {totals['car']}, {car_only} are unmatched: no logged-command burst starts within {BURST_T:g} s "
+        + "(a count, not a cause: it needs delay-aligned plan, actuator output and measured accel to say whose they are)")
   print(f"{reproduced} of the {totals['logged']} logged bursts reproduced within {BURST_REPRO_TOL:g} m/s^2 and attributed "
         + f"({far_count} start on a far lead); the other {totals['logged'] - reproduced} are unexplained:")
   for kind, count in sorted(kinds.items(), key=lambda kv: -kv[1]):
