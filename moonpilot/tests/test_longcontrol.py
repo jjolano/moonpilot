@@ -259,6 +259,31 @@ class TestCrawlRelease(unittest.TestCase):
       with self.subTest(v_ego=v_ego, a_target=a_target, standstill=standstill):
         self.assertEqual(self._settled(True, v_ego, a_target, should_stop, standstill), self._settled(False, v_ego, a_target, should_stop, standstill))
 
+  def test_plan_noise_across_either_end_of_the_release_moves_nothing(self):
+    """A running controller whose plan jitters across the release's depth limit, or across zero while stopping, settles
+    to one command: neither end of the release is a step for noise to pump."""
+    for edge, should_stop in ((-MOONPILOT_CRAWL_RELEASE_MAX_ASK, False), (-MOONPILOT_CRAWL_RELEASE_MAX_ASK, True), (0.0, True)):
+      with self.subTest(edge=edge, should_stop=should_stop):
+        CP = CarInterface.get_non_essential_params(CAR.HONDA_CIVIC)
+        controller = MoonpilotLongControl(CP, crawl_release=True)
+        CS = _state(v_ego=0.25, a_ego=edge)
+        outputs = [_step(controller, CS, edge + (1e-6 if k % 2 else -1e-6), should_stop=should_stop) for k in range(200)]
+        self.assertLess(max(outputs[-50:]) - min(outputs[-50:]), 1e-4)
+
+  def test_an_integral_carried_into_the_release_neither_cancels_nor_deepens_the_eased_ask(self):
+    """Rolling in pid with an integral already wound either way, the release commands its eased ask exactly: a retained
+    positive integral does not cancel the braking, a negative one does not deepen it."""
+    CP = CarInterface.get_non_essential_params(CAR.HONDA_CIVIC)
+    CS = _state(v_ego=0.4, a_ego=-0.3)
+    expected = self._settled(True, 0.4, -0.16)
+    self.assertLess(expected, -0.1)  # still braking
+    for integral in (0.2, -0.2):
+      with self.subTest(integral=integral):
+        controller = MoonpilotLongControl(CP, crawl_release=True)
+        _step(controller, CS, 0.0)  # into pid
+        controller.pid.i = integral
+        self.assertAlmostEqual(_step(controller, CS, -0.16, frames=100), expected, places=9)
+
 
 class TestLongControlSeam(unittest.TestCase):
   def test_factory_returns_the_fork_controller_only_when_wanted(self):

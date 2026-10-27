@@ -36,14 +36,16 @@ MOONPILOT_ACCEL_JERK = 8.0  # m/s^3 limit on the commanded accel, so a plan step
 MOONPILOT_STOPPING_JERK = 1.0  # m/s^3 ramp toward CP.stopAccel once physically stopped
 MOONPILOT_MIN_ROLLING_STOP_DECEL = 0.2  # m/s^2 ensures a zero-target rolling stop can finish
 MOONPILOT_STANDSTILL_SPEED = 0.1  # m/s; below it aEgo is noise, so the integrator freezes
-# `MoonpilotCrawlRelease` (test, off): below this speed, still rolling, a braking ask no deeper than MAX_ASK is scaled by
-# the speed's share of it, never below MIN — the way a driver lets off just before the car stops. On route 00000468
+# `MoonpilotCrawlRelease` (test, off): below this speed, still rolling, a gentle braking ask is scaled toward the speed's
+# share of it, never below MIN — the way a driver lets off just before the car stops. On route 00000468
 # the car's own decel deepened from -0.14 to -0.28 m/s^2 between 0.37 and 0.25 m/s while the request sat at -0.16
 # (wheel speeds and the VSC G sensor agree), and the rolling stop's floor stepped the request to -0.20 at 0.27 m/s.
 # Whether a lighter request takes that out is the drive's answer. Open-loop from 0.4 m/s it doubles the crawl's own stopping
-# distance — 1.0 m against 0.5 behind a -0.16 ask, 0.54 against 0.27 behind -0.3 — and a gap that closes faster than the
-# plan wanted draws an ask past MAX_ASK, which passes untouched.
+# distance — 1.0 m against 0.5 behind a -0.16 ask — and a gap that closes faster than the plan wanted draws a deeper ask,
+# which the release fades out of: whole at FULL_ASK and shallower, none at MAX_ASK and deeper, linear between, so plan
+# noise across either end moves the command continuously.
 MOONPILOT_CRAWL_RELEASE_SPEED = 0.5  # m/s
+MOONPILOT_CRAWL_RELEASE_FULL_ASK = 0.2  # m/s^2
 MOONPILOT_CRAWL_RELEASE_MAX_ASK = 0.3  # m/s^2; a deeper ask is a stop that needs its braking, untouched
 MOONPILOT_CRAWL_RELEASE_MIN = 0.3  # share of the ask (and of the rolling stop's floor) kept at the end
 
@@ -61,11 +63,14 @@ class MoonpilotLongControl:
 
   def _crawl_share(self, CS, a_target) -> float:
     """How much of a gentle braking ask, and of the rolling stop's floor, is kept in the last of a stop: 1 unless
-    `MoonpilotCrawlRelease` is on and the car is still rolling under MOONPILOT_CRAWL_RELEASE_SPEED behind an ask no deeper
-    than MOONPILOT_CRAWL_RELEASE_MAX_ASK."""
-    if not self.crawl_release or CS.standstill or CS.vEgo >= MOONPILOT_CRAWL_RELEASE_SPEED or not -MOONPILOT_CRAWL_RELEASE_MAX_ASK <= a_target < 0.0:
+    `MoonpilotCrawlRelease` is on and the car is still rolling under MOONPILOT_CRAWL_RELEASE_SPEED. Continuous in both:
+    the speed share fades out between FULL_ASK and MAX_ASK of depth, and an ask at or above zero gets the full share, so
+    the stopping floor does not snap back when the plan crosses zero."""
+    if not self.crawl_release or CS.standstill or CS.vEgo >= MOONPILOT_CRAWL_RELEASE_SPEED:
       return 1.0
-    return max(CS.vEgo / MOONPILOT_CRAWL_RELEASE_SPEED, MOONPILOT_CRAWL_RELEASE_MIN)
+    speed_share = max(CS.vEgo / MOONPILOT_CRAWL_RELEASE_SPEED, MOONPILOT_CRAWL_RELEASE_MIN)
+    depth = (a_target + MOONPILOT_CRAWL_RELEASE_MAX_ASK) / (MOONPILOT_CRAWL_RELEASE_MAX_ASK - MOONPILOT_CRAWL_RELEASE_FULL_ASK)
+    return 1.0 - (1.0 - speed_share) * min(max(depth, 0.0), 1.0)
 
   def reset(self):
     self.pid.reset()
@@ -76,7 +81,8 @@ class MoonpilotLongControl:
 
     previous_state = self.long_control_state
     share = self._crawl_share(CS, a_target)
-    a_target *= share
+    if a_target < 0.0:
+      a_target *= share  # a positive ask is never scaled; the share still eases the stopping floor below
     self.long_control_state = long_control_state_trans(active, self.long_control_state, should_stop, CS.brakePressed, CS.cruiseState.standstill)
     if self.long_control_state == LongCtrlState.off:
       self.reset()
@@ -106,14 +112,18 @@ class MoonpilotLongControl:
       return self.last_output_accel
 
     # LongCtrlState.pid
-    error = a_target - CS.aEgo
-    # Standing still, or with the driver on a pedal, the integrator would wind up on error that
-    # is a measurement artifact or a command the driver is overriding. Under the crawl release the eased ask is not a
-    # target to track — this car decelerates past a gentle ask at a crawl, so tracking it would wind toward throttle.
-    freeze = CS.vEgo < MOONPILOT_STANDSTILL_SPEED or CS.brakePressed or CS.gasPressed or share < 1.0
-    output_accel = self.pid.update(error, speed=CS.vEgo, feedforward=a_target, freeze_integrator=freeze)
-    if share < 1.0:
-      output_accel = min(output_accel, 0.0)  # the release lightens a braking ask; it never turns one into throttle
+    if share < 1.0 and a_target < 0.0:
+      # Under the crawl release the eased ask is commanded as is: this car decelerates past a gentle crawl ask, so tracking
+      # it would wind toward throttle, and an integral carried in would cancel it. kp is 0, so the PID is i + feedforward
+      # and resetting it leaves the feedforward — and resumes from zero integral as the release fades out.
+      self.reset()
+      output_accel = a_target
+    else:
+      error = a_target - CS.aEgo
+      # Standing still, or with the driver on a pedal, the integrator would wind up on error that
+      # is a measurement artifact or a command the driver is overriding.
+      freeze = CS.vEgo < MOONPILOT_STANDSTILL_SPEED or CS.brakePressed or CS.gasPressed
+      output_accel = self.pid.update(error, speed=CS.vEgo, feedforward=a_target, freeze_integrator=freeze)
 
     output_accel = float(
       np.clip(output_accel, self.last_output_accel - MOONPILOT_ACCEL_JERK * DT_CTRL, self.last_output_accel + MOONPILOT_ACCEL_JERK * DT_CTRL)
