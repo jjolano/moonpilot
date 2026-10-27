@@ -1611,9 +1611,10 @@ def _launch_episodes(d):
   it never happens inside 6 s, and the ego's own accel over its first 2 s moving)."""
   n2, n6, settle = round(2.0 / DT_MDL), round(6.0 / DT_MDL), round(1.0 / DT_MDL)
   v, v_lead, gap, brake, gas = d["v"], d["v_lead"], d["gap"], d["brake"] > 0, d["gas"] > 0
-  continuous = np.r_[False, (np.abs(np.diff(gap)) <= 1.0) & (np.abs(np.diff(v_lead)) <= 1.0) & (np.diff(d["route"]) == 0)]
+  continuous = np.r_[False, (np.abs(np.diff(gap)) <= 1.0) & (np.abs(np.diff(v_lead)) <= 1.0) & (np.diff(d["route"]) == 0)
+                     & (np.diff(d["track_id"]) == 0)]
   rows = []
-  for r in runs((d["manual"] > 0) & (d["lead"] > 0) & (v < 0.1)):
+  for r in runs((d["manual"] > 0) & (d["lead"] > 0) & (d["lead_radar"] > 0) & (v < 0.1)):
     if r.stop - r.start < settle or np.median(v_lead[r]) > 0.3 or np.median(gap[r]) > 20.0:
       continue
     # the lead's onset: the last frame under 0.2 m/s before it passes 1 m/s, the same lead throughout
@@ -1648,8 +1649,16 @@ def _launch_episodes(d):
 def _launch_reaction(args):
   """The driver's reaction from a standstill behind a stopped radar lead when it launches, against how hard it launches:
   from the lead's onset (its last frame under 0.2 m/s before it passes 1 m/s), how long to the brake release, the gas and
-  the ego moving. Pedal booleans at the 20 Hz planner tick: switch timing, not pressure, and a switch can lag the pedal."""
-  x = _launch_episodes(_pooled_manual(expand(args.routes, ROUTE_SETS), args.root))
+  the ego moving. Pedal booleans at the driver extract's 20 Hz: switch timing, not pressure, and a switch can lag the pedal
+  (this car leaves `carState.brake`/`gas` unpopulated). Every drive with rlogs under --root by default; one lead is one
+  `radarTrackId` whose gap and speed move continuously through the launch."""
+  from moonpilot.lab import driver
+  routes = expand(args.routes, ROUTE_SETS) if args.routes else driver._routes(args.root)
+  frames = [driver.extract(r, args.root) for r in routes]
+  d = {k: np.concatenate([f[k] for f in frames]) for k in ("manual", "v", "brake", "gas", "lead", "lead_radar", "gap", "v_lead", "track_id")}
+  d["route"] = np.concatenate([np.full(len(f["t"]), i) for i, f in enumerate(frames)])
+  x = _launch_episodes(d)
+  print(f"{len(routes)} drives")
   a_lead, gap, held, release, gas, moving, ego_a, opened, v_rel = x.T
   held = held > 0
   print(f"{len(x)} manual launches behind a stopped radar lead (median gap at rest {np.median(gap):.1f} m); brake held at the lead's "
@@ -1732,8 +1741,7 @@ def _register_manual(sub):
                       help="one lead = one radarTrackId, or a gap and speed that move continuously under any id")
   parser.set_defaults(fn=_stop_cues)
   parser = sub.add_parser("launch-reaction", help="the driver's brake release, gas and move times behind a launching lead, by its launch accel")
-  parser.add_argument("--routes", nargs="+", default=["manual-approach", "0000044e", "0000044f", "00000450", "00000451"],
-                      help=f"manual route names or sets: {', '.join(ROUTE_SETS)}")
+  parser.add_argument("--routes", nargs="*", default=[], help=f"route names or sets: {', '.join(ROUTE_SETS)}; default every drive with rlogs")
   parser.set_defaults(fn=_launch_reaction)
 
 
