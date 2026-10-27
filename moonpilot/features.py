@@ -165,6 +165,17 @@ ENGINE_COAST = Feature(
   offroad_only=True,
 )
 
+CRAWL_RELEASE = Feature(
+  key="MoonpilotCrawlRelease",
+  title="ease off before the stop (test)",
+  description=(
+    "In the last 2 km/h of a gentle stop the brake request eases toward zero, the way a driver lets off just before "
+    + "the car stops, to take out the final lurch. Firmer stops are unchanged. Untested on the road: watch the stopping "
+    + "distance. Needs moonpilot longitudinal; openpilot-longitudinal cars only. Takes effect after a restart."
+  ),
+  offroad_only=True,
+)
+
 # No requires: `requires` gates on importable Python modules, and tailscale here is a binary.
 # There is nothing to gate either way — the supervisor installs what is missing and the settings
 # row says so while it does.
@@ -227,7 +238,8 @@ SPEED = Group(
   description="What the car does with the pedals: whose planner sets the speed, and how it reads the road ahead.",
   # The lead's lateral prediction sits here rather than with the steering because the fork reaches
   # it through the planner's time gap, not through a steering request.
-  features=(LONGITUDINAL, EXPERIMENTAL_MODE, MODEL_BRAKING, CURVE_SPEED, SQUEEZE, PATH_OUTSIDE, COAST_GRADE, BRAKE_BAND, ENGINE_COAST, LEAD_LATERAL, SLAM),
+  features=(LONGITUDINAL, EXPERIMENTAL_MODE, MODEL_BRAKING, CURVE_SPEED, SQUEEZE, PATH_OUTSIDE, COAST_GRADE, BRAKE_BAND, ENGINE_COAST, CRAWL_RELEASE,
+            LEAD_LATERAL, SLAM),
 )
 
 DEVICE = Group(

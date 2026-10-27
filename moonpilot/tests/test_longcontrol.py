@@ -16,6 +16,8 @@ from openpilot.common.realtime import DT_CTRL
 
 from moonpilot.longcontrol import (
   MOONPILOT_ACCEL_JERK,
+  MOONPILOT_CRAWL_RELEASE_MAX_ASK,
+  MOONPILOT_CRAWL_RELEASE_SPEED,
   MOONPILOT_MIN_ROLLING_STOP_DECEL,
   MOONPILOT_STANDSTILL_SPEED,
   MoonpilotLongControl,
@@ -233,11 +235,43 @@ class TestMoonpilotLongControl(unittest.TestCase):
     self.assertEqual(controller.long_control_state, LongCtrlState.stopping)
 
 
+class TestCrawlRelease(unittest.TestCase):
+  """`MoonpilotCrawlRelease`: the last of a gentle stop asks less, and nothing else moves."""
+
+  @staticmethod
+  def _settled(release, v_ego, a_target, should_stop=False, standstill=False):
+    CP = CarInterface.get_non_essential_params(CAR.HONDA_CIVIC)
+    controller = MoonpilotLongControl(CP, crawl_release=release)
+    return _step(controller, _state(v_ego=v_ego, a_ego=a_target, standstill=standstill), a_target, should_stop=should_stop, frames=100)
+
+  def test_a_gentle_crawl_ask_eases_with_speed_and_still_brakes(self):
+    for should_stop in (False, True):
+      with self.subTest(should_stop=should_stop):
+        slow, slower = (self._settled(True, v, -0.16, should_stop) for v in (0.4, 0.15))
+        off = self._settled(False, 0.4, -0.16, should_stop)
+        self.assertLess(off, slow)  # lighter than without the release
+        self.assertLess(slow, slower)  # and lighter the slower the car rolls
+        self.assertLess(slower, 0.0)  # but a rolling stop still finishes
+
+  def test_a_firm_ask_a_launch_a_faster_car_and_a_standstill_are_untouched(self):
+    for v_ego, a_target, should_stop, standstill in ((0.3, -MOONPILOT_CRAWL_RELEASE_MAX_ASK - 0.2, True, False), (0.3, 0.5, False, False),
+                                                     (MOONPILOT_CRAWL_RELEASE_SPEED + 0.1, -0.16, True, False), (0.0, -0.16, True, True)):
+      with self.subTest(v_ego=v_ego, a_target=a_target, standstill=standstill):
+        self.assertEqual(self._settled(True, v_ego, a_target, should_stop, standstill), self._settled(False, v_ego, a_target, should_stop, standstill))
+
+
 class TestLongControlSeam(unittest.TestCase):
   def test_factory_returns_the_fork_controller_only_when_wanted(self):
     CP = CarInterface.get_non_essential_params(CAR.HONDA_CIVIC)
     self.assertIsInstance(moonpilot_longcontrol(CP, _params(on=True)), MoonpilotLongControl)
     self.assertIsNone(moonpilot_longcontrol(CP, _params(on=False)))
+
+  def test_the_crawl_release_is_read_from_its_toggle_at_construction(self):
+    CP = CarInterface.get_non_essential_params(CAR.HONDA_CIVIC)
+    for on in (False, True):
+      controller = moonpilot_longcontrol(CP, _params(on=True, overrides={"MoonpilotCrawlRelease": on}))
+      assert controller is not None
+      self.assertIs(controller.crawl_release, on)
 
 
 if __name__ == "__main__":

@@ -1412,16 +1412,37 @@ def _delay_cost(args):
           + f"| stop: ask {s_ask:+.2f} aEgo {s_felt:+.2f} closest {s_gap:.2f} m")
 
 
-def _shape_fly(job):
-  """One `stop-shape` flight, engine coast off as the device runs; `flat` flies the braking match's former flat 0.85."""
+# stop-shape's arms: (braking-match shares, the ease rate while a lead brakes); None keeps today's value, and an infinite ease
+# rate is no ease limit at all.
+SHAPE_ARMS: dict[str, tuple[list[float] | None, float | None]] = {
+  "flat 0.85": ([0.85, 0.85, 0.85], math.inf),
+  "scheduled": (None, math.inf),
+  "today": (None, None),
+  "ease 0.3": (None, 0.3),
+}
+
+
+@contextmanager
+def _shape_arm(arm):
+  """The planner's constants under one `SHAPE_ARMS` arm, restored on exit."""
   import moonpilot.longitudinal as longitudinal
-  flat, flight = job
-  scheduled = longitudinal.MOONPILOT_TRACK_BRAKE_V
-  longitudinal.MOONPILOT_TRACK_BRAKE_V = [0.85] * len(scheduled) if flat else scheduled
+  shares, ease = SHAPE_ARMS[arm]
+  saved = longitudinal.MOONPILOT_TRACK_BRAKE_V, longitudinal.MOONPILOT_JERK_EASE_LEAD_BRAKING
+  if shares is not None:
+    longitudinal.MOONPILOT_TRACK_BRAKE_V = shares
+  if ease is not None:
+    longitudinal.MOONPILOT_JERK_EASE_LEAD_BRAKING = ease  # ty: ignore[invalid-assignment]  # the arm's rate, a float like the constant
   try:
-    return _fly_logged_lead(flight, engine_coast=False)
+    yield
   finally:
-    longitudinal.MOONPILOT_TRACK_BRAKE_V = scheduled
+    longitudinal.MOONPILOT_TRACK_BRAKE_V, longitudinal.MOONPILOT_JERK_EASE_LEAD_BRAKING = saved
+
+
+def _shape_fly(job):
+  """One `stop-shape` flight under one `SHAPE_ARMS` arm, engine coast off as the device runs."""
+  arm, flight = job
+  with _shape_arm(arm):
+    return _fly_logged_lead(flight, engine_coast=False)
 
 
 def _shape(v, a, gap, cmd=None):
@@ -1437,8 +1458,9 @@ def _shape(v, a, gap, cmd=None):
 
 def _stop_shape(args):
   """Where a lead-caused decel's braking peaks: the 57 manual decels `decel-peaks` flies, split into stops (the driver
-  ends at rest) and slowdowns, the driver against today's headway-scheduled braking match and the flat 0.85 it replaced;
-  then one engaged stop flown with its own model ask (`engaged-fly`'s window)."""
+  ends at rest) and slowdowns, the driver against `SHAPE_ARMS` — the flat 0.85 braking match, the headway schedule alone,
+  today's schedule with its ease limit while a lead brakes, and a slower ease; then one engaged stop flown with its own
+  model ask (`engaged-fly`'s window)."""
   from concurrent.futures import ProcessPoolExecutor
   d = _pooled_manual(expand(args.routes, ROUTE_SETS), args.root)
   a_s = np.concatenate([np.convolve(d["a"][d["route"] == r], np.ones(10) / 10, mode="same") for r in np.unique(d["route"])])
@@ -1448,8 +1470,8 @@ def _stop_shape(args):
   stops = np.asarray([job[0][-1] < 0.5 for job in jobs], dtype=bool)
   shapes = {"driver": [_shape(job[0], np.r_[np.diff(job[0]) / DT_MDL, 0.0], job[1]) for job in jobs]}
   with ProcessPoolExecutor(4) as pool:
-    for name, flat in (("flat 0.85", True), ("today", False)):
-      shapes[name] = [_shape(f["v"], f["a"], f["gap"], f["cmd"]) for f in pool.map(_shape_fly, [(flat, job) for job in jobs])]
+    for name in SHAPE_ARMS:
+      shapes[name] = [_shape(f["v"], f["a"], f["gap"], f["cmd"]) for f in pool.map(_shape_fly, [(name, job) for job in jobs])]
   print(f"{len(jobs)} manual lead-caused decels (calibration {args.calibration}): median peak, where in the braking it lands, "
         + "first / last third, closest gap, brake pumps")
   for kind, mask in (("stops", stops), ("slowdowns", ~stops)):
@@ -1459,30 +1481,25 @@ def _stop_shape(args):
       print(f"    {name:10s} peak {np.median(x[:, 0]):+.2f} at {np.median(x[:, 1]):4.0%}  thirds {np.median(x[:, 2]):+.2f} / {np.median(x[:, 3]):+.2f}  "
             + f"closest {x[:, 4].min():4.1f} m  pumps {int(x[:, 5].sum()):3d}")
 
-  # The gate before the counterfactual: the drive replayed under the braking match it ran (`--route-match`), against the
-  # aTarget it logged. Everything below is flown on the lab's plant; this is the only line about the car's own code.
-  import moonpilot.longitudinal as longitudinal
-  scheduled = longitudinal.MOONPILOT_TRACK_BRAKE_V
-  longitudinal.MOONPILOT_TRACK_BRAKE_V = [0.85] * len(scheduled) if args.route_match == "flat" else scheduled
+  # The gate before the counterfactual: the drive replayed under the arm it drove (`--route-match`), against the aTarget
+  # it logged. Everything below is flown on the lab's plant; this is the only line about the car's own code.
   details = []
-  try:
+  with _shape_arm(args.route_match):
     replayed, logged, active, _ = replay(args.route, extract(args.route, args.root), args.root, details_out=details)
-  finally:
-    longitudinal.MOONPILOT_TRACK_BRAKE_V = scheduled
   m = _details_arrays(details)
   t = m["t"] - m["t"][0]
   w = (t >= args.start) & (t < args.end)
   commit, _ = drive_config(args.route, args.root)
   for name, mask in (("drive", active & np.isfinite(logged)), ("window", active & np.isfinite(logged) & w)):
     err = np.abs(replayed[mask] - logged[mask])
-    print(f"{args.route} (commit {commit}, {args.route_match} match) replay-vs-logged |aTarget error| over the {name}, "
+    print(f"{args.route} (commit {commit}, replayed as '{args.route_match}') replay-vs-logged |aTarget error| over the {name}, "
           + f"{mask.sum()} engaged frames: median {np.median(err):.4f} p95 {np.percentile(err, 95):.4f} max {err.max():.4f} m/s^2")
   flight = (m["v_ego"][w], m["d_rel"][w], m["v_lead"][w], float(m["a_ego"][w][0]), _calibration(args.route, args.root),
             float(np.nanmedian(m["v_cruise"][w])), m["model_accel"][w])
   print(f"{args.route} {args.start:g}-{args.end:g} s: peak, where, thirds, s to rest, rest gap, pumps — the car as recorded, "
-        + "then both matches flown on the lab's plant (simulation against simulation)")
+        + "then every arm flown on the lab's plant (simulation against simulation)")
   for name, f in (("car (log)", {"v": m["v_ego"][w], "a": m["a_ego"][w], "gap": m["d_rel"][w], "cmd": logged[w]}),
-                  ("flat 0.85", _shape_fly((True, flight))), ("today", _shape_fly((False, flight)))):
+                  *((arm, _shape_fly((arm, flight))) for arm in SHAPE_ARMS)):
     peak, where, first, last, _, pumps = _shape(f["v"], f["a"], f["gap"], f["cmd"])
     rest = np.flatnonzero(f["v"] < 0.3)
     print(f"  {name:10s} peak {peak:+.2f} at {where:4.0%}  thirds {first:+.2f} / {last:+.2f}  "
@@ -1632,8 +1649,8 @@ def _register_manual(sub):
   parser.add_argument("--route", default="00000468--34a8e259a0", help="engaged drive whose stop is flown with its own model ask")
   parser.add_argument("--start", type=float, default=597.0, help="s from the drive's first plan")
   parser.add_argument("--end", type=float, default=623.0, help="s from the drive's first plan")
-  parser.add_argument("--route-match", choices=("flat", "scheduled"), default="flat",
-                      help="the braking match the route drove: flat 0.85 before a48c66e63, scheduled after")
+  parser.add_argument("--route-match", choices=tuple(SHAPE_ARMS), default="flat 0.85",
+                      help="the arm the route drove: 'flat 0.85' before a48c66e63, 'scheduled' to the ease limit, 'today' after")
   parser.set_defaults(fn=_stop_shape)
   parser = sub.add_parser("stop-cues", help="whether a braking lead ends at rest: braking time, time to rest, model stop intent, leadTwo")
   parser.add_argument("--routes", nargs="+", default=["manual-approach", "0000044e", "0000044f", "00000450", "00000451", "engaged", "00000468"],

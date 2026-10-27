@@ -426,6 +426,19 @@ class TestPolicyFunctions(unittest.TestCase):
     self.assertAlmostEqual(jerk_limit(-1.0, 0.0, DT_MDL, 25.0, lead_braking=True), -MOONPILOT_JERK_DOWN * DT_MDL, places=9)
     self.assertAlmostEqual(jerk_limit(-2.0, 0.0, DT_MDL, 25.0), -MOONPILOT_JERK_DOWN * DT_MDL, places=9)
 
+  def test_a_braking_ask_eases_slower_while_a_lead_brakes_and_nothing_else_moves(self):
+    """A driver does not let off while the car ahead is still braking: past the hold, the ask eases slower behind a braking
+    lead than behind a steady one, and only that — deepening, an ask above the hold, and a steady lead ease or deepen exactly
+    as they do with no ease limit at all (the comfort up-jerk standing in for it)."""
+    no_limit = mock.patch("moonpilot.longitudinal.MOONPILOT_JERK_EASE_LEAD_BRAKING", MOONPILOT_JERK_UP)
+    braking, steady = jerk_limit(0.0, -1.0, DT_MDL, 10.0, lead_braking=True), jerk_limit(0.0, -1.0, DT_MDL, 10.0)
+    self.assertGreater(braking, -1.0)  # still easing, just slower
+    self.assertLess(braking, steady)
+    cases = [(0.0, -0.2, True), (-2.5, -1.0, True), (-0.5, -1.0, False), (-2.5, -1.0, False)]
+    with no_limit:
+      unlimited = [jerk_limit(a, a_prev, DT_MDL, 10.0, lead_braking=lb) for a, a_prev, lb in cases]
+    self.assertEqual([jerk_limit(a, a_prev, DT_MDL, 10.0, lead_braking=lb) for a, a_prev, lb in cases], unlimited)
+
   def test_the_approach_stops_behind_a_stopped_lead_at_every_reachable_speed(self):
     """The safety property: the fork's car can reach V_CRUISE_MAX on openpilot longitudinal, and it
     must stop behind a stopped lead from every reachable speed. The maneuver suite's fastest

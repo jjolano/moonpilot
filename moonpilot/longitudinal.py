@@ -345,6 +345,13 @@ MOONPILOT_JERK_DOWN = 2.0  # m/s^3 at a -2.0 ask; 6.05 m end gap, no contact at 
 MOONPILOT_JERK_EMERGENCY = 10.0  # m/s^3, reached at ACCEL_MIN
 MOONPILOT_JERK_ONSET = 1.0  # m/s^3 above JERK_ONSET_A; this and below: docs/longitudinal.md
 MOONPILOT_JERK_ONSET_A = -1.0  # m/s^2
+# m/s^3; a braking ask past MOONPILOT_JERK_EASE_HOLD_A eases no faster than this while any lead brakes — a driver does not let
+# off while the car ahead is still braking. The headway-scheduled braking match lets closing build behind a braking lead, and
+# the arrival's closing^2 term then follows every wobble of the lead's estimate: through stop-shape's 57 decels it eased and
+# re-deepened (a pump) 79 times against the flat match's 51; at 0.5 it is 52, with the stops' peak still 36% in, and 0.3
+# over-brakes, deepening the slowdowns' last third. `python -m moonpilot.lab stop-shape` flies all four.
+MOONPILOT_JERK_EASE_LEAD_BRAKING = 0.5
+MOONPILOT_JERK_EASE_HOLD_A = -0.3  # m/s^2
 MOONPILOT_JERK_ONSET_LEAD_A = -0.2  # m/s^2; a lead slowing past this keeps JERK_DOWN
 MOONPILOT_BRAKE_EXIT_A = -0.5  # m/s^2; braking past this holds the positive ask, as curve braking does
 MOONPILOT_BRAKE_EXIT_JERK = 0.5  # m/s^3; its rebuild with the wheel straight, above the launch band
@@ -660,6 +667,8 @@ def jerk_limit(a_cmd, a_prev, dt, v_ego, comfort_scale=1.0, lead_braking=False) 
   onset = float(np.interp(v_ego, [MOONPILOT_JERK_LAUNCH_SPEED, 2 * MOONPILOT_JERK_LAUNCH_SPEED], [MOONPILOT_JERK_DOWN, MOONPILOT_JERK_ONSET]))
   onset = MOONPILOT_JERK_DOWN if lead_braking else onset
   down = float(np.interp(a_cmd, [ACCEL_MIN, -2.0, MOONPILOT_JERK_ONSET_A], [MOONPILOT_JERK_EMERGENCY, MOONPILOT_JERK_DOWN, onset]))
+  if lead_braking and a_prev < MOONPILOT_JERK_EASE_HOLD_A:
+    up = min(up, MOONPILOT_JERK_EASE_LEAD_BRAKING)
   return float(np.clip(a_cmd, a_prev - down * dt, a_prev + up * dt))
 
 

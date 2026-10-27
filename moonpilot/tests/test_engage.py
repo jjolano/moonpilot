@@ -18,7 +18,7 @@ from openpilot.selfdrive.selfdrived.events import ET, EVENTS, Events
 from openpilot.selfdrive.selfdrived.alertmanager import AlertManager
 from openpilot.selfdrive.selfdrived.state import SOFT_DISABLE_TIME, StateMachine
 
-from moonpilot.features import LATERAL_ENGAGE, LONGITUDINAL, SLAM, TORQUE_LATERAL
+from moonpilot.features import CRAWL_RELEASE, LATERAL_ENGAGE, LONGITUDINAL, SLAM, TORQUE_LATERAL
 from moonpilot.engage import (
   LATERAL_ENGAGE_FLAGS,
   LateralEngage,
@@ -830,16 +830,18 @@ class TestCarGate(unittest.TestCase):
           car_unavailable_reason(TORQUE_LATERAL, _cp(lateral_tuning='torque', steer_control_type=steer_control_type)), "torque-steered cars only"
         )
 
-  def test_longitudinal_needs_openpilot_longitudinal_control(self):
-    self.assertIsNone(car_unavailable_reason(LONGITUDINAL, _cp(openpilot_longitudinal=True)))
-    self.assertEqual(car_unavailable_reason(LONGITUDINAL, _cp(openpilot_longitudinal=False)), "openpilot-longitudinal cars only")
+  def test_longitudinal_and_its_crawl_release_need_openpilot_longitudinal_control(self):
+    for feature in (LONGITUDINAL, CRAWL_RELEASE):
+      with self.subTest(feature=feature.key):
+        self.assertIsNone(car_unavailable_reason(feature, _cp(openpilot_longitudinal=True)))
+        self.assertEqual(car_unavailable_reason(feature, _cp(openpilot_longitudinal=False)), "openpilot-longitudinal cars only")
 
   def test_features_without_a_car_requirement_are_unaffected(self):
     self.assertIsNone(car_unavailable_reason(SLAM, _cp(brand='hyundai')))
 
   def test_no_carparams_yet_is_not_a_reason(self):
     """The panel renders before carParams lands, and an unloaded CP is not a verdict on the car."""
-    for feature in (LATERAL_ENGAGE, TORQUE_LATERAL, LONGITUDINAL):
+    for feature in (LATERAL_ENGAGE, TORQUE_LATERAL, LONGITUDINAL, CRAWL_RELEASE):
       with self.subTest(feature=feature.key):
         self.assertIsNone(car_unavailable_reason(feature, None))
 

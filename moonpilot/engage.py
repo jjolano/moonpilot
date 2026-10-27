@@ -16,7 +16,7 @@ What the module does at runtime:
   - `car_unavailable_reason`, what both settings panels ask: why a driver cannot use a feature on
     this car, or `None`. For `LATERAL_ENGAGE` that is the panel's half of `_available` — the same
     `_unsupported_reason` the gate itself reads — so a car that can never be half-engaged says so
-    instead of reading as on and doing nothing. `TORQUE_LATERAL` and `LONGITUDINAL` have one too,
+    instead of reading as on and doing nothing. `TORQUE_LATERAL`, `LONGITUDINAL` and `CRAWL_RELEASE` have one too,
     panel-facing only: each names a car whose controlsd branch the fork's seam is not in, so the
     feature is inert rather than gated, and nothing but the row's reason changes.
   - `moonpilot_actuator_gate`, built once by controlsd: the panda's two grants, read back by the
@@ -105,7 +105,7 @@ from openpilot.cereal import log
 from openpilot.common.params import Params
 from openpilot.selfdrive.selfdrived.events import ET
 
-from moonpilot.features import ENGINE_COAST, LATERAL_ENGAGE, LONGITUDINAL, TORQUE_LATERAL, Feature, enabled
+from moonpilot.features import CRAWL_RELEASE, ENGINE_COAST, LATERAL_ENGAGE, LONGITUDINAL, TORQUE_LATERAL, Feature, enabled
 
 ButtonType = car.CarState.ButtonEvent.Type
 GearShifter = car.CarState.GearShifter
@@ -214,12 +214,12 @@ def car_unavailable_reason(feature: Feature, CP) -> str | None:
   than as a per-feature branch inside both panel files. `ui_state.CP` is None until carParams
   arrives offroad, which reads as "say nothing".
 
-  Four features have a reason, and only the first of them is a safety gate. `LATERAL_ENGAGE`'s is
+  Five features have a reason, and only the first of them is a safety gate. `LATERAL_ENGAGE`'s is
   the same `_unsupported_reason(CP)` `_available` reads, so the row and the behavior cannot
   disagree. `ENGINE_COAST`'s is also the gate `moonpilot_engage_safety_param` reads before it flags
-  the car. `TORQUE_LATERAL`'s and `LONGITUDINAL`'s are panel-facing only — nothing gates behavior
-  on them — because a car outside their seam's dispatch is a car the seam never runs on: the
-  feature is inert there, not gated.
+  the car. `TORQUE_LATERAL`'s, `LONGITUDINAL`'s and `CRAWL_RELEASE`'s (the fork controller's own, so
+  `LONGITUDINAL`'s car) are panel-facing only — nothing gates behavior on them — because a car outside
+  their seam's dispatch is a car the seam never runs on: the feature is inert there, not gated.
   """
   if CP is None:
     return None
@@ -227,7 +227,7 @@ def car_unavailable_reason(feature: Feature, CP) -> str | None:
     return _unsupported_reason(CP)
   if feature is TORQUE_LATERAL and not _torque_steered(CP):
     return "torque-steered cars only"
-  if feature is LONGITUDINAL and not CP.openpilotLongitudinalControl:
+  if feature in (LONGITUDINAL, CRAWL_RELEASE) and not CP.openpilotLongitudinalControl:
     return "openpilot-longitudinal cars only"
   if feature is ENGINE_COAST and not (CP.brand == "toyota" and CP.openpilotLongitudinalControl):
     return "Toyota openpilot-longitudinal only"
