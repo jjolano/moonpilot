@@ -31,6 +31,7 @@ LAMP_VERSION = 1
 LAMP_ADDRESS = 0x320  # VSC1S07: the skid-control ECU's own frame, where BRKON is the brake-lamp proxy
 CONTROL_VERSION = 1  # one row per carControl frame: the rate the acceleration controller is written for
 MANUAL_VERSION = 2
+CUES_VERSION = 1
 ROUTE_SETS = {
   # Engaged local drives. 0000042c/42d/42e have zero longActive frames and are skipped by the commands.
   "longitudinal": ("000003f8", "000003fe", "00000400", "00000401", "00000408", "0000040d", "0000040e", "00000410", "00000414", "0000043e", "0000043f"),
@@ -1488,6 +1489,105 @@ def _stop_shape(args):
           + f"under 0.3 m/s at {rest[0] * DT_MDL if len(rest) else float('nan'):4.1f} s, {f['gap'][-1]:.1f} m  pumps {pumps}")
 
 
+def _cue_frames(route, root=DEFAULT_ROOT):
+  """leadOne, leadTwo and the driving model's stop intent, one row per planner tick of the route's extract, with leadOne's
+  slow accel from the planner's own `LeadAccelEstimator` over the same rows (as `_manual_frames`)."""
+  from moonpilot.lead import LeadAccelEstimator
+
+  def build(_segs):
+    data = extract(route, root)
+    blob, offsets = data["blob"], data["offsets"]
+    index = {k: 1 + i * 3 for i, k in enumerate(MESSAGES)}
+    estimator, rows = LeadAccelEstimator(), []
+    for row in offsets:
+      def read(kind, row=row):
+        start, size = row[index[kind]], row[index[kind] + 1]
+        return messaging.log_from_bytes(blob[start:start + size].tobytes()) if size else None
+      radar, model = read("radarState").radarState, read("modelV2")
+      one, two = radar.leadOne, radar.leadTwo
+      estimator.update(one)
+      m = model.modelV2 if model is not None else None
+      vel = m.velocity if m is not None and len(m.velocity.x) else None
+      rows.append((row[0] * 1e-9, one.radarTrackId if one.present and one.radar else -1, one.dRel, one.vLead, estimator.a_slow,
+                   two.present, two.dRel, two.vLead, bool(m.action.shouldStop) if m is not None else False,
+                   float(m.action.desiredAcceleration) if m is not None else np.nan,
+                   float(np.interp(6.0, list(vel.t), list(vel.x))) if vel is not None else np.nan, float(vel.x[-1]) if vel is not None else np.nan))
+    keys = ("t", "track", "gap", "v_lead", "a_slow", "two", "gap_two", "v_two", "should_stop", "model_accel", "model_v6", "model_v10")
+    return {k: np.asarray(col, dtype=float) for k, col in zip(keys, zip(*rows, strict=True), strict=True)}
+
+  return cached(route, "cues", CUES_VERSION, root, build)
+
+
+STOP_CUE_HOLD_S = 4.0  # s after a braking read ends in which the same track must reach rest, or stay visible to count as released
+
+
+def _stop_cues(args):
+  """Whether a braking lead ends at rest, from what the planner can see while it brakes: how long it has braked, its time to
+  rest, the driving model's stop intent and leadTwo. One lead is, by `--identity`, a gap and speed that move continuously
+  (at most 1 m and 1 m/s a tick) under any `radarTrackId` — the radar re-issues ids to one car — or one id with no vLead
+  jump past 2.5 m/s; a braking read starting within 1 s of its lead's first frame is skipped, the slow accel being the
+  previous lead's. Each read is stopped (the same lead under 0.5 m/s within `STOP_CUE_HOLD_S` of its end), released (the
+  lead then stays visible that long without stopping) or censored (the lead or the drive ends first) — censored reads are
+  counted and kept out of every share."""
+  hold, settle = round(STOP_CUE_HOLD_S / DT_MDL), round(1.0 / DT_MDL)
+  rows, censored = [], 0
+  for route in dict.fromkeys(expand(args.routes, ROUTE_SETS)):  # the default sets overlap
+    c = _cue_frames(route, args.root)
+    track, v1, a_slow = c["track"], c["v_lead"], c["a_slow"]
+    if args.identity == "track":
+      same = np.r_[False, (track[1:] == track[:-1]) & (np.abs(np.diff(v1)) <= 2.5)]
+    else:  # the radar re-issues ids to one car: the same lead is a gap and speed that move continuously, under any id
+      same = np.r_[False, (track[1:] >= 0) & (track[:-1] >= 0) & (np.abs(np.diff(v1)) <= 1.0) & (np.abs(np.diff(c["gap"])) <= 1.0)]
+    starts = np.flatnonzero((track >= 0) & ~same)
+    for r in runs(track >= 0):
+      bounds = [r.start, *(p for p in starts if r.start < p < r.stop), r.stop]  # a new track id, or a vLead jump, starts a new lead
+      for s, e in zip(bounds[:-1], bounds[1:], strict=True):
+        for b in runs(a_slow[s:e] < args.threshold):
+          if b.start < settle:
+            continue
+          b0, b1 = s + b.start, s + b.stop
+          if (v1[b0:min(b1 + hold, e)] < 0.5).any():
+            outcome = 1
+          elif b1 + hold <= e:
+            outcome = 0
+          else:
+            censored += 1
+            continue
+          for into in (1.0, 2.0, 3.0, 4.0):
+            k = b0 + round(into / DT_MDL)
+            if k >= b1:
+              break
+            stopped_two = c["two"][k] > 0 and c["v_two"][k] < 1.0 and c["gap_two"][k] > c["gap"][k] + 2.0
+            rows.append((outcome, (b1 - b0) * DT_MDL, into, v1[k] / -a_slow[k], c["model_v10"][k] < 1.0, c["model_v6"][k] < 1.0,
+                         c["should_stop"][k] > 0, c["model_accel"][k] <= -1.0, stopped_two))
+  x = np.asarray(rows, dtype=float)
+  first = x[x[:, 2] == 1.0]
+  stop = x[:, 0] > 0
+  print(f"leadOne braking reads (slow accel < {args.threshold}) that last past 1 s, one lead each ({args.identity} identity): {len(first)} decided "
+        + f"({np.mean(first[:, 0]) * 100:.0f}% stop), {censored} censored (all lengths) and left out")
+  print("  braked tau s so far: n, share that stop")
+  for tau in (1.0, 2.0, 3.0, 4.0, 6.0):
+    m = first[:, 1] >= tau
+    if m.sum() >= 10:
+      print(f"    {tau:3.1f} s: n {m.sum():4d}  {np.mean(first[m, 0]) * 100:3.0f}%")
+  print("  1 s in, by time to rest at the current slow accel: n, share that stop")
+  for lo, hi in ((0, 3), (3, 5), (5, 8), (8, 12), (12, 20), (20, math.inf)):
+    m = (first[:, 3] >= lo) & (first[:, 3] < hi)
+    if m.any():
+      print(f"    {lo:2d}-{hi:<3g} s: n {m.sum():4d}  {np.mean(first[m, 0]) * 100:3.0f}%")
+  print("  gentle (time to rest > 3 s at that point): share that stop with / without each cue, and the stops it catches")
+  for when in (1.0, 2.0, 3.0, 4.0):
+    g = (x[:, 2] == when) & (x[:, 3] > 3.0)
+    cells = []
+    for name, col in (("model v10<1", 4), ("model v6<1", 5), ("shouldStop", 6), ("model<=-1", 7), ("leadTwo at rest", 8)):
+      cue = x[:, col] > 0
+      hit = cue & g
+      share = f"{np.mean(stop[hit]) * 100:3.0f}%" if hit.any() else "  -"
+      caught = f"{np.mean(cue[stop & g]) * 100:3.0f}%" if (stop & g).any() else "  -"
+      cells.append(f"{name} n {int(hit.sum()):3d} {share} (else {np.mean(stop[~cue & g]) * 100:3.0f}%) catches {caught}")
+    print(f"    {when:.0f} s in, n {int(g.sum()):3d} ({np.mean(stop[g]) * 100:3.0f}% stop): " + " | ".join(cells))
+
+
 def _register_manual(sub):
   parser = sub.add_parser("manual-decel", help="the lead law's approach requirement against the driver's own longitudinal")
   parser.add_argument("--routes", nargs="+", default=["manual-approach"], help=f"route names or sets: {', '.join(ROUTE_SETS)}")
@@ -1535,6 +1635,13 @@ def _register_manual(sub):
   parser.add_argument("--route-match", choices=("flat", "scheduled"), default="flat",
                       help="the braking match the route drove: flat 0.85 before a48c66e63, scheduled after")
   parser.set_defaults(fn=_stop_shape)
+  parser = sub.add_parser("stop-cues", help="whether a braking lead ends at rest: braking time, time to rest, model stop intent, leadTwo")
+  parser.add_argument("--routes", nargs="+", default=["manual-approach", "0000044e", "0000044f", "00000450", "00000451", "engaged", "00000468"],
+                      help=f"route names or sets: {', '.join(ROUTE_SETS)}")
+  parser.add_argument("--threshold", type=float, default=-0.3, help="slow accel that reads as braking, m/s^2")
+  parser.add_argument("--identity", choices=("track", "kinematic"), default="kinematic",
+                      help="one lead = one radarTrackId, or a gap and speed that move continuously under any id")
+  parser.set_defaults(fn=_stop_cues)
 
 
 def register(sub):
