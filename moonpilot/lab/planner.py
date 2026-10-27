@@ -1605,7 +1605,7 @@ def _stop_cues(args):
     print(f"    {when:.0f} s in, n {int(g.sum()):3d} ({np.mean(stop[g]) * 100:3.0f}% stop): " + " | ".join(cells))
 
 
-def _launch_episodes(d):
+def _launch_episodes(d, windows_out=None):
   """Each manual standstill behind a stopped radar lead that then launches: (lead launch accel over its first 2 s, gap at
   rest, brake held when the lead moved, then brake release, gas and ego-moving times from the lead's onset, the ego's own
   accel over its first 2 s moving, the lead's own travel (integrated vLead) and its speed at the release).
@@ -1614,7 +1614,7 @@ def _launch_episodes(d):
   same `radarTrackId`, timestamp-contiguous, a continuous gap and speed, a radar lead and manual. A marker seen there is
   its time; one not seen in a window that lasted the full 6 s is `inf`; one not seen in a window cut short is NaN,
   censored. The ego's accel needs its whole 2 s inside the window, and a launch whose window is shorter than the lead's
-  own 2 s is dropped."""
+  own 2 s is dropped. `windows_out`, when given, gets each kept launch's (rest start, onset, window end) indices, row for row."""
   n2, n6, settle = round(2.0 / DT_MDL), round(6.0 / DT_MDL), round(1.0 / DT_MDL)
   v, v_lead, gap, brake, gas = d["v"], d["v_lead"], d["gap"], d["brake"] > 0, d["gas"] > 0
   lead = (d["manual"] > 0) & (d["lead"] > 0) & (d["lead_radar"] > 0)
@@ -1656,7 +1656,90 @@ def _launch_episodes(d):
     lead_travel = float(np.sum(v_lead[t0:k_rel]) * DT_MDL) if k_rel is not None else math.nan  # its own, not the gap: the ego creeps
     v_rel = v_lead[k_rel] if k_rel is not None else math.nan
     rows.append(((v_lead[t0 + n2] - v_lead[t0]) / 2.0, float(np.median(gap[rest])), held, release, first(gas), moving, ego_a, lead_travel, v_rel))
+    if windows_out is not None:
+      windows_out.append((rest.start, t0, end))
   return np.asarray(rows, dtype=float).reshape(-1, 9)
+
+
+def _launch_frames(args):
+  """The driver extract pooled over `--routes` (every drive with rlogs by default), with `route` numbering the drives."""
+  from moonpilot.lab import driver
+  routes = expand(args.routes, ROUTE_SETS) if args.routes else driver._routes(args.root)
+  frames = [driver.extract(r, args.root) for r in routes]
+  keys = ("t", "manual", "v", "a", "brake", "gas", "lead", "lead_radar", "gap", "v_lead", "track_id", "desired_a")
+  d = {k: np.concatenate([f[k] for f in frames]) for k in keys}
+  d["route"] = np.concatenate([np.full(len(f["t"]), i) for i, f in enumerate(frames)])
+  return routes, d
+
+
+LAUNCH_FLY_PRE_S, LAUNCH_FLY_POST_S, LAUNCH_FLY_REST_GAP = 2.0, 8.0, 4.3
+LAUNCH_ARMS = {"as flown": (None, None), f"own rest gap {LAUNCH_FLY_REST_GAP}": (LAUNCH_FLY_REST_GAP, None),
+               f"{LAUNCH_FLY_REST_GAP}, reserve 0": (LAUNCH_FLY_REST_GAP, 0.0)}
+
+
+def _launch_fly_one(job):
+  """One `launch-fly` flight: today's planner from rest behind the logged lead (engine coast off, the drive's model ask),
+  under one `LAUNCH_ARMS` arm — the rest gap moved to the planner's own (the same lead path, the ego resting further back),
+  and the moving-lead reserve changed."""
+  import moonpilot.longitudinal as longitudinal
+  arm, (v_log, gap, v_lead, model, calibration) = job
+  rest_gap, reserve = LAUNCH_ARMS[arm]
+  n_pre = round(LAUNCH_FLY_PRE_S / DT_MDL)
+  if rest_gap is not None:
+    gap = gap + (rest_gap - float(np.mean(gap[:n_pre])))
+  saved = longitudinal.MOONPILOT_MOVING_STOP_RESERVE
+  if reserve is not None:
+    longitudinal.MOONPILOT_MOVING_STOP_RESERVE = reserve  # ty: ignore[invalid-assignment]  # the arm's reserve, a float like the constant
+  try:
+    f = _fly_logged_lead((v_log, gap, v_lead, 0.0, calibration, 50.0, model), engine_coast=False)
+  finally:
+    longitudinal.MOONPILOT_MOVING_STOP_RESERVE = saved
+  return {k: f[k][n_pre:] for k in ("cmd", "a", "v", "gap")}
+
+
+def _launch_fly(args):
+  """Today's planner flown from rest behind the leads of `launch-reaction`'s launches, the same selection, kept only where
+  that launch's own window — one drive, one radar track, contiguous — covers the whole flight (`LAUNCH_FLY_PRE_S` before
+  the onset to `LAUNCH_FLY_POST_S` after). The ego's logged path is the lead's frame; the planner flies its own on the lab's
+  plant (`HOLD_FLY_DEAD_S` dead time, `HOLD_FLY_TAU_S` lag) at a 50 kph set speed with the drive's own model ask. The car's
+  own resume out of standstill is not simulated: command-path evidence, against the driver's recorded launch."""
+  from concurrent.futures import ProcessPoolExecutor
+  routes, d = _launch_frames(args)
+  windows = []
+  x = _launch_episodes(d, windows)
+  n_pre, n_post = round(LAUNCH_FLY_PRE_S / DT_MDL), round(LAUNCH_FLY_POST_S / DT_MDL)
+  calibration = _calibration(args.calibration, args.root)
+  keep = [i for i, (rest, t0, end) in enumerate(windows) if rest <= t0 - n_pre and end >= t0 + n_post]
+  jobs = []
+  for i in keep:
+    w = slice(windows[i][1] - n_pre, windows[i][1] + n_post)
+    jobs.append((d["v"][w], d["gap"][w], d["v_lead"][w], np.nan_to_num(d["desired_a"][w], nan=0.0), calibration))
+  driver_a = [d["a"][windows[i][1]:windows[i][1] + n_post] for i in keep]
+  driver_gap = [float(np.median(d["gap"][windows[i][1] + n_post - round(2.0 / DT_MDL):windows[i][1] + n_post])) for i in keep]
+  driver_v = [float(d["v"][windows[i][1] + n_post - 1]) for i in keep]
+  print(f"{len(routes)} drives, {len(x)} launches, {len(keep)} whose own window covers the flight; the driver releases after "
+        + f"{np.nanmedian(x[keep, 7]):.2f} m of lead travel and is moving at {np.nanmedian(x[keep, 5][np.isfinite(x[keep, 5])]):.2f} s")
+  times = (0.5, 1.0, 1.5, 2.0, 2.5, 3.0)
+  with ProcessPoolExecutor(4) as pool:
+    for arm in LAUNCH_ARMS:
+      flown = list(pool.map(_launch_fly_one, [(arm, job) for job in jobs]))
+      ask, mv, travel = [], [], []
+      for f, job in zip(flown, jobs, strict=True):
+        pos, moving = np.flatnonzero(f["cmd"] > 0.05), np.flatnonzero(f["v"] > 0.3)
+        ask.append(pos[0] * DT_MDL if len(pos) else math.inf)
+        mv.append(moving[0] * DT_MDL if len(moving) else math.inf)
+        travel.append(float(np.sum(job[2][n_pre:n_pre + pos[0]]) * DT_MDL) if len(pos) else math.nan)
+      ask, mv = np.asarray(ask), np.asarray(mv)
+      print(f"  {arm:18s} ask > 0.05 at {np.median(ask[np.isfinite(ask)]):4.2f} s after {np.nanmedian(travel):4.2f} m of lead travel, "
+            + f"moving {np.median(mv[np.isfinite(mv)]):4.2f} s (never {int(np.sum(mv == math.inf))}), "
+            + f"gap {LAUNCH_FLY_POST_S - 2:g}-{LAUNCH_FLY_POST_S:g} s in {np.median([np.median(f['gap'][-round(2.0 / DT_MDL):]) for f in flown]):4.1f} m")
+      if arm == f"own rest gap {LAUNCH_FLY_REST_GAP}":
+        traced = flown
+  print("  s after onset             " + " ".join(f"{s:5.1f}" for s in times))
+  for name, series in (("planner ask (own rest)", [f["cmd"] for f in traced]), ("plant aEgo (own rest)", [f["a"] for f in traced]),
+                       ("model desired", [job[3][n_pre:] for job in jobs]), ("driver aEgo", driver_a)):
+    print(f"  {name:24s}  " + " ".join(f"{np.median([s[round(t / DT_MDL)] for s in series]):+5.2f}" for t in times))
+  print(f"  driver gap {LAUNCH_FLY_POST_S - 2:g}-{LAUNCH_FLY_POST_S:g} s in {np.median(driver_gap):.1f} m at {np.median(driver_v):.1f} m/s")
 
 
 def _launch_reaction(args):
@@ -1665,11 +1748,7 @@ def _launch_reaction(args):
   the ego moving. Pedal booleans at the driver extract's 20 Hz: switch timing, not pressure, and a switch can lag the pedal
   (this car leaves `carState.brake`/`gas` unpopulated). Every drive with rlogs under --root by default; one lead is one
   `radarTrackId` whose gap and speed move continuously through the launch."""
-  from moonpilot.lab import driver
-  routes = expand(args.routes, ROUTE_SETS) if args.routes else driver._routes(args.root)
-  frames = [driver.extract(r, args.root) for r in routes]
-  d = {k: np.concatenate([f[k] for f in frames]) for k in ("t", "manual", "v", "brake", "gas", "lead", "lead_radar", "gap", "v_lead", "track_id")}
-  d["route"] = np.concatenate([np.full(len(f["t"]), i) for i, f in enumerate(frames)])
+  routes, d = _launch_frames(args)
   x = _launch_episodes(d)
   print(f"{len(routes)} drives")
   a_lead, gap, held, release, gas, moving, ego_a, opened, v_rel = x.T  # opened: the lead's own travel to the release
@@ -1756,6 +1835,10 @@ def _register_manual(sub):
   parser = sub.add_parser("launch-reaction", help="the driver's brake release, gas and move times behind a launching lead, by its launch accel")
   parser.add_argument("--routes", nargs="*", default=[], help=f"route names or sets: {', '.join(ROUTE_SETS)}; default every drive with rlogs")
   parser.set_defaults(fn=_launch_reaction)
+  parser = sub.add_parser("launch-fly", help="today's planner flown from rest behind launch-reaction's launching leads, against the driver")
+  parser.add_argument("--routes", nargs="*", default=[], help=f"route names or sets: {', '.join(ROUTE_SETS)}; default every drive with rlogs")
+  parser.add_argument("--calibration", default="00000451", help="drive whose recorded lag and radar latency seed the flights")
+  parser.set_defaults(fn=_launch_fly)
 
 
 def register(sub):
