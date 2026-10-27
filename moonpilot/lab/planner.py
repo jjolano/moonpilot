@@ -1605,6 +1605,78 @@ def _stop_cues(args):
     print(f"    {when:.0f} s in, n {int(g.sum()):3d} ({np.mean(stop[g]) * 100:3.0f}% stop): " + " | ".join(cells))
 
 
+def _launch_episodes(d):
+  """Each manual standstill behind a stopped radar lead that then launches: (lead launch accel over its first 2 s, gap at
+  rest, brake held when the lead moved, then brake release, gas and ego-moving times from the lead's onset, s, NaN where
+  it never happens inside 6 s, and the ego's own accel over its first 2 s moving)."""
+  n2, n6, settle = round(2.0 / DT_MDL), round(6.0 / DT_MDL), round(1.0 / DT_MDL)
+  v, v_lead, gap, brake, gas = d["v"], d["v_lead"], d["gap"], d["brake"] > 0, d["gas"] > 0
+  continuous = np.r_[False, (np.abs(np.diff(gap)) <= 1.0) & (np.abs(np.diff(v_lead)) <= 1.0) & (np.diff(d["route"]) == 0)]
+  rows = []
+  for r in runs((d["manual"] > 0) & (d["lead"] > 0) & (v < 0.1)):
+    if r.stop - r.start < settle or np.median(v_lead[r]) > 0.3 or np.median(gap[r]) > 20.0:
+      continue
+    # the lead's onset: the last frame under 0.2 m/s before it passes 1 m/s, the same lead throughout
+    end = min(r.stop + n6, len(v))
+    fast = np.flatnonzero(v_lead[r.start:end] > 1.0)
+    if not len(fast):
+      continue
+    k1 = r.start + fast[0]
+    slow = np.flatnonzero(v_lead[r.start:k1] < 0.2)
+    if not len(slow) or k1 + n2 >= len(v):
+      continue
+    t0 = r.start + slow[-1]
+    if t0 < r.start + settle or not continuous[t0 + 1:t0 + n2 + 1].all() or not (d["manual"][t0:t0 + n6] > 0).all():
+      continue
+
+    def first(mask, start=t0):
+      hit = np.flatnonzero(mask[start:t0 + n6])
+      return (start + hit[0] - t0) * DT_MDL if len(hit) else np.nan
+
+    moving = first(v > 0.3)
+    held = bool(brake[t0])
+    release = first(~brake) if held else np.nan  # a brake already off when the lead moved is not a reaction
+    k_rel = t0 + round(release / DT_MDL) if np.isfinite(release) else None
+    k_move = t0 + round(moving / DT_MDL) if np.isfinite(moving) else None
+    ego_a = (v[min(k_move + n2, len(v) - 1)] - v[k_move]) / 2.0 if k_move is not None else np.nan
+    opened = gap[k_rel] - gap[t0] if k_rel is not None else np.nan
+    v_rel = v_lead[k_rel] if k_rel is not None else np.nan
+    rows.append(((v_lead[t0 + n2] - v_lead[t0]) / 2.0, float(np.median(gap[r])), held, release, first(gas), moving, ego_a, opened, v_rel))
+  return np.asarray(rows, dtype=float)
+
+
+def _launch_reaction(args):
+  """The driver's reaction from a standstill behind a stopped radar lead when it launches, against how hard it launches:
+  from the lead's onset (its last frame under 0.2 m/s before it passes 1 m/s), how long to the brake release, the gas and
+  the ego moving. Pedal booleans at the 20 Hz planner tick: switch timing, not pressure, and a switch can lag the pedal."""
+  x = _launch_episodes(_pooled_manual(expand(args.routes, ROUTE_SETS), args.root))
+  a_lead, gap, held, release, gas, moving, ego_a, opened, v_rel = x.T
+  held = held > 0
+  print(f"{len(x)} manual launches behind a stopped radar lead (median gap at rest {np.median(gap):.1f} m); brake held at the lead's "
+        + f"onset on {held.sum()} ({int((held & ~np.isfinite(release)).sum())} of them still held 6 s later), already released on "
+        + f"{(~held).sum()} (no reaction to time)")
+
+  def cell(y):
+    y = y[np.isfinite(y)]
+    return f"{np.median(y):4.2f} ({np.percentile(y, 25):4.2f}-{np.percentile(y, 75):4.2f}) n {len(y):3d}" if len(y) >= 3 else f"{'-':>21s}"
+
+  print(f"  {'lead launch, m/s^2':20s} {'brake release s':>24s} {'gas s':>24s} {'ego moving s':>24s}  {'gap opened at release m':>24s}"
+        + f"  {'lead speed at release':>24s}  ego accel, first 2 s")
+  for lo, hi in ((0.0, 0.5), (0.5, 1.0), (1.0, 1.5), (1.5, 2.5), (2.5, math.inf)):
+    m = (a_lead >= lo) & (a_lead < hi)
+    print(f"  {lo:3.1f}-{hi:<3g} (n {m.sum():3d})       {cell(release[m & held]):>24s} {cell(gas[m & held]):>24s} {cell(moving[m & held]):>24s}  "
+          + f"{cell(opened[m & held]):>24s}  {cell(v_rel[m & held]):>24s}  " + (f"{np.nanmedian(ego_a[m & held]):+.2f}" if (m & held).sum() >= 3 else "-"))
+
+  def spearman(a, b):
+    ok = np.isfinite(a) & np.isfinite(b)
+    ra, rb = (np.argsort(np.argsort(z[ok])) for z in (a, b))
+    return float(np.corrcoef(ra, rb)[0, 1]), int(ok.sum())
+
+  for name, y in (("brake release", release), ("gas", gas), ("ego moving", moving), ("ego accel", ego_a), ("gap opened", opened)):
+    rho, n = spearman(a_lead[held], y[held])
+    print(f"  Spearman rho, lead launch accel vs {name:13s}: {rho:+.2f} (n {n})")
+
+
 def _register_manual(sub):
   parser = sub.add_parser("manual-decel", help="the lead law's approach requirement against the driver's own longitudinal")
   parser.add_argument("--routes", nargs="+", default=["manual-approach"], help=f"route names or sets: {', '.join(ROUTE_SETS)}")
@@ -1659,6 +1731,10 @@ def _register_manual(sub):
   parser.add_argument("--identity", choices=("track", "kinematic"), default="kinematic",
                       help="one lead = one radarTrackId, or a gap and speed that move continuously under any id")
   parser.set_defaults(fn=_stop_cues)
+  parser = sub.add_parser("launch-reaction", help="the driver's brake release, gas and move times behind a launching lead, by its launch accel")
+  parser.add_argument("--routes", nargs="+", default=["manual-approach", "0000044e", "0000044f", "00000450", "00000451"],
+                      help=f"manual route names or sets: {', '.join(ROUTE_SETS)}")
+  parser.set_defaults(fn=_launch_reaction)
 
 
 def register(sub):
