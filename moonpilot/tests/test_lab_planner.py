@@ -117,6 +117,12 @@ class TestLaunchWindow(unittest.TestCase):
   def test_a_window_shorter_than_the_lead_launch_is_dropped(self):
     self.assertEqual(len(_launch(break_at_s=1.0)), 0)
 
+  def test_a_lead_that_appeared_under_a_second_before_its_launch_has_not_settled(self):
+    for kind in ("track", "route"):
+      with self.subTest(kind=kind):
+        self.assertEqual(len(_launch(break_at_s=-0.5, break_kind=kind)), 0)
+        self.assertEqual(len(_launch(break_at_s=-1.5, break_kind=kind)), 1)  # a second and more on it is a launch
+
 
 if __name__ == "__main__":
   unittest.main()

@@ -1630,8 +1630,11 @@ def _launch_episodes(d):
     if not len(slow):
       continue
     t0 = r.start + slow[-1]  # the lead's onset: its last frame under 0.2 m/s before it passes 1 m/s (0.2/a after it starts)
-    rest = slice(r.start, t0)  # the lead judged stopped, and the gap at rest, only before it launched
-    if t0 - r.start < settle or t0 >= r.stop or np.median(v_lead[rest]) > 0.3 or np.median(gap[rest]) > 20.0:
+    # the lead judged stopped, and the gap at rest, only before it launched and only on the lead that launches: the rest
+    # starts at the last break (a new track or drive, a gap) before the onset, so an old lead's wait is not credited to it
+    breaks = np.flatnonzero(~joined[r.start + 1:t0 + 1])
+    rest = slice(r.start + 1 + breaks[-1] if len(breaks) else r.start, t0)
+    if t0 - rest.start < settle or t0 >= r.stop or np.median(v_lead[rest]) > 0.3 or np.median(gap[rest]) > 20.0:
       continue
     end = t0 + 1
     while end < min(t0 + n6 + n2, len(v)) and joined[end]:
@@ -1687,9 +1690,9 @@ def _launch_reaction(args):
           + f"{cell(opened[m & held]):>24s}  {cell(v_rel[m & held]):>24s}  " + (f"{np.nanmedian(ego_a[m & held]):+.2f}" if (m & held).sum() >= 3 else "-"))
 
   def spearman(a, b):
-    ok = np.isfinite(a) & np.isfinite(b)
-    ra, rb = (np.argsort(np.argsort(z[ok])) for z in (a, b))
-    return float(np.corrcoef(ra, rb)[0, 1]), int(ok.sum())
+    """`driver._corr`'s tie-averaged Spearman (NaN under 30 pairs or a constant side), with the pairs it saw."""
+    from moonpilot.lab.driver import _corr
+    return _corr(a, b), int((np.isfinite(a) & np.isfinite(b)).sum())
 
   for name, y in (("brake release", release), ("gas", gas), ("ego moving", moving), ("ego accel", ego_a), ("lead travel", opened)):
     rho, n = spearman(a_lead[held], y[held])
