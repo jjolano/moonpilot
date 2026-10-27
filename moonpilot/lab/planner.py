@@ -1629,9 +1629,9 @@ def _launch_episodes(d):
     if t0 < r.start + settle or not continuous[t0 + 1:t0 + n2 + 1].all() or not (d["manual"][t0:t0 + n6] > 0).all():
       continue
 
-    def first(mask, start=t0):
-      hit = np.flatnonzero(mask[start:t0 + n6])
-      return (start + hit[0] - t0) * DT_MDL if len(hit) else np.nan
+    def first(mask, t0=t0):
+      hit = np.flatnonzero(mask[t0:t0 + n6])
+      return hit[0] * DT_MDL if len(hit) else np.nan
 
     moving = first(v > 0.3)
     held = bool(brake[t0])
