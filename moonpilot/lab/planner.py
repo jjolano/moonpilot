@@ -22,7 +22,7 @@ from openpilot.common.constants import CV
 from openpilot.common.realtime import DT_CTRL, DT_MDL
 from openpilot.tools.lib.logreader import LogReader
 from moonpilot.latency import MOONPILOT_LAG_MAX
-from moonpilot.longitudinal import MoonpilotLongitudinalPlanner
+from moonpilot.longitudinal import LongitudinalPlanSource, MoonpilotLongitudinalPlanner
 from moonpilot.longcontrol import MoonpilotLongControl
 from moonpilot.lab import DEFAULT_ROOT, cached, drive_config, expand, lag_s, param_index, runs
 
@@ -1778,6 +1778,144 @@ def _launch_reaction(args):
     print(f"  Spearman rho, lead launch accel vs {name:13s}: {rho:+.2f} (n {n})")
 
 
+BURST_RISE, BURST_END, BURST_T = 0.4, 0.3, 1.0  # `driver._bursts`' definition: a rise of 0.4 m/s^2 in 1 s that ends above +0.3
+BURST_FAR_MIN_GAP = 50.0  # m; `--far-headway` drops a lead only past this as well, so a slow-speed lead is never far
+
+
+def _burst_replay(job):
+  """One engaged drive replayed through today's planner with each live `policy` call recorded — what won, the cruise
+  candidate with no lead cap, each lead's own ask, the model's ask — optionally ignoring leads past `far_headway`."""
+  import moonpilot.longitudinal as longitudinal
+  route, root, far_headway = job
+  policy0, update0 = longitudinal.policy, longitudinal.MoonpilotLongitudinalPlanner.update
+  calls, frames = [], []
+
+  def policy(v_ego, leads, *a, **k):
+    if far_headway is not None:
+      leads = [lead for lead in leads if lead[1] <= max(far_headway * v_ego, BURST_FAR_MIN_GAP)]
+    accel, source = policy0(v_ego, leads, *a, **k)
+    if not calls:  # the live call; the plan rollout's follow
+      cruise = policy0(v_ego, [], *a[:3], None, *a[4:], **k)[0]  # ty: ignore[too-many-positional-arguments]  # the same call, no leads, no model
+      # the set-speed ladder alone: the same, with curve speed, the in-curve hold, the squeeze and the curve-exit cap all lifted
+      ladder = policy0(v_ego, [], *a[:3], None, *a[4:], **{**k, "curve": None, "v_hold": math.inf,  # ty: ignore[too-many-positional-arguments]
+                                                             "squeeze": longitudinal.ACCEL_MAX, "exit_cap": longitudinal.ACCEL_MAX})[0]
+      asks = [(float(gap), float(v_lead), float(extra[-1]) if extra else 0.0, longitudinal.lead_accel(v_ego, gap, v_lead, a_lead, a[1], *extra))
+              for _, gap, v_lead, a_lead, *extra in leads]
+      calls.append((accel, int(source), cruise, asks, a[3], v_ego, ladder))
+    return accel, source
+
+  def update(self, sm):
+    calls.clear()
+    update0(self, sm)
+    frames.append(calls[0] if calls else None)
+
+  longitudinal.policy, longitudinal.MoonpilotLongitudinalPlanner.update = policy, update  # ty: ignore[invalid-assignment]
+  try:
+    details = []
+    replayed, logged, active, _ = replay(route, extract(route, root), root, details_out=details)
+  finally:
+    longitudinal.policy, longitudinal.MoonpilotLongitudinalPlanner.update = policy0, update0
+  return replayed, logged, active, _details_arrays(details), frames
+
+
+def _burst_starts(a, mask):
+  """Where each burst starts, inside `mask` (engaged, above 5 m/s) only and never across its edge."""
+  n, out = round(BURST_T / DT_MDL), []
+  for r in runs(mask):
+    i = r.start
+    while i < r.stop - n:
+      if a[i + n] > BURST_END and a[i + n] - a[i] >= BURST_RISE:
+        out.append(i)
+        i += n
+      else:
+        i += 1
+  return out
+
+
+BURST_REPRO_TOL = 0.05  # m/s^2; a logged burst is attributed only where today's replay matches it this closely throughout
+
+
+def _burst_kind(f0, f1, m, i, n, far_headway):
+  """What lifted the command over one burst, from the recorded `policy` frames at its start and end: the winning candidate,
+  and for a lead the headway and whether its own ask rose or it left the race; for cruise, a lead's runway cap lifting,
+  the throttle permission returning, or the set-speed ladder (with its deficit)."""
+  names = {int(LongitudinalPlanSource.cruise): "cruise", int(LongitudinalPlanSource.lead0): "lead0",
+           int(LongitudinalPlanSource.lead1): "lead1", int(LongitudinalPlanSource.e2e): "model"}
+  kind, far, deficit = f"{names.get(f0[1], f0[1])} -> {names.get(f1[1], f1[1])}", False, None
+  if f0[1] in (int(LongitudinalPlanSource.lead0), int(LongitudinalPlanSource.lead1)) and f0[3]:
+    gap0 = min(f0[3], key=lambda x: x[3])[0]
+    far = gap0 / max(f0[5], 0.1) > far_headway and gap0 > BURST_FAR_MIN_GAP
+    lead_left = not f1[3] or min(x[3] for x in f1[3]) > f1[2] - 1e-6
+    kind += f" ({'far' if far else 'near'} lead, {'lead left the race' if lead_left else 'lead ask rose'})"
+  elif f0[1] == f1[1] == int(LongitudinalPlanSource.cruise):
+    # which part of the cruise slot let go: a lead's runway cap, the curve terms (curve speed, in-curve hold, squeeze,
+    # curve-exit cap), the throttle permission, or the set-speed ladder itself; anything else stays unresolved
+    capped_by_lead = f0[0] < f0[2] - 0.05 and f1[0] >= f1[2] - 0.05
+    capped_by_curve = f0[2] < f0[6] - 0.05 and f1[2] >= f1[6] - 0.05
+    if capped_by_lead:
+      kind += " (a lead's runway cap lifted)"
+    elif capped_by_curve:
+      kind += " (a curve term lifted: curve speed, in-curve hold, squeeze or curve-exit cap)"
+    elif not m["plan_allow_throttle"][i] and m["plan_allow_throttle"][i + n]:
+      kind += " (throttle permission returned)"
+    elif f0[0] >= f0[6] - 0.05 and f1[0] >= f1[6] - 0.05:
+      kind += " (the set-speed ladder)"
+      deficit = m["v_cruise"][i] / 3.6 - m["v_ego"][i]
+    else:
+      kind += " (unresolved)"
+  return kind, far, deficit
+
+
+def _accel_bursts(args):
+  """Positive accel bursts while openpilot has the pedals above 5 m/s — `driver._bursts`' rise of 0.4 m/s^2 in 1 s ending
+  above +0.3 — in the logged command and in the car's own aEgo (over 0.5 s), and what the logged ones came from.
+
+  The drives ran older code, and this replays today's (with each drive's own params): a logged burst is attributed only
+  where today's replay reproduces the logged command within `BURST_REPRO_TOL` over the whole burst, so the recorded
+  candidates are the ones that produced it; the rest are counted, unexplained. Today's own bursts, and today's with leads
+  past `--far-headway` (and `BURST_FAR_MIN_GAP`) ignored, are counterfactual counts. Command path only."""
+  from concurrent.futures import ProcessPoolExecutor
+  routes = list(dict.fromkeys(expand(args.routes, ROUTE_SETS)))
+  n = round(BURST_T / DT_MDL)
+  totals, kinds = {"logged": 0, "car": 0, "today (counterfactual)": 0, "today, far leads ignored": 0}, {}
+  minutes, errs, deficits, car_only, reproduced, far_count = 0.0, [], [], 0, 0, 0
+  with ProcessPoolExecutor(3, max_tasks_per_child=1) as pool:
+    base = list(pool.map(_burst_replay, [(r, args.root, None) for r in routes]))
+    arm = list(pool.map(_burst_replay, [(r, args.root, args.far_headway) for r in routes]))
+  for (replayed, logged, active, m, frames), (dropped, *_) in zip(base, arm, strict=True):
+    mask = active & np.isfinite(logged) & (m["v_ego"] > 5.0)
+    if not mask.any() or len(frames) != len(replayed):
+      continue
+    errs.append(np.abs(replayed[mask] - logged[mask]))
+    minutes += mask.sum() * DT_MDL / 60
+    car = np.convolve(m["a_ego"], np.ones(10) / 10, mode="same")
+    commanded = _burst_starts(logged, mask)
+    for key, series in (("logged", logged), ("car", car), ("today (counterfactual)", replayed), ("today, far leads ignored", dropped)):
+      totals[key] += len(_burst_starts(series, mask))
+    car_only += sum(not any(abs(c - k) <= n for k in commanded) for c in _burst_starts(car, mask))  # the car answers the logged command
+    for i in commanded:
+      if np.max(np.abs(replayed[i:i + n + 1] - logged[i:i + n + 1])) > BURST_REPRO_TOL or frames[i] is None or frames[i + n] is None:
+        continue
+      reproduced += 1
+      kind, far, deficit = _burst_kind(frames[i], frames[i + n], m, i, n, args.far_headway)
+      far_count += far
+      if deficit is not None:
+        deficits.append(deficit)
+      kinds[kind] = kinds.get(kind, 0) + 1
+  err = np.concatenate(errs) if errs else np.zeros(1)
+  print(f"{len(routes)} drives, {minutes:.1f} engaged min above 5 m/s; today's replay vs the logged command |aTarget error| median "
+        + f"{np.median(err):.4f} p95 {np.percentile(err, 95):.4f} m/s^2 — the drives' older code")
+  print("bursts per engaged minute: " + ", ".join(f"{k} {v / max(minutes, 1e-9):.2f} ({v})" for k, v in totals.items()))
+  print(f"  of the car's {totals['car']}, {car_only} have no logged-command burst within {BURST_T:g} s: the car's own, not the plan's")
+  print(f"{reproduced} of the {totals['logged']} logged bursts reproduced within {BURST_REPRO_TOL:g} m/s^2 and attributed "
+        + f"({far_count} start on a far lead); the other {totals['logged'] - reproduced} are unexplained:")
+  for kind, count in sorted(kinds.items(), key=lambda kv: -kv[1]):
+    print(f"  {count:3d}  {kind}")
+  if deficits:
+    print(f"  the ladder's bursts start a median {np.median(deficits):.1f} m/s under the set speed (p25 {np.percentile(deficits, 25):.1f}, "
+          + f"p75 {np.percentile(deficits, 75):.1f})")
+
+
 def _register_manual(sub):
   parser = sub.add_parser("manual-decel", help="the lead law's approach requirement against the driver's own longitudinal")
   parser.add_argument("--routes", nargs="+", default=["manual-approach"], help=f"route names or sets: {', '.join(ROUTE_SETS)}")
@@ -1839,6 +1977,10 @@ def _register_manual(sub):
   parser.add_argument("--routes", nargs="*", default=[], help=f"route names or sets: {', '.join(ROUTE_SETS)}; default every drive with rlogs")
   parser.add_argument("--calibration", default="00000451", help="drive whose recorded lag and radar latency seed the flights")
   parser.set_defaults(fn=_launch_fly)
+  parser = sub.add_parser("accel-bursts", help="engaged positive accel bursts and what they come from; far leads ignored as an arm")
+  parser.add_argument("--routes", nargs="+", default=["engaged", "00000468"], help=f"route names or sets: {', '.join(ROUTE_SETS)}")
+  parser.add_argument("--far-headway", type=float, default=4.0, help="s of headway past which a lead counts as far (and is ignored in the arm)")
+  parser.set_defaults(fn=_accel_bursts)
 
 
 def register(sub):
