@@ -56,9 +56,12 @@ CHAIN_RISE = 0.2  # m/s^2; half a burst — a stage that rose this much behind a
 
 def _chain_window(c, a, k, lp, lo, n):
   """(plan, fork controller, sent to the PCM, measured) rises over one burst second starting at chain frame `k`, each
-  command shifted back by its own delay to aEgo."""
+  command shifted back by its own delay to aEgo, and whether the window — from a burst second before the earliest shifted
+  start — touches a frame without openpilot's longitudinal: a hand-back from the driver's pedal, where the controller
+  steps from its inactive zero to the plan and the car's measured accel fills in the dip the release left."""
   w_plan, w_out = slice(k - lp, k - lp + n + 1), slice(k - lo, k - lo + n + 1)
-  return _rise(c["a_target"][w_plan]), _rise(c["accel"][w_plan]), _rise(c["output"][w_out]), a[k + n] - a[k]
+  handback = bool(np.any(c["long_active"][max(k - max(lp, lo) - n, 0):k + n + 1] == 0))
+  return _rise(c["a_target"][w_plan]), _rise(c["accel"][w_plan]), _rise(c["output"][w_out]), a[k + n] - a[k], float(handback)
 
 
 def _chain_bursts(job):
@@ -93,22 +96,29 @@ def _chain_bursts(job):
     placed = (max(lp, lo) <= k < len(t_ns) - n and abs(t_ns[k] - t * 1e9) <= 1.5 * DT_CTRL * 1e9
               and np.all(np.diff(t_ns[k - max(lp, lo):k + n + 1]) <= 1.5 * DT_CTRL * 1e9))
     events.append((float(t), _chain_window(c, a, k, lp, lo, n) if placed else None))
-  return route, (lag_plan, lag_out, mask.sum() * DT_CTRL / 60, np.asarray(rows, dtype=float).reshape(-1, 4)), events
+  return route, (lag_plan, lag_out, mask.sum() * DT_CTRL / 60, np.asarray(rows, dtype=float).reshape(-1, 5)), events
+
+
+def _class_masks(x):
+  """Each burst on the first stage that rose `CHAIN_RISE` behind it — a hand-back from the driver's pedal first — as
+  (name, mask) per class, in chain order."""
+  plan, ctrl, out, _, handback = x.T
+  own = handback == 0
+  return (
+    ("a hand-back from the driver's pedal", handback > 0),
+    ("the plan rose a full burst", own & (plan >= BURST_RISE)),
+    ("the plan rose, under a burst", own & (plan >= CHAIN_RISE) & (plan < BURST_RISE)),
+    ("the fork controller rose without the plan", own & (plan < CHAIN_RISE) & (ctrl >= CHAIN_RISE)),
+    ("the car's controller rose without either", own & (plan < CHAIN_RISE) & (ctrl < CHAIN_RISE) & (out >= CHAIN_RISE)),
+    ("no stage rose: the measurement's alone", own & (plan < CHAIN_RISE) & (ctrl < CHAIN_RISE) & (out < CHAIN_RISE)),
+  )
 
 
 def _chain_classes(x):
-  """Each burst put on the first stage that rose `CHAIN_RISE` behind it, printed with each stage's median rise."""
-  plan, ctrl, out, felt = x.T
-  classes = (
-    ("the plan rose a full burst", plan >= BURST_RISE),
-    ("the plan rose, under a burst", (plan >= CHAIN_RISE) & (plan < BURST_RISE)),
-    ("the fork controller rose without the plan", (plan < CHAIN_RISE) & (ctrl >= CHAIN_RISE)),
-    ("the car's controller rose without either", (plan < CHAIN_RISE) & (ctrl < CHAIN_RISE) & (out >= CHAIN_RISE)),
-    ("no stage rose: the measurement's alone", (plan < CHAIN_RISE) & (ctrl < CHAIN_RISE) & (out < CHAIN_RISE)),
-  )
+  """The classes, printed with each stage's median rise."""
   print(f"  {'':44s} {'n':>4s}  median rise behind it, m/s^2: plan / fork controller / sent to PCM / measured")
-  for name, m in classes:
-    cells = " / ".join(f"{np.median(v[m]):+.2f}" if m.any() else "  -  " for v in (plan, ctrl, out, felt))
+  for name, m in _class_masks(x):
+    cells = " / ".join(f"{np.median(v[m]):+.2f}" if m.any() else "  -  " for v in x.T[:4])
     print(f"  {name:44s} {int(m.sum()):4d}  {cells}")
 
 
@@ -125,13 +135,18 @@ def _burst_chain(args):
   with ProcessPoolExecutor(3, max_tasks_per_child=1) as pool:
     results = list(pool.map(_chain_bursts, [(route, args.root) for route in routes]))
   events = [(route, t, row) for route, _, ev in results for t, row in ev]
-  placed = np.asarray([row for _, _, row in events if row is not None], dtype=float).reshape(-1, 4)
+  placed = np.asarray([row for _, _, row in events if row is not None], dtype=float).reshape(-1, 5)
   unresolved = [(route, t) for route, t, row in events if row is None]
   print(f"accel-bursts' {len(events)} unmatched events, by drive and time: {len(placed)} placed on the chain, {len(unresolved)} unresolved")
   if len(placed):
     _chain_classes(placed)
   for route, t in unresolved:
     print(f"  unresolved: {route} at {t:.2f} s (mono)")
+  if args.list:
+    placed_events = [(route, t) for route, t, row in events if row is not None]
+    for name, m in _class_masks(placed):
+      for (route, t), row in zip(np.asarray(placed_events, dtype=object)[m], placed[m], strict=True):
+        print(f"  {name}: {route} at {t:.2f} s (mono), rises {' / '.join(f'{v:+.2f}' for v in row[:4])}")
   summaries = [s for _, s, _ in results if s is not None]
   if not summaries:
     print(f"none of {len(routes)} drives has 30 s of engaged frames above 5 m/s to estimate its delay from")
@@ -321,3 +336,4 @@ def register(sub):
   parser = sub.add_parser("burst-chain", help="each measured engaged accel burst against the delay-aligned plan, controller and PCM command")
   parser.add_argument("--routes", nargs="+", default=["engaged", "00000468"], help=f"route names or sets: {', '.join(ROUTE_SETS)}")
   parser.set_defaults(fn=_burst_chain)
+  parser.add_argument("--list", action="store_true", help="every placed unmatched event, by class, drive and time")
