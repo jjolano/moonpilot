@@ -1607,43 +1607,53 @@ def _stop_cues(args):
 
 def _launch_episodes(d):
   """Each manual standstill behind a stopped radar lead that then launches: (lead launch accel over its first 2 s, gap at
-  rest, brake held when the lead moved, then brake release, gas and ego-moving times from the lead's onset, s, NaN where
-  it never happens inside 6 s, and the ego's own accel over its first 2 s moving)."""
+  rest, brake held when the lead moved, then brake release, gas and ego-moving times from the lead's onset, the ego's own
+  accel over its first 2 s moving, the lead's own travel (integrated vLead) and its speed at the release).
+
+  Every marker is read only inside the launch's window: from the onset to the first frame that is not the same drive, the
+  same `radarTrackId`, timestamp-contiguous, a continuous gap and speed, a radar lead and manual. A marker seen there is
+  its time; one not seen in a window that lasted the full 6 s is `inf`; one not seen in a window cut short is NaN,
+  censored. The ego's accel needs its whole 2 s inside the window, and a launch whose window is shorter than the lead's
+  own 2 s is dropped."""
   n2, n6, settle = round(2.0 / DT_MDL), round(6.0 / DT_MDL), round(1.0 / DT_MDL)
   v, v_lead, gap, brake, gas = d["v"], d["v_lead"], d["gap"], d["brake"] > 0, d["gas"] > 0
-  continuous = np.r_[False, (np.abs(np.diff(gap)) <= 1.0) & (np.abs(np.diff(v_lead)) <= 1.0) & (np.diff(d["route"]) == 0)
-                     & (np.diff(d["track_id"]) == 0)]
+  lead = (d["manual"] > 0) & (d["lead"] > 0) & (d["lead_radar"] > 0)
+  joined = np.r_[False, (np.abs(np.diff(gap)) <= 1.0) & (np.abs(np.diff(v_lead)) <= 1.0) & (np.diff(d["route"]) == 0)
+                 & (np.diff(d["track_id"]) == 0) & (np.diff(d["t"]) <= 1.5 * DT_MDL)] & lead
   rows = []
-  for r in runs((d["manual"] > 0) & (d["lead"] > 0) & (d["lead_radar"] > 0) & (v < 0.1)):
-    if r.stop - r.start < settle or np.median(v_lead[r]) > 0.3 or np.median(gap[r]) > 20.0:
-      continue
-    # the lead's onset: the last frame under 0.2 m/s before it passes 1 m/s, the same lead throughout
-    end = min(r.stop + n6, len(v))
-    fast = np.flatnonzero(v_lead[r.start:end] > 1.0)
+  for r in runs(lead & (v < 0.1)):
+    fast = np.flatnonzero(v_lead[r.start:min(r.stop + n6, len(v))] > 1.0)
     if not len(fast):
       continue
     k1 = r.start + fast[0]
     slow = np.flatnonzero(v_lead[r.start:k1] < 0.2)
-    if not len(slow) or k1 + n2 >= len(v):
+    if not len(slow):
       continue
-    t0 = r.start + slow[-1]
-    if t0 < r.start + settle or not continuous[t0 + 1:t0 + n2 + 1].all() or not (d["manual"][t0:t0 + n6] > 0).all():
+    t0 = r.start + slow[-1]  # the lead's onset: its last frame under 0.2 m/s before it passes 1 m/s (0.2/a after it starts)
+    rest = slice(r.start, t0)  # the lead judged stopped, and the gap at rest, only before it launched
+    if t0 - r.start < settle or t0 >= r.stop or np.median(v_lead[rest]) > 0.3 or np.median(gap[rest]) > 20.0:
       continue
+    end = t0 + 1
+    while end < min(t0 + n6 + n2, len(v)) and joined[end]:
+      end += 1
+    if end - t0 <= n2:
+      continue
+    full = end - t0 >= n6
 
-    def first(mask, t0=t0):
-      hit = np.flatnonzero(mask[t0:t0 + n6])
-      return hit[0] * DT_MDL if len(hit) else np.nan
+    def first(mask, t0=t0, end=end, full=full):
+      hit = np.flatnonzero(mask[t0:min(end, t0 + n6)])
+      return hit[0] * DT_MDL if len(hit) else (math.inf if full else math.nan)
 
     moving = first(v > 0.3)
     held = bool(brake[t0])
-    release = first(~brake) if held else np.nan  # a brake already off when the lead moved is not a reaction
-    k_rel = t0 + round(release / DT_MDL) if np.isfinite(release) else None
-    k_move = t0 + round(moving / DT_MDL) if np.isfinite(moving) else None
-    ego_a = (v[min(k_move + n2, len(v) - 1)] - v[k_move]) / 2.0 if k_move is not None else np.nan
-    opened = gap[k_rel] - gap[t0] if k_rel is not None else np.nan
-    v_rel = v_lead[k_rel] if k_rel is not None else np.nan
-    rows.append(((v_lead[t0 + n2] - v_lead[t0]) / 2.0, float(np.median(gap[r])), held, release, first(gas), moving, ego_a, opened, v_rel))
-  return np.asarray(rows, dtype=float)
+    release = first(~brake) if held else math.nan  # a brake already off when the lead moved is not a reaction
+    k_rel = t0 + round(release / DT_MDL) if math.isfinite(release) else None
+    k_move = t0 + round(moving / DT_MDL) if math.isfinite(moving) else None
+    ego_a = (v[k_move + n2] - v[k_move]) / 2.0 if k_move is not None and k_move + n2 < end else math.nan
+    lead_travel = float(np.sum(v_lead[t0:k_rel]) * DT_MDL) if k_rel is not None else math.nan  # its own, not the gap: the ego creeps
+    v_rel = v_lead[k_rel] if k_rel is not None else math.nan
+    rows.append(((v_lead[t0 + n2] - v_lead[t0]) / 2.0, float(np.median(gap[rest])), held, release, first(gas), moving, ego_a, lead_travel, v_rel))
+  return np.asarray(rows, dtype=float).reshape(-1, 9)
 
 
 def _launch_reaction(args):
@@ -1655,21 +1665,21 @@ def _launch_reaction(args):
   from moonpilot.lab import driver
   routes = expand(args.routes, ROUTE_SETS) if args.routes else driver._routes(args.root)
   frames = [driver.extract(r, args.root) for r in routes]
-  d = {k: np.concatenate([f[k] for f in frames]) for k in ("manual", "v", "brake", "gas", "lead", "lead_radar", "gap", "v_lead", "track_id")}
+  d = {k: np.concatenate([f[k] for f in frames]) for k in ("t", "manual", "v", "brake", "gas", "lead", "lead_radar", "gap", "v_lead", "track_id")}
   d["route"] = np.concatenate([np.full(len(f["t"]), i) for i, f in enumerate(frames)])
   x = _launch_episodes(d)
   print(f"{len(routes)} drives")
-  a_lead, gap, held, release, gas, moving, ego_a, opened, v_rel = x.T
+  a_lead, gap, held, release, gas, moving, ego_a, opened, v_rel = x.T  # opened: the lead's own travel to the release
   held = held > 0
   print(f"{len(x)} manual launches behind a stopped radar lead (median gap at rest {np.median(gap):.1f} m); brake held at the lead's "
-        + f"onset on {held.sum()} ({int((held & ~np.isfinite(release)).sum())} of them still held 6 s later), already released on "
-        + f"{(~held).sum()} (no reaction to time)")
+        + f"onset on {held.sum()} ({int((held & (release == math.inf)).sum())} still held 6 s later, {int((held & np.isnan(release)).sum())} "
+        + f"censored before a release), already released on {(~held).sum()} (no reaction to time)")
 
   def cell(y):
     y = y[np.isfinite(y)]
     return f"{np.median(y):4.2f} ({np.percentile(y, 25):4.2f}-{np.percentile(y, 75):4.2f}) n {len(y):3d}" if len(y) >= 3 else f"{'-':>21s}"
 
-  print(f"  {'lead launch, m/s^2':20s} {'brake release s':>24s} {'gas s':>24s} {'ego moving s':>24s}  {'gap opened at release m':>24s}"
+  print(f"  {'lead launch, m/s^2':20s} {'brake release s':>24s} {'gas s':>24s} {'ego moving s':>24s}  {'lead travel to release m':>24s}"
         + f"  {'lead speed at release':>24s}  ego accel, first 2 s")
   for lo, hi in ((0.0, 0.5), (0.5, 1.0), (1.0, 1.5), (1.5, 2.5), (2.5, math.inf)):
     m = (a_lead >= lo) & (a_lead < hi)
@@ -1681,7 +1691,7 @@ def _launch_reaction(args):
     ra, rb = (np.argsort(np.argsort(z[ok])) for z in (a, b))
     return float(np.corrcoef(ra, rb)[0, 1]), int(ok.sum())
 
-  for name, y in (("brake release", release), ("gas", gas), ("ego moving", moving), ("ego accel", ego_a), ("gap opened", opened)):
+  for name, y in (("brake release", release), ("gas", gas), ("ego moving", moving), ("ego accel", ego_a), ("lead travel", opened)):
     rho, n = spearman(a_lead[held], y[held])
     print(f"  Spearman rho, lead launch accel vs {name:13s}: {rho:+.2f} (n {n})")
 
