@@ -487,6 +487,103 @@ def extract_control(route: str, root: str = DEFAULT_ROOT) -> dict[str, np.ndarra
   return cached(route, "control", CONTROL_VERSION, root, _control_build)
 
 
+CHAIN_VERSION = 1
+
+
+def _chain_build(segs):
+  """One row per carControl frame (100 Hz): the plan's aTarget, the fork controller's accel, what the car's own controller
+  sent to the PCM after its PID, pitch compensation and clip (`carOutput.actuatorsOutput.accel`), and the measured aEgo."""
+  latest, rows = {}, []
+  for msg in (m for seg in segs for m in LogReader(seg, sort_by_time=True)):
+    kind = msg.which()
+    if kind == "carState":
+      cs = msg.carState
+      latest[kind] = (cs.vEgo, cs.aEgo, cs.gasPressed, cs.brakePressed)
+    elif kind == "longitudinalPlan":
+      latest[kind] = (msg.longitudinalPlan.aTarget,)
+    elif kind == "carOutput":
+      latest[kind] = (msg.carOutput.actuatorsOutput.accel,)
+    elif kind == "carControl" and all(k in latest for k in ("carState", "longitudinalPlan", "carOutput")):
+      cc = msg.carControl
+      rows.append((int(msg.logMonoTime), float(cc.longActive), float(cc.actuators.accel), *latest["longitudinalPlan"], *latest["carOutput"],
+                   *latest["carState"]))
+  if not rows:
+    raise ValueError("no complete chain frames")
+  cols = np.asarray(rows, dtype=float).T
+  return dict(zip(("t", "long_active", "accel", "a_target", "output", "v_ego", "a_ego", "gas", "brake"), cols, strict=True))
+
+
+def extract_chain(route: str, root: str = DEFAULT_ROOT) -> dict[str, np.ndarray]:
+  return cached(route, "chain", CHAIN_VERSION, root, _chain_build)
+
+
+def _rise(x):
+  """The largest rise inside a window: the most any sample sits above the lowest before it."""
+  return float(np.max(x - np.minimum.accumulate(x))) if len(x) else math.nan
+
+
+CHAIN_RISE = 0.2  # m/s^2; half a burst — a stage that rose this much behind a burst is a stage that asked for it
+
+
+def _chain_bursts(job):
+  route, root = job
+  c = extract_chain(route, root)
+  n, smooth = round(BURST_T / DT_CTRL), round(0.5 / DT_CTRL)
+  mask = (c["long_active"] > 0) & (c["gas"] == 0) & (c["brake"] == 0) & (c["v_ego"] > 5.0) & np.isfinite(c["a_ego"])
+  if mask.sum() < round(30.0 / DT_CTRL):
+    return route, None
+  a = np.convolve(c["a_ego"], np.ones(smooth) / smooth, mode="same")
+  max_lag = 1.0
+  lag_plan = lag_s(c["a_target"], a, mask, DT_CTRL, max_lag)
+  lag_out = lag_s(c["output"], a, mask, DT_CTRL, max_lag)
+  lp, lo = round(lag_plan / DT_CTRL), round(lag_out / DT_CTRL)
+  rows = []
+  for r in runs(mask):
+    i = r.start + max(lp, lo)
+    while i < r.stop - n:
+      if a[i + n] > BURST_END and a[i + n] - a[i] >= BURST_RISE:
+        w_plan, w_out = slice(i - lp, i - lp + n + 1), slice(i - lo, i - lo + n + 1)
+        rows.append((_rise(c["a_target"][w_plan]), _rise(c["accel"][w_plan]), _rise(c["output"][w_out]), a[i + n] - a[i]))
+        i += n
+      else:
+        i += 1
+  return route, (lag_plan, lag_out, mask.sum() * DT_CTRL / 60, np.asarray(rows, dtype=float).reshape(-1, 4))
+
+
+def _burst_chain(args):
+  """Every measured accel burst while openpilot has the pedals above 5 m/s (aEgo over 0.5 s; `driver._bursts`' rise of 0.4
+  m/s^2 in 1 s ending above +0.3), at 100 Hz, against what each stage of the chain did over the same second shifted by
+  that drive's own delay to aEgo (`lag_s`, up to 1 s): the plan's aTarget, the fork controller's accel, and what the car's
+  controller sent the PCM. Each burst is put on the first stage that rose `CHAIN_RISE` behind it; a burst no stage rose
+  behind is the measurement's alone — the PCM, the road's grade, or the aEgo estimate, which this cannot tell apart."""
+  from concurrent.futures import ProcessPoolExecutor
+  routes = list(dict.fromkeys(expand(args.routes, ROUTE_SETS)))
+  with ProcessPoolExecutor(3, max_tasks_per_child=1) as pool:
+    results = [r for r in pool.map(_chain_bursts, [(route, args.root) for route in routes]) if r[1] is not None]
+  if not results:
+    print(f"none of {len(routes)} drives has 30 s of engaged frames above 5 m/s to estimate its delay from")
+    return
+  lags = np.asarray([(lp, lo) for _, (lp, lo, _, _) in results])
+  minutes = sum(m for _, (_, _, m, _) in results)
+  x = np.concatenate([rows for _, (*_, rows) in results]) if results else np.zeros((0, 4))
+  print(f"{len(results)} drives, {minutes:.1f} engaged min above 5 m/s, {len(x)} measured bursts ({len(x) / max(minutes, 1e-9):.2f}/min); "
+        + f"delay to aEgo median: plan {np.median(lags[:, 0]):.2f} s, sent to the PCM {np.median(lags[:, 1]):.2f} s")
+  plan, ctrl, out, felt = x.T
+  classes = (
+    ("the plan rose a full burst", plan >= BURST_RISE),
+    ("the plan rose, under a burst", (plan >= CHAIN_RISE) & (plan < BURST_RISE)),
+    ("the fork controller rose without the plan", (plan < CHAIN_RISE) & (ctrl >= CHAIN_RISE)),
+    ("the car's controller rose without either", (plan < CHAIN_RISE) & (ctrl < CHAIN_RISE) & (out >= CHAIN_RISE)),
+    ("no stage rose: the measurement's alone", (plan < CHAIN_RISE) & (ctrl < CHAIN_RISE) & (out < CHAIN_RISE)),
+  )
+  print(f"  {'':44s} {'n':>4s}  median rise behind it, m/s^2: plan / fork controller / sent to PCM / measured")
+  for name, m in classes:
+    cells = " / ".join(f"{np.median(v[m]):+.2f}" if m.any() else "  -  " for v in (plan, ctrl, out, felt))
+    print(f"  {name:44s} {int(m.sum()):4d}  {cells}")
+
+
+
+
 def control_rate_dt(t_ns: np.ndarray) -> float:
   """The median spacing of control frames, refusing anything that is not the rate the controller is written for.
 
@@ -1984,6 +2081,9 @@ def _register_manual(sub):
   parser.add_argument("--routes", nargs="+", default=["engaged", "00000468"], help=f"route names or sets: {', '.join(ROUTE_SETS)}")
   parser.add_argument("--far-headway", type=float, default=4.0, help="s of headway past which a lead counts as far (and is ignored in the arm)")
   parser.set_defaults(fn=_accel_bursts)
+  parser = sub.add_parser("burst-chain", help="each measured engaged accel burst against the delay-aligned plan, controller and PCM command")
+  parser.add_argument("--routes", nargs="+", default=["engaged", "00000468"], help=f"route names or sets: {', '.join(ROUTE_SETS)}")
+  parser.set_defaults(fn=_burst_chain)
 
 
 def register(sub):
