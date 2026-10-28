@@ -48,6 +48,9 @@
     // Off by default, a test toggle: below 0.5 m/s a gentle brake request eases toward zero before the
     // stop; read once when the longitudinal controller is built, so restart.
     {"MoonpilotCrawlRelease", {PERSISTENT, BOOL, "0"}},
+    // On by default: on a hand-back from the driver's gas the positive ask starts low and rebuilds; read every
+    // frame, so it applies immediately.
+    {"MoonpilotHandbackEase", {PERSISTENT, BOOL, "1"}},
     // Off by default: an index into PATH_LOOKAHEAD.choices (0 off, then light / medium / strong):
     // the turn-in lead-in from the planned curvature averaged over a window ahead; chosen at
     // construction, so a restart.

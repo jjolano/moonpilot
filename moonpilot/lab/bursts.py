@@ -345,6 +345,64 @@ def _accel_bursts(args):
           + f"p75 {np.percentile(deficits, 75):.1f})")
 
 
+HANDBACK_WINDOW_S, HANDBACK_GAS_S = 4.0, 0.5
+
+
+def _handback_replay(job):
+  route, root, on = job
+  details = []
+  replayed, logged, active, _ = replay(route, extract(route, root), root, overrides={"MoonpilotHandbackEase": int(on)}, details_out=details)
+  return replayed, logged, active, _details_arrays(details)
+
+
+def _handback_edges(active, gas, v_ego, t):
+  """Gas-led hand-backs: openpilot's longitudinal inactive to active, the gas pressed in the `HANDBACK_GAS_S` before, above
+  5 m/s, and active, timestamp-contiguous, for the `HANDBACK_WINDOW_S` after."""
+  n, pre = round(HANDBACK_WINDOW_S / DT_MDL), round(HANDBACK_GAS_S / DT_MDL)
+  out = []
+  for e in np.flatnonzero(active[1:] & ~active[:-1]) + 1:
+    w = slice(e, e + n + 1)
+    if e < pre or e + n >= len(active) or v_ego[e] <= 5.0 or not gas[e - pre:e].any() or not active[w].all():
+      continue
+    if np.max(np.diff(t[w])) > 1.5 * DT_MDL:
+      continue
+    out.append(e)
+  return out
+
+
+def _handback(args):
+  """Every gas-led hand-back on the engaged drives, today's planner replayed with `MoonpilotHandbackEase` off and on: the
+  command's largest rise in any 1 s of the `HANDBACK_WINDOW_S` after, the bursts in it (`driver._bursts`' definition), the
+  command at +1 s, its peak and its mean (the speed it buys). The off arm against the logged command is the gate: those
+  drives had no ease. Command path only: the car is held as recorded, so the ease's own effect on speed is not flown."""
+  from concurrent.futures import ProcessPoolExecutor
+  routes = list(dict.fromkeys(expand(args.routes, ROUTE_SETS)))
+  with ProcessPoolExecutor(3, max_tasks_per_child=1) as pool:
+    off = list(pool.map(_handback_replay, [(r, args.root, False) for r in routes]))
+    on = list(pool.map(_handback_replay, [(r, args.root, True) for r in routes]))
+  n, one = round(HANDBACK_WINDOW_S / DT_MDL), round(1.0 / DT_MDL)
+  rows, errs = {"off": [], "on": []}, []
+  for (cmd_off, logged, active, m), (cmd_on, *_) in zip(off, on, strict=True):
+    for e in _handback_edges(active, m["gas_pressed"], m["v_ego"], m["t"]):
+      w = slice(e, e + n + 1)
+      errs.append(np.abs(cmd_off[w] - logged[w]))
+      inside = np.zeros(len(active), dtype=bool)
+      inside[w] = True
+      for arm, cmd in (("off", cmd_off), ("on", cmd_on)):
+        c = cmd[w]
+        rows[arm].append((float(np.max(c[one:] - c[:-one])), len(_burst_starts(cmd, inside)), c[one], c.max(), c.mean()))
+  if not rows["off"]:
+    print(f"no gas-led hand-backs on {len(routes)} drives")
+    return
+  err = np.concatenate(errs)
+  print(f"{len(rows['off'])} gas-led hand-backs on {len(routes)} drives; the off arm against the logged command over their "
+        + f"{HANDBACK_WINDOW_S:g} s: |error| median {np.median(err):.4f} p95 {np.percentile(err, 95):.4f} m/s^2")
+  print(f"  {'':4s} {'largest 1 s rise':>17s} {'bursts':>7s} {'at +1 s':>8s} {'peak':>7s} {'mean':>7s}   (medians; bursts summed)")
+  for arm, x in rows.items():
+    x = np.asarray(x)
+    print(f"  {arm:4s} {np.median(x[:, 0]):+17.2f} {int(x[:, 1].sum()):7d} {np.median(x[:, 2]):+8.2f} {np.median(x[:, 3]):+7.2f} {np.median(x[:, 4]):+7.2f}")
+
+
 def register(sub):
   parser = sub.add_parser("accel-bursts", help="engaged positive accel bursts and what they come from; far leads ignored as an arm")
   parser.add_argument("--routes", nargs="+", default=["engaged", "00000468"], help=f"route names or sets: {', '.join(ROUTE_SETS)}")
@@ -354,3 +412,6 @@ def register(sub):
   parser.add_argument("--routes", nargs="+", default=["engaged", "00000468"], help=f"route names or sets: {', '.join(ROUTE_SETS)}")
   parser.set_defaults(fn=_burst_chain)
   parser.add_argument("--list", action="store_true", help="every placed unmatched event, by class, drive and time")
+  parser = sub.add_parser("handback", help="gas-led hand-backs replayed with MoonpilotHandbackEase off and on")
+  parser.add_argument("--routes", nargs="+", default=["engaged", "00000468"], help=f"route names or sets: {', '.join(ROUTE_SETS)}")
+  parser.set_defaults(fn=_handback)

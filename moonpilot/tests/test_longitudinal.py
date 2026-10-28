@@ -1369,6 +1369,41 @@ class TestPlanner(unittest.TestCase):
     planner.update(_inputs(v_ego=15.0, v_cruise_kph=V_CRUISE_UNSET, a_ego=0.4))
     self.assertAlmostEqual(planner.output_a_target, 0.4 + MOONPILOT_JERK_UP * DT_MDL, delta=1e-6)
 
+  @staticmethod
+  def _handback(ease, gas, frames_after=40, model_accel=0.0):
+    """1 s of the driver on the gas (`gas`) with openpilot's longitudinal off, accelerating at +1.2 m/s^2 6.5 m/s under the
+    set speed, then openpilot back on with the model asking `model_accel`: the commands after, on inputs held where the
+    hand-back found them, so both arms see the same car and differ only by the ease."""
+    planner = _planner(params_overrides={"MoonpilotHandbackEase": ease})
+    for _ in range(20):
+      sm = _inputs(v_ego=10.7, v_cruise_kph=62.0, a_ego=1.2, enabled=False)
+      sm["carState"].gasPressed = gas
+      sm["controlsState"].longControlState = car.CarControl.Actuators.LongControlState.off
+      planner.update(sm)
+    out = []
+    for _ in range(frames_after):
+      planner.update(_inputs(v_ego=10.7, v_cruise_kph=62.0, a_ego=1.2, model_accel=model_accel))
+      out.append((planner.output_a_target, planner.model_fade))
+    return out
+
+  def test_a_gas_hand_back_eases_off_and_a_pedal_free_engagement_does_not(self):
+    """Lifting off the gas below the set speed eases the car (`MoonpilotHandbackEase`) rather than carrying the driver's
+    acceleration on; an engagement with no pedal behind it is planned as it was."""
+    carried, eased = ([a for a, _ in self._handback(ease, True)] for ease in (False, True))
+    self.assertGreater(carried[20], 0.8)  # without the ease the driver's +1.2 carries on: the case is real
+    self.assertLess(eased[20], carried[20] - 0.3)  # 1 s after the hand-back, clearly eased
+    self.assertTrue(all(e <= c + 1e-9 for e, c in zip(eased, carried, strict=True)))  # it only ever lowers the ask
+    self.assertEqual(self._handback(True, False), self._handback(False, False))
+
+  def test_the_hand_back_ease_never_deepens_a_fading_model_brake(self):
+    """The model's braking is admitted and still fading in when openpilot takes over from the gas: the ease bounds only
+    the positive result, so the braking the car gets is exactly what it gets without the ease. A ceiling inside a
+    candidate would have deepened it, the model ask being blended from the other candidates' minimum."""
+    eased, plain = self._handback(True, True, model_accel=-2.0), self._handback(False, True, model_accel=-2.0)
+    self.assertTrue(any(0.0 < fade < 1.0 for _, fade in plain))  # a partly faded model ask is in play
+    self.assertLess(min(a for a, _ in plain), 0.0)  # and it brakes
+    self.assertEqual(eased, plain)
+
   def test_jerk_is_bounded_at_every_frame(self):
     """A set speed step and a cut-in 10 m ahead, which is the worst case the rate limit exists for:
     the cruise term sits at its cap, then a stopped lead 10 m out demands ACCEL_MIN."""

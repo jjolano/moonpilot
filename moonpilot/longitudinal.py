@@ -96,7 +96,8 @@ from moonpilot.pose import MOONPILOT_POSE_MAX_DT
 from moonpilot.corridor import RollingCorridor, squeeze_accel
 from moonpilot.brake_band import MOONPILOT_BRAKE_BAND_FLOOR, BrakeBand
 from moonpilot.engine_coast import engine_floor
-from moonpilot.features import BRAKE_BAND, COAST_GRADE, CURVE_SPEED, EXPERIMENTAL_MODE, LEAD_LATERAL, LONGITUDINAL, MODEL_BRAKING, SQUEEZE, enabled
+from moonpilot.features import (BRAKE_BAND, COAST_GRADE, CURVE_SPEED, EXPERIMENTAL_MODE, HANDBACK_EASE, LEAD_LATERAL, LONGITUDINAL, MODEL_BRAKING,
+                                 SQUEEZE, enabled)
 from moonpilot.latency import (
   MOONPILOT_LAG_BLOCKS_KEY,
   MOONPILOT_LAG_HISTORY_KEY,
@@ -355,6 +356,15 @@ MOONPILOT_JERK_EASE_HOLD_A = -0.3  # m/s^2
 MOONPILOT_JERK_ONSET_LEAD_A = -0.2  # m/s^2; a lead slowing past this keeps JERK_DOWN
 MOONPILOT_BRAKE_EXIT_A = -0.5  # m/s^2; braking past this holds the positive ask, as curve braking does
 MOONPILOT_BRAKE_EXIT_JERK = 0.5  # m/s^3; its rebuild with the wheel straight, above the launch band
+# `MoonpilotHandbackEase` (on, live): when openpilot takes back over from the driver's gas, the positive ask is capped at
+# HANDBACK_A and the cap rebuilds at HANDBACK_JERK, so lifting off below the set speed eases the car rather than carrying
+# the driver's own acceleration on. Without it, the plan resumed from the measured accel: on route 0000043f a lift-off 6.5
+# m/s under the set speed dipped to +0.53 before the command landed and then held +1.25 for 2 s
+# (`python -m moonpilot.lab burst-chain --list`, `python -m moonpilot.lab handback`). A gas press this recent when the reset
+# ends counts, since the pedal clears a frame or two before longitudinal re-engages.
+MOONPILOT_HANDBACK_A = 0.3  # m/s^2
+MOONPILOT_HANDBACK_JERK = 0.25  # m/s^3; under a burst's 0.4 in 1 s, so the rebuild is not a burst of its own (0.4 was)
+MOONPILOT_HANDBACK_GAS_T = 0.5  # s
 MOONPILOT_ALLOW_THROTTLE_THRESHOLD = 0.4
 # Throttle comes back only once the model's gas-press probability clears this, not the 0.4 that took it
 # away. On route 000003f8 the probability hovered on 0.4 while following a slowing lead and the cruise
@@ -931,6 +941,11 @@ class MoonpilotLongitudinalPlanner:
     # The curve exit ramp's ceiling on the positive ask: zero while a curve term brakes, rebuilt at
     # `MOONPILOT_CURVE_EXIT_JERK` after it lets go, `ACCEL_MAX` (inert) once rebuilt or disengaged.
     self.curve_exit_cap = ACCEL_MAX
+    # The hand-back cap: `MOONPILOT_HANDBACK_A` on the first frame after a gas-led reset, rebuilt at `MOONPILOT_HANDBACK_JERK`;
+    # `ACCEL_MAX` (inert) otherwise. `gas_recent` is how long a gas press during the reset still counts.
+    self.handback_cap = ACCEL_MAX
+    self.gas_recent = 0.0
+    self.was_reset = True
     self.brake_band = BrakeBand()
     self.solve_time = 0.0
 
@@ -971,7 +986,16 @@ class MoonpilotLongitudinalPlanner:
       self.model_braking = False
       self.model_fade = 0.0
       self.curve_exit_cap = ACCEL_MAX
+      self.handback_cap = ACCEL_MAX
+      self.gas_recent = MOONPILOT_HANDBACK_GAS_T if CS.gasPressed else max(self.gas_recent - self.dt, 0.0)
       self.brake_band.reset()
+    elif self.was_reset:
+      if self.gas_recent > 0.0 and enabled(HANDBACK_EASE, self.params):
+        self.handback_cap = MOONPILOT_HANDBACK_A
+      self.gas_recent = 0.0
+    else:
+      self.handback_cap = min(self.handback_cap + MOONPILOT_HANDBACK_JERK * self.dt, ACCEL_MAX)
+    self.was_reset = reset_state
 
     # Learn the chain's lag from the command that was in effect last frame (`output_a_target` is
     # assigned at the end of this one) and the acceleration the car answered with. Gated to the frames
@@ -1221,6 +1245,10 @@ class MoonpilotLongitudinalPlanner:
       err_bp=err_bp,
       model_weight=model_weight,
     )
+    # The hand-back ceiling bounds the policy's result, not a candidate: an admitted model ask is blended from the other
+    # candidates' minimum, so lowering one of them would deepen a partly faded model brake. A ceiling of at least
+    # MOONPILOT_HANDBACK_A on the result leaves every nonpositive ask exactly as the policy gave it.
+    a_cmd = min(a_cmd, self.handback_cap)
 
     # The brake band shapes what the car is asked for, after the policy picked it and before the comfort ramp.
     # It never lifts the ask over `cruise_cap`, which the policy's output already sits under through the cruise
@@ -1257,6 +1285,7 @@ class MoonpilotLongitudinalPlanner:
       squeeze=squeeze,
       exit_cap=self.curve_exit_cap,
       exit_jerk=exit_jerk,
+      handback_cap=self.handback_cap,
       err_bp=err_bp,
       model_weight=model_weight,
     )
@@ -1387,6 +1416,7 @@ class MoonpilotLongitudinalPlanner:
     exit_jerk=MOONPILOT_CURVE_EXIT_JERK,
     err_bp=MOONPILOT_CRUISE_ERR_BP,
     model_weight=1.0,
+    handback_cap=ACCEL_MAX,
   ):
     """The same policy rolled forward over the published horizon, from (v_ego, a_target). The ego's
     own travel is carried in x, so the gap the leads are rolled against is the gap this plan
@@ -1428,6 +1458,7 @@ class MoonpilotLongitudinalPlanner:
         err_bp=err_bp,
         model_weight=max(model_weight, min(self.model_fade + t / MOONPILOT_MODEL_BRAKE_FADE_T, 1.0)),
       )
+      a_cmd = min(a_cmd, handback_cap + MOONPILOT_HANDBACK_JERK * t)  # the hand-back ceiling, rebuilt over the horizon as in `update`
       a = float(np.clip(jerk_limit(a_cmd, a, t - t_prev, v, comfort_scale, lead_braking(states)), ACCEL_MIN, ACCEL_MAX))
       speeds[i] = v
       accels[i] = a

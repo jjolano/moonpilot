@@ -165,6 +165,15 @@ ENGINE_COAST = Feature(
   offroad_only=True,
 )
 
+HANDBACK_EASE = Feature(
+  key="MoonpilotHandbackEase",
+  title="ease off after the gas",
+  description=(
+    "When you lift off the gas below the set speed, openpilot eases off and builds back up to the set speed over a couple "
+    + "of seconds, instead of carrying on at the rate you were accelerating. Braking is unchanged. Applies immediately."
+  ),
+)
+
 CRAWL_RELEASE = Feature(
   key="MoonpilotCrawlRelease",
   title="ease off before the stop (test)",
@@ -239,7 +248,7 @@ SPEED = Group(
   # The lead's lateral prediction sits here rather than with the steering because the fork reaches
   # it through the planner's time gap, not through a steering request.
   features=(LONGITUDINAL, EXPERIMENTAL_MODE, MODEL_BRAKING, CURVE_SPEED, SQUEEZE, PATH_OUTSIDE, COAST_GRADE, BRAKE_BAND, ENGINE_COAST, CRAWL_RELEASE,
-            LEAD_LATERAL, SLAM),
+            HANDBACK_EASE, LEAD_LATERAL, SLAM),
 )
 
 DEVICE = Group(
