@@ -54,14 +54,30 @@ def _rise(x):
 CHAIN_RISE = 0.2  # m/s^2; half a burst — a stage that rose this much behind a burst is a stage that asked for it
 
 
+def _transition(c, k, lead_in, n):
+  """How control changed around a burst starting at chain frame `k`: 2, a hand-back from the driver's pedal — openpilot's
+  longitudinal goes inactive to active between `lead_in` frames before `k` and `k`, with the gas or brake pressed in the
+  burst second before that edge; 1, any other frame without openpilot's longitudinal in the whole window (an engagement
+  with no pedal, a disengagement during or after the burst); 0, active throughout."""
+  active = c["long_active"] > 0
+  lo, hi = max(k - lead_in - n, 0), min(k + n + 1, len(active))
+  if active[lo:hi].all():
+    return 0
+  for j in range(max(k - lead_in, 1), k + 1):
+    if active[j] and not active[j - 1]:
+      before = slice(max(j - n, 0), j)
+      if (c["gas"][before] > 0).any() or (c["brake"][before] > 0).any():
+        return 2
+  return 1
+
+
 def _chain_window(c, a, k, lp, lo, n):
   """(plan, fork controller, sent to the PCM, measured) rises over one burst second starting at chain frame `k`, each
-  command shifted back by its own delay to aEgo, and whether the window — from a burst second before the earliest shifted
-  start — touches a frame without openpilot's longitudinal: a hand-back from the driver's pedal, where the controller
-  steps from its inactive zero to the plan and the car's measured accel fills in the dip the release left."""
+  command shifted back by its own delay to aEgo, and `_transition` over the earliest shifted start: on a hand-back the
+  controller steps from its inactive zero to the plan and the car's measured accel fills in the dip the release left."""
   w_plan, w_out = slice(k - lp, k - lp + n + 1), slice(k - lo, k - lo + n + 1)
-  handback = bool(np.any(c["long_active"][max(k - max(lp, lo) - n, 0):k + n + 1] == 0))
-  return _rise(c["a_target"][w_plan]), _rise(c["accel"][w_plan]), _rise(c["output"][w_out]), a[k + n] - a[k], float(handback)
+  return (_rise(c["a_target"][w_plan]), _rise(c["accel"][w_plan]), _rise(c["output"][w_out]), a[k + n] - a[k],
+          float(_transition(c, k, max(lp, lo), n)))
 
 
 def _chain_bursts(job):
@@ -100,12 +116,13 @@ def _chain_bursts(job):
 
 
 def _class_masks(x):
-  """Each burst on the first stage that rose `CHAIN_RISE` behind it — a hand-back from the driver's pedal first — as
-  (name, mask) per class, in chain order."""
-  plan, ctrl, out, _, handback = x.T
-  own = handback == 0
+  """Each burst on the first stage that rose `CHAIN_RISE` behind it — control transitions first — as (name, mask) per
+  class, in chain order."""
+  plan, ctrl, out, _, transition = x.T
+  own = transition == 0
   return (
-    ("a hand-back from the driver's pedal", handback > 0),
+    ("a hand-back from the driver's pedal", transition == 2),
+    ("another control transition in the window", transition == 1),
     ("the plan rose a full burst", own & (plan >= BURST_RISE)),
     ("the plan rose, under a burst", own & (plan >= CHAIN_RISE) & (plan < BURST_RISE)),
     ("the fork controller rose without the plan", own & (plan < CHAIN_RISE) & (ctrl >= CHAIN_RISE)),
