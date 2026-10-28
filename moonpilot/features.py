@@ -172,6 +172,7 @@ HANDBACK_EASE = Feature(
     "When you lift off the gas below the set speed, openpilot eases off and builds back up to the set speed over a couple "
     + "of seconds, instead of carrying on at the rate you were accelerating. Braking is unchanged. Applies immediately."
   ),
+  offroad_only=True,
 )
 
 CRAWL_RELEASE = Feature(

@@ -1404,6 +1404,13 @@ class TestPlanner(unittest.TestCase):
     self.assertLess(min(a for a, _ in plain), 0.0)  # and it brakes
     self.assertEqual(eased, plain)
 
+  def test_the_hand_back_ease_row_is_on_and_parked_only(self):
+    feature = next(f for f in FEATURES if f.key == "MoonpilotHandbackEase")
+    self.assertTrue(feature.offroad_only)  # it changes driving behavior, so both panels only flip it while parked
+    self.assertFalse(feature.requires)
+    text = (ROOT / "moonpilot" / "params_keys.h").read_text()
+    self.assertTrue('{"MoonpilotHandbackEase", {PERSISTENT, BOOL, "1"}}' in text)
+
   def test_jerk_is_bounded_at_every_frame(self):
     """A set speed step and a cut-in 10 m ahead, which is the worst case the rate limit exists for:
     the cruise term sits at its cap, then a stopped lead 10 m out demands ACCEL_MIN."""
