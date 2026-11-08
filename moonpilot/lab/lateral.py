@@ -2,6 +2,7 @@
 
   python -m moonpilot.lab torque   # MoonpilotSteerHysteresis: torque reversals per second (AGENTS.md, The lateral controller)
   python -m moonpilot.lab smooth   # MoonpilotPathSmooth: request lag behind the model's action (docs/curvature.md)
+  python -m moonpilot.lab stick    # MoonpilotSteerFrictionRamp: command change, and the lurch's torque peak (AGENTS.md)
 
 `extract` is the shared lateral extract; other lab modules may read it.
 """
@@ -20,7 +21,7 @@ from openpilot.tools.lib.logreader import LogReader
 
 from moonpilot.curvature import MOONPILOT_PREVIEW_MIN_SPEED, MOONPILOT_SMOOTH_TAUS, PathSmooth, response_aligned_curvature
 from moonpilot.lab import DEFAULT_ROOT, cached, drive_config, expand, lag_s, param_index, predates, reversals_per_s
-from moonpilot.latcontrol import MOONPILOT_DAMPING_T, MOONPILOT_TORQUE_HYSTERESIS, MoonpilotLatControlTorque
+from moonpilot.latcontrol import MOONPILOT_DAMPING_T, MOONPILOT_FRICTION_RISE, MOONPILOT_TORQUE_HYSTERESIS, MoonpilotLatControlTorque
 
 EXTRACT_VERSION = 2  # bump whenever _build() changes what it stores; v1's steer_limited paired the wrong frames
 ROUTE_SETS = {
@@ -31,7 +32,12 @@ ROUTE_SETS = {
   # Engaged lateral drives (3f8-418, 43e, 43f, 44d) beside the two all-manual drives 44e/44f, for lane-position.
   "lanes": (*(f"0000{i:04x}" for i in range(0x3F8, 0x411)), "00000413", "00000414", "00000417", "00000418", "0000043e", "0000043f",
             "0000044d", "0000044e", "0000044f"),
+  # MoonpilotSteerFrictionRamp: every engaged drive above 10 m/s and the drive that lurched past an intersection.
+  "stick": (*(f"0000{i:04x}" for i in range(0x3F8, 0x411)), "00000413", "00000414", "00000417", "00000418", "0000043e", "0000043f",
+            "0000044d", "0000046b--fbae8b11b5"),
 }
+# 0000046b's lurch: route time 640-644 s (segment 10), as logMonoTime seconds.
+STICK_EVENT = ("0000046b--fbae8b11b5", 667.85, 671.85)
 LANE_VERSION = 1
 SMOOTH_IN_DELAY_UNTIL = "d8b15bd1b"  # before this commit controlsd added PathSmooth's tau to the controller's lat_delay
 
@@ -101,6 +107,7 @@ class TorqueConfig(NamedTuple):
   hysteresis: float = 0.0
   damping_t: float = 0.0
   delay_offset: float = 0.0  # s added to the logged lateralDelay
+  friction_rise: float = 0.0  # MoonpilotSteerFrictionRamp: m/s^2 per second, 0 = no ramp
 
 
 def as_driven(route: str, root: str = DEFAULT_ROOT) -> TorqueConfig:
@@ -112,6 +119,7 @@ def as_driven(route: str, root: str = DEFAULT_ROOT) -> TorqueConfig:
     hysteresis=MOONPILOT_TORQUE_HYSTERESIS[min(param_index(params, "MoonpilotSteerHysteresis"), len(MOONPILOT_TORQUE_HYSTERESIS) - 1)],
     damping_t=MOONPILOT_DAMPING_T[min(param_index(params, "MoonpilotSteerDamping"), len(MOONPILOT_DAMPING_T) - 1)],
     delay_offset=tau if predates(commit, SMOOTH_IN_DELAY_UNTIL) else 0.0,
+    friction_rise=MOONPILOT_FRICTION_RISE if param_index(params, "MoonpilotSteerFrictionRamp") else 0.0,
   )
 
 
@@ -119,7 +127,7 @@ def replay_torque(d: dict[str, np.ndarray], cfg: TorqueConfig, lac_out: list | N
   """The fork torque controller's output per frame (carControl's sign), driven the way controlsd drives it.
   Pass `lac_out` to collect each frame's torque log."""
   CP = messaging.log_from_bytes(d["cp"].tobytes(), car.CarParams)
-  lac = MoonpilotLatControlTorque(CP, interfaces[CP.carFingerprint](CP), DT_CTRL, cfg.hysteresis, cfg.damping_t)
+  lac = MoonpilotLatControlTorque(CP, interfaces[CP.carFingerprint](CP), DT_CTRL, cfg.hysteresis, cfg.damping_t, cfg.friction_rise)
   VM = VehicleModel(CP)
   out = np.zeros(len(d["t"]))
   for k in range(len(out)):
@@ -198,6 +206,44 @@ def _smooth(args):
     print(f"  tau {tau:.2f} s: {no_lead:4.0f} ms no lead, {led:4.0f} ms lead tau")
 
 
+def _stick_route(job):
+  route, root, rises = job
+  try:
+    d, cfg = extract(route, root), as_driven(route, root)
+  except (FileNotFoundError, ValueError) as e:
+    return route, None, str(e)
+  base = replay_torque(d, cfg._replace(friction_rise=0.0))
+  return route, {"t": d["t"], "mask": d["lat_active"] & ~d["pressed"] & (d["v_ego"] > 10.0), "base": base,
+                 "arms": {r: replay_torque(d, cfg._replace(friction_rise=r)) for r in rises}}, None
+
+
+def _stick(args):
+  """MoonpilotSteerFrictionRamp over engaged driving above 10 m/s: how much of the command the ramp changes and how often,
+  and the torque peak and swing through route 0000046b's lurch. Command-path evidence only: whether the wheel stops
+  snapping is a drive's answer, because the replay holds the recorded wheel."""
+  from concurrent.futures import ProcessPoolExecutor
+  with ProcessPoolExecutor(3) as pool:
+    results = list(pool.map(_stick_route, [(r, args.root, tuple(args.rise)) for r in expand(args.routes, ROUTE_SETS)]))
+  done = [(route, r) for route, r, _ in results if r is not None]
+  for route, _, err in results:
+    if err is not None:
+      print(f"{route}: skipped, {err}")
+  print(f"{len(done)} drives, {sum(r['mask'].sum() for _, r in done) * DT_CTRL / 60:.0f} min steering above 10 m/s; "
+        + "command change against no ramp, |delta| torque:")
+  for rise in args.rise:
+    dd = np.concatenate([np.abs(r["arms"][rise] - r["base"])[r["mask"]] for _, r in done])
+    print(f"  rise {rise}: >0.02 {np.mean(dd > 0.02) * 100:5.2f}%  >0.05 {np.mean(dd > 0.05) * 100:5.2f}%  >0.10 {np.mean(dd > 0.10) * 100:5.2f}%  "
+          + f"p99 {np.percentile(dd, 99):.3f}")
+  route, lo, hi = STICK_EVENT
+  event = next((r for name, r in done if name == route), None)
+  if event is not None:
+    w = (event["t"] >= lo) & (event["t"] <= hi)
+    print(f"\n{route}, the lurch (route 640-644 s), command peak / min / swing:")
+    for name, series in (("no ramp", event["base"]), *((f"rise {r}", event["arms"][r]) for r in args.rise)):
+      tq = series[w]
+      print(f"  {name:9s} {tq.max():+.3f} / {tq.min():+.3f} / {tq.max() - tq.min():.3f}")
+
+
 def _lane_build(segs: list[str]) -> dict[str, np.ndarray]:
   """Per modelV2: the ego lane's center and width from laneLines 1/2 at x = 0 (y right-positive, so a positive center is
   the ego left of it), the weaker line's prob, the path's curvature, speed, and who steered."""
@@ -248,8 +294,11 @@ def register(sub):
   for name, fn, default, help_text in (
     ("torque", _torque, "hysteresis", "MoonpilotSteerHysteresis: torque reversals per second"),
     ("smooth", _smooth, "smooth", "MoonpilotPathSmooth: request lag behind the model's action"),
+    ("stick", _stick, "stick", "MoonpilotSteerFrictionRamp: command change and the lurch's torque peak"),
     ("lane-position", _lane_position, "lanes", "where in the lane the car sits: openpilot steering against the driver"),
   ):
     p = sub.add_parser(name, help=help_text, description=help_text)
     p.add_argument("--routes", nargs="+", default=[default], help=f"route names or sets: {', '.join(ROUTE_SETS)}")
+    if name == "stick":
+      p.add_argument("--rise", nargs="+", type=float, default=[MOONPILOT_FRICTION_RISE], help="friction rise, m/s^2 per second")
     p.set_defaults(fn=fn)

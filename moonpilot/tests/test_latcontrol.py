@@ -17,6 +17,7 @@ from openpilot.common.realtime import DT_CTRL
 from moonpilot.latcontrol import (
   MOONPILOT_DAMPING_T,
   MOONPILOT_FRICTION_DEADBAND,
+  MOONPILOT_FRICTION_RISE,
   MOONPILOT_JERK_LOOKAHEAD_T,
   MOONPILOT_KI,
   MOONPILOT_KP_BP,
@@ -27,7 +28,7 @@ from moonpilot.latcontrol import (
   MoonpilotLatControlTorque,
   moonpilot_latcontrol,
 )
-from moonpilot.features import STEER_DAMPING, STEER_HYSTERESIS
+from moonpilot.features import STEER_DAMPING, STEER_FRICTION_RAMP, STEER_HYSTERESIS
 from moonpilot.tests.fakes import _params
 
 # A request small enough that the controller runs inside its own limits, so the integrator
@@ -35,10 +36,10 @@ from moonpilot.tests.fakes import _params
 LINEAR_REQUEST = 0.3 / 625
 
 
-def _controller(car_name=TOYOTA.TOYOTA_RAV4, hysteresis=0.0):
+def _controller(car_name=TOYOTA.TOYOTA_RAV4, hysteresis=0.0, friction_rise=0.0):
   CP = interfaces[car_name].get_non_essential_params(car_name)
   CI = interfaces[car_name](CP)
-  return MoonpilotLatControlTorque(CP.as_reader(), CI, DT_CTRL, hysteresis), VehicleModel(CP), CI
+  return MoonpilotLatControlTorque(CP.as_reader(), CI, DT_CTRL, hysteresis, friction_rise=friction_rise), VehicleModel(CP), CI
 
 
 def _state(VEgo=25.0):
@@ -386,6 +387,46 @@ class TestCurveDamping(unittest.TestCase):
         expected = MOONPILOT_DAMPING_T[index] if index < len(MOONPILOT_DAMPING_T) else 0.0
         lac.pid.update(0.0, error_rate=1.0, speed=10.0)
         self.assertAlmostEqual(lac.pid.d, float(np.interp(10.0, MOONPILOT_KP_BP, MOONPILOT_KP_V)) * expected, delta=1e-9)
+
+
+class TestFrictionRamp(unittest.TestCase):
+  """MoonpilotSteerFrictionRamp: friction compensation rises at the ramp and falls at once, and only when chosen."""
+
+  def _states(self, lac, VM, frames, desired):
+    CS, params = _state(15.0), log.VehicleParameters.new_message()
+    out = []
+    for _ in range(frames):
+      _run(lac, VM, CS, params, 1, desired_curvature=desired)
+      out.append(lac.friction_state)
+    return out
+
+  def test_the_rise_is_bounded_and_the_fall_is_not(self):
+    lac, VM, _ = _controller(friction_rise=MOONPILOT_FRICTION_RISE)
+    rising = self._states(lac, VM, 60, 0.5 / 15.0**2)
+    deltas = [abs(b - a) for a, b in zip(rising, rising[1:], strict=False)]
+    self.assertGreater(abs(rising[-1]), 0.0)
+    self.assertTrue(all(delta <= MOONPILOT_FRICTION_RISE * DT_CTRL + 1e-12 for delta in deltas))
+    self.assertAlmostEqual(rising[-1], rising[0] + 59 * MOONPILOT_FRICTION_RISE * DT_CTRL, delta=1e-9)
+    falling = self._states(lac, VM, 1, 0.0)
+    self.assertLess(abs(falling[0]), abs(rising[-1]))  # release is immediate, not ramped
+
+  def test_a_sign_change_starts_from_zero(self):
+    lac, VM, _ = _controller(friction_rise=MOONPILOT_FRICTION_RISE)
+    self._states(lac, VM, 40, 0.5 / 15.0**2)
+    before = lac.friction_state
+    self._states(lac, VM, 1, -0.5 / 15.0**2)
+    self.assertLess(abs(lac.friction_state), abs(before))
+    self.assertLessEqual(abs(lac.friction_state), MOONPILOT_FRICTION_RISE * DT_CTRL + 1e-12)
+
+  def test_the_toggle_is_read_once_at_construction(self):
+    CP = interfaces[TOYOTA.TOYOTA_RAV4].get_non_essential_params(TOYOTA.TOYOTA_RAV4)
+    CI = interfaces[TOYOTA.TOYOTA_RAV4](CP)
+    for on, expected in ((False, 0.0), (True, MOONPILOT_FRICTION_RISE)):
+      with self.subTest(on=on):
+        lac = moonpilot_latcontrol(CP.as_reader(), CI, DT_CTRL, _params(True, {STEER_FRICTION_RAMP.key: on}))
+        assert isinstance(lac, MoonpilotLatControlTorque)
+        self.assertEqual(lac.friction_rise, expected)
+    self.assertIsNone(moonpilot_latcontrol(CP.as_reader(), CI, DT_CTRL, _params(False, {STEER_FRICTION_RAMP.key: True})))
 
 
 if __name__ == "__main__":

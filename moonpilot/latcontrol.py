@@ -39,7 +39,7 @@ from openpilot.common.params import Params
 from openpilot.common.pid import PIDController
 from openpilot.selfdrive.controls.lib.latcontrol import LatControl
 
-from moonpilot.features import STEER_DAMPING, STEER_HYSTERESIS, TORQUE_LATERAL, choice, enabled
+from moonpilot.features import STEER_DAMPING, STEER_FRICTION_RAMP, STEER_HYSTERESIS, TORQUE_LATERAL, choice, enabled
 
 # Error correction runs in lateral-acceleration space, where the same curvature error means less
 # lateral acceleration the slower the car goes; the speed schedule is what puts that back. These
@@ -56,6 +56,11 @@ MOONPILOT_INTEGRATOR_MIN_SPEED = 5.0  # m/s; below it the angle measurement is t
 # output on a rough-highway route) chases them and weaves; a few Hz still tracks real cornering.
 MOONPILOT_MEAS_CUTOFF_HZ = 8.0
 MOONPILOT_FRICTION_DEADBAND = 0.05  # m/s^2; keep near-zero noise out of friction compensation
+# MoonpilotSteerFrictionRamp: friction compensation may rise no faster than this, m/s^2 per second; it may always
+# fall as fast as the error does. The term is what breaks the wheel loose, so letting it arrive in ~0.1 s stores the
+# torque that then overshoots; a ramp gives the wheel time to follow before the next increment. It is also the one term
+# that turns a road bump's short error spike, or the error flip after a snap, into a full-size torque step at once.
+MOONPILOT_FRICTION_RISE = 0.3
 MOONPILOT_VERSION = 1001  # logged; a fork band upstream's counter will not reach
 MOONPILOT_VERSION_HYSTERESIS = 1002  # the same law with output hysteresis on
 # Half-widths in normalized steer torque per MoonpilotSteerHysteresis choice. On a RAV4 (STEER_MAX 1500)
@@ -75,7 +80,7 @@ MOONPILOT_DAMPING_SPEEDS = ([3.0, 5.0, 15.0, 20.0], [0.0, 1.0, 1.0, 0.0])
 
 
 class MoonpilotLatControlTorque(LatControl):
-  def __init__(self, CP, CI, dt, hysteresis: float = 0.0, damping_t: float = 0.0):
+  def __init__(self, CP, CI, dt, hysteresis: float = 0.0, damping_t: float = 0.0, friction_rise: float = 0.0):
     super().__init__(CP, CI, dt)
     self.torque_params = CP.lateralTuning.torque.as_builder()
     self.torque_from_lateral_accel = CI.torque_from_lateral_accel()
@@ -95,6 +100,8 @@ class MoonpilotLatControlTorque(LatControl):
     self.meas_filter = FirstOrderFilter(0.0, 1 / (2 * np.pi * MOONPILOT_MEAS_CUTOFF_HZ), self.dt)
     self.hysteresis = hysteresis
     self.held_torque: float | None = None
+    self.friction_rise = friction_rise
+    self.friction_state = 0.0
 
   def update_torque_parameters(self, latAccelFactor, latAccelOffset, friction):
     # controlsd calls this whenever torqued publishes a new fit; the limits move with the factor.
@@ -115,6 +122,7 @@ class MoonpilotLatControlTorque(LatControl):
     self.pid.reset()
     self.jerk_filter.x = 0.0
     self.held_torque = None  # a re-engage starts from the controller's own output, not a stale hold
+    self.friction_state = 0.0
     # The measurement filter is not reset: it keeps tracking the wheel while inactive, the same
     # way the delay line does, so re-engaging does not start from a stale zero.
 
@@ -190,7 +198,22 @@ class MoonpilotLatControlTorque(LatControl):
     # already supplies, less the learned bias in that roll estimate, plus enough to move the
     # steering against its friction.
     feedforward = desired_lat_accel - params.roll * ACCELERATION_DUE_TO_GRAVITY - self.torque_params.latAccelOffset
-    feedforward += self._friction(error, desired_jerk, deadzone)
+    friction = self._friction(error, desired_jerk, deadzone)
+    if self.friction_rise > 0.0 and active:
+      step = self.friction_rise * self.dt
+      if friction == 0.0:
+        self.friction_state = 0.0
+      elif friction * self.friction_state > 0.0:
+        if abs(friction) <= abs(self.friction_state):
+          self.friction_state = friction  # falling: release at once
+        else:
+          self.friction_state += math.copysign(min(abs(friction) - abs(self.friction_state), step), friction)
+      else:
+        # A reversal or a start from zero: the old direction is released at once, the new one begins from zero.
+        self.friction_state = math.copysign(min(abs(friction), step), friction)
+    else:
+      self.friction_state = friction
+    feedforward += self.friction_state
 
     if not active:
       output_torque = 0.0
@@ -231,4 +254,5 @@ def moonpilot_latcontrol(CP, CI, dt, params: Params | None = None) -> LatControl
     return None
   hysteresis = MOONPILOT_TORQUE_HYSTERESIS[choice(STEER_HYSTERESIS, params)] if enabled(STEER_HYSTERESIS, params) else 0.0
   damping_t = MOONPILOT_DAMPING_T[choice(STEER_DAMPING, params)] if enabled(STEER_DAMPING, params) else 0.0
-  return MoonpilotLatControlTorque(CP, CI, dt, hysteresis, damping_t)
+  friction_rise = MOONPILOT_FRICTION_RISE if enabled(STEER_FRICTION_RAMP, params) else 0.0
+  return MoonpilotLatControlTorque(CP, CI, dt, hysteresis, damping_t, friction_rise)

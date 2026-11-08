@@ -77,6 +77,17 @@ STEER_DAMPING = Feature(
   choices=("off", "light", "medium", "strong"),
 )
 
+STEER_FRICTION_RAMP = Feature(
+  key="MoonpilotSteerFrictionRamp",
+  title="smooth friction breakaway",
+  description=(
+    "moonpilot steering only. Lets the torque that breaks the wheel loose build over a couple of tenths of a second "
+    + "instead of in one step, so the wheel does not snap past the path when it lets go. Releasing is always immediate. "
+    + "Restart to apply."
+  ),
+  offroad_only=True,
+)
+
 TURN_DESIRE = Feature(
   key="MoonpilotTurnDesire",
   title="turn desire",
@@ -240,7 +251,8 @@ class Group:
 STEERING = Group(
   title="steering",
   description="How openpilot moves the wheel: whose controller, when a curve is entered, and whether openpilot can steer at all.",
-  features=(LATERAL_ENGAGE, TORQUE_LATERAL, PATH_LOOKAHEAD, PATH_SMOOTH, STEER_HYSTERESIS, STEER_DAMPING, TURN_DESIRE),
+  features=(LATERAL_ENGAGE, TORQUE_LATERAL, PATH_LOOKAHEAD, PATH_SMOOTH, STEER_HYSTERESIS, STEER_DAMPING, STEER_FRICTION_RAMP,
+            TURN_DESIRE),
 )
 
 SPEED = Group(

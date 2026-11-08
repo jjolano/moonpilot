@@ -68,6 +68,10 @@
     // derivative time on the fork torque controller's feedback, 5-15 m/s); chosen at construction,
     // so the row takes a restart.
     {"MoonpilotSteerDamping", {PERSISTENT, INT, "0"}},
+    // Off by default, a test toggle: the fork torque controller's friction compensation may rise
+    // no faster than MOONPILOT_FRICTION_RISE, so the torque that breaks the wheel loose is not
+    // stored in one step; release is unthrottled. Chosen at construction, so the row takes a restart.
+    {"MoonpilotSteerFrictionRamp", {PERSISTENT, BOOL, "0"}},
     // On by default: below the lane-change speed threshold a turn signal
     // feeds a turn desire into the model so it steers into the corner. The
     // model's own turn prediction picks the direction.
