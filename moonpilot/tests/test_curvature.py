@@ -1,4 +1,5 @@
-"""The smoothing lead, the look-ahead lead-in and the curvature request filter: behavior and their restart-gated factories."""
+"""The smoothing lead, the look-ahead lead-in, the re-centering cap and the curvature request filter: behavior and their
+restart-gated factories."""
 
 import functools
 import math
@@ -19,14 +20,16 @@ from moonpilot.curvature import (
   MOONPILOT_LOOKAHEAD,
   MOONPILOT_MAX_MODEL_AGE,
   MOONPILOT_PREVIEW_MIN_SPEED,
+  MOONPILOT_RECENTER_LAT_ACCEL,
   MOONPILOT_SMOOTH_LEAD_MAX_LAT_ACCEL,
   MOONPILOT_SMOOTH_TAUS,
   PathSmooth,
+  lane_bend,
   moonpilot_curvature,
   moonpilot_path_smooth,
   response_aligned_curvature,
 )
-from moonpilot.features import PATH_LOOKAHEAD, PATH_SMOOTH
+from moonpilot.features import PATH_LOOKAHEAD, PATH_RECENTER, PATH_SMOOTH
 from moonpilot.tests.fakes import FakeParams, _params
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -85,14 +88,19 @@ class TestFactory(unittest.TestCase):
   def test_the_look_ahead_alone_binds_no_lead(self):
     reference = moonpilot_curvature(_params(0, {PATH_LOOKAHEAD.key: 2}))
     assert isinstance(reference, functools.partial)
-    self.assertEqual(reference.keywords, {"lookahead": MOONPILOT_LOOKAHEAD[2], "lead": 0.0})
+    self.assertEqual(reference.keywords, {"lookahead": MOONPILOT_LOOKAHEAD[2], "lead": 0.0, "recenter": 0.0})
 
   def test_smoothing_alone_binds_its_tau_as_the_lead(self):
     for index in range(1, len(MOONPILOT_SMOOTH_TAUS)):
       with self.subTest(index=index):
         reference = moonpilot_curvature(_params(0, {PATH_SMOOTH.key: index}))
         assert isinstance(reference, functools.partial)
-        self.assertEqual(reference.keywords, {"lookahead": None, "lead": MOONPILOT_SMOOTH_TAUS[index]})
+        self.assertEqual(reference.keywords, {"lookahead": None, "lead": MOONPILOT_SMOOTH_TAUS[index], "recenter": 0.0})
+
+  def test_recentering_alone_binds_its_cap(self):
+    reference = moonpilot_curvature(_params(0, {PATH_RECENTER.key: True}))
+    assert isinstance(reference, functools.partial)
+    self.assertEqual(reference.keywords, {"lookahead": None, "lead": 0.0, "recenter": MOONPILOT_RECENTER_LAT_ACCEL})
 
   def test_it_is_chosen_once_so_the_rows_take_a_restart(self):
     with mock.patch.object(curvature_mod, "Params", lambda: FakeParams(0)):
@@ -149,6 +157,90 @@ class TestLookahead(unittest.TestCase):
     assert lookahead is not None
     late = T_IDXS[-1] - CAPTURE_AGE - lookahead[0] + 0.01
     self.assertEqual(_bits(_update(model, 0.03125, lat_delay=late, lead=0.0, lookahead=lookahead)), _bits(0.03125))
+
+
+def _lanes(bend=0.0, *, probs=(0.9, 0.9), heading=0.0, offset=0.0, edges=None, lane_change=log.LaneChangeState.off):
+  """A straight path whose ego lane lines bend at `bend` 1/m (positive right), 3.6 m apart, the car `offset` m right of the
+  lane's center; `edges` is (left y, right y, std) of straight road edges in the car's frame, none published by default."""
+  model = _corner(0.0)
+  x = np.asarray(ModelConstants.X_IDXS)
+  model.laneLines = [log.XYZTData.new_message(x=x.tolist(), y=(line - offset + heading * x + 0.5 * bend * x**2).tolist())
+                     for line in (-5.4, -1.8, 1.8, 5.4)]
+  model.laneLineProbs = [0.5, probs[0], probs[1], 0.5]
+  if edges is not None:
+    model.roadEdges = [log.XYZTData.new_message(x=x.tolist(), y=[edge] * len(x)) for edge in edges[:2]]
+    model.roadEdgeStds = [edges[2], edges[2]]
+  model.meta.laneChangeState = lane_change
+  return model
+
+
+class TestRecenter(unittest.TestCase):
+  """MoonpilotPathRecenter: the request may follow the lane's bend at any pace, but on straight-ish lanes its part beyond
+  the bend is capped; the cap only ever takes turn away, and only touches a move whose recovery side is known to be clear."""
+
+  CAP = MOONPILOT_RECENTER_LAT_ACCEL / V_EGO**2
+  SLIGHT = 0.2 / V_EGO**2  # a bend under the curve fade
+
+  def _out(self, model, desired, **overrides):
+    return _update(model, desired, lead=0.0, recenter=MOONPILOT_RECENTER_LAT_ACCEL, **overrides)
+
+  def test_the_lane_is_read_off_its_lines_and_one_seen_line_is_enough(self):
+    lane = lane_bend(_lanes(0.002, offset=0.5))
+    self.assertAlmostEqual(lane.bend, 0.002, delta=1e-8)  # lines are float32
+    self.assertAlmostEqual(lane.left, -2.3, delta=1e-6)
+    self.assertAlmostEqual(lane.right, 1.3, delta=1e-6)
+    self.assertAlmostEqual(lane_bend(_lanes(0.002, heading=0.03)).bend, 0.002, delta=1e-9)  # the car's heading is not a bend
+    one = lane_bend(_lanes(-0.001, probs=(0.9, 0.1)))
+    self.assertAlmostEqual(one.bend, -0.001, delta=1e-9)
+    self.assertTrue(math.isnan(one.right))
+    self.assertEqual(lane_bend(_lanes(0.002, probs=(0.3, 0.3))).weight, 0.0)
+
+  def test_a_sideways_move_on_a_straight_lane_is_held_to_the_cap(self):
+    self.assertAlmostEqual(self._out(_lanes(), -4 * self.CAP), -self.CAP, delta=1e-12)
+    self.assertAlmostEqual(self._out(_lanes(), 4 * self.CAP), self.CAP, delta=1e-12)
+    self.assertEqual(_bits(self._out(_lanes(), 0.5 * self.CAP)), _bits(0.5 * self.CAP))  # inside the cap: untouched
+
+  def test_a_slight_bend_is_followed_and_a_curve_is_left_alone(self):
+    self.assertEqual(_bits(self._out(_lanes(self.SLIGHT), self.SLIGHT)), _bits(self.SLIGHT))
+    self.assertAlmostEqual(self._out(_lanes(self.SLIGHT), self.SLIGHT + 3 * self.CAP), self.SLIGHT + self.CAP, delta=1e-8)  # lines are float32
+    curve = 1.5 / V_EGO**2
+    self.assertEqual(_bits(self._out(_lanes(curve), curve + 3 * self.CAP)), _bits(curve + 3 * self.CAP))  # taking turn away runs wide
+
+  def test_it_never_adds_turn_or_reverses_the_request(self):
+    with mock.patch.object(curvature_mod, "MOONPILOT_RECENTER_BENDS", ([0.0, 1.0], [1.0, 1.0])):  # the guard, not the curve fade
+      bend = 1.5 / V_EGO**2
+      self.assertEqual(_bits(self._out(_lanes(bend), 0.2 * bend)), _bits(0.2 * bend))  # drifting wide: not pulled in
+      self.assertEqual(self._out(_lanes(-bend), 2 * self.CAP), 0.0)  # a right move in a left curve stops at zero
+
+  def test_a_move_away_from_a_close_line_is_never_capped(self):
+    near_left = _lanes(offset=-0.7)  # 1.1 m from the left line
+    self.assertEqual(_bits(self._out(near_left, 4 * self.CAP)), _bits(4 * self.CAP))  # back toward the center: free
+    self.assertAlmostEqual(self._out(near_left, -4 * self.CAP), -self.CAP, delta=1e-12)  # further toward the line: capped
+
+  def test_a_move_away_from_an_unseen_line_is_never_capped_whatever_the_road_edge_says(self):
+    # 1.1 m from a left line the model does not see: the right move may be the recovery from it, so it passes...
+    for edges in (None, (-5.0, 5.0, 0.1), (-1.2, 1.2, 0.0)):
+      with self.subTest(edges=edges):
+        self.assertEqual(_bits(self._out(_lanes(offset=-0.7, probs=(0.1, 0.9), edges=edges), 4 * self.CAP)), _bits(4 * self.CAP))
+    # ...and a far road edge certifies nothing: it is the road's boundary, not the lane's, so it cannot re-enable the cap
+    self.assertEqual(_bits(self._out(_lanes(offset=-0.7, probs=(0.1, 0.9), edges=(-5.0, 5.0, 0.1)), 4 * self.CAP)), _bits(4 * self.CAP))
+    # the same road edges with the line seen do not change a decision the line already makes
+    self.assertAlmostEqual(self._out(_lanes(offset=-0.7, edges=(-5.0, 5.0, 0.1)), 4 * self.CAP), 4 * self.CAP, delta=1e-12)
+
+  def test_lane_changes_unseen_lines_and_corner_speeds_are_left_alone(self):
+    for model, v in ((_lanes(lane_change=log.LaneChangeState.laneChangeStarting), V_EGO), (_lanes(probs=(0.3, 0.3)), V_EGO), (_lanes(), 7.9)):
+      with self.subTest(v=v):
+        self.assertEqual(_bits(self._out(model, 0.004, v_ego=v)), _bits(0.004))
+
+  def test_line_confidence_speed_and_bend_fade_it_in_continuously(self):
+    request = 4 * self.CAP
+    half = self._out(_lanes(probs=(0.5, 0.5)), request)
+    self.assertAlmostEqual(half, request + 0.5 * (self.CAP - request), delta=1e-12)
+    v = 10.0
+    self.assertAlmostEqual(self._out(_lanes(), 1.0 / v**2, v_ego=v), 1.0 / v**2 + 0.5 * (MOONPILOT_RECENTER_LAT_ACCEL - 1.0) / v**2, delta=1e-12)
+    bend = 0.45 / V_EGO**2  # halfway through the curve fade
+    capped = bend + self.CAP
+    self.assertAlmostEqual(self._out(_lanes(bend), bend + 4 * self.CAP), bend + 4 * self.CAP + 0.5 * (capped - bend - 4 * self.CAP), delta=1e-8)
 
 
 class TestSmoothingLead(unittest.TestCase):

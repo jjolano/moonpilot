@@ -60,6 +60,10 @@
     // led by the same time on the planned path above 5 m/s; chosen at construction, so the row
     // takes a restart.
     {"MoonpilotPathSmooth", {PERSISTENT, INT, "0"}},
+    // Off by default: the part of the curvature request beyond the ego lane's own bend is capped
+    // at MOONPILOT_RECENTER_LAT_ACCEL above 12 m/s (faded in from 8) on seen lane lines; bound into
+    // the curvature reference at construction, so the row takes a restart.
+    {"MoonpilotPathRecenter", {PERSISTENT, BOOL, "0"}},
     // Off by default: an index into STEER_HYSTERESIS.choices (0 off, then 0.3 / 0.7 / 1.3 % of
     // max torque), the half-width of a backlash on the fork torque controller's output; chosen at
     // construction, so the row takes a restart.

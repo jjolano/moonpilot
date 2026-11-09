@@ -53,6 +53,18 @@ PATH_SMOOTH = Feature(
   choices=("off", "0.05 s", "0.10 s", "0.15 s"),
 )
 
+PATH_RECENTER = Feature(
+  key="MoonpilotPathRecenter",
+  title="calm re-centering",
+  description=(
+    "Above about 40 km/h, the planned path may move the car sideways within its lane only gently: steering beyond the "
+    + "lane's own bend is held to a small sideways acceleration, so a plan that suddenly shifts over, like re-centering "
+    + "on a curb that reappears past an intersection, drifts instead of lurching. Never adds steering, and does "
+    + "nothing during lane changes or where the lane lines are not seen. Restart to apply."
+  ),
+  offroad_only=True,
+)
+
 STEER_HYSTERESIS = Feature(
   key="MoonpilotSteerHysteresis",
   title="steady steering torque",
@@ -251,7 +263,7 @@ class Group:
 STEERING = Group(
   title="steering",
   description="How openpilot moves the wheel: whose controller, when a curve is entered, and whether openpilot can steer at all.",
-  features=(LATERAL_ENGAGE, TORQUE_LATERAL, PATH_LOOKAHEAD, PATH_SMOOTH, STEER_HYSTERESIS, STEER_DAMPING, STEER_FRICTION_RAMP,
+  features=(LATERAL_ENGAGE, TORQUE_LATERAL, PATH_LOOKAHEAD, PATH_SMOOTH, PATH_RECENTER, STEER_HYSTERESIS, STEER_DAMPING, STEER_FRICTION_RAMP,
             TURN_DESIRE),
 )
 
