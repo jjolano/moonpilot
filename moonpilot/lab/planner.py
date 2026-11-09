@@ -10,7 +10,7 @@ the band would have produced.
 import math
 from collections import deque
 from contextlib import contextmanager
-from functools import cache
+from functools import cache, partial
 from types import MethodType, SimpleNamespace
 
 import numpy as np
@@ -749,37 +749,42 @@ HOLD_FLY_DEAD_S, HOLD_FLY_TAU_S = 0.2, 0.25  # the plant: dead time, then a firs
 class _LaggedPlant:
   """Acceleration following the command after `dead` s of dead time, then a first-order lag of `tau` s (by default
   `HOLD_FLY_DEAD_S` and `HOLD_FLY_TAU_S`), exactly discretized at the tick: the command fed on frame i first moves `a` on
-  frame i + dead/dt."""
+  frame i + dead/dt. `gain` is a scalar or `(cmd, v) -> factor`, applied to the delayed command."""
 
-  def __init__(self, dead=HOLD_FLY_DEAD_S, tau=HOLD_FLY_TAU_S, dt=DT_MDL):
+  def __init__(self, dead=HOLD_FLY_DEAD_S, tau=HOLD_FLY_TAU_S, dt=DT_MDL, gain=None):
     self.queue = deque([0.0] * round(dead / dt))
     self.alpha = 1.0 - math.exp(-dt / tau)
     self.a = 0.0
+    self.gain = gain
 
-  def step(self, cmd):
+  def step(self, cmd, v=0.0):
     delayed = self.queue.popleft()  # the oldest leaves before this frame's command joins
     self.queue.append(cmd)
-    self.a += (delayed - self.a) * self.alpha
+    factor = float(self.gain(delayed, v)) if callable(self.gain) else (1.0 if self.gain is None else float(self.gain))
+    self.a += (delayed * factor - self.a) * self.alpha
     return self.a
 
 
 
-def _fly_lagged(v0, v_set_kph, gap0, v_lead0, a_lead_fn, T, seed=None):
-  """The engine-coast RAV4 planner against a scripted lead through a lagged point-mass plant; with a seed, white radar
-  noise on `dRel` (0.3 m + 0.4 %) and `vLead` (0.05 m/s)."""
+def _fly_lagged(v0, v_set_kph, gap0, v_lead0, a_lead_fn, T, seed=None, engine_coast=True, gain=None, visible_fn=None):
+  """The RAV4 planner against a scripted lead through a lagged point-mass plant; with a seed, white radar
+  noise on `dRel` (0.3 m + 0.4 %) and `vLead` (0.05 m/s). `gain` scales the delayed command, and `visible_fn(t)`
+  drops the lead when it returns False."""
   from moonpilot.tests.test_engine_coast import _planner
   from moonpilot.tests.test_longitudinal import _inputs, _lead
   rng = np.random.default_rng(seed) if seed is not None else None
-  planner, plant, v, gap, v_lead = _planner(True), _LaggedPlant(), v0, gap0, v_lead0
+  planner, plant, v, gap, v_lead = _planner(engine_coast), _LaggedPlant(gain=gain), v0, gap0, v_lead0
   out = {k: [] for k in ("v", "gap", "v_lead", "cmd")}
   for i in range(round(T / DT_MDL)):
     d_seen, v_seen = gap, v_lead
     if rng is not None:
       d_seen, v_seen = gap + rng.normal(0.0, 0.3 + 0.004 * gap), v_lead + rng.normal(0.0, 0.05)
-    planner.update(_inputs(v_ego=max(v, 0.0), v_cruise_kph=v_set_kph, a_ego=plant.a, lead=_lead(max(d_seen, 0.0), max(v_seen, 0.0)), personality=1))
+    present = visible_fn(i * DT_MDL) if visible_fn is not None else True
+    planner.update(_inputs(v_ego=max(v, 0.0), v_cruise_kph=v_set_kph, a_ego=plant.a,
+                           lead=_lead(max(d_seen, 0.0), max(v_seen, 0.0), present=present), personality=1))
     for k, x in zip(out, (v, gap, v_lead, float(planner.output_a_target)), strict=True):
       out[k].append(x)
-    a = plant.step(float(planner.output_a_target))
+    a = plant.step(float(planner.output_a_target), v)
     v_next = max(0.0, v_lead + float(a_lead_fn(i * DT_MDL, v_lead)) * DT_MDL)
     v = max(0.0, v + a * DT_MDL)
     gap += (0.5 * (v_lead + v_next) - v) * DT_MDL
@@ -996,7 +1001,7 @@ def _plant_inputs(v, a, gap, v_lead, a_lead, v_cruise):
           "selfdriveState": ss.selfdriveState, "modelV2": model.modelV2}
 
 
-def _hard_brake_run(kind, v0, a_brake, lag, onset=5.0, T=30.0):
+def _hard_brake_run(kind, v0, a_brake, lag, onset=5.0, T=30.0, gain=None):
   """A 1.45 s follow at v0 whose lead brakes to rest at `onset`: (min gap, peak, s to an ask <= -3.0, s to FCW)."""
   from openpilot.selfdrive.controls.lib.longitudinal_planner import ACCEL_MIN, LongitudinalPlanner
   from opendbc.car.toyota.interface import CarInterface
@@ -1013,7 +1018,7 @@ def _hard_brake_run(kind, v0, a_brake, lag, onset=5.0, T=30.0):
   else:
     planner = _planner(kind == "fork+engine")
     update = lambda sm: planner.update(_plant_sm(sm))  # noqa: E731
-  plant = _LaggedPlant() if lag else None
+  plant = _LaggedPlant(gain=gain) if lag else None
   v, v_lead, gap, a, v_prev = v0, v0, 1.45 * v0, 0.0, v0
   gaps, cmds, fcw = [], [], []
   for i in range(round(T / DT_MDL)):
@@ -1026,7 +1031,7 @@ def _hard_brake_run(kind, v0, a_brake, lag, onset=5.0, T=30.0):
     v_prev = v_lead
     cmds.append(cmd)
     fcw.append(warned)
-    a = plant.step(cmd) if plant else cmd
+    a = plant.step(cmd, v) if plant else cmd
     v_next = max(0.0, v_lead + (a_brake * DT_MDL if t >= onset else 0.0))
     v_ego_next = max(0.0, v + a * DT_MDL)
     gap += (0.5 * (v_lead + v_next) - 0.5 * (v + v_ego_next)) * DT_MDL  # both cars on the trapezoid
@@ -1193,11 +1198,12 @@ def _in_flight_update():
   return scope["update"]
 
 
-def _fly_logged_lead(job, plant=(HOLD_FLY_DEAD_S, HOLD_FLY_TAU_S), engine_coast=True, delay=None, in_flight=False):
+def _fly_logged_lead(job, plant=(HOLD_FLY_DEAD_S, HOLD_FLY_TAU_S), engine_coast=True, delay=None, in_flight=False, gain=None):
   """The RAV4 planner (engine coast on unless `engine_coast` is False), seeded with `calibration`, on the lagged plant
   (`plant`: dead time, first-order lag) from a logged start behind the logged lead's own path. The set speed is the
   start's unless a sixth element gives one, so by default only the lead terms brake; a seventh is the drive's model ask,
-  frame by frame. `delay` replaces the delay the planner projects through, `in_flight` its projection (`delay-cost`)."""
+  frame by frame. `delay` replaces the delay the planner projects through, `in_flight` its projection (`delay-cost`), and
+  `gain` scales the delayed command (a scalar or `(cmd, v) -> factor`)."""
   from moonpilot.tests.test_engine_coast import _planner
   from moonpilot.tests.test_longitudinal import _inputs, _lead
   v_log, gap_log, v_lead, a0, calibration, *extra = job
@@ -1207,7 +1213,7 @@ def _fly_logged_lead(job, plant=(HOLD_FLY_DEAD_S, HOLD_FLY_TAU_S), engine_coast=
   for v0, v1 in zip(v_log[:-1], v_log[1:], strict=True):
     s_ego.append(_advance(s_ego[-1], v0, v1))
   s_lead = np.asarray(s_ego) + gap_log
-  planner, plant = _planner(engine_coast, calibration), _LaggedPlant(*plant)
+  planner, plant = _planner(engine_coast, calibration), _LaggedPlant(*plant, gain=gain)
   if delay is not None:
     planner.long_lag.applied_delay = lambda: delay  # ty: ignore[invalid-assignment]  # this flight's delay, same signature
   if in_flight:
@@ -1219,7 +1225,7 @@ def _fly_logged_lead(job, plant=(HOLD_FLY_DEAD_S, HOLD_FLY_TAU_S), engine_coast=
                            standstill=v < 0.05, personality=1, model_accel=float(model[i])))
     for k, x in zip(out, (v, plant.a, s_lead[i] - s, planner.brake_band.pressing, float(planner.output_a_target)), strict=True):
       out[k].append(x)
-    v_new = max(0.0, v + plant.step(float(planner.output_a_target)) * DT_MDL)
+    v_new = max(0.0, v + plant.step(float(planner.output_a_target), v) * DT_MDL)
     s, v = _advance(s, v, v_new), v_new
   return {k: np.asarray(x) for k, x in out.items()}
 
@@ -1452,6 +1458,8 @@ def _shape(v, a, gap, cmd=None):
   from moonpilot.lab.driver import _pumps
   felt = np.convolve(a, np.ones(10) / 10, mode="same")
   braking = np.flatnonzero(felt < -0.3)
+  if not len(braking):
+    return (math.nan, math.nan, math.nan, math.nan, gap.min(), _pumps(cmd) if cmd is not None else 0)
   seg = felt[braking[0]:braking[-1] + 1]
   n = len(seg)
   return (seg.min(), np.argmin(seg) / max(n - 1, 1), seg[:n // 3].mean(), seg[2 * n // 3:].mean(), gap.min(), _pumps(cmd) if cmd is not None else 0)
@@ -1619,7 +1627,7 @@ def _launch_episodes(d, windows_out=None):
   n2, n6, settle = round(2.0 / DT_MDL), round(6.0 / DT_MDL), round(1.0 / DT_MDL)
   v, v_lead, gap, brake, gas = d["v"], d["v_lead"], d["gap"], d["brake"] > 0, d["gas"] > 0
   lead = (d["manual"] > 0) & (d["lead"] > 0) & (d["lead_radar"] > 0)
-  joined = np.r_[False, (np.abs(np.diff(gap)) <= 1.0) & (np.abs(np.diff(v_lead)) <= 1.0) & (np.diff(d["route"]) == 0)
+  joined = np.r_[False, (np.abs(np.diff(gap)) <= 1.0) & (np.abs(np.diff(v_lead)) <= 1.0) & (d["route"][1:] == d["route"][:-1])
                  & (np.diff(d["track_id"]) == 0) & (np.diff(d["t"]) <= 1.5 * DT_MDL)] & lead
   rows = []
   for r in runs(lead & (v < 0.1)):
@@ -1674,11 +1682,12 @@ def _launch_frames(args):
 
 
 LAUNCH_FLY_PRE_S, LAUNCH_FLY_POST_S, LAUNCH_FLY_REST_GAP = 2.0, 8.0, 4.3
+LAUNCH_FLY_MIN_POST_S = 3.0  # scorecard: a launch needs this much after the onset, not the whole 8 s
 LAUNCH_ARMS = {"as flown": (None, None), f"own rest gap {LAUNCH_FLY_REST_GAP}": (LAUNCH_FLY_REST_GAP, None),
                f"{LAUNCH_FLY_REST_GAP}, reserve 0": (LAUNCH_FLY_REST_GAP, 0.0)}
 
 
-def _launch_fly_one(job):
+def _launch_fly_one(job, gain=None):
   """One `launch-fly` flight: today's planner from rest behind the logged lead (engine coast off, the drive's model ask),
   under one `LAUNCH_ARMS` arm — the rest gap moved to the planner's own (the same lead path, the ego resting further back),
   and the moving-lead reserve changed."""
@@ -1692,7 +1701,7 @@ def _launch_fly_one(job):
   if reserve is not None:
     longitudinal.MOONPILOT_MOVING_STOP_RESERVE = reserve  # ty: ignore[invalid-assignment]  # the arm's reserve, a float like the constant
   try:
-    f = _fly_logged_lead((v_log, gap, v_lead, 0.0, calibration, 50.0, model), engine_coast=False)
+    f = _fly_logged_lead((v_log, gap, v_lead, 0.0, calibration, 50.0, model), engine_coast=False, gain=gain)
   finally:
     longitudinal.MOONPILOT_MOVING_STOP_RESERVE = saved
   return {k: f[k][n_pre:] for k in ("cmd", "a", "v", "gap")}
@@ -1779,6 +1788,204 @@ def _launch_reaction(args):
     print(f"  Spearman rho, lead launch accel vs {name:13s}: {rho:+.2f} (n {n})")
 
 
+SCORECARD_HOLDOUT = 0.25
+
+
+def _split_routes(routes, holdout=SCORECARD_HOLDOUT, seed=0):
+  """Deterministic train/holdout split by route name, so an added route does not move the existing ones."""
+  import zlib
+  if not 0.0 < holdout < 1.0:
+    raise ValueError("holdout must be between 0 and 1")
+  routes = sorted(set(routes))
+  train, held = [], []
+  for route in routes:
+    bucket = zlib.crc32(f"{seed}:{route}".encode()) / 2**32
+    (held if bucket < holdout else train).append(route)
+  if not train or not held:
+    raise ValueError(f"the {holdout:.0%} split leaves {len(train)} train / {len(held)} holdout routes")
+  return train, held
+
+
+def _score_subset(d, routes):
+  """The pooled manual frames of `routes`, keeping the arrays' route and route_id columns for episode builders."""
+  mask = np.isin(d["route"], routes)
+  return {k: v[mask] for k, v in d.items()}
+
+
+def _median_text(x, fmt=".2f"):
+  x = np.asarray(x, dtype=float)
+  x = x[np.isfinite(x)]
+  return f"{np.median(x):{fmt}}" if len(x) else "-"
+
+
+def _shape_line(rows):
+  x = np.asarray(rows, dtype=float)
+  if not len(x):
+    return "no flights"
+  def med(col, fmt="+.2f"):
+    y = x[:, col][np.isfinite(x[:, col])]
+    return f"{np.median(y):{fmt}}" if len(y) else "-"
+  closest = x[:, 4][np.isfinite(x[:, 4])]
+  if not len(closest):
+    return "no braking"
+  no_brake = int(np.sum(~np.isfinite(x[:, 0])))
+  suffix = f"  ({no_brake} no brake)" if no_brake else ""
+  return (f"peak {med(0)} at {med(1, '4.0%')}  thirds {med(2)}/{med(3)}  "
+          + f"closest {closest.min():.1f} m  pumps {int(np.sum(x[np.isfinite(x[:, 5]), 5]))}{suffix}")
+
+
+def _score_following(d, calibration, engine_coast, gain=None):
+  from concurrent.futures import ProcessPoolExecutor
+  from moonpilot.lab.driver import _follow_line, _follow_stretches, _stretch_rows
+  jobs, drv = _follow_stretches(d, calibration)
+  if not jobs:
+    print("  following: no stretches")
+    return
+  minutes = len(jobs) * 30.0 / 60.0
+  with ProcessPoolExecutor(max_workers=6) as pool:
+    flown = list(pool.map(partial(_fly_logged_lead, engine_coast=engine_coast, gain=gain), jobs))
+  print(f"  following: {len(jobs)} stretches ({minutes:.0f} min)")
+  print("    " + _follow_line("driver", drv, minutes))
+  planner_rows = _stretch_rows(flown)
+  print("    " + _follow_line("planner", planner_rows, minutes))
+  return {"driver": drv, "planner": planner_rows}
+
+
+def _score_decels(d, calibration, engine_coast, gain=None):
+  from concurrent.futures import ProcessPoolExecutor
+  from moonpilot.lab.driver import _decel_line, _fly_stages
+  a_s = np.concatenate([np.convolve(d["a"][d["route"] == r], np.ones(10) / 10, mode="same") for r in np.unique(d["route"])])
+  jobs, drv = _decel_jobs(d, a_s)
+  if not jobs:
+    print("  lead-caused decels: none")
+    return
+  with ProcessPoolExecutor(max_workers=6) as pool:
+    flown = list(pool.map(partial(_fly_stages, engine_coast=engine_coast, gain=gain), [(*job, calibration) for job in jobs]))
+  print(f"  lead-caused decels: {len(jobs)}")
+  print("    " + _decel_line(flown, drv))
+  stops = np.asarray([job[0][-1] < 0.5 for job in jobs], dtype=bool)
+  for label, mask in (("stops", stops), ("slowdowns", ~stops)):
+    idx = np.flatnonzero(mask)
+    if not len(idx):
+      continue
+    driver_rows = [_shape(jobs[i][0], np.r_[np.diff(jobs[i][0]) / DT_MDL, 0.0], jobs[i][1]) for i in idx]
+    planner_rows = [_shape(flown[i]["v"], flown[i]["a"], flown[i]["gap"], flown[i]["cmd"]) for i in idx]
+    print(f"    {label} (n {len(idx)}): driver  {_shape_line(driver_rows)}")
+    print(f"    {label} (n {len(idx)}): planner {_shape_line(planner_rows)}")
+  return {"jobs": jobs, "drv": drv, "flown": flown, "stops": stops}
+
+
+def _score_launches(d, calibration, gain=None):
+  from concurrent.futures import ProcessPoolExecutor
+  windows = []
+  x = _launch_episodes(d, windows)
+  if not len(x):
+    print("  launches: none")
+    return
+  n_pre, n_post = round(LAUNCH_FLY_PRE_S / DT_MDL), round(LAUNCH_FLY_POST_S / DT_MDL)
+  n_short = round(LAUNCH_FLY_MIN_POST_S / DT_MDL)
+  keep = [i for i, (rest, t0, end) in enumerate(windows) if rest <= t0 - n_pre and end >= t0 + n_short]
+  print(f"  launches: {len(x)} manual, {len(keep)} with at least {LAUNCH_FLY_MIN_POST_S:g} s after the onset")
+  print(f"    driver  release {_median_text(x[:, 3])} s, gas {_median_text(x[:, 4])} s, moving {_median_text(x[:, 5])} s, "
+        + f"accel {_median_text(x[:, 6])} m/s^2, rest gap {_median_text(x[:, 1])} m")
+  if not keep:
+    return {"x": x, "keep": [], "ask": [], "moving": [], "gap": []}
+  jobs = []
+  for i in keep:
+    t0 = windows[i][1]
+    w = slice(t0 - n_pre, min(t0 + n_post, windows[i][2]))
+    jobs.append((d["v"][w], d["gap"][w], d["v_lead"][w], np.nan_to_num(d["desired_a"][w], nan=0.0), calibration))
+  arm = f"own rest gap {LAUNCH_FLY_REST_GAP}"
+  with ProcessPoolExecutor(max_workers=4) as pool:
+    flown = list(pool.map(partial(_launch_fly_one, gain=gain), [(arm, job) for job in jobs]))
+  ask, moving, gap = [], [], []
+  for f in flown:
+    pos, mv = np.flatnonzero(f["cmd"] > 0.05), np.flatnonzero(f["v"] > 0.3)
+    ask.append(pos[0] * DT_MDL if len(pos) else math.inf)
+    moving.append(mv[0] * DT_MDL if len(mv) else math.inf)
+    gap.append(float(np.median(f["gap"][-round(2.0 / DT_MDL):])))
+  missing = (f" (never {int(np.sum(~np.isfinite(ask)))} ask, {int(np.sum(~np.isfinite(moving)))} move)"
+             if not np.all(np.isfinite(ask)) or not np.all(np.isfinite(moving)) else "")
+  print(f"    planner ask {_median_text(ask)} s, moving {_median_text(moving)} s, gap {_median_text(gap)} m{missing}")
+  return {"x": x, "keep": keep, "ask": ask, "moving": moving, "gap": gap}
+
+
+def _score_hard_brakes(engine_coast, gain=None):
+  kind = "fork+engine" if engine_coast else "fork"
+  print("\n== synthetic hard brake (no manual reference; lagged plant) ==")
+  rows = []
+  for v0 in (20.0, 25.0, 30.0):
+    cells = []
+    for a_brake in (-3.5, -5.0):
+      gap, _, deep, fcw = _hard_brake_run(kind, v0, a_brake, True, gain=gain)
+      rows.append((v0, a_brake, gap, deep, fcw))
+      cells.append(f"{a_brake:+.1f}: gap {gap:4.2f} m, ask<=-3 {deep:4.2f} s, FCW {fcw:4.2f} s{' CONTACT' if gap < 0.4 else ''}")
+    print(f"  {v0:.0f} m/s  " + " | ".join(cells))
+  return rows
+
+
+def _score_coverage(d):
+  """The split's manual minutes by speed band, so the highway-data limit is visible beside the metrics."""
+  v = d["v"][d["manual"] > 0]
+  parts = []
+  for lo, hi in ((0, 5), (5, 15), (15, 25), (25, 45)):
+    m = (v >= lo) & (v < hi)
+    parts.append(f"{lo}-{hi} m/s {m.sum() * 0.05 / 60:.0f} min")
+  print("  coverage: " + " | ".join(parts))
+
+
+def _scorecard(args):
+  """Driver against the current planner on the existing manual flights, split into train and held-out routes: following,
+  lead-caused decels with their stop shape, and launches. Synthetic hard brakes are reported without a split; crawl is
+  not scored because the plant has no standstill resume or low-speed brake arbitration."""
+  from moonpilot.lab import driver
+  from moonpilot.lab.plant import _plant_gain, _plant_results, _plant_table, _plant_table_text
+  from moonpilot.lab.probes import _scorecard_checks
+  available = driver._routes(args.root)
+  short_available = {r.split("--")[0] for r in available}
+  routes = [r.split("--")[0] for r in expand(args.routes, ROUTE_SETS)] if args.routes else sorted(short_available)
+  routes = [r for r in dict.fromkeys(routes) if r in short_available]
+  if not routes:
+    raise ValueError("no routes with rlogs")
+  train, holdout = _split_routes(routes, args.holdout, args.seed)
+  train_full = [r for r in available if r.split("--")[0] in set(train)]
+  holdout_full = [r for r in available if r.split("--")[0] in set(holdout)]
+  keys = ("t", "manual", "v", "a", "lead", "lead_radar", "gap", "v_lead", "a_lead", "a_slow", "brake", "gas", "track_id", "desired_a")
+  d = driver._load(args.root, keys)
+  calibration = _calibration(args.calibration, args.root)
+  print(f"scorecard: {len(routes)} routes, {len(train)} train / {len(holdout)} holdout ({len(holdout) / len(routes):.0%}), "
+        + f"calibration {args.calibration}, engine coast {'on' if args.engine_coast else 'off'}, plant {args.plant}")
+  plant_gain = None
+  if args.plant == "fitted":
+    plant_results = _plant_results(args.root, train_full)
+    if not plant_results:
+      raise ValueError("no engaged train drives to fit the plant")
+    plant_table, plant_counts = _plant_table(plant_results)
+    plant_gain = _plant_gain(plant_table)
+    print("  plant fitted on train: " + _plant_table_text(plant_table, plant_counts))
+  results = {}
+  for name, group, full in (("train", train, train_full), ("holdout", holdout, holdout_full)):
+    sub = _score_subset(d, full)
+    if not len(sub["t"]):
+      print(f"\n== {name}: {len(group)} routes, no frames ==")
+      continue
+    print(f"\n== {name}: {len(group)} routes, {np.sum(sub['manual'] > 0) * 0.05 / 60:.0f} manual min ==")
+    _score_coverage(sub)
+    results[name] = {"following": _score_following(sub, calibration, args.engine_coast, plant_gain),
+                     "decels": _score_decels(sub, calibration, args.engine_coast, plant_gain),
+                     "launches": _score_launches(sub, calibration, plant_gain)}
+  hard_rows = _score_hard_brakes(args.engine_coast, plant_gain)
+  print("\n  crawl: not scored — the plant has no standstill resume or low-speed brake arbitration; see `crawl-stop`.")
+  if args.check:
+    checks = _scorecard_checks(results, hard_rows)
+    failures = [c for c in checks if c[1] is False]
+    print("\n== checks ==")
+    for name, ok, detail in checks:
+      print(f"  {'PASS' if ok is True else 'FAIL' if ok is False else 'SKIP'}  {name}: {detail}")
+    if failures:
+      raise SystemExit(1)
+
+
 def _register_manual(sub):
   parser = sub.add_parser("manual-decel", help="the lead law's approach requirement against the driver's own longitudinal")
   parser.add_argument("--routes", nargs="+", default=["manual-approach"], help=f"route names or sets: {', '.join(ROUTE_SETS)}")
@@ -1840,6 +2047,15 @@ def _register_manual(sub):
   parser.add_argument("--routes", nargs="*", default=[], help=f"route names or sets: {', '.join(ROUTE_SETS)}; default every drive with rlogs")
   parser.add_argument("--calibration", default="00000451", help="drive whose recorded lag and radar latency seed the flights")
   parser.set_defaults(fn=_launch_fly)
+  parser = sub.add_parser("scorecard", help="driver vs planner over following, lead-caused decels/stops and launches, train vs held-out")
+  parser.add_argument("--routes", nargs="*", default=[], help=f"route names or sets: {', '.join(ROUTE_SETS)}; default every drive with rlogs")
+  parser.add_argument("--holdout", type=float, default=SCORECARD_HOLDOUT, help="fraction of routes held out")
+  parser.add_argument("--seed", type=int, default=0, help="split seed")
+  parser.add_argument("--calibration", default="00000451", help="drive whose recorded lag and radar latency seed the flights")
+  parser.add_argument("--engine-coast", action="store_true", help="fly with the engine-coast planner (default off, the device's setting)")
+  parser.add_argument("--plant", choices=("default", "fitted"), default="default", help="plant gain: the 1.0 point mass or the train-fitted table")
+  parser.add_argument("--check", action="store_true", help="enforce the scorecard's regression thresholds and exit nonzero on a failure")
+  parser.set_defaults(fn=_scorecard)
 
 
 def register(sub):

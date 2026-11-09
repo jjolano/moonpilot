@@ -404,6 +404,7 @@ def _load(root, keys):
   with ProcessPoolExecutor(max_workers=6) as pool:
     parts = [d for _, d, error in pool.map(_route_job, [(r, root) for r in _routes(root)]) if error is None]
   out = {k: np.concatenate([np.asarray(p[k], dtype=float) for p in parts]) for k in keys}
+  out["route"] = np.concatenate([p["route"] for p in parts])
   out["route_id"] = np.concatenate([np.full(len(p["t"]), i) for i, p in enumerate(parts)])
   # the driver's accel over the next 0.5 s, never across a route boundary
   out["a_next"] = np.concatenate([np.convolve(np.asarray(p["a"], dtype=float), np.ones(10) / 10, mode="full")[9:9 + len(p["a"])] for p in parts])
@@ -453,7 +454,7 @@ def _pumps(cmd, dt=DT):
   return pumps
 
 
-def _fly_stages(job):
+def _fly_stages(job, engine_coast=True, gain=None):
   """`_fly_logged_lead` with the first lead ask of each planner tick recorded as stage 'lead'."""
   import moonpilot.longitudinal as longitudinal
   from moonpilot.lab.planner import _fly_logged_lead
@@ -472,7 +473,7 @@ def _fly_stages(job):
   longitudinal.lead_accel = wrapped  # ty: ignore[invalid-assignment]  # the stage recorder, same signature
   longitudinal.MoonpilotLongitudinalPlanner.update = tick
   try:
-    out = _fly_logged_lead(job)
+    out = _fly_logged_lead(job, engine_coast=engine_coast, gain=gain)
   finally:
     longitudinal.lead_accel, longitudinal.MoonpilotLongitudinalPlanner.update = lead_accel, update
   out["lead"] = np.nan_to_num(np.asarray(lead, dtype=float))
@@ -516,9 +517,13 @@ def _decel_line(flown, drv):
   band = (drv[:, 0] >= 10) & (drv[:, 0] < 16)
   peak = np.asarray([np.convolve(f["a"], np.ones(10) / 10, mode="same")[f["v"] > 2.0].min() for f in flown])
   gaps = np.asarray([f["gap"].min() for f in flown])
+  if not len(peak):
+    return "no decels"
+  peak_text = f"{np.median(peak[band]):5.2f}" if band.any() else "  -  "
+  driver_text = f"{np.median(drv[band, 1]):5.2f}" if band.any() else "  -  "
   return (f"pumps lead {sum(_pumps(f['lead']) for f in flown):3d} / command {sum(_pumps(f['cmd']) for f in flown):3d}  "
           + f"jitter {np.median([_jitter(f['cmd']) for f in flown]):.3f}  presses {sum(_presses(f) for f in flown):3d}  "
-          + f"10-16 peak {np.median(peak[band]):5.2f} (driver {np.median(drv[band, 1]):5.2f}), all p10 {np.percentile(peak, 10):5.2f}  "
+          + f"10-16 peak {peak_text} (driver {driver_text}), all p10 {np.percentile(peak, 10):5.2f}  "
           + f"min gap median {np.median(gaps):4.1f} closest {gaps.min():4.1f} m")
 
 

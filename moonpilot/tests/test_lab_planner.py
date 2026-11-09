@@ -1,11 +1,15 @@
 import math
+import pickle
 import unittest
 
 import numpy as np
 
 from openpilot.common.realtime import DT_CTRL, DT_MDL
 
-from moonpilot.lab.planner import HOLD_FLY_DEAD_S, HOLD_FLY_TAU_S, _LaggedPlant, _launch_episodes, _rest_gaps, control_rate_dt
+from moonpilot.lab.plant import PLANT_MIN_FRAMES, _PlantGain, _plant_table
+from moonpilot.lab.probes import _scorecard_checks
+from moonpilot.lab.driver import _pumps
+from moonpilot.lab.planner import HOLD_FLY_DEAD_S, HOLD_FLY_TAU_S, _LaggedPlant, _launch_episodes, _rest_gaps, _shape_line, _split_routes, control_rate_dt
 
 
 class TestControlRateGuard(unittest.TestCase):
@@ -39,6 +43,42 @@ class TestLaggedPlant(unittest.TestCase):
     self.assertEqual(a[:dead], [0.0] * dead)
     self.assertGreater(a[dead], 0.0)
     self.assertAlmostEqual(a[dead - 1 + round(HOLD_FLY_TAU_S / DT_MDL)], 1.0 - math.exp(-1.0), places=9)
+
+  def test_a_gain_scales_the_delayed_command(self):
+    plant = _LaggedPlant(gain=2.0)
+    a = [plant.step(1.0) for _ in range(20)]
+    dead = round(HOLD_FLY_DEAD_S / DT_MDL)
+    n = 20 - dead
+    self.assertAlmostEqual(a[-1], 2.0 * (1.0 - math.exp(-n * DT_MDL / HOLD_FLY_TAU_S)), places=6)
+
+  def test_the_identified_gain_is_picklable_and_selects_by_sign(self):
+    table = {"accel": np.full(5, 1.25), "brake": np.full(5, 0.90)}
+    gain = pickle.loads(pickle.dumps(_PlantGain(table)))
+    self.assertAlmostEqual(float(gain(1.0, 1.0)), 1.25, places=6)
+    self.assertAlmostEqual(float(gain(-1.0, 1.0)), 0.90, places=6)
+    np.testing.assert_allclose(gain(np.array([1.0, -1.0, 0.0]), 1.0), [1.25, 0.90, 1.0])
+
+
+class TestPlantTable(unittest.TestCase):
+  """The gain table is built from steady frames only, by sign and speed band, and leaves engine-coast braking out."""
+
+  @staticmethod
+  def _result(ratio, sign, ec=0, frames=PLANT_MIN_FRAMES):
+    v = np.concatenate([np.full(frames, (lo + hi) / 2) for lo, hi in ((0.0, 3.0), (3.0, 6.0), (6.0, 10.0), (10.0, 15.0), (15.0, 40.0))])
+    cmd = np.full(len(v), 1.0 if sign > 0 else -1.0)
+    return "r", {"lag": 0.3, "cmd": cmd, "a": cmd * ratio, "v": v, "steady": np.ones(len(v), dtype=bool), "ec": ec}
+
+  def test_it_medians_by_sign_and_band_and_excludes_engine_coast_braking(self):
+    table, counts = _plant_table([self._result(1.25, 1), self._result(1.10, -1), self._result(2.0, -1, ec=1)])
+    self.assertAlmostEqual(table["accel"][0], 1.25, places=6)
+    self.assertAlmostEqual(table["brake"][0], 1.10, places=6)
+    self.assertEqual(counts[("accel", 0.0, 3.0)], PLANT_MIN_FRAMES)
+    self.assertEqual(counts[("brake", 0.0, 3.0)], PLANT_MIN_FRAMES)
+
+  def test_a_thin_band_falls_back_to_the_unity_gain(self):
+    table, counts = _plant_table([self._result(1.5, 1, frames=PLANT_MIN_FRAMES - 1)])
+    self.assertAlmostEqual(table["accel"][0], 1.0, places=6)
+    self.assertEqual(counts[("accel", 0.0, 3.0)], PLANT_MIN_FRAMES - 1)
 
 
 def _frames(*pieces):
@@ -122,6 +162,46 @@ class TestLaunchWindow(unittest.TestCase):
       with self.subTest(kind=kind):
         self.assertEqual(len(_launch(break_at_s=-0.5, break_kind=kind)), 0)
         self.assertEqual(len(_launch(break_at_s=-1.5, break_kind=kind)), 1)  # a second and more on it is a launch
+
+
+class TestScorecardSplit(unittest.TestCase):
+  """The scorecard's held-out split: deterministic, disjoint, complete, and never one-sided."""
+
+  ROUTES = [f"0000{i:04x}--deadbeef" for i in range(86)]
+
+  def test_it_is_deterministic_disjoint_and_complete(self):
+    train, held = _split_routes(self.ROUTES, 0.25, seed=7)
+    self.assertEqual(sorted(train + held), sorted(self.ROUTES))
+    self.assertFalse(set(train) & set(held))
+    self.assertEqual((train, held), _split_routes(self.ROUTES, 0.25, seed=7))
+    self.assertGreater(len(train), 0)
+    self.assertGreater(len(held), 0)
+
+  def test_a_different_seed_moves_routes(self):
+    self.assertNotEqual(_split_routes(self.ROUTES, 0.25, seed=1)[1], _split_routes(self.ROUTES, 0.25, seed=2)[1])
+
+  def test_an_invalid_fraction_or_a_one_sided_split_is_refused(self):
+    for holdout in (0.0, 1.0, -0.1, 1.1):
+      with self.subTest(holdout=holdout), self.assertRaises(ValueError):
+        _split_routes(self.ROUTES, holdout)
+    with self.assertRaises(ValueError):
+      _split_routes(["000003f8--deadbeef"], 0.5)
+
+  def test_the_shape_line_ignores_and_counts_a_no_brake_flight(self):
+    line = _shape_line([(math.nan, math.nan, math.nan, math.nan, 4.0, 2), (-1.5, 0.5, -0.6, -0.8, 3.0, 1)])
+    self.assertTrue("peak -1.50" in line)
+    self.assertTrue("thirds -0.60/-0.80" in line)
+    self.assertTrue("1 no brake" in line)
+
+  def test_stop_pumps_are_counted_on_stop_flights_only(self):
+    def flight(cmd):
+      return {"a": np.zeros(len(cmd)), "v": np.full(len(cmd), 10.0), "gap": np.full(len(cmd), 5.0), "cmd": np.asarray(cmd, dtype=float)}
+    stop = flight([-1.0, -0.8, -1.0] * 4)  # long enough for the 0.5 s mean, two pumps
+    slow = flight([-1.0, -0.8] * 10)  # many pumps, but not a stop
+    results = {"train": {"decels": {"drv": np.asarray([[10.0, -1.0, 5.0]]), "flown": [stop] * 10 + [slow],
+                                      "stops": np.asarray([True] * 10 + [False])}}}
+    detail = next(d for n, _, d in _scorecard_checks(results, []) if n == "train stop pumps")
+    self.assertTrue(f"{float(_pumps(stop['cmd'])):.2f} per stop ({_pumps(stop['cmd']) * 10}/10)" in detail)
 
 
 if __name__ == "__main__":
