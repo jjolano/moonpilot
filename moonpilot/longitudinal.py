@@ -163,6 +163,14 @@ MOONPILOT_PREDICT_T = 1.0  # s of the lead's slow accel credited to its speed
 MOONPILOT_ARRIVE_T = 9.0  # s; an edge this far away at the current closing starts being arrived at...
 MOONPILOT_ARRIVE_RAMP_T = 3.0  # s; ...wholly by this much sooner
 MOONPILOT_ARRIVE_MIN_T = 1.5  # s; the near edge's arrival never takes less than this much closing time
+# ...behind a lead at rest, blended in as its predicted speed falls through `MOONPILOT_CREEP_SPEED`. Inside the minimum
+# the arrival brakes in proportion to the closing (closing / 2 min_t), so speed decays on a 2 min_t time constant: 1.5 s
+# crawled the last of a stop for 3 s, 4.2 s from 2 to 0.3 m/s at -0.38 / -0.24 at 1.0 / 0.5 m/s, flown on the driver's
+# 144 lead-caused stops, where he takes 1.9 s at -1.00 / -0.73. At 0.75 s: 3.2 s at -0.61 / -0.36, the closest gap
+# 3.0 -> 3.8 m, the peak unchanged (`python -m moonpilot.lab stop-finish`); 0.5 s bought only 0.4 s more finish for
+# four more brake-pump cycles over eleven stops, the firmness crossing the ease/re-deepen band, and that cycling is the
+# plan's, not `MoonpilotBrakeBand`'s (identical pump counts with the band off). A moving lead keeps 1.5 s.
+MOONPILOT_ARRIVE_MIN_T_REST = 0.75  # s
 MOONPILOT_LEAVE_MIN_T = 2.0  # s; nor the far edge's, a lead pulling away
 # Share of a slowing lead's slow accel the ego also matches while arriving, scheduled on the time headway
 # (`gap / v_ego`): this driver's own share falls with it — median aEgo/aLead at matched speed behind a slowing lead,
@@ -638,7 +646,7 @@ def lead_accel(v_ego, gap, v_lead, a_lead, t_follow, sustain=None, a_slow=0.0) -
   reach = max(gap - MOONPILOT_CRASH_DISTANCE - MOONPILOT_REACH_LAG_T * max(closing, 0.0), 0.05)
   share = float(np.interp(gap / max(v_ego, 1.0), MOONPILOT_TRACK_BRAKE_BP, MOONPILOT_TRACK_BRAKE_V))
   a_track = share * min(max(-a_slow, 0.0), v_pred / MOONPILOT_TRACK_BRAKE_T)
-  a -= _arrive(gap - near, closing, MOONPILOT_ARRIVE_MIN_T, a_track, reach)
+  a -= _arrive(gap - near, closing, MOONPILOT_ARRIVE_MIN_T_REST + (MOONPILOT_ARRIVE_MIN_T - MOONPILOT_ARRIVE_MIN_T_REST) * moving, a_track, reach)
   a += min(gap - near, 0.0) / (MOONPILOT_RECOVER_T * MOONPILOT_RESPONSE_T)
   catch_up = min(max(gap - far - MOONPILOT_CATCH_UP_SLACK, 0.0) / MOONPILOT_RECOVER_T, MOONPILOT_CATCH_UP_CLOSING)
   a += max(catch_up - max(closing, 0.0), 0.0) / MOONPILOT_RESPONSE_T
