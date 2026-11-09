@@ -329,8 +329,8 @@ MOONPILOT_FAST_CRAWL = 0.31  # m/s^2
 # Combined accel budget. 2.0 up to 4.5 m/s lets the measured launch rungs (1.96-1.97 at 2.5-3.5 m/s)
 # through: at a flat 1.7 the planner held a trapezoid at the clip where 20 of 31 manual launches behind
 # a departing lead (cached routes 000002ac-00000405) peaked above 1.7, median 1.92 at 2.8 s. Flown from
-# those same states the planner now peaks at a median 1.97 at 2.8 s, with a median 6 s speed of 8.36
-# against the driver's 8.24 m/s.
+# those same states under the 4.0 m/s^3 launch jerk the planner peaked at a median 1.97 at 2.8 s, with a
+# median 6 s speed of 8.36 against the driver's 8.24 m/s; the launch ramp now reaches that peak later.
 # Lateral demand at launch speeds is small, so the cornering share of the budget does not bind there.
 MOONPILOT_A_TOTAL_MAX_BP = [4.5, 7.0, 20.0, 40.0]  # m/s
 MOONPILOT_A_TOTAL_MAX_V = [2.0, 1.7, 1.7, 3.2]  # m/s^2
@@ -344,11 +344,7 @@ MOONPILOT_COAST_RECOVERY_ACCEL = 0.15  # m/s^2; positive-ask cap just past the c
 # At the edge the coast taper is already 0; the plain ladder's slow/fast rung would surge back toward
 # set speed on the same hill that just earned the sag. Cap holds only in [band, 2*band) of underspeed —
 # further out (a launch, a long deficit) the plain law still runs.
-MOONPILOT_JERK_UP = 1.5  # m/s^3
-MOONPILOT_JERK_LAUNCH = 4.0  # m/s^3; the up-limit at and below MOONPILOT_JERK_LAUNCH_SPEED, tapering
-# back to `MOONPILOT_JERK_UP` at twice it, and only from the second frame of a ramp — `jerk_limit`
-# keeps the first step at the comfort value, which is what holds a parked car's brake hold out of one
-# frame of a lead's reported speed. Measured gains: docs/longitudinal.md, "The up-jerk is scheduled".
+MOONPILOT_JERK_UP = 1.5  # m/s^3; a command at or below zero rises this fast: a brake unwinds, and a ramp leaves zero
 MOONPILOT_JERK_LAUNCH_SPEED = 2.5  # m/s
 MOONPILOT_JERK_DOWN = 2.0  # m/s^3 at a -2.0 ask; 6.05 m end gap, no contact at 90-144 kph
 MOONPILOT_JERK_EMERGENCY = 10.0  # m/s^3, reached at ACCEL_MIN
@@ -363,7 +359,21 @@ MOONPILOT_JERK_EASE_LEAD_BRAKING = 0.5
 MOONPILOT_JERK_EASE_HOLD_A = -0.3  # m/s^2
 MOONPILOT_JERK_ONSET_LEAD_A = -0.2  # m/s^2; a lead slowing past this keeps JERK_DOWN
 MOONPILOT_BRAKE_EXIT_A = -0.5  # m/s^2; braking past this holds the positive ask, as curve braking does
-MOONPILOT_BRAKE_EXIT_JERK = 0.5  # m/s^3; its rebuild with the wheel straight, above the launch band
+MOONPILOT_BRAKE_EXIT_JERK = 0.5  # m/s^3; its rebuild with the wheel straight, and every positive ramp's with no lead close ahead
+# A positive command builds no faster than the ramp jerk, at every speed: with no lead close ahead the brake exit's own
+# rebuild, behind one a ramp that follows how hard the slowest such lead accelerates, never past the lead-free one. A lead
+# is close within MOONPILOT_JERK_RAMP_GAP or MOONPILOT_JERK_RAMP_HEADWAY of the ego's speed, whichever is farther: the
+# driver follows at a p90 2.70 s (`python -m moonpilot.lab intent`), so past 3 s a lead is not the one being followed.
+# It was 4.0 m/s^3 at launch speeds tapering to `MOONPILOT_JERK_UP` by 5 m/s, which left the speed-scheduled fast rung as a
+# launch's only shape: over 11 engaged standstill launches aEgo built at a median 2.17 m/s^3 (steepest 0.5 s) to a 2.37 m/s^2
+# peak — the driver's own manual launches (1.89 / 2.22 over 115 with no lead), and stronger than he wants from the car. His
+# build does scale with the lead's launch (1.35 / 1.79 / 2.08 m/s^3 behind leads launching under 1.0, at 1.0-1.5 and past
+# 1.5 m/s^2), reaching his lead-free one near the last breakpoint (`python -m moonpilot.lab accel-ramp`). A brake still
+# unwinds at `MOONPILOT_JERK_UP` (`jerk_limit`'s first step out of zero), so letting off is never slowed.
+MOONPILOT_JERK_RAMP_A_BP = [0.0, 1.25]  # m/s^2 of the lead's accel
+MOONPILOT_JERK_RAMP_V = [0.25, MOONPILOT_BRAKE_EXIT_JERK]  # m/s^3
+MOONPILOT_JERK_RAMP_GAP = 25.0  # m
+MOONPILOT_JERK_RAMP_HEADWAY = 3.0  # s
 # `MoonpilotHandbackEase` (on, live): when openpilot takes back over from the driver's gas, the positive ask is capped at
 # HANDBACK_A and the cap rebuilds at HANDBACK_JERK, so lifting off below the set speed eases the car rather than carrying
 # the driver's own acceleration on. Without it, the plan resumed from the measured accel: on route 0000043f a lift-off 6.5
@@ -663,24 +673,23 @@ def lead_braking(lead_states) -> bool:
   return any(a_lead < MOONPILOT_JERK_ONSET_LEAD_A for _, _, _, a_lead, *_ in lead_states)
 
 
-def jerk_limit(a_cmd, a_prev, dt, v_ego, comfort_scale=1.0, lead_braking=False) -> float:
-  """Rate limit, asymmetric and urgency-scaled.
+def ramp_jerk(lead_states, v_ego) -> float:
+  """The positive ramp's jerk: `MOONPILOT_JERK_RAMP_V` on the slowest-accelerating close lead (within
+  `MOONPILOT_JERK_RAMP_GAP` or `MOONPILOT_JERK_RAMP_HEADWAY` of `v_ego`), the lead-free ramp with none there."""
+  near = max(MOONPILOT_JERK_RAMP_GAP, MOONPILOT_JERK_RAMP_HEADWAY * v_ego)
+  a = min((a_lead for _, gap, _, a_lead, *_ in lead_states if gap < near), default=MOONPILOT_JERK_RAMP_A_BP[-1])
+  return float(np.interp(a, MOONPILOT_JERK_RAMP_A_BP, MOONPILOT_JERK_RAMP_V))
+
+
+def jerk_limit(a_cmd, a_prev, dt, v_ego, comfort_scale=1.0, lead_braking=False, ramp=MOONPILOT_JERK_RAMP_V[-1]) -> float:
+  """Rate limit, asymmetric and urgency-scaled. A command above zero rises at `ramp` (`ramp_jerk`), at or below it at
+  `MOONPILOT_JERK_UP`, so letting off a brake is never the slow part.
 
   The learned scale is deliberately only on the positive, comfort-side ramp. The braking-side
   interpolation and its emergency endpoint are the stopping-distance-tested constants.
   """
   comfort_scale = float(np.clip(comfort_scale, 0.5, 1.0))
-  up = (
-    MOONPILOT_JERK_UP
-    if a_prev <= 0.0
-    else float(
-      np.interp(
-        v_ego,
-        [MOONPILOT_JERK_LAUNCH_SPEED, 2 * MOONPILOT_JERK_LAUNCH_SPEED],
-        [MOONPILOT_JERK_LAUNCH, MOONPILOT_JERK_UP],
-      )
-    )
-  ) * comfort_scale
+  up = (MOONPILOT_JERK_UP if a_prev <= 0.0 else ramp) * comfort_scale
   # The gentle onset is off at a crawl and while a lead brakes, where a shallow ask is urgent.
   onset = float(np.interp(v_ego, [MOONPILOT_JERK_LAUNCH_SPEED, 2 * MOONPILOT_JERK_LAUNCH_SPEED], [MOONPILOT_JERK_DOWN, MOONPILOT_JERK_ONSET]))
   onset = MOONPILOT_JERK_DOWN if lead_braking else onset
@@ -1216,7 +1225,7 @@ class MoonpilotLongitudinalPlanner:
     x_pred = 0.5 * (v_ego + v_pred) * self.action_t
     # The exit ramp: while a curve term brakes or the plan brakes past MOONPILOT_BRAKE_EXIT_A, the positive
     # ask is held where the command is; after release it rebuilds at MOONPILOT_CURVE_EXIT_JERK while still
-    # cornering or with a curve ahead, else at MOONPILOT_BRAKE_EXIT_JERK above the launch band.
+    # cornering or with a curve ahead, else at MOONPILOT_BRAKE_EXIT_JERK — the lead-free positive ramp's own pace.
     exit_jerk = MOONPILOT_CURVE_EXIT_JERK
     if min(curve_accel(v_pred, x_pred, curve), lat_accel_hold(v_pred, v_hold), squeeze) < 0.0 or a_prev < MOONPILOT_BRAKE_EXIT_A:
       self.curve_exit_cap = max(a_prev, 0.0)
@@ -1224,7 +1233,7 @@ class MoonpilotLongitudinalPlanner:
       cornering = abs(measured_curvature) * CS.vEgo**2 >= MOONPILOT_CURVE_EXIT_LAT_ACCEL
       curve_ahead = curve_accel(max(v_cruise, v_pred), x_pred, curve) < 0.0
       if not (cornering or curve_ahead):
-        exit_jerk = float(np.interp(v_ego, [MOONPILOT_JERK_LAUNCH_SPEED, 2 * MOONPILOT_JERK_LAUNCH_SPEED], [MOONPILOT_JERK_LAUNCH, MOONPILOT_BRAKE_EXIT_JERK]))
+        exit_jerk = MOONPILOT_BRAKE_EXIT_JERK
       self.curve_exit_cap = min(self.curve_exit_cap + exit_jerk * self.dt, ACCEL_MAX)
     lead_states = []
     for source, lead, a_lead, a_lead_tau, a_slow in leads:
@@ -1269,7 +1278,8 @@ class MoonpilotLongitudinalPlanner:
       a_cmd = min(shaped, cruise_cap(v_pred, e2e, steer_angle, self.CP, accel_coast, self.allow_throttle))
     else:
       self.brake_band.reset()
-    a_target = float(np.clip(jerk_limit(a_cmd, a_prev, self.dt, v_ego, jerk_scale, lead_braking(lead_states)), ACCEL_MIN, ACCEL_MAX))
+    braking = lead_braking(lead_states)
+    a_target = float(np.clip(jerk_limit(a_cmd, a_prev, self.dt, v_ego, jerk_scale, braking, ramp_jerk(lead_states, v_ego)), ACCEL_MIN, ACCEL_MAX))
 
     if not math.isfinite(a_target):
       # One guard, so that no input can latch a NaN into the command.
@@ -1467,7 +1477,7 @@ class MoonpilotLongitudinalPlanner:
         model_weight=max(model_weight, min(self.model_fade + t / MOONPILOT_MODEL_BRAKE_FADE_T, 1.0)),
       )
       a_cmd = min(a_cmd, handback_cap + MOONPILOT_HANDBACK_JERK * t)  # the hand-back ceiling, rebuilt over the horizon as in `update`
-      a = float(np.clip(jerk_limit(a_cmd, a, t - t_prev, v, comfort_scale, lead_braking(states)), ACCEL_MIN, ACCEL_MAX))
+      a = float(np.clip(jerk_limit(a_cmd, a, t - t_prev, v, comfort_scale, lead_braking(states), ramp_jerk(states, v)), ACCEL_MIN, ACCEL_MAX))
       speeds[i] = v
       accels[i] = a
       dt = float(MOONPILOT_CONTROL_T_IDX[i + 1]) - t if i + 1 < CONTROL_N else 0.0

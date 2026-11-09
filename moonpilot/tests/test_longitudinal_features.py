@@ -38,7 +38,7 @@ from moonpilot.jerk import (
   MOONPILOT_LONG_JERK_SCALE_KEY,
 )
 from moonpilot.features import FEATURES
-from moonpilot.longitudinal import MOONPILOT_BRAKE_EXIT_JERK
+from moonpilot.longitudinal import MOONPILOT_BRAKE_EXIT_JERK, MOONPILOT_JERK_RAMP_V, MOONPILOT_JERK_UP
 from moonpilot.tests.test_longitudinal import ROOT, Source, _cp, _inputs, _path, _planner
 
 
@@ -371,10 +371,10 @@ class TestCurveSpeed(unittest.TestCase):
 
   def test_the_exit_rebuilds_the_positive_ask_at_the_exit_jerk(self):
     """Route 000003f8 segment 0: below set speed the command went -1.50 -> +1.17 within 2 s of a curve
-    letting go, the cruise rung behind the comfort jerk, and the car pulled +1.35 m/s^2 with 20 degrees
+    letting go, the positive ask behind the comfort jerk, and the car pulled +1.35 m/s^2 with 20 degrees
     of wheel still in. Once the curve terms stop braking with the car still cornering, the positive ask
     rebuilds from zero at `MOONPILOT_CURVE_EXIT_JERK`: at k frames after the release it is at most
-    `JERK * k * dt`, so +0.5 takes ~2 s where the comfort jerk alone gets there in ~0.35 s. The ramp only
+    `JERK * k * dt`, so +0.5 takes ~2 s where the positive ramp alone gets there in ~1 s. The ramp only
     ever caps the positive side and is armed only by braking, so a straight road that never braked is
     the planner without it, frame for frame."""
     v_ego, v_cruise_kph = 20.0, 108.0
@@ -405,7 +405,12 @@ class TestCurveSpeed(unittest.TestCase):
     with mock.patch("moonpilot.longitudinal.MOONPILOT_CURVE_EXIT_JERK", math.inf):
       uncapped = cruise(_planner())
     self.assertEqual(cruise(_planner()), uncapped)
-    self.assertGreater(uncapped[7], 0.5)  # the comfort jerk's own ramp: past +0.5 inside 0.4 s
+    # the step out of zero is the comfort jerk in both; past it the capped arm rebuilds at the exit jerk and the uncapped
+    # one at the positive ramp, four times faster
+    self.assertAlmostEqual(uncapped[0], MOONPILOT_JERK_UP * DT_MDL, places=9)
+    positive = next(i for i, c in enumerate(exit_cmds) if c > 0.0)
+    self.assertAlmostEqual(float(np.median(np.diff(exit_cmds[positive + 1:]))), MOONPILOT_CURVE_EXIT_JERK * DT_MDL, places=9)
+    self.assertAlmostEqual(float(np.median(np.diff(uncapped[1:]))), MOONPILOT_JERK_RAMP_V[-1] * DT_MDL, places=9)
 
   def test_a_straight_wheel_with_no_curve_ahead_rebuilds_at_the_brake_exit_jerk(self):
     """Route 00000408: a predicted intersection turn the car never took asked -0.04..-0.32 m/s^2 with the

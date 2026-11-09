@@ -61,9 +61,7 @@ from moonpilot.longitudinal import (
   MOONPILOT_FOLLOW_BAND_T,
   MOONPILOT_JERK_EMERGENCY,
   MOONPILOT_JERK_DOWN,
-  MOONPILOT_JERK_ONSET,
-  MOONPILOT_JERK_LAUNCH,
-  MOONPILOT_JERK_LAUNCH_SPEED,
+  MOONPILOT_JERK_RAMP_V,
   MOONPILOT_JERK_UP,
   MOONPILOT_LADDER_V_BP,
   MOONPILOT_LEAD_PREVIEW_T,
@@ -398,33 +396,6 @@ class TestPolicyFunctions(unittest.TestCase):
           neutral = lead_accel(v_ego, gap, 10.0, 0.0, 1.45)
           self.assertEqual(neutral, lead_accel(v_ego, gap, 10.0, 2.0, 1.45))
           self.assertGreaterEqual(neutral, lead_accel(v_ego, gap, 10.0, -2.0, 1.45))
-
-  def test_the_up_jerk_is_scheduled_on_speed_and_the_down_jerk_is_not(self):
-    """The up limit is `MOONPILOT_JERK_LAUNCH` at and below `MOONPILOT_JERK_LAUNCH_SPEED`, tapering
-    back to `MOONPILOT_JERK_UP` by twice it — a launch is the one place the plan's own ask outruns the
-    comfort limit, and the car's answer to a lead pulling away is the most visible thing this planner
-    does. The down side reads the *command*: a shallow ask onsets at `MOONPILOT_JERK_ONSET` above the
-    creep band, and keeps `MOONPILOT_JERK_DOWN` at a crawl, while a lead brakes, and from -2.0 on,
-    where it interpolates into the untouched emergency ramp.
-    """
-    for v_ego, expected in (
-      (0.0, MOONPILOT_JERK_LAUNCH),
-      (MOONPILOT_JERK_LAUNCH_SPEED, MOONPILOT_JERK_LAUNCH),
-      (2 * MOONPILOT_JERK_LAUNCH_SPEED, MOONPILOT_JERK_UP),
-      (25.0, MOONPILOT_JERK_UP),
-    ):
-      # measured from a command already off zero: the first step of a ramp is the comfort step at
-      # every speed, which is what keeps `should_stop`'s 0.1 release threshold out of a single frame's
-      # reach — a parked car cannot lose its brake hold to a lead whose reported speed jitters, and
-      # `test_the_stop_gate_follows_the_governing_candidate_not_every_lead` pins that from the other end
-      self.assertAlmostEqual(jerk_limit(10.0, 0.05, DT_MDL, v_ego), 0.05 + expected * DT_MDL, places=9)
-    for v_ego in (0.0, MOONPILOT_JERK_LAUNCH_SPEED, 25.0):
-      self.assertAlmostEqual(jerk_limit(10.0, 0.0, DT_MDL, v_ego), MOONPILOT_JERK_UP * DT_MDL, places=9)
-    for v_ego in (0.0, MOONPILOT_JERK_LAUNCH_SPEED):
-      self.assertAlmostEqual(jerk_limit(-1.0, 0.0, DT_MDL, v_ego), -MOONPILOT_JERK_DOWN * DT_MDL, places=9)
-    self.assertAlmostEqual(jerk_limit(-1.0, 0.0, DT_MDL, 25.0), -MOONPILOT_JERK_ONSET * DT_MDL, places=9)
-    self.assertAlmostEqual(jerk_limit(-1.0, 0.0, DT_MDL, 25.0, lead_braking=True), -MOONPILOT_JERK_DOWN * DT_MDL, places=9)
-    self.assertAlmostEqual(jerk_limit(-2.0, 0.0, DT_MDL, 25.0), -MOONPILOT_JERK_DOWN * DT_MDL, places=9)
 
   def test_a_braking_ask_eases_slower_while_a_lead_brakes_and_nothing_else_moves(self):
     """A driver does not let off while the car ahead is still braking: past the hold, the ask eases slower behind a braking
@@ -1143,29 +1114,25 @@ class TestPlanner(unittest.TestCase):
       planner.update(sm)
     self.assertGreaterEqual(planner.output_a_target, 0.1)
 
-  def test_a_launch_is_not_held_back_by_the_comfort_jerk(self):
-    """From a standstill behind a lead pulling away at 2 m/s^2, the ramp starts at the comfort step and is
-    not held there: the command is at 0.54 m/s^2 seven frames in, past what six comfort frames deliver,
-    so the launch jerk is available where the plan wants it. The first step stays the comfort one on
-    purpose: `should_stop` releases a standstill hold when `a_target` crosses 0.1, so a step of 0.2 would
-    let one frame of a lead's reported speed lift a parked car's brake hold, which
-    `test_the_stop_gate_follows_the_governing_candidate_not_every_lead` pins from the other side.
+  def test_a_launch_ramps_in_at_the_pace_of_the_lead_ahead(self):
+    """From a standstill the ask builds instead of stepping to the ladder's rung. Past the comfort first step it climbs at
+    the lead-free ramp with nothing ahead; behind a lead already rolling away at a steady 3 m/s — a far-edge arrival asking
+    the whole rung, from a lead that is not launching — at the floor ramp. The 4.0 m/s^3 limit this replaced let the command
+    follow the rung, and on the car aEgo built at a median 2.17 m/s^3 to a 2.37 m/s^2 peak (`lab accel-ramp`)."""
+    def launch(lead_fn):
+      planner, steps = _planner(), []
+      for frame in range(20):
+        previous = planner.output_a_target
+        planner.update(_inputs(v_ego=0.0, v_cruise_kph=108.0, lead=lead_fn(frame * DT_MDL), standstill=True))
+        steps.append(planner.output_a_target - previous)
+      return steps
 
-    The ramp is ask-limited here, not jerk-limited — the lead law takes only `MOONPILOT_TRACK_ACCEL` of a
-    launching lead's accel, which is what keeps the answer this smooth — so what is pinned is the shape,
-    not which of the two limits produced each step.
-    """
-    planner = _planner()
-    a_lead, steps = 2.0, []
-    for frame in range(8):
-      t = frame * DT_MDL
-      lead = _lead(MOONPILOT_STOP_DISTANCE + 0.5 * a_lead * t**2, a_lead * t, a_lead=a_lead)
-      previous = planner.output_a_target
-      planner.update(_inputs(v_ego=0.0, v_cruise_kph=108.0, lead=lead, standstill=True))
-      steps.append(planner.output_a_target - previous)
-    self.assertAlmostEqual(steps[0], MOONPILOT_JERK_UP * DT_MDL, delta=1e-9)
-    self.assertTrue(all(step <= MOONPILOT_JERK_LAUNCH * DT_MDL + 1e-9 for step in steps))
-    self.assertGreater(planner.output_a_target, MOONPILOT_JERK_UP * DT_MDL * 6)  # past what six comfort frames could deliver
+    free = launch(lambda t: None)
+    rolling = launch(lambda t: _lead(MOONPILOT_STOP_DISTANCE + 3.0 * t, 3.0))
+    for steps, ramp in ((free, MOONPILOT_JERK_RAMP_V[-1]), (rolling, MOONPILOT_JERK_RAMP_V[0])):
+      self.assertAlmostEqual(steps[0], MOONPILOT_JERK_UP * DT_MDL, delta=1e-9)
+      for step in steps[1:]:
+        self.assertAlmostEqual(step, ramp * DT_MDL, delta=1e-9)
 
   def test_a_stop_behind_a_stopped_lead_eases_in(self):
     s = _fly(12.0, 43.2, 70.0, 0.0, lambda t: 0.0, 30.0)
@@ -1365,9 +1332,9 @@ class TestPlanner(unittest.TestCase):
     self.assertLess(planner.output_a_target, -1.0)
 
     # no lead, so the policy itself wants to accelerate: the only thing holding the command back is
-    # the jerk limit measured from the reset baseline of aEgo
+    # the positive ramp, measured from the reset baseline of aEgo
     planner.update(_inputs(v_ego=15.0, v_cruise_kph=V_CRUISE_UNSET, a_ego=0.4))
-    self.assertAlmostEqual(planner.output_a_target, 0.4 + MOONPILOT_JERK_UP * DT_MDL, delta=1e-6)
+    self.assertAlmostEqual(planner.output_a_target, 0.4 + MOONPILOT_JERK_RAMP_V[-1] * DT_MDL, delta=1e-6)
 
   @staticmethod
   def _handback(ease, gas, frames_after=40, model_accel=0.0):

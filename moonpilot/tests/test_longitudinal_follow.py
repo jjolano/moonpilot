@@ -106,9 +106,9 @@ class TestFollowPolicy(unittest.TestCase):
   def test_speeding_up_after_a_brake_rebuilds_at_the_drivers_pace(self):
     """Rolling out of a brake (routes 00000410 at 7.6 m/s, 00000414 at 11.5 m/s) the cruise rung came back
     at the 1.5 m/s^3 comfort jerk and peaked 1.5 / 1.21 m/s^2; over 210 manual brake-then-gas episodes
-    on 31 routes the driver rose at a median 0.50 at 5-10 m/s and 0.30 at 10-15. Above the launch band
-    the positive ask now rebuilds at `MOONPILOT_BRAKE_EXIT_JERK`; inside it, a launch keeps its jerk."""
-    for v_ego, exit_ramp in ((10.0, True), (2.0, False)):
+    on 31 routes the driver rose at a median 0.50 at 5-10 m/s and 0.30 at 10-15. The positive ask now rebuilds at
+    `MOONPILOT_BRAKE_EXIT_JERK`, inside the launch band too, where a launch ramps at that same pace."""
+    for v_ego in (10.0, 2.0):
       with self.subTest(v_ego=v_ego):
         planner = _planner()
         for _ in range(20):
@@ -119,11 +119,8 @@ class TestFollowPolicy(unittest.TestCase):
           cmds.append(planner.output_a_target)
         release = next(i for i, c in enumerate(cmds) if c >= -0.5)
         ramp = [MOONPILOT_BRAKE_EXIT_JERK * (k - release) * DT_MDL for k in range(len(cmds))]
-        if exit_ramp:
-          self.assertTrue(all(c <= r + 1e-9 for c, r in zip(cmds[release:], ramp[release:], strict=True)))
-          self.assertGreater(cmds[-1], 0.5)  # it does come back
-        else:
-          self.assertGreater(max(c - r for c, r in zip(cmds[release:], ramp[release:], strict=True)), 0.2)
+        self.assertTrue(all(c <= r + 1e-9 for c, r in zip(cmds[release:], ramp[release:], strict=True)))
+        self.assertGreater(cmds[-1], 0.5)  # it does come back
 
   def test_a_launch_asks_for_what_the_car_delivers_not_what_the_feet_did(self):
     """Sweep of 434 cached segments: below 3 m/s the car lands 1.27x the fast-rung ask, and four
