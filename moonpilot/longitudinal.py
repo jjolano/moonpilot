@@ -376,8 +376,8 @@ MOONPILOT_JERK_RAMP_GAP = 25.0  # m
 MOONPILOT_JERK_RAMP_HEADWAY = 3.0  # s
 # From a standstill the ramp above is too slow to move the car: the driver's own launches build aEgo at 1.35 / 1.79 / 2.08
 # m/s^3 (steepest 0.5 s) behind leads launching under 1.0, at 1.0-1.5 and past 1.5 m/s^2, and at 1.89 with no lead (`python
-# -m moonpilot.lab accel-ramp`), where 0.25-0.5 reaches 1 m/s^2 only after 2-4 s; over 11 engaged standstill launches the car
-# itself moved within 0.15 s of the ask and built 2.17 m/s^3, so the deficit is the ramp and not the car. Below
+# -m moonpilot.lab accel-ramp`), where 0.25-0.5 reaches 1 m/s^2 only after 2-4 s; the planner's own ask is a median +0.66 m/s^2 when the car
+# first moves (19 engaged standstill launches, p10 0.05, p90 0.83), which 0.5 m/s^3 reaches only after 1.3 s of sitting. Below
 # MOONPILOT_JERK_LAUNCH_SPEED the ramp is the launch band's, following the lead's launch the same way, and it fades to the
 # ordinary ramp by twice that speed. A faster ramp, not a floor: a floor is a one-frame step, and a first step above
 # `should_stop`'s 0.1 would drop a parked car's brake hold.
