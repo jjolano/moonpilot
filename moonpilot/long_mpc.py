@@ -9,8 +9,9 @@ suite against a second solver iterated to convergence on the same inputs, and bo
   plan). Full Gauss-Newton steps oscillate there before settling — 6.9 / 0.55 / 2.2 / 0.15 m/s^2 off after 2 / 3 / 4 / 6
   steps, 0.001 after 10 — so the cap is a bound, not the expected count: over the suite a frame took 2.03 steps on
   average, 3 at p99, 5 at most, and the accel the planner reads off the plan came within 0.005 m/s^2 of the converged
-  plan's on every frame, against 0.52 for one step. Settling is judged step against step, so a settled frame costs two:
-  acados time p50 0.34 -> 0.55 ms on a dev PC.
+  plan's on every frame, against 0.52 for one step. Settling is judged step against step, so a settled frame costs two.
+  On a parked comma 3X over the same suite, acados time per frame went 0.79 / 1.54 / 4.2 ms (p50 / p99 / max) to
+  1.53 / 2.77 / 14.4, and plannerd's whole `update` 3.3 / 5.1 / 12.7 to 4.4 / 6.6 / 26.9 — inside its 50 ms frame.
 - **Why steps, not codegen'd SQP.** SQP capped at 3 iterations was tried: the prebuilt libacados prints
   `ocp_nlp_sqp: maximum iterations reached` to stdout on every capped frame, and with the NLP tolerances at their 1e-6
   default under a 1e-3 QP tolerance every frame is capped. Iterating here also leaves the generated solver alone.
@@ -35,7 +36,8 @@ ACADOS_SUCCESS = 0  # acados/utils/types.h
 
 MOONPILOT_MPC_MAX_STEPS = 10  # RTI steps per frame at most
 MOONPILOT_MPC_STEP_TOL = 1e-2  # m/s and m/s^2: a step that moves no planned speed or accel more than this ends the frame
-# ponytail: no recorded failure to size it on (none in upstream's maneuver suite); measure hold runs on device if they appear
+# ponytail: unsized — no failure in upstream's maneuver suite or 1.8 M recorded frames (`python -m moonpilot.lab mpc-solve`);
+# size it from hold-run lengths in swaglog ("holding its last plan") if they ever appear
 MOONPILOT_MPC_HOLD_T = 0.5  # s a failing solver may run on the last plan before upstream's reset
 
 
