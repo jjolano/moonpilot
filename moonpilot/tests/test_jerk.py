@@ -14,8 +14,11 @@ from moonpilot.longitudinal import (
   MOONPILOT_JERK_ONSET,
   MOONPILOT_JERK_RAMP_GAP,
   MOONPILOT_JERK_RAMP_HEADWAY,
+  MOONPILOT_JERK_LAUNCH_A_BP,
+  MOONPILOT_JERK_LAUNCH_V,
   MOONPILOT_JERK_RAMP_V,
   MOONPILOT_JERK_UP,
+  positive_ramp,
   jerk_limit,
   ramp_jerk,
 )
@@ -134,6 +137,27 @@ class TestPositiveRamp(unittest.TestCase):
     # 20 m/s: 3 s of headway is 60 m, so a lead at 50 m is being followed and sets the ramp
     self.assertEqual(ramp_jerk([state(50.0, 0.0)], 20.0), floor)
     self.assertEqual(ramp_jerk([state(MOONPILOT_JERK_RAMP_HEADWAY * 20.0 + 1.0, 0.0)], 20.0), lead_free)
+
+  def test_a_standstill_launch_uses_the_launch_band_and_speed_returns_to_the_ordinary_ramp(self):
+    """From rest the positive ramp is the driver's own launch build, `MOONPILOT_JERK_LAUNCH_V` on the close lead's launch;
+    by twice `MOONPILOT_JERK_LAUNCH_SPEED` it is `ramp_jerk`'s and the launch band has no say. The ordinary ramp alone is
+    2.7-4x slower than the driver's build (`python -m moonpilot.lab accel-ramp`), which moved the car within 0.15 s of the
+    ask: the ramp, not the car, is what a launch waits on."""
+    def state(gap, a_lead):
+      return (0, gap, 0.0, a_lead, 2.0, a_lead)
+
+    gentle_lead, brisk_lead = MOONPILOT_JERK_LAUNCH_A_BP[0], MOONPILOT_JERK_LAUNCH_A_BP[-1]
+    self.assertAlmostEqual(positive_ramp([], 0.0), MOONPILOT_JERK_LAUNCH_V[-1], places=9)
+    self.assertAlmostEqual(positive_ramp([state(5.0, gentle_lead)], 0.0), MOONPILOT_JERK_LAUNCH_V[0], places=9)
+    self.assertAlmostEqual(positive_ramp([state(5.0, brisk_lead)], 0.0), MOONPILOT_JERK_LAUNCH_V[-1], places=9)
+    self.assertGreater(MOONPILOT_JERK_LAUNCH_V[0], MOONPILOT_JERK_RAMP_V[-1])  # faster than the at-speed ramp, at every lead
+    for v_ego in (2 * MOONPILOT_JERK_LAUNCH_SPEED, 25.0):
+      self.assertAlmostEqual(positive_ramp([state(5.0, 0.0)], v_ego), ramp_jerk([state(5.0, 0.0)], v_ego), places=9)
+      self.assertAlmostEqual(positive_ramp([], v_ego), ramp_jerk([], v_ego), places=9)
+    # monotone through the blend, and the launch band owns the whole standstill
+    asks = [positive_ramp([state(5.0, 0.5)], v) for v in (0.0, 1.0, 2.5, 4.0, 5.0, 10.0)]
+    self.assertGreater(asks[0], asks[-1])
+    self.assertTrue(all(later <= earlier + 1e-12 for earlier, later in zip(asks, asks[1:], strict=False)))
 
 
 if __name__ == "__main__":

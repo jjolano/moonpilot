@@ -374,6 +374,15 @@ MOONPILOT_JERK_RAMP_A_BP = [0.0, 1.25]  # m/s^2 of the lead's accel
 MOONPILOT_JERK_RAMP_V = [0.25, MOONPILOT_BRAKE_EXIT_JERK]  # m/s^3
 MOONPILOT_JERK_RAMP_GAP = 25.0  # m
 MOONPILOT_JERK_RAMP_HEADWAY = 3.0  # s
+# From a standstill the ramp above is too slow to move the car: the driver's own launches build aEgo at 1.35 / 1.79 / 2.08
+# m/s^3 (steepest 0.5 s) behind leads launching under 1.0, at 1.0-1.5 and past 1.5 m/s^2, and at 1.89 with no lead (`python
+# -m moonpilot.lab accel-ramp`), where 0.25-0.5 reaches 1 m/s^2 only after 2-4 s; over 11 engaged standstill launches the car
+# itself moved within 0.15 s of the ask and built 2.17 m/s^3, so the deficit is the ramp and not the car. Below
+# MOONPILOT_JERK_LAUNCH_SPEED the ramp is the launch band's, following the lead's launch the same way, and it fades to the
+# ordinary ramp by twice that speed. A faster ramp, not a floor: a floor is a one-frame step, and a first step above
+# `should_stop`'s 0.1 would drop a parked car's brake hold.
+MOONPILOT_JERK_LAUNCH_A_BP = [0.0, 1.5]  # m/s^2 of the close lead's launch
+MOONPILOT_JERK_LAUNCH_V = [1.3, 2.1]  # m/s^3
 # `MoonpilotHandbackEase` (on, live): when openpilot takes back over from the driver's gas, the positive ask is capped at
 # HANDBACK_A and the cap rebuilds at HANDBACK_JERK, so lifting off below the set speed eases the car rather than carrying
 # the driver's own acceleration on. Without it, the plan resumed from the measured accel: on route 0000043f a lift-off 6.5
@@ -673,12 +682,34 @@ def lead_braking(lead_states) -> bool:
   return any(a_lead < MOONPILOT_JERK_ONSET_LEAD_A for _, _, _, a_lead, *_ in lead_states)
 
 
-def ramp_jerk(lead_states, v_ego) -> float:
-  """The positive ramp's jerk: `MOONPILOT_JERK_RAMP_V` on the slowest-accelerating close lead (within
-  `MOONPILOT_JERK_RAMP_GAP` or `MOONPILOT_JERK_RAMP_HEADWAY` of `v_ego`), the lead-free ramp with none there."""
+def _close_lead_accel(lead_states, v_ego) -> float | None:
+  """The slowest-accelerating lead within `MOONPILOT_JERK_RAMP_GAP` or `MOONPILOT_JERK_RAMP_HEADWAY` of `v_ego`, whichever
+  is farther; None with none there, so each band supplies its own lead-free end."""
   near = max(MOONPILOT_JERK_RAMP_GAP, MOONPILOT_JERK_RAMP_HEADWAY * v_ego)
-  a = min((a_lead for _, gap, _, a_lead, *_ in lead_states if gap < near), default=MOONPILOT_JERK_RAMP_A_BP[-1])
-  return float(np.interp(a, MOONPILOT_JERK_RAMP_A_BP, MOONPILOT_JERK_RAMP_V))
+  return min((a_lead for _, gap, _, a_lead, *_ in lead_states if gap < near), default=None)
+
+
+def ramp_jerk(lead_states, v_ego) -> float:
+  """The positive ramp's jerk at speed: `MOONPILOT_JERK_RAMP_V` on the slowest-accelerating close lead, the lead-free ramp
+  with none there."""
+  a = _close_lead_accel(lead_states, v_ego)
+  return float(np.interp(MOONPILOT_JERK_RAMP_A_BP[-1] if a is None else a, MOONPILOT_JERK_RAMP_A_BP, MOONPILOT_JERK_RAMP_V))
+
+
+def launch_ramp(lead_states, v_ego) -> float:
+  """The ramp from a standstill: `MOONPILOT_JERK_LAUNCH_V` on the same close lead's launch, its lead-free end with none there
+  — the driver's own build, 1.89 m/s^3 with no lead and 1.35 behind one barely moving."""
+  a = _close_lead_accel(lead_states, v_ego)
+  if a is None:
+    return MOONPILOT_JERK_LAUNCH_V[-1]
+  return float(np.interp(max(a, 0.0), MOONPILOT_JERK_LAUNCH_A_BP, MOONPILOT_JERK_LAUNCH_V))
+
+
+def positive_ramp(lead_states, v_ego) -> float:
+  """The ramp a command above zero may build at: the launch band's at a standstill, `ramp_jerk`'s by twice
+  `MOONPILOT_JERK_LAUNCH_SPEED`, blended across it."""
+  w = float(np.clip(1.0 - v_ego / (2.0 * MOONPILOT_JERK_LAUNCH_SPEED), 0.0, 1.0))
+  return launch_ramp(lead_states, v_ego) * w + ramp_jerk(lead_states, v_ego) * (1.0 - w)
 
 
 def jerk_limit(a_cmd, a_prev, dt, v_ego, comfort_scale=1.0, lead_braking=False, ramp=MOONPILOT_JERK_RAMP_V[-1]) -> float:
@@ -1279,7 +1310,7 @@ class MoonpilotLongitudinalPlanner:
     else:
       self.brake_band.reset()
     braking = lead_braking(lead_states)
-    a_target = float(np.clip(jerk_limit(a_cmd, a_prev, self.dt, v_ego, jerk_scale, braking, ramp_jerk(lead_states, v_ego)), ACCEL_MIN, ACCEL_MAX))
+    a_target = float(np.clip(jerk_limit(a_cmd, a_prev, self.dt, v_ego, jerk_scale, braking, positive_ramp(lead_states, v_ego)), ACCEL_MIN, ACCEL_MAX))
 
     if not math.isfinite(a_target):
       # One guard, so that no input can latch a NaN into the command.
@@ -1477,7 +1508,7 @@ class MoonpilotLongitudinalPlanner:
         model_weight=max(model_weight, min(self.model_fade + t / MOONPILOT_MODEL_BRAKE_FADE_T, 1.0)),
       )
       a_cmd = min(a_cmd, handback_cap + MOONPILOT_HANDBACK_JERK * t)  # the hand-back ceiling, rebuilt over the horizon as in `update`
-      a = float(np.clip(jerk_limit(a_cmd, a, t - t_prev, v, comfort_scale, lead_braking(states), ramp_jerk(states, v)), ACCEL_MIN, ACCEL_MAX))
+      a = float(np.clip(jerk_limit(a_cmd, a, t - t_prev, v, comfort_scale, lead_braking(states), positive_ramp(states, v)), ACCEL_MIN, ACCEL_MAX))
       speeds[i] = v
       accels[i] = a
       dt = float(MOONPILOT_CONTROL_T_IDX[i + 1]) - t if i + 1 < CONTROL_N else 0.0

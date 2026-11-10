@@ -61,6 +61,7 @@ from moonpilot.longitudinal import (
   MOONPILOT_FOLLOW_BAND_T,
   MOONPILOT_JERK_EMERGENCY,
   MOONPILOT_JERK_DOWN,
+  MOONPILOT_JERK_LAUNCH_V,
   MOONPILOT_JERK_RAMP_V,
   MOONPILOT_JERK_UP,
   MOONPILOT_LADDER_V_BP,
@@ -1114,11 +1115,13 @@ class TestPlanner(unittest.TestCase):
       planner.update(sm)
     self.assertGreaterEqual(planner.output_a_target, 0.1)
 
-  def test_a_launch_ramps_in_at_the_pace_of_the_lead_ahead(self):
-    """From a standstill the ask builds instead of stepping to the ladder's rung. Past the comfort first step it climbs at
-    the lead-free ramp with nothing ahead; behind a lead already rolling away at a steady 3 m/s — a far-edge arrival asking
-    the whole rung, from a lead that is not launching — at the floor ramp. The 4.0 m/s^3 limit this replaced let the command
-    follow the rung, and on the car aEgo built at a median 2.17 m/s^3 to a 2.37 m/s^2 peak (`lab accel-ramp`)."""
+  def test_a_launch_ramps_in_at_the_drivers_own_pace_and_at_speed_at_the_lead_ahead(self):
+    """From a standstill the ask builds instead of stepping to the ladder's rung, and it builds at the launch band:
+    `MOONPILOT_JERK_LAUNCH_V` on the lead's launch, its lead-free end with nothing ahead, because the at-speed ramp reaches
+    1 m/s^2 only after 2-4 s where the driver builds aEgo at 1.89 m/s^3 with no lead and 1.35 behind one barely moving, and
+    the car itself moved within 0.15 s of the ask (`lab accel-ramp`). A lead already rolling away at a steady 3 m/s is not
+    launching, so it gets the band's low end. Above twice `MOONPILOT_LAUNCH_SPEED` the band has no say and the ramp is the
+    at-speed one, which `test_jerk.py` pins directly."""
     def launch(lead_fn):
       planner, steps = _planner(), []
       for frame in range(20):
@@ -1129,10 +1132,12 @@ class TestPlanner(unittest.TestCase):
 
     free = launch(lambda t: None)
     rolling = launch(lambda t: _lead(MOONPILOT_STOP_DISTANCE + 3.0 * t, 3.0))
-    for steps, ramp in ((free, MOONPILOT_JERK_RAMP_V[-1]), (rolling, MOONPILOT_JERK_RAMP_V[0])):
+    for steps, ramp in ((free, MOONPILOT_JERK_LAUNCH_V[-1]), (rolling, MOONPILOT_JERK_LAUNCH_V[0])):
       self.assertAlmostEqual(steps[0], MOONPILOT_JERK_UP * DT_MDL, delta=1e-9)
-      for step in steps[1:]:
-        self.assertAlmostEqual(step, ramp * DT_MDL, delta=1e-9)
+      self.assertAlmostEqual(steps[1], ramp * DT_MDL, delta=1e-9)  # the ramp sets the build, not the target
+      for step in steps[1:]:  # and nothing outruns it once the policy's own target takes over
+        self.assertLessEqual(step, ramp * DT_MDL + 1e-9)
+    self.assertGreater(MOONPILOT_JERK_LAUNCH_V[0], MOONPILOT_JERK_RAMP_V[-1])  # the band is what a launch gained
 
   def test_a_stop_behind_a_stopped_lead_eases_in(self):
     s = _fly(12.0, 43.2, 70.0, 0.0, lambda t: 0.0, 30.0)
