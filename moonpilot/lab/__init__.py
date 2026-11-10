@@ -54,7 +54,9 @@ def cached(route: str, name: str, version: int, root: str, build) -> dict[str, n
   d = build(segs)
   d["segments"] = np.array(names)
   os.makedirs(DEFAULT_CACHE, exist_ok=True)
-  np.savez(path, **d)
+  tmp = f"{path}.{os.getpid()}.tmp.npz"  # a write cut short (a kill, a reboot) must never be read back as the cache
+  np.savez(tmp, **d)
+  os.replace(tmp, path)
   return d
 
 
