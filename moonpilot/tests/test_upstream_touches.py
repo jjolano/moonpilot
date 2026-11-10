@@ -46,7 +46,7 @@ ALLOWED = {
   "openpilot/selfdrive/car/card.py": "lateral engagement safety param",
   "openpilot/selfdrive/controls/plannerd.py": "moonpilotState subscription; moonpilot longitudinal planner",
   "openpilot/selfdrive/controls/lib/longitudinal_planner.py": "lead danger factor from moonpilot",
-  "openpilot/selfdrive/controls/lib/longitudinal_mpc_lib/long_mpc.py": "lead_danger_factor kwarg",
+  "openpilot/selfdrive/controls/lib/longitudinal_mpc_lib/long_mpc.py": "lead_danger_factor kwarg, solve through moonpilot.long_mpc",
   "openpilot/selfdrive/controls/controlsd.py": "moonpilot torque lateral controller, response-aligned curvature, acceleration controller, and actuator gate",
   "openpilot/selfdrive/pandad/pandad.cc": "lateral-controls health flag",
   "openpilot/selfdrive/selfdrived/selfdrived.py": "engagement, panda checks, startup/turn/path banners, bounded locationd ride-through",

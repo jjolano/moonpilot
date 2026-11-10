@@ -9,6 +9,7 @@ from openpilot.common.swaglog import cloudlog
 # WARNING: imports outside of constants will not trigger a rebuild
 from openpilot.selfdrive.modeld.constants import index_function
 from openpilot.selfdrive.controls.radard import _LEAD_ACCEL_TAU
+from moonpilot.long_mpc import MoonpilotSolve  # moonpilot seam, see AGENTS.md
 
 if __name__ == '__main__':  # generating code
   from acados.acados_template import AcadosModel, AcadosOcp, AcadosOcpSolver
@@ -215,6 +216,7 @@ class LongitudinalMpc:
   def __init__(self, dt=DT_MDL):
     self.dt = dt
     self.solver = AcadosOcpSolverCython(MODEL_NAME, ACADOS_SOLVER_TYPE, N)
+    self.moonpilot_solve = MoonpilotSolve(T_IDXS, dt)  # moonpilot seam, see AGENTS.md
     self.reset()
     self.source = LongitudinalPlanSource.cruise
 
@@ -347,8 +349,7 @@ class LongitudinalMpc:
     self.solver.constraints_set(0, "lbx", self.x0)
     self.solver.constraints_set(0, "ubx", self.x0)
 
-    self.solution_status = self.solver.solve()
-    self.solve_time = float(self.solver.get_stats('time_tot')[0])
+    self.solution_status, self.solve_time = self.moonpilot_solve(self.solver, self.x0, self.x_sol, self.u_sol)  # moonpilot seam, see AGENTS.md
 
     for i in range(N+1):
       self.x_sol[i] = self.solver.get(i, 'x')
