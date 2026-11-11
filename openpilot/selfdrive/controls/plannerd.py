@@ -22,6 +22,7 @@ def main():
   pm = messaging.PubMaster(['longitudinalPlan', 'driverAssistance'])
   sm = messaging.SubMaster(['carControl', 'carState', 'controlsState', 'radarState', 'modelV2', 'selfdriveState',
                            'vehicleParameters', 'moonpilotState'],  # moonpilot seam, see AGENTS.md
+                           ignore_alive=['moonpilotState'], ignore_valid=['moonpilotState'],  # a dead leadd must not fail the plan; see AGENTS.md
                            poll='modelV2')
 
   while True:
