@@ -13,6 +13,7 @@ from openpilot.selfdrive.controls.lib.drive_helpers import get_accel_from_plan
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import LongitudinalMpc, T_IDXS as MPC_T_IDXS
 from openpilot.selfdrive.controls.lib.longitudinal_planner import CONTROL_N_T_IDX
 from opendbc.car.structs import car
+from moonpilot.features import LONGITUDINAL
 
 from moonpilot.lab import drive_config
 from moonpilot.lab.planner import MESSAGES, extract
@@ -60,7 +61,7 @@ def _route_job(job):
     d = extract(route, root)
     cp = messaging.log_from_bytes(d["cp"].tobytes(), car.CarParams)
     _, params = drive_config(route, root)
-    stock_error_allowed = not cp.openpilotLongitudinalControl or params.get("MoonpilotLongitudinal") in ("0", "false", "False", "")
+    stock_error_allowed = not cp.openpilotLongitudinalControl or params.get(LONGITUDINAL.key) in ("0", "false", "False", "")
 
     fork, upstream = LongitudinalMpc(), LongitudinalMpc()
     fork_proxy, upstream_proxy = _SolverProxy(fork.solver), _SolverProxy(upstream.solver)
