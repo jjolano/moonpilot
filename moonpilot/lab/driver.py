@@ -529,9 +529,10 @@ def _decel(args):
   print(f"    hard-brake min gap, default calibration (20/25/30 m/s x -3.5/-5, then lagged): {' '.join(f'{g:5.1f}' for g in _hard_gaps())}")
 
 
-def _follow_stretches(d, calibration):
+def _follow_stretches(d, calibration, windows_out=None):
   """Every 30 s of manual following behind one radar track as a flight job (set speed 3 m/s over the driver's highest), and the
-  driver's own stretch: (jobs, rows of accel p90, p99, bursts, median headway, closest gap, accel p1)."""
+  driver's own stretch: (jobs, rows of accel p90, p99, bursts, median headway, closest gap, accel p1). `windows_out`, when given,
+  gets each stretch's slice of `d`, job for job."""
   v, gap, v_lead = d["v"], d["gap"], d["v_lead"]
   win, jobs, drv = round(30.0 / DT_MDL), [], []
   cut = np.r_[True, (np.diff(d["route_id"]) != 0) | (np.abs(np.diff(v_lead)) > 2.5)]
@@ -541,6 +542,8 @@ def _follow_stretches(d, calibration):
       if np.max(np.abs(np.diff(gap[w]) - (v_lead[w][:-1] - v[w][:-1]) * DT_MDL)) > 1.0 or gap[w].max() > 9.0 * max(v[w].min(), 1.0):
         continue
       jobs.append((v[w], gap[w], v_lead[w], d["a"][w][0], calibration, (v[w].max() + 3.0) * CV.MS_TO_KPH))
+      if windows_out is not None:
+        windows_out.append(w)
       a_s = moving_mean(d["a"][w], 10)
       drv.append((np.percentile(a_s, 90), np.percentile(a_s, 99), len(burst_starts(a_s, dt=DT_MDL)),
                   np.median(gap[w] / np.maximum(v[w], 0.1)), gap[w].min(), np.percentile(a_s, 1)))
