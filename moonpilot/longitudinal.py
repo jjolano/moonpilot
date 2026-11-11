@@ -141,6 +141,11 @@ MOONPILOT_TRACK_BRAKE_T = 3.0  # s; cap on how much braking-lead speed loss is m
 MOONPILOT_TRACK_ACCEL = 0.5  # share of positive lead acceleration matched while arriving
 MOONPILOT_RECOVER_T = 6.0  # s; outside the band its edge is closed in at the gap error over this...
 MOONPILOT_RESPONSE_T = 1.5  # s; ...with the speed error answered over this
+# ...except for a car at rest behind a lead that is leaving it: it cannot back up, the gap opens by itself, and the
+# recovery would otherwise cancel the far edge's ask for the whole launch. Faded out over these two, so neither the
+# jerk limiter nor the brake band sees a step.
+MOONPILOT_RECOVER_REST_SPEED = 1.0  # m/s; below it, at `MOONPILOT_LEAVE_DEADBAND` of opening and past
+MOONPILOT_RECOVER_OPEN_BAND = 0.3  # m/s of opening past the deadband the fade completes
 MOONPILOT_CATCH_UP_CLOSING = 0.5  # m/s; the fastest a lead beyond the band is closed on
 MOONPILOT_REACH_LAG_T = 0.5  # s of closing held back from the physical gap a close-in arrival may spend
 MOONPILOT_CATCH_UP_SLACK = 2.0  # m past the far edge left alone: a car parked a little long behind a stopped lead stays put
@@ -386,6 +391,15 @@ def lead_band(v_lead, t_follow, a_slow=0.0):
   return near, near + MOONPILOT_FOLLOW_BAND_T * v_pred
 
 
+def recover_share(v_ego, closing) -> float:
+  """The near-edge recovery's share: full unless the car is at rest with the lead leaving it — `1 - rest * open` over
+  `MOONPILOT_RECOVER_REST_SPEED` and `MOONPILOT_RECOVER_OPEN_BAND` past `MOONPILOT_LEAVE_DEADBAND`, both clamped, so
+  it reaches 0 without stepping."""
+  rest = float(np.clip(1.0 - v_ego / MOONPILOT_RECOVER_REST_SPEED, 0.0, 1.0))
+  opening = float(np.clip((-closing - MOONPILOT_LEAVE_DEADBAND) / MOONPILOT_RECOVER_OPEN_BAND, 0.0, 1.0))
+  return 1.0 - rest * opening
+
+
 def lead_accel(v_ego, gap, v_lead, a_lead, t_follow, sustain=None, a_slow=0.0) -> float:
   """The lead law: where to be, by when, from where the lead is going — then the stopping floor as the hard bound.
 
@@ -400,7 +414,9 @@ def lead_accel(v_ego, gap, v_lead, a_lead, t_follow, sustain=None, a_slow=0.0) -
   lead's. Both are kinematic predictions rather than reactions, and continuous through zero closing.
 
   Outside the band the edge is recovered gently: inside the near edge over `MOONPILOT_RECOVER_T` and
-  `MOONPILOT_RESPONSE_T`; beyond the far edge, closing at no more than `MOONPILOT_CATCH_UP_CLOSING`.
+  `MOONPILOT_RESPONSE_T`; beyond the far edge, closing at no more than `MOONPILOT_CATCH_UP_CLOSING`. The near-edge
+  recovery stands down (`recover_share`) for a car at rest behind a lead that is leaving it: it cannot back up, and
+  the recovery would otherwise cancel the far edge's ask for the whole launch.
 
   The stopping floor is the kinematic term kept as a bound, in the frame the gap actually closes in: the constant decel
   that keeps the slack past a rest anchor, less `MOONPILOT_STOP_LAG_T` of closing, against the lead's raw,
@@ -418,7 +434,7 @@ def lead_accel(v_ego, gap, v_lead, a_lead, t_follow, sustain=None, a_slow=0.0) -
   share = float(np.interp(gap / max(v_ego, 1.0), MOONPILOT_TRACK_BRAKE_BP, MOONPILOT_TRACK_BRAKE_V))
   a_track = share * min(max(-a_slow, 0.0), v_pred / MOONPILOT_TRACK_BRAKE_T)
   a -= _arrive(gap - near, closing, MOONPILOT_ARRIVE_MIN_T_REST + (MOONPILOT_ARRIVE_MIN_T - MOONPILOT_ARRIVE_MIN_T_REST) * moving, a_track, reach)
-  a += min(gap - near, 0.0) / (MOONPILOT_RECOVER_T * MOONPILOT_RESPONSE_T)
+  a += recover_share(v_ego, closing) * min(gap - near, 0.0) / (MOONPILOT_RECOVER_T * MOONPILOT_RESPONSE_T)
   catch_up = min(max(gap - far - MOONPILOT_CATCH_UP_SLACK, 0.0) / MOONPILOT_RECOVER_T, MOONPILOT_CATCH_UP_CLOSING)
   a += max(catch_up - max(closing, 0.0), 0.0) / MOONPILOT_RESPONSE_T
   # The floor reads the raw estimate, its braking credited over MOONPILOT_LEAD_PREVIEW_T: a real brake, without lag.

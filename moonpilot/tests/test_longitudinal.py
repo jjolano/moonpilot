@@ -54,6 +54,7 @@ from moonpilot.longitudinal import (
   MOONPILOT_FOLLOW_BAND_T,
   MOONPILOT_LADDER_V_BP,
   MOONPILOT_LEAD_PREVIEW_T,
+  MOONPILOT_LEAVE_DEADBAND,
   MOONPILOT_MIN_SLACK,
   MOONPILOT_MODEL_BRAKE_RELEASE,
   MOONPILOT_MODEL_BRAKE_THRESHOLD,
@@ -82,6 +83,7 @@ from moonpilot.longitudinal import (
   model_release,
   moonpilot_longitudinal_planner,
   policy,
+  recover_share,
   required_decel,
   stopping_decel,
   lead_band,
@@ -596,6 +598,22 @@ class TestLeadLaw(unittest.TestCase):
             self.assertLessEqual(lead_accel(v_ego, near * frac, v_lead, 0.0, self.T_FOLLOW, a_slow=a_slow), 1e-9)
             exercised += 1
     self.assertGreater(exercised, 0)
+
+  def test_the_near_edge_recovery_stands_down_for_a_launch(self):
+    """A car at rest inside the near edge cannot back up, and behind a lead that is leaving the gap opens by itself, so
+    the recovery stands down there: the far edge's ask is no longer canceled for the whole launch. A lead still at
+    rest, a lead being closed on, and anything at speed keep it exactly — and the stand-down is continuous in both of
+    its inputs, so the jerk limiter and the brake band see no step."""
+    gap = MOONPILOT_STOP_REST - 1.0  # inside the near edge at rest, where the recovery is the whole brake
+    self.assertLess(lead_accel(0.0, gap, MOONPILOT_LEAVE_DEADBAND, 0.0, self.T_FOLLOW), -0.05)  # a lead at rest holds
+    self.assertGreater(lead_accel(0.0, gap, 1.0, 0.0, self.T_FOLLOW), 0.0)  # a leaving lead is launched after
+    # closing on the same gap is still braked for: no standstill, no stand-down
+    self.assertLess(lead_accel(5.0, gap + 6.0, 4.0, 0.0, self.T_FOLLOW), -0.1)
+    self.assertEqual(recover_share(5.0, -1.0), 1.0)
+    self.assertEqual(recover_share(0.0, -MOONPILOT_LEAVE_DEADBAND), 1.0)
+    self.assertEqual(recover_share(0.0, -1.0), 0.0)
+    self._assert_continuous(lambda v: recover_share(v, -0.5), 0.0, 2.0, "stand-down across the rest speed")
+    self._assert_continuous(lambda c: recover_share(0.0, c), -0.8, 0.0, "stand-down across the deadband")
 
 
 class TestDriverLadder(unittest.TestCase):

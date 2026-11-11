@@ -30,7 +30,7 @@ from moonpilot.latency import MOONPILOT_LAG_BLOCKS_KEY, MOONPILOT_LAG_HISTORY_KE
 from moonpilot.radar_latency import MOONPILOT_RADAR_LATENCY_KEY, MOONPILOT_RADAR_LATENCY_SAMPLES_KEY
 from moonpilot.features import BRAKE_BAND, ENGINE_COAST
 from moonpilot.longcontrol import MoonpilotLongControl
-from moonpilot.longitudinal import MoonpilotLongitudinalPlanner, lead_band
+from moonpilot.longitudinal import MOONPILOT_STOP_REST, MoonpilotLongitudinalPlanner, lead_band
 from moonpilot.tests.harness import fly, inputs, lead, planner as make_planner, plant_planner
 from moonpilot.lab import DEFAULT_ROOT, cached, drive_config, expand, lag_s, manual_authority, moving_mean, param_index, p95_abs_err, route_moving_mean, runs
 from moonpilot.lab.routes import STOP_SHAPE_ROUTE, add_calibration_arg, add_routes_arg
@@ -1541,7 +1541,8 @@ def _launch_frames(args):
 LAUNCH_FLY_PRE_S, LAUNCH_FLY_POST_S, LAUNCH_FLY_REST_GAP = 2.0, 8.0, 4.3
 LAUNCH_FLY_MIN_POST_S = 3.0  # scorecard: a launch needs this much after the onset, not the whole 8 s
 LAUNCH_ARMS = {"as flown": (None, None), f"own rest gap {LAUNCH_FLY_REST_GAP}": (LAUNCH_FLY_REST_GAP, None),
-               f"{LAUNCH_FLY_REST_GAP}, reserve 0": (LAUNCH_FLY_REST_GAP, 0.0)}
+               f"{LAUNCH_FLY_REST_GAP}, reserve 0": (LAUNCH_FLY_REST_GAP, 0.0),
+               f"planner's rest gap {MOONPILOT_STOP_REST}": (MOONPILOT_STOP_REST, None)}
 
 
 def _launch_fly_one(job, gain=None):
