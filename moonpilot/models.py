@@ -1,50 +1,36 @@
-"""The model store, and the one place every rule about it lives.
+"""The model store and boot commit.
 
-A driver may replace the model the car drives with one from the openmodels catalog. That is a
-selection, not a setting: the catalog publishes bytes and a structural identity, the device
-downloads and compiles them (moonpilot/modelcatalog.py, moonpilot/modelbuild.py, moonpilot/modelsd.py),
-and this module says which selections exist, where their files live, which of them a boot may
-actually run, and what every panel prints about them.
+A driver may replace the model the car drives with one from the openmodels catalog. The catalog
+publishes bytes and a structural identity, the device downloads and compiles them
+(`moonpilot/modelcatalog.py`, `moonpilot/modelbuild.py`, `moonpilot/modelsd.py`), and this module
+owns the store and says which selection the next boot may run. Protocol and admission rules live in
+`moonpilot/modelprotocols.py`, worker request/status rules in `moonpilot/modelstatus.py`, and panel
+wording and chooser state in `moonpilot/modelview.py`.
 
-Four things are worth knowing before reading the rest.
+Three things are worth knowing before reading the rest.
 
-**Selections are strings, and `""` is the bundled model.** A non-empty selection is one 64-hex recipe
-digest from the catalog. The string is the whole identity: it names the package directory and build
-directory, so a selection that is not installed is a selection whose directories do not exist.
+**Selections are strings, and `""` is the bundled model.** Non-empty selections are 64-hex recipe
+digests from the catalog; the value names the package and build directories.
 
-**Nothing here is on a load path.** The modules the manager and the two UI trees import at boot —
-`moonpilot.procs`, `moonpilot.ui.settings*` — import this one, so it is stdlib plus
-`moonpilot.paths` and nothing else. The catalog SDK, tinygrad and the runtime are all behind
-imports the worker and the seams do themselves.
-
-**The boot snapshot is the seam between the worker and the car.** `commit_boot_selection` runs
-once, in the manager, after the `CLEAR_ON_MANAGER_START` clears and the default seeding and before
-the first `ensure_running`, and writes every check it made into `MoonpilotModelsBoot`. The model
-processes read that param and nothing else, because a per-process read of the desired value is not
-a coherent switch: `dmonitoringmodeld` runs during the offroad driver preview and can outlive an
-onroad cycle, so two processes reading two params at two times can load two generations.
+**The boot snapshot is the model-process input.** `commit_boot_selection` publishes
+`MoonpilotModelsBoot` once at manager startup.
 
 **A failure is never silent and never a fallback mid-drive.** Every refusal ends up as a string in
 the boot entry's `fallback` and the car runs the bundled model — the driver's selection is
 preserved, the panel shows why, and nothing swaps a model under a running prediction.
 """
 
-import datetime
+
 import hashlib
 import json
 import os
-import shutil
-import time
-from collections.abc import Sequence
-from dataclasses import dataclass
 from typing import Any
 
-from moonpilot import paths
+from moonpilot import modelprotocols, paths
+
 
 # --- param rows --------------------------------------------------------------
-# The declared defaults and flags are in moonpilot/params_keys.h. Read them with
-# `params.get(key, return_default=True)` where a default exists -- `get_bool` ignores the declared
-# default and reports off for an unset param (AGENTS.md, Features).
+# Read declared defaults with return_default=True; get_bool ignores an unset row's declared default.
 DRIVING_KEY = "MoonpilotModelsDriving"
 MONITORING_KEY = "MoonpilotModelsMonitoring"
 BOOT_KEY = "MoonpilotModelsBoot"
@@ -53,21 +39,27 @@ STATUS_KEY = "MoonpilotModelsStatus"
 ACTIVE_DRIVING_KEY = "MoonpilotModelsActiveDriving"
 ACTIVE_MONITORING_KEY = "MoonpilotModelsActiveMonitoring"
 FAVS_KEY = "MoonpilotModelsFavs"
+ACTIVE_FAILURE_PREFIX = "stock: "
+
+
+def active_failure(reason: str) -> str:
+  return f"{ACTIVE_FAILURE_PREFIX}{reason}"
+
+
+def active_failure_reason(text: str) -> str | None:
+  return text[len(ACTIVE_FAILURE_PREFIX):] if text.startswith(ACTIVE_FAILURE_PREFIX) else None
+
+REBOOT_KEY = "DoReboot"  # upstream's own param, read by the manager power path (manager.py:204)
 
 # Two kinds, because two processes run models and a param has one writer: `modeld` reads the
 # driving half of the boot snapshot, `dmonitoringmodeld` the monitoring half.
-DRIVING = "driving"
-MONITORING = "monitoring"
-KINDS = (DRIVING, MONITORING)
-DESIRED_KEY = {DRIVING: DRIVING_KEY, MONITORING: MONITORING_KEY}
-ACTIVE_KEY = {DRIVING: ACTIVE_DRIVING_KEY, MONITORING: ACTIVE_MONITORING_KEY}
+DESIRED_KEY = {modelprotocols.DRIVING: DRIVING_KEY, modelprotocols.MONITORING: MONITORING_KEY}
+ACTIVE_KEY = {modelprotocols.DRIVING: ACTIVE_DRIVING_KEY, modelprotocols.MONITORING: ACTIVE_MONITORING_KEY}
 
 # The camera resolutions a driving build compiles for: the two the device's cameras report
 # (`_ar_ox_fisheye`, `_os_fisheye`). A build is only valid for the set it was compiled for, which
 # is why the resolutions are part of the build key and the record.
 CAMERA_RESOLUTIONS = ((1928, 1208), (1344, 760))
-# The DM warp compiles to the model's own input size (openpilot/common/transformations/model.py).
-DM_INPUT_SIZE = (1440, 960)
 
 
 # The compiler and the runtime must share this one definition.
@@ -76,11 +68,25 @@ def nv12_copy_size(stride: int, y_height: int, uv_height: int) -> int:
 
 
 SCHEMA = 1
+NOT_BUILT = "not built yet"
+BUILD_FAILED = "the build failed"
+BUILD_INCOMPLETE = "the build is incomplete"
+BUILD_FAILED_PREFIX = "build failed: "
+BUILD_MISMATCH = "the build was made for another protocol"
+ARTIFACT_CHANGED = "the installed bytes changed since the build"
+UNKNOWN_SELECTION = "not a selection"
+WRONG_KIND = "selected for the other kind"
+SELECTED_HINT = "switch to another model first"
+PACKAGED = "packaged"
+BUILT = "built"
+FAILED = "failed"
+MODEL_STATES = (PACKAGED, BUILT, FAILED)
+
+def short(value: str) -> str:
+  return value[:12]
 
 
 # --- store layout ------------------------------------------------------------
-# `<models_root>/` is `data_dir()`'s tree: on the data partition, beside the params, and not
-# managed by the drive deleter -- so the caps below are the store's own bound (AGENTS.md, Storage).
 def models_root() -> str:
   return paths.data_dir("models")
 
@@ -104,12 +110,11 @@ def builds_dir() -> str:
 
 
 def tmp_dir() -> str:
-  """Scratch space for the worker. Inside the store on purpose: `dump_oob`'s and tinygrad's temp
-  files must never land in the checkout, which is git state (AGENTS.md, Storage)."""
+  """Scratch space for the worker; tinygrad's temporary files stay out of the checkout."""
   return os.path.join(models_root(), "tmp")
 
 
-def build_key(selection: str, protocol: str, resolutions: tuple[tuple[int, int], ...] = CAMERA_RESOLUTIONS) -> str:
+def build_key(selection: str, protocol: str, resolutions: tuple[tuple[int, int], ...]) -> str:
   """The build directory name: one directory per (selection, protocol, resolution set).
 
   A changed member, protocol or resolution set is a *new* directory rather than a stale one that
@@ -120,7 +125,7 @@ def build_key(selection: str, protocol: str, resolutions: tuple[tuple[int, int],
   return hashlib.sha256(raw.encode()).hexdigest()
 
 
-def build_dir(selection: str, protocol: str, resolutions: tuple[tuple[int, int], ...] = CAMERA_RESOLUTIONS) -> str:
+def build_dir(selection: str, protocol: str, resolutions: tuple[tuple[int, int], ...]) -> str:
   return os.path.join(builds_dir(), build_key(selection, protocol, resolutions))
 
 
@@ -136,552 +141,15 @@ def is_recipe(selection: str) -> bool:
   return len(selection) == 64 and all(c in "0123456789abcdef" for c in selection)
 
 
-def valid_selection(selection: str) -> bool:
-  return is_recipe(selection)
 
 
-# --- protocols: what may be selected -----------------------------------------
-# A protocol is a statement about an *interchange controller*, not about a catalog entry: it names
-# the roles a selection must have, the inputs the fork's runtime feeds each role, the outputs a
-# consumer in this tree reads, and how the action head is contracted. Admission
-# (moonpilot/modelcatalog.py) checks a recipe against exactly this table, and nothing else may
-# decide what the device executes.
-#
-# Two things about the shape:
-#
-# - **The slice requirement is the union over the members, not a per-role pin.** Every consumer
-#   here (`fill_model_msg`, `fill_pose_msg`, `parse_model_output`) reads names off one dict, so what
-#   has to hold is that *some* member produces each required name. That is the property the real
-#   split generations satisfy: a family-C set puts `lane_lines`/`lead` in the off-policy member and
-#   `plan`/`desire_state` in whichever policy member carries them, and pinning the slices per role
-#   refuses sets that run fine -- 24 of the catalog's family-C recipes are admissible under the
-#   union and would be refused by any per-role pin that also admits them.
-# - **`action_contract` is per protocol, and it is the one place a wrong guess is a steering
-#   request.** `plan` decodes both lateral and longitudinal from the trajectory through upstream's
-#   `get_action_from_model`; `lateral-accel` is that same current function's `action` branch
-#   (`action[0,0] / max(1, v_ego)**2`, i.e. the head's second column is an acceleration);
-#   `curvature-100` is the older convention (`action[0,0] / 100`, the head's first column is a
-#   curvature times 100) that `openpilot@9757bf10` used. Upstream switched the meaning of that head
-#   in `249cafe897deb433944c84fa6c3c6ce568f727e1` ("Prereqs deep models", 2026-06-01), and no shape
-#   in the catalog distinguishes the two eras, so admission refuses an action-declaring member on
-#   the wrong side of that date rather than scale it by the other convention's constant.
-LATERAL_ACCEL_SINCE = datetime.date(2026, 6, 1)
 
-# `ModelConstants`-era `STOCK_SLICES` minus `pad`: every name `fill_model_msg`, `fill_pose_msg` and
-# the loop's own `prev_feat` read from the model output dict.
-DRIVING_SLICES = frozenset(
-  {
-    "meta",
-    "desire_pred",
-    "pose",
-    "wide_from_device_euler",
-    "road_transform",
-    "lane_lines",
-    "lane_lines_prob",
-    "road_edges",
-    "lead",
-    "lead_prob",
-    "hidden_state",
-    "plan",
-    "desire_state",
-  }
-)
 
-# What `dmonitoringmodeld`'s `parse_model_output`/`fill_driver_data` read. `sleep_prob_*` and
-# `features` are deliberately absent: they are newer heads, nothing in this tree reads
-# `driverStateV2.sleepProb` (`openpilot/selfdrive/monitoring/policy.py`), and a legacy 551-slice
-# model that lacks them is safe rather than degraded.
-DM_SLICES = frozenset(
-  {
-    "face_descs_lhd",
-    "face_descs_rhd",
-    "face_prob_lhd",
-    "face_prob_rhd",
-    "left_eye_prob_lhd",
-    "left_eye_prob_rhd",
-    "right_eye_prob_lhd",
-    "right_eye_prob_rhd",
-    "left_blink_prob_lhd",
-    "left_blink_prob_rhd",
-    "right_blink_prob_lhd",
-    "right_blink_prob_rhd",
-    "sunglasses_prob_lhd",
-    "sunglasses_prob_rhd",
-    "using_phone_prob_lhd",
-    "using_phone_prob_rhd",
-    "wheel_on_right",
-  }
-)
 
-CONFIGURATION_KEYS = ("frame_skip", "LAT_SMOOTH_SECONDS", "LONG_SMOOTH_SECONDS")
 
 
-@dataclass(frozen=True)
-class Protocol:
-  """One way of running a model, pinned to the roles, inputs and outputs a consumer here needs."""
 
-  id: str
-  kind: str
-  roles: tuple[str, ...]
-  role_inputs: dict[str, frozenset[str]]  # required ONNX input names, per role
-  optional_inputs: dict[str, frozenset[str]]  # fed and packed when the member declares them
-  slices: frozenset[str]  # required output names, somewhere in the member set
-  optional_slices: frozenset[str]  # published when present, unread either way
-  action_contract: str
-  required_configuration: tuple[str, ...] = CONFIGURATION_KEYS
 
-
-SUPERCOMBO = Protocol(
-  id="comma.supercombo.v1",
-  kind=DRIVING,
-  roles=("supercombo",),
-  role_inputs={
-    "supercombo": frozenset({"img", "big_img", "features_buffer", "desire_pulse", "traffic_convention", "action_t"}),
-  },
-  optional_inputs={"supercombo": frozenset()},
-  slices=DRIVING_SLICES,
-  optional_slices=frozenset({"action", "desired_curvature", "sim_pose", "stop_lines", "stop_lines_prob", "pad"}),
-  action_contract="lateral-accel",
-)
-
-SPLIT_VISION_POLICY = Protocol(
-  id="comma.split-vision-policy.v1",
-  kind=DRIVING,
-  roles=("vision", "on_policy"),
-  role_inputs={
-    "vision": frozenset({"img", "big_img"}),
-    "on_policy": frozenset({"desire_pulse", "features_buffer", "traffic_convention"}),
-  },
-  optional_inputs={"vision": frozenset(), "on_policy": frozenset({"action_t"})},
-  slices=DRIVING_SLICES,
-  optional_slices=frozenset({"action", "desired_curvature", "sim_pose", "pad"}),
-  action_contract="plan",
-)
-
-SPLIT_VISION_OFF_ON = Protocol(
-  id="comma.split-vision-off-on.v1",
-  kind=DRIVING,
-  roles=("vision", "off_policy", "on_policy"),
-  role_inputs={
-    "vision": frozenset({"img", "big_img"}),
-    "off_policy": frozenset({"desire_pulse", "features_buffer", "traffic_convention"}),
-    "on_policy": frozenset({"desire_pulse", "features_buffer", "traffic_convention"}),
-  },
-  optional_inputs={
-    "vision": frozenset(),
-    "off_policy": frozenset({"action_t"}),
-    "on_policy": frozenset({"action_t"}),
-  },
-  slices=DRIVING_SLICES,
-  optional_slices=frozenset({"desired_curvature", "sim_pose", "pad"}),
-  action_contract="curvature-100",
-)
-
-DMONITORING = Protocol(
-  id="comma.dmonitoring.v1",
-  kind=MONITORING,
-  roles=("dmonitoring",),
-  role_inputs={"dmonitoring": frozenset({"input_img", "calib"})},
-  optional_inputs={"dmonitoring": frozenset()},
-  slices=DM_SLICES,
-  optional_slices=frozenset({"sleep_prob_lhd", "sleep_prob_rhd", "features"}),
-  action_contract="plan",
-  required_configuration=(),
-)
-
-PROTOCOLS: tuple[Protocol, ...] = (SUPERCOMBO, SPLIT_VISION_POLICY, SPLIT_VISION_OFF_ON, DMONITORING)
-
-
-def protocol(protocol_id: str) -> Protocol | None:
-  return next((p for p in PROTOCOLS if p.id == protocol_id), None)
-
-
-def protocol_for_roles(roles: Any) -> Protocol | None:
-  """The protocol whose role set is exactly `roles`. A role set no protocol claims is refused
-  rather than mapped onto the nearest one."""
-  wanted = frozenset(roles)
-  return next((p for p in PROTOCOLS if frozenset(p.roles) == wanted), None)
-
-
-def features_role(proto: Protocol) -> str:
-  """The role whose output carries `hidden_state`, i.e. the one whose feature the runtime feeds
-  back as `prev_feat`. Every protocol has exactly one, which admission enforces."""
-  return proto.roles[0] if len(proto.roles) == 1 else "vision"
-
-
-# --- what a runnable member set looks like -----------------------------------
-# Admission (moonpilot/modelcatalog.py) checks a catalog recipe with these, and modelbuild checks
-# the stored members again before compiling. One rule, two callers, so a recipe the panel offers is
-# a recipe the worker will accept.
-#
-# Nothing here needs the catalog SDK: every input is a plain dict of what a document recorded --
-# `input_shapes`, `output_slices`, `targets`, `format` -- which is exactly what the catalog's
-# metadata reader and the stored `recipe.json` both carry.
-#
-# A member that declares an input the protocol does not list is refused rather than half-fed. That
-# is the rule that refuses the pre-`action_t` monoliths (`lateral_control_params`,
-# `prev_desired_curv`, `nav_features`), and it is also what would refuse a member declaring
-# `prev_action`: no recipe in the 2026-09-19 catalog declares it, so nothing here carries the
-# queue for it, and a model that needs one would be a model this runtime cannot run yet.
-UNSUPPORTED_INPUT = "needs inputs this runtime does not supply"
-UNKNOWN_ROLE = "a role this protocol does not have"
-MISSING_OUTPUTS = "missing outputs this runtime publishes"
-HIDDEN_STATE_MISMATCH = "the vision feature width does not match the policy's features_buffer"
-NOT_ONNX = "not an ONNX model"
-NOT_QCOM = "chestnut/AMD models are not selectable"
-NO_METADATA = "the catalog records no interface for this member"
-ACTION_ERA = "predates the fork's action contract"
-
-
-def member_reason(role: str, proto: Protocol, member: dict) -> str | None:
-  """Why one member cannot be run as this protocol's `role`, or `None`.
-
-  `member` carries `input_shapes` (name -> shape), `slices` (name -> [start, stop, step]), `format`,
-  `targets` and `published_at` (ISO 8601, the catalog's own observation of when the artifact was
-  published; absent for a stored package, where the check has already been made at install time).
-  """
-  required = proto.role_inputs.get(role)
-  if required is None:
-    return UNKNOWN_ROLE
-  shapes = member.get("input_shapes")
-  if not isinstance(shapes, dict) or not shapes:
-    return NO_METADATA
-  if member.get("format") != "onnx":
-    return NOT_ONNX
-  targets = member.get("targets")
-  if isinstance(targets, list) and "QCOM" not in targets:
-    return NOT_QCOM
-  unsupported = set(shapes) - required - proto.optional_inputs.get(role, frozenset())
-  if unsupported:
-    return UNSUPPORTED_INPUT
-  if not required <= set(shapes):
-    return UNSUPPORTED_INPUT
-  return _action_era_reason(proto, member)
-
-
-def _action_era_reason(proto: Protocol, member: dict) -> str | None:
-  """The action head's *meaning* changed on 2026-06-01, and nothing in a model's structure records
-  which side of it a head was trained on. The protocol pins the convention it decodes, so a member
-  that declares an `action` slice on the wrong side of the change is refused rather than scaled by
-  the other era's constant -- a wrong scale factor here is a wrong steering request, silently."""
-  if "action" not in (member.get("slices") or {}):
-    return None
-  published = member.get("published_at")
-  if not published:
-    return None
-  try:
-    published_date = datetime.datetime.fromisoformat(published).date()
-  except (TypeError, ValueError):
-    return None
-  # `plan` and `lateral-accel` both end in upstream's current function, which decodes the `action`
-  # head when one is present -- so an action head is only admissible there after the change, and only
-  # before it under the family-C protocol, whose decode is pinned to the old convention.
-  old_head = published_date < LATERAL_ACCEL_SINCE
-  if proto.action_contract == "curvature-100":
-    return ACTION_ERA if not old_head else None
-  return ACTION_ERA if old_head else None
-
-
-def set_reason(proto: Protocol, members: dict[str, dict]) -> str | None:
-  """Why a whole member set cannot be run, or `None`: the role set must be the protocol's, every
-  member must pass `member_reason`, the union of their outputs must cover what the consumers read,
-  and the feature the runtime feeds back must have the width the policy's buffer expects.
-
-  The union is the right shape here rather than a per-role pin -- see the comment above `PROTOCOLS`.
-  """
-  if frozenset(members) != frozenset(proto.roles):
-    return NOT_INSTALLED
-  for role, member in members.items():
-    if (reason := member_reason(role, proto, member)) is not None:
-      return f"{role}: {reason}"
-  published = set()
-  for member in members.values():
-    published |= set(member.get("slices") or {})
-  if missing := proto.slices - published:
-    return f"{MISSING_OUTPUTS}: {', '.join(sorted(missing))}"
-  vision = members.get(features_role(proto))
-  if vision is None:
-    return NOT_INSTALLED
-  hidden = (vision.get("slices") or {}).get("hidden_state")
-  width = _slice_width(hidden)
-  policy = members.get("on_policy") or members.get("supercombo") or vision
-  buffer_shape = (policy.get("input_shapes") or {}).get("features_buffer")
-  if width is not None and isinstance(buffer_shape, list) and buffer_shape:
-    if width != buffer_shape[-1]:
-      return HIDDEN_STATE_MISMATCH
-  return None
-
-
-def _slice_width(bounds: Any) -> int | None:
-  try:
-    start, stop = bounds[0], bounds[1]
-  except (TypeError, IndexError):
-    return None
-  if not isinstance(start, int) or not isinstance(stop, int):
-    return None
-  return stop - start
-
-
-# --- capacity ----------------------------------------------------------------
-MAX_ARTIFACT_BYTES = 300 * 1024 * 1024  # a member bigger than this is refused before any download
-MIN_FREE_BYTES = 2 * 1024**3  # headroom the store leaves the rest of /data
-MAX_STORE_BYTES = 8 * 1024**3  # packages + builds together; removal is the driver's action
-
-
-def _tree_bytes(root: str) -> int:
-  total = 0
-  for dirpath, _dirnames, filenames in os.walk(root):
-    for name in filenames:
-      path = os.path.join(dirpath, name)
-      try:
-        total += os.lstat(path).st_size
-      except OSError:
-        continue
-  return total
-
-
-def store_usage() -> int:
-  """Bytes under `packages/` and `builds/`. The digest cache counts, being hard links into it."""
-  return sum(_tree_bytes(d) for d in (packages_dir(), builds_dir()))
-
-
-def storage_status() -> dict:
-  """The `storage` member of the status snapshot: used, free, limit -- all in bytes."""
-  return {"used": store_usage(), "free": free_bytes(), "limit": MAX_STORE_BYTES}
-
-
-def free_bytes() -> int:
-  try:
-    return int(shutil.disk_usage(models_root()).free)
-  except OSError:
-    return 0
-
-
-def capacity_reason(declared_bytes: int) -> str | None:
-  """Why a package cannot be fetched now, or None. Called before any work starts, so a refusal is
-  a driver-visible sentence and never a download that dies at 90 %."""
-  if declared_bytes > MAX_ARTIFACT_BYTES:
-    return TOO_LARGE
-  # Three copies while it is in flight: the staging file, the digest-cache hard link and the build
-  # output, none of which can be assumed to share blocks.
-  demand = declared_bytes * 3 + MIN_FREE_BYTES
-  if free_bytes() - demand < 0:
-    return NO_SPACE
-  if store_usage() + declared_bytes > MAX_STORE_BYTES:
-    return STORE_FULL
-  return None
-
-
-# --- request and status codecs -----------------------------------------------
-# One JSON op in, one JSON snapshot out, both on params: the panels never touch the store, and the
-# worker never touches a widget. A malformed request reads as None -- dropped, never retried,
-# because a retry of something unparsable is a loop.
-OPS = ("refresh", "install", "remove", "cancel")
-PHASES = ("waiting-network", "waiting-offroad", "downloading", "verifying", "building", "done", "error", "canceled")
-
-
-def job_active(job: dict | None) -> bool:
-  """Whether a published job can still be canceled."""
-  return bool(job) and job.get("phase") in PHASES[:5]
-
-
-def request(params: Any, op: str, selection: str = "") -> str | None:
-  """Write a request and return its id. The id is what makes a request cancellable: the worker's
-  `canceled()` re-reads the param and stops when it no longer holds this id."""
-  if op != "cancel" and read_request(params) is not None:
-    return None
-  request_id = str(time.monotonic_ns())
-  params.put(REQUEST_KEY, json.dumps({"schema": SCHEMA, "id": request_id, "op": op, "recipe": selection}), block=True)
-  return request_id
-
-
-def read_request(params: Any) -> dict | None:
-  raw = params.get(REQUEST_KEY)
-  if not raw:
-    return None
-  try:
-    data = json.loads(raw)
-  except (TypeError, ValueError):
-    return None
-  if not isinstance(data, dict) or data.get("schema") != SCHEMA:
-    return None
-  if data.get("op") not in OPS or not isinstance(data.get("id"), str) or not data["id"]:
-    return None
-  selection = data.get("recipe", "")
-  if not isinstance(selection, str) or (selection and not valid_selection(selection)):
-    return None
-  return {"schema": SCHEMA, "id": data["id"], "op": data["op"], "recipe": selection}
-
-
-def clear_request(params: Any, request_id: str | None = None) -> None:
-  current = read_request(params)
-  if request_id is None or current is None or current["id"] == request_id:
-    params.remove(REQUEST_KEY)
-
-
-@dataclass
-class Job:
-  """The worker's own view of the request it is serving. `PHASES` is the closed set the panels
-  switch on, so an unknown phase is a bug and not a rendering case."""
-
-  id: str
-  op: str
-  selection: str = ""
-  phase: str = "waiting-network"
-  received: int = 0
-  total: int = 0
-  error: str | None = None
-  metered: bool = False
-  # The worker's own monotonic clock, when the job started. It is published as *elapsed seconds*
-  # rather than as a timestamp: the panels then need no clock agreement with the worker, and a job
-  # whose elapsed is missing (an older worker's snapshot) simply reads without a clock.
-  started_at: float = 0.0
-
-  def to_dict(self) -> dict:
-    snapshot = {
-      "id": self.id,
-      "op": self.op,
-      "recipe": self.selection,
-      "phase": self.phase,
-      "received": self.received,
-      "total": self.total,
-      "error": self.error,
-      "metered": self.metered,
-    }
-    if self.started_at:
-      snapshot["elapsed"] = max(0.0, time.monotonic() - self.started_at)
-    return snapshot
-
-
-def _job_from_dict(data: Any) -> dict | None:
-  if not isinstance(data, dict):
-    return None
-  phase = data.get("phase")
-  if phase not in PHASES:
-    return None
-  elapsed = data.get("elapsed")
-  return {
-    "id": str(data.get("id", "")),
-    "op": str(data.get("op", "")),
-    "recipe": str(data.get("recipe", "")),
-    "phase": phase,
-    "received": int(data.get("received", 0) or 0),
-    "total": int(data.get("total", 0) or 0),
-    "error": data.get("error") if isinstance(data.get("error"), str) else None,
-    "metered": bool(data.get("metered", False)),
-    "elapsed": max(0.0, float(elapsed)) if isinstance(elapsed, (int, float)) and not isinstance(elapsed, bool) else None,
-  }
-
-
-def empty_status() -> dict:
-  """The status every reader gets when nothing has been published: one shape, so the panels have
-  one code path and an absent worker looks exactly like a worker with nothing to say."""
-  return {
-    "schema": SCHEMA,
-    "catalog": {"revision": "", "generated_at": "", "total": 0, "error": None},
-    "job": None,
-    "installed": [],
-    "storage": {"used": 0, "free": 0, "limit": MAX_STORE_BYTES},
-  }
-
-
-_STATUS_CACHE: tuple[str, dict] | None = None
-
-
-def status(params: Any) -> dict:
-  """The worker's snapshot, or the empty one. Never raises: a param written by an older fork must
-  not take a panel down at boot.
-
-  One slot of cache, keyed on the raw param text: both trees read this on every frame (their values
-  are pushed, not resolved) and the worker writes it at most once a second, so without the cache
-  every frame would re-parse the same JSON.
-  """
-  global _STATUS_CACHE
-
-  raw = params.get(STATUS_KEY)
-  if not raw:
-    return empty_status()
-  if _STATUS_CACHE is not None and _STATUS_CACHE[0] == raw:
-    return _STATUS_CACHE[1]
-  data = None
-  try:
-    data = json.loads(raw)
-  except (TypeError, ValueError):
-    data = None
-  result = _status_from(data)
-  _STATUS_CACHE = (raw, result)
-  return result
-
-
-def _status_from(data: Any) -> dict:
-  """The fixed shape, from whatever the param held. Anything unparsable reads as the empty status:
-  one code path for every reader."""
-  result = empty_status()
-  if not isinstance(data, dict) or data.get("schema") != SCHEMA:
-    return result
-
-  catalog = data.get("catalog")
-  if isinstance(catalog, dict):
-    result["catalog"] = {
-      "revision": str(catalog.get("revision", "")),
-      "generated_at": str(catalog.get("generated_at", "")),
-      "total": int(catalog.get("total", 0) or 0),
-      "error": catalog.get("error") if isinstance(catalog.get("error"), str) else None,
-    }
-  result["job"] = _job_from_dict(data.get("job"))
-  installed = data.get("installed")
-  if isinstance(installed, list):
-    result["installed"] = [entry for entry in (_installed_from_dict(e) for e in installed) if entry is not None]
-  storage = data.get("storage")
-  if isinstance(storage, dict):
-    result["storage"] = {
-      "used": int(storage.get("used", 0) or 0),
-      "free": int(storage.get("free", 0) or 0),
-      "limit": int(storage.get("limit", MAX_STORE_BYTES) or MAX_STORE_BYTES),
-    }
-  return result
-
-
-def _installed_from_dict(data: Any) -> dict | None:
-  if not isinstance(data, dict):
-    return None
-  selection = data.get("recipe", "")
-  if not isinstance(selection, str) or not selection or not valid_selection(selection):
-    return None
-  state = data.get("state")
-  if state not in ("packaged", "built", "failed"):
-    state = "packaged"
-  kind = data.get("kind")
-  return {
-    "recipe": selection,
-    "name": str(data.get("name", "")),
-    "kind": kind if kind in KINDS else DRIVING,
-    "protocol": str(data.get("protocol", "")),
-    "roles": [str(r) for r in data.get("roles", [])] if isinstance(data.get("roles"), list) else [],
-    "size": int(data.get("size", 0) or 0),
-    "state": state,
-    "error": data.get("error") if isinstance(data.get("error"), str) else None,
-    "provenance": str(data.get("provenance", "")),
-  }
-
-
-def selection_of(entry: dict) -> str:
-  """The recipe digest an entry names."""
-  return entry.get("recipe") or ""
-
-
-def publish_status(
-  params: Any, *, catalog: dict | None = None, job: Job | None = None, installed: list[dict] | None = None, storage: dict | None = None
-) -> None:
-  """Write the snapshot the panels render."""
-  snapshot = {
-    "schema": SCHEMA,
-    "catalog": catalog if catalog is not None else empty_status()["catalog"],
-    "job": job.to_dict() if job is not None else None,
-    "installed": installed if installed is not None else [],
-    "storage": storage if storage is not None else storage_status(),
-  }
-  params.put(STATUS_KEY, json.dumps(snapshot), block=True)
 
 
 # --- store records -----------------------------------------------------------
@@ -694,8 +162,7 @@ def read_json(path: str) -> Any:
 
 
 def write_json(path: str, value: Any) -> None:
-  """Atomic write, overwriting. The worker's only write primitive, so a reader either sees the
-  previous file or the whole new one -- never a half-written record."""
+  """Atomic write, overwriting. The worker's only write primitive."""
   from openpilot.common.utils import atomic_write
 
   os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -713,12 +180,27 @@ def build_state(key: str) -> tuple[str, str | None]:
   compiler's message, `built` when `model.pkl` and the record are both there."""
   record = load_build(key)
   if record is None:
-    return "packaged", None
-  if record.get("state") != "built":
-    return "failed", record.get("error") if isinstance(record.get("error"), str) else BUILD_FAILED
+    return PACKAGED, None
+  if record.get("state") != BUILT:
+    return FAILED, record.get("error") if isinstance(record.get("error"), str) else BUILD_FAILED
   if not os.path.isfile(build_model(key)):
-    return "failed", BUILD_INCOMPLETE
-  return "built", None
+    return FAILED, BUILD_INCOMPLETE
+  return BUILT, None
+
+
+def write_build_record(key: str, protocol: str, action_contract: str, version: str) -> None:
+  write_json(build_record(key), {
+    "schema": SCHEMA,
+    "state": BUILT,
+    "error": None,
+    "protocol": protocol,
+    "provenance": {"version": version},
+    "action_contract": action_contract,
+  })
+
+
+def write_failed_build(key: str, error: str) -> None:
+  write_json(build_record(key), {"schema": SCHEMA, "state": FAILED, "error": error})
 
 
 def package_dir(recipe: str) -> str:
@@ -742,11 +224,10 @@ def load_package(recipe: str) -> dict | None:
   return {"recipe": document, "profile": profile}
 
 
-def package_members(recipe: str, document: dict | None = None) -> dict[str, dict]:
-  """`{role: {"path", "sha256", "size", "metadata"}}` for a stored package, from its own recipe
-  document. Paths are inside the package; nothing here checks the bytes (see `verify_members`)."""
-  recipe_document = document if document is not None else (load_package(recipe) or {}).get("recipe")
-  members = (recipe_document or {}).get("members")
+def package_members(recipe: str, document: dict) -> dict[str, dict]:
+  """`{role: {"path", "sha256", "size", "metadata"}}` for a stored package. Paths are inside the
+  package; nothing here checks the bytes (see `verify_members`)."""
+  members = document.get("members")
   if not isinstance(members, dict):
     return {}
   result = {}
@@ -774,7 +255,7 @@ def verify_members(members: dict[str, dict]) -> str | None:
         if os.fstat(handle.fileno()).st_size != member["size"] or hashlib.file_digest(handle, "sha256").hexdigest() != member["sha256"]:
           return ARTIFACT_CHANGED
     except OSError:
-      return NOT_INSTALLED
+      return modelprotocols.NOT_INSTALLED
   return None
 
 
@@ -801,7 +282,7 @@ def selection_record(selection: str) -> dict | None:
   """Resolve a recipe to its protocol, configuration and members, or None when it is not installed,
   its role set matches no protocol, or its own records do not check out. Pure file I/O: no catalog,
   network or tinygrad, which is what lets the manager call it."""
-  if not valid_selection(selection):
+  if not is_recipe(selection):
     return None
   package = load_package(selection)
   if package is None:
@@ -809,7 +290,7 @@ def selection_record(selection: str) -> dict | None:
   members = package_members(selection, package["recipe"])
   if not members:
     return None
-  proto = protocol_for_roles(members)
+  proto = modelprotocols.protocol_for_roles(members)
   if proto is None:
     return None
   # The protocol's own required keys, out of the recipe's top-level configuration: the worker's
@@ -839,9 +320,9 @@ def _entry_for(selection: str) -> dict | None:
   resolved = selection_record(selection)
   if resolved is None:
     return None
-  proto: Protocol = resolved["protocol"]
+  proto: modelprotocols.Protocol = resolved["protocol"]
   members: dict[str, dict] = resolved["members"]
-  key = build_key(selection, proto.id)
+  key = build_key(selection, proto.id, CAMERA_RESOLUTIONS)
   state, error = build_state(key)
   provenance = ""
   record = load_build(key) or {}
@@ -849,7 +330,6 @@ def _entry_for(selection: str) -> dict | None:
     provenance = str(record["provenance"].get("version", ""))
   return {
     "recipe": selection,
-    "name": entry_name(selection),
     "kind": proto.kind,
     "protocol": proto.id,
     "roles": sorted(members),
@@ -872,7 +352,7 @@ def select(params: Any, kind: str, selection: str) -> None:
   """Set one kind's selection. Validates the shape only -- whether the selection can run is the
   boot commit's question, and answering it here would mean the panel could refuse a selection the
   car could run."""
-  if selection and not valid_selection(selection):
+  if selection and not is_recipe(selection):
     raise ValueError(f"not a selection: {selection!r}")
   params.put(DESIRED_KEY[kind], selection, block=True)
 
@@ -883,8 +363,8 @@ def boot(params: Any) -> dict:
   raw = params.get(BOOT_KEY)
   result = {
     "schema": SCHEMA,
-    DRIVING: {"kind": "bundled", "id": "", "protocol": "", "build": "", "members": {}, "configuration": {}, "requested": "", "fallback": None},
-    MONITORING: {"kind": "bundled", "id": "", "protocol": "", "build": "", "members": {}, "configuration": {}, "requested": "", "fallback": None},
+    modelprotocols.DRIVING: empty_boot_entry(""),
+    modelprotocols.MONITORING: empty_boot_entry(""),
   }
   if not raw:
     return result
@@ -894,7 +374,7 @@ def boot(params: Any) -> dict:
     return result
   if not isinstance(data, dict) or data.get("schema") != SCHEMA:
     return result
-  for kind in KINDS:
+  for kind in modelprotocols.KINDS:
     entry = data.get(kind)
     if isinstance(entry, dict):
       result[kind] = _boot_entry(entry)
@@ -911,7 +391,7 @@ def boot_configuration(params: Any, key: str, fallback: float) -> float:
   fails to load: modeld drops the runtime and uses its module constants, while this still reports what
   the selection declared (the panel already says the model fell back).
   """
-  configuration = boot(params)[DRIVING].get("configuration") or {}
+  configuration = boot(params)[modelprotocols.DRIVING].get("configuration") or {}
   try:
     return float(configuration.get(key, fallback))
   except (TypeError, ValueError):
@@ -920,8 +400,8 @@ def boot_configuration(params: Any, key: str, fallback: float) -> float:
 
 def _boot_entry(entry: dict) -> dict:
   kind = entry.get("kind")
-  if kind not in ("bundled", "custom"):
-    kind = "bundled"
+  if kind not in (modelprotocols.BUNDLED, modelprotocols.CUSTOM):
+    kind = modelprotocols.BUNDLED
   members = entry.get("members") if isinstance(entry.get("members"), dict) else {}
   return {
     "kind": kind,
@@ -933,6 +413,10 @@ def _boot_entry(entry: dict) -> dict:
     "requested": str(entry.get("requested", "")),
     "fallback": entry.get("fallback") if isinstance(entry.get("fallback"), str) else None,
   }
+
+
+def empty_boot_entry(requested: str) -> dict:
+  return {"kind": modelprotocols.BUNDLED, "id": "", "protocol": "", "build": "", "members": {}, "configuration": {}, "requested": requested, "fallback": None}
 
 
 def commit_boot_selection(params: Any) -> dict:
@@ -947,9 +431,9 @@ def commit_boot_selection(params: Any) -> dict:
   selection in place for the panel to explain.
   """
   snapshot = {"schema": SCHEMA}
-  for kind in KINDS:
+  for kind in modelprotocols.KINDS:
     requested = desired(params, kind)
-    entry = {"kind": "bundled", "id": "", "protocol": "", "build": "", "members": {}, "configuration": {}, "requested": requested, "fallback": None}
+    entry = empty_boot_entry(requested)
     if requested:
       entry = _resolve(requested, kind)
     snapshot[kind] = entry
@@ -959,39 +443,36 @@ def commit_boot_selection(params: Any) -> dict:
 
 def _resolve(selection: str, kind: str) -> dict:
   """One kind's entry: the built model, or `bundled` with the reason it is not."""
-  entry = {"kind": "bundled", "id": "", "protocol": "", "build": "", "members": {}, "configuration": {}, "requested": selection, "fallback": None}
-  if not valid_selection(selection):
+  entry = empty_boot_entry(selection)
+  if not is_recipe(selection):
     entry["fallback"] = UNKNOWN_SELECTION
     return entry
   resolved = selection_record(selection)
   if resolved is None:
-    entry["fallback"] = NOT_INSTALLED
+    entry["fallback"] = modelprotocols.NOT_INSTALLED
     return entry
-  proto: Protocol = resolved["protocol"]
+  proto: modelprotocols.Protocol = resolved["protocol"]
   if proto.kind != kind:
     entry["fallback"] = WRONG_KIND
     return entry
   members: dict[str, dict] = resolved["members"]
-  if frozenset(members) != frozenset(proto.roles):
-    entry["fallback"] = NOT_INSTALLED
-    return entry
   if (reason := verify_members(members)) is not None:
     entry["fallback"] = reason
     return entry
-  key = build_key(selection, proto.id)
-  directory = build_dir(selection, proto.id)
+  key = build_key(selection, proto.id, CAMERA_RESOLUTIONS)
+  directory = build_dir(selection, proto.id, CAMERA_RESOLUTIONS)
   if (load_build(key) or {}).get("protocol") not in (None, proto.id):
     # The key already encodes the protocol, so this is a store that was edited under its own name --
     # caught here so the panel can explain it, and again in the runtime, which cannot see the commit.
     entry["fallback"] = BUILD_MISMATCH
     return entry
   state, error = build_state(key)
-  if state != "built":
+  if state != BUILT:
     entry["fallback"] = error or NOT_BUILT
     return entry
   entry.update(
     {
-      "kind": "custom",
+      "kind": modelprotocols.CUSTOM,
       "id": selection,
       "protocol": proto.id,
       "build": directory,
@@ -1003,16 +484,11 @@ def _resolve(selection: str, kind: str) -> dict:
 
 
 def restart_needed(params: Any) -> bool:
-  """Whether either kind owes a restart -- the condition the panes' reboot row appears on.
 
-  `commit_boot_selection` runs once per boot, so a selection change is only a *desired* value until
-  the device restarts: this is the one place that difference is summarized for the driver.
-  """
-  return any(restart_pending(params, kind) for kind in KINDS)
+  return any(restart_pending(params, kind) for kind in modelprotocols.KINDS)
 
 
 def request_reboot(params: Any) -> None:
-  """Ask the manager to restart the device, through upstream's own param."""
   params.put_bool(REBOOT_KEY, True, block=True)
 
 
@@ -1023,471 +499,3 @@ def restart_pending(params: Any, kind: str) -> bool:
   return desired(params, kind) != boot(params)[kind]["requested"]
 
 
-# --- what the panels print ---------------------------------------------------
-# Both trees say the same thing because the strings live here, like offroad.py's (AGENTS.md,
-# Settings organization). Panels choose layout; they never choose wording.
-BUNDLED_LABEL = "stock"
-RESTART_NOTE = "(restart to apply)"
-TITLE_MODELS = "models"
-TITLE_CURRENT_MODEL = "current model"
-TITLE_SELECT_MODEL = "select a model"
-TITLE_FAVORITES = "favorites"
-LABEL_SEARCH = "SEARCH"
-DESCRIPTION_CURRENT_MODEL = "Select the model used for driving. Driver monitoring uses a separate model."
-TITLE_INSTALLED = "downloaded models"
-TITLE_STORAGE = "storage"
-TITLE_DRIVING = "driving model"
-TITLE_MONITORING = "driver monitoring"
-TITLE_REFRESH = "refresh catalog"
-DESCRIPTION_MODELS = "Choose the model used for driving and the separate model used to watch \
-driver. Driving models can change steering and slowing; monitoring models only watch attention."
-DESCRIPTION_BROWSE = "Models available to install. Choose one from the model chooser after it is built."
-DESCRIPTION_INSTALLED = "Models installed on this device. Manage or remove packages here."
-DESCRIPTION_STORAGE = "Space the model store uses on the data partition. Installing needs room for \
-the package, the digest cache and the build."
-DESCRIPTION_REFRESH = "Fetch the catalog again. Needs a network; a failed refresh keeps the copy \
-this device already has."
-LABEL_REBOOT = "REBOOT NOW"
-LABEL_INSTALL = "INSTALL"
-LABEL_SELECT = "SELECT"
-LABEL_REBUILD = "REBUILD"
-LABEL_REMOVE = "REMOVE"
-LABEL_CANCEL = "CANCEL"
-REBOOT_KEY = "DoReboot"  # upstream's own, read by the manager's power path (manager.py:199)
-CONFIRM_SELECT = "Use this model?"
-CONFIRM_CANCEL = "Cancel the current model job?"
-REMOVE_TEXT = "This deletes the package and its build from the device. The model can be installed \
-again from the catalog."
-DESCRIPTION_CANCEL = "Canceling stops the current model job. You can start it again later."
-DESCRIPTION_REBOOT = "A selected model starts after restart. Restart after installing and selecting."
-REASON_SELECTED = "in effect"
-LABEL_BACK = "BACK"
-# The picker's footer, one sentence per state of the highlighted row. Kept here with the other
-# wording because both trees print the same thing and a panel chooses layout, never words.
-CHOOSER_HINT_STOCK = "the bundled model. Applies after a restart."
-CHOOSER_HINT_SELECTED = "in effect since this boot."
-CHOOSER_HINT_BUILT = "built and ready. Applies after a restart."
-CHOOSER_HINT_INSTALL = "not built yet: this downloads and builds it, then applies after a restart."
-CHOOSER_HINT_OFFROAD = "available when the device is offroad."
-BROWSE_EMPTY = "no catalog yet"
-BROWSE_NONE = "nothing matches"
-INSTALL_TEXT = "Download and build this model. Then choose it from the model chooser and restart to use it."
-# The protocol ids are precise and unreadable; these are what a driver picks between.
-PROTOCOL_LABELS = {
-  "comma.supercombo.v1": "supercombo",
-  "comma.split-vision-policy.v1": "vision + policy",
-  "comma.split-vision-off-on.v1": "vision + off + on",
-  "comma.dmonitoring.v1": "driver monitoring",
-}
-PHASE_TEXT = {
-  "waiting-network": "waiting for network",
-  "waiting-offroad": "waiting for offroad",
-  "downloading": "downloading",
-  "verifying": "verifying",
-  "building": "building",
-  "done": "done",
-  "error": "failed",
-  "canceled": "canceled",
-}
-TOO_LARGE = "too large to build on this device"
-NO_SPACE = "not enough free space on the data partition"
-STORE_FULL = "the model store is full; remove a model first"
-NOT_INSTALLED = "not installed"
-NOT_BUILT = "not built yet"
-BUILD_FAILED = "the build failed"
-BUILD_INCOMPLETE = "the build is incomplete"
-BUILD_FAILED_PREFIX = "build failed: "
-BUILD_MISMATCH = "the build was made for another protocol"
-ARTIFACT_CHANGED = "the installed bytes changed since the build"
-UNKNOWN_SELECTION = "not a selection"
-WRONG_KIND = "selected for the other kind"
-SELECTED_HINT = "switch to another model first"
-
-
-def protocol_label(protocol_id: str) -> str:
-  return PROTOCOL_LABELS.get(protocol_id, protocol_id)
-
-
-def human_size(size: int) -> str:
-  for unit, scale in (("GB", 1024**3), ("MB", 1024**2), ("kB", 1024)):
-    if size >= scale:
-      return f"{size / scale:.1f} {unit}"
-  return f"{size} B"
-
-
-def storage_text(storage: dict) -> str:
-  return f"{human_size(storage.get('used', 0))} used, {human_size(storage.get('free', 0))} free"
-
-
-# The phases that can sit for a while without a fraction to show. `downloading` is not among them:
-# it has bytes, and a clock beside them would be noise.
-PATIENT_PHASES = ("waiting-network", "waiting-offroad", "verifying", "building")
-
-
-def clock(seconds: float) -> str:
-  """`m:ss`, or `h:mm:ss` past an hour -- the same in both trees, and short enough for a row."""
-  total = max(0, int(seconds))
-  hours, minutes, secs = total // 3600, (total % 3600) // 60, total % 60
-  return f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes}:{secs:02d}"
-
-
-def job_fraction(job: dict | None) -> float | None:
-  """How far along a download is, 0..1, or `None` when there is nothing to measure.
-
-  A bar is only honest where a total is known: `building`, `verifying` and the two waiting phases
-  have none, and drawing a full or empty bar for them would be a claim about progress that no
-  number backs.
-  """
-  if not job or job.get("phase") != "downloading":
-    return None
-  total = int(job.get("total") or 0)
-  if total <= 0:
-    return None
-  return min(1.0, max(0.0, int(job.get("received") or 0) / total))
-
-
-def job_text(job: dict | None) -> str:
-  """The one line the panels show for a running job, in the driver's terms."""
-  if not job:
-    return ""
-  phase = PHASE_TEXT.get(str(job.get("phase", "")), str(job.get("phase", "")))
-  if job.get("phase") == "downloading" and job.get("total"):
-    return f"{phase} {human_size(int(job.get('received', 0) or 0))} of {human_size(int(job['total']))}"
-  if job.get("phase") in PATIENT_PHASES and job.get("elapsed") is not None:
-    # The one answer a stalled build needs: how long it has been going. The worker refreshes this
-    # with the rest of the snapshot, so it keeps counting.
-    return f"{phase} {clock(float(job['elapsed']))}"
-  return phase
-
-
-def job_progress_text(job: dict | None) -> str:
-  """The label on the bar: the percentage beside the bytes, because a bar shows the shape of the
-  wait and only the numbers show the size of it."""
-  fraction = job_fraction(job)
-  if fraction is None or not job:
-    return job_text(job)
-  return f"{round(fraction * 100)}%  {human_size(int(job.get('received', 0) or 0))} of {human_size(int(job['total']))}"
-
-
-def job_description(job: dict | None, params: Any) -> str:
-  """The job row's detail: the phase, whether the bytes are metered, and how to stop it.
-
-  Canceling is a *new* request (models.OPS), not a flag: the worker's `canceled()` callback reads
-  the request param and stops the moment it holds anything else, so a cancel is the same mechanism
-  as changing your mind.
-  """
-  if not job:
-    return ""
-  parts = [f"{job.get('op', '')} {str(job.get('recipe', ''))[:12]}".strip(), PHASE_TEXT.get(str(job.get("phase", "")), "")]
-  if job.get("metered"):
-    parts.append("over a metered connection")
-  if job.get("error"):
-    parts.append(str(job["error"]))
-  if job.get("phase") in ("waiting-network", "waiting-offroad", "downloading", "verifying", "building"):
-    parts.append("canceling starts a new request")
-  return ". ".join(p for p in parts if p) + "."
-
-
-def catalog_text(catalog: dict) -> str:
-  """The refresh row's value: the snapshot this device holds, and the last refresh's error."""
-  if not catalog.get("revision"):
-    return "never"
-  if catalog.get("error"):
-    return "stale"
-  return str(catalog.get("generated_at", ""))[:10] or catalog["revision"][:12]
-
-
-def catalog_description(catalog: dict) -> str:
-  parts = [DESCRIPTION_REFRESH]
-  if catalog.get("revision"):
-    revision, total = str(catalog["revision"])[:12], int(catalog.get("total", 0) or 0)
-    parts.append(f"holding {revision}, {total} models, generated {str(catalog.get('generated_at', ''))[:10]}")
-  if catalog.get("error"):
-    parts.append(f"last refresh failed: {catalog['error']}")
-  return " ".join(parts)
-
-
-def installed_detail(entry: dict) -> str:
-  parts = [f"{entry.get('protocol', '')}", f"roles: {', '.join(entry.get('roles', []))}", human_size(int(entry.get("size", 0))), str(entry.get("state", ""))]
-  if entry.get("provenance"):
-    parts.append(f"built by {entry['provenance']}")
-  if entry.get("error"):
-    parts.append(str(entry["error"]))
-  return ". ".join(p for p in parts if p) + "."
-
-
-def model_label(params: Any, kind: str) -> str:
-  """The model row's value: the selection in effect, and whether a restart is owed."""
-  entry = boot(params)[kind]
-  if entry["kind"] == "bundled":
-    name = BUNDLED_LABEL
-    if entry.get("fallback"):
-      name = f"{BUNDLED_LABEL}, {entry['requested'][:12]} refused"
-  else:
-    active = params.get(ACTIVE_KEY[kind]) or ""
-    name = entry_name(entry["id"]) or entry["id"][:12]
-    name = f"{BUNDLED_LABEL}, {name} did not load" if active.startswith("stock: ") else f"{name} ({protocol_label(entry['protocol'])})"
-  return f"{name} {RESTART_NOTE}" if restart_pending(params, kind) else name
-
-
-def model_description(params: Any, kind: str) -> str:
-  """The model row's description: what is in effect, and the reason when a selection did not run.
-
-  Two reasons can stop a selection, and they are different moments: the boot commit refused it (the
-  entry's `fallback`, known before any process started) or the model process failed to load it
-  (`MoonpilotModelsActive*`, written by `moonpilot/modelruntime.py` -- the boot commit cannot see
-  that one, because it happens later and in another process). Both are shown here, because a driver
-  looking at a selection that is not driving the car needs the sentence either way.
-  """
-  entry = boot(params)[kind]
-  if entry.get("fallback"):
-    return f"{entry['requested'][:12]} is not in use: {entry['fallback']}."
-  if entry["kind"] == "bundled":
-    return DESCRIPTION_MODELS
-  active = params.get(ACTIVE_KEY[kind]) or ""
-  if active.startswith("stock: "):
-    return f"{entry['id'][:12]} did not load: {active[len('stock: ') :]}. {DESCRIPTION_MODELS}"
-  return f"in effect since this boot, built from {entry['id'][:12]}. {DESCRIPTION_MODELS}"
-
-
-def browse_row(selection: str) -> dict:
-  """The index row that names one selection, or `{}`. A selection that is a *variant* of the row's
-  model is named through that row, so a recipe the row does not show still has a name."""
-  for entry in browse().get("entries", []):
-    if selection_of(entry) == selection or selection in entry.get("variants", ()):
-      return entry
-  return {}
-
-
-def entry_name(selection: str) -> str:
-  """The catalog's display name for a recipe, from the browse index the worker wrote, and `""`
-  when the index does not know it -- neither does a recipe whose catalog entry is gone. A variant
-  its group's row does not show is named through that row's `variants`."""
-  return str(browse_row(selection).get("name", ""))
-
-
-# One slot of cache, like `_STATUS_CACHE`: the pickers re-resolve their rows on every tap and the
-# panels re-resolve their row callables every frame, and without this every resolution would open, read
-# and re-parse the whole index. The key is the file's stat -- the worker writes through `atomic_write`
-# (a rename), so a refresh changes the inode and the panels pick the new index up on their next frame.
-# A missing file reads as empty and never serves a stale slot.
-_BROWSE_CACHE: tuple[tuple | None, dict] | None = None
-
-
-def browse() -> dict:
-  """The worker's display index: `{"revision", "generated_at", "entries"}`. Stdlib JSON only, so a
-  panel can read it; entries keep the shape the worker wrote. Parsed at most once per file version."""
-  global _BROWSE_CACHE
-  path = browse_file()
-  try:
-    stat = os.stat(path)
-    key = (path, stat.st_mtime_ns, stat.st_size, stat.st_ino)
-  except OSError:
-    key = None
-  if _BROWSE_CACHE is not None and _BROWSE_CACHE[0] == key:
-    return _BROWSE_CACHE[1]
-  document = read_json(path)
-  if not isinstance(document, dict) or not isinstance(document.get("entries"), list):
-    result = {"revision": "", "generated_at": "", "entries": []}
-  else:
-    result = {
-      "revision": str(document.get("revision", "")),
-      "generated_at": str(document.get("generated_at", "")),
-      "entries": [e for e in document["entries"] if isinstance(e, dict)],
-    }
-  _BROWSE_CACHE = (key, result)
-  return result
-
-
-def chooser_entries(params: Any, kind: str) -> list[dict | None]:
-  """Stock, built installed entries, then admitted catalog entries for one model kind.
-
-  An installed entry is merged over its index row (`{**row, **entry}`) so a model the driver has
-  already built carries the same folder, short name and model class as the catalog row beside it --
-  without that, the same model would land in two different groups depending on which list found it.
-  """
-  installed = status(params)["installed"]
-  installed_recipes = {selection_of(entry) for entry in installed}
-  entries: list[dict | None] = [None]
-  seen = set()
-  for entry in installed:
-    recipe = selection_of(entry)
-    if recipe in seen or entry.get("kind") != kind or entry.get("state") != "built":
-      continue
-    seen.add(recipe)
-    entries.append({**browse_row(recipe), **entry})
-  for entry in admitted_entries(kind):
-    recipe = selection_of(entry)
-    if not recipe or recipe in installed_recipes or recipe in seen:
-      continue
-    seen.add(recipe)
-    entries.append(entry)
-  return entries
-
-
-# --- what the pickers group and search -----------------------------------------
-# The catalog owns every name and folder here: `folder` and `short_name` are its own reviewed,
-# evidence-checked claims (openmodels' naming records), and a device holding an older snapshot simply
-# has neither. So the grouping falls back to the one axis the fork owns -- the protocol a recipe
-# needs, and the model class it was built for -- rather than to a fork table that would rot against
-# every catalog refresh.
-GROUP_STOCK = ""  # no header: the bundled model leads the picker, as it leads sunnypilot's
-GROUP_FAVORITES = "favorites"
-KIND_TITLES = {DRIVING: "Driving", MONITORING: "Driver monitoring"}
-
-
-def is_built(params: Any, kind: str, selection: str) -> bool:
-  """Whether a selection can be chosen right now: the bundled model always can, and a recipe needs
-  a build of its own kind in the store. Whether that build may *run* is the boot commit's question."""
-  if not selection:
-    return True
-  return any(entry.get("kind") == kind and entry.get("state") == "built" and selection_of(entry) == selection
-             for entry in status(params)["installed"])
-
-
-def entry_group(entry: dict | None) -> str:
-  """The group one chooser row belongs under. `None` is the bundled model.
-
-  Whichever parts the row does carry are the group, so an installed model whose catalog entry is
-  gone still reads as the protocol it needs rather than as a row of unknowns."""
-  if entry is None:
-    return GROUP_STOCK
-  folder = str(entry.get("folder", ""))
-  if folder:
-    return folder
-  parts = [part for part in (protocol_label(str(entry.get("protocol", ""))), str(entry.get("model_class") or "")) if part]
-  return " · ".join(parts) or KIND_TITLES.get(str(entry.get("kind", "")), "models")
-
-
-def favorites(params: Any) -> set[str]:
-  """The driver's starred recipes. A stale digest -- one the catalog no longer lists -- matches no
-  row and is rewritten on the next change, so a star can outlive its model without cost."""
-  value = params.get(FAVS_KEY, return_default=True) or ""
-  return {part for part in str(value).split(";") if is_recipe(part)}
-
-
-def set_favorite(params: Any, selection: str, starred: bool) -> None:
-  """Star or unstar one recipe. The bundled model is not a recipe and cannot be starred."""
-  if not is_recipe(selection):
-    return
-  current = favorites(params)
-  current.add(selection) if starred else current.discard(selection)
-  params.put(FAVS_KEY, ";".join(sorted(current)), block=True)
-
-
-def chooser_groups(params: Any, kind: str) -> list[tuple[str, list[dict | None]]]:
-  """`[(group, rows)]` for one kind: the bundled model first, starred models duplicated into
-  Favorites, then the rest newest group first. Inside a group the chooser's own order stands, so an
-  installed model leads its group and the catalog follows newest first.
-
-  Group order is the order the rows were first seen in, which is `chooser_entries`' order -- and that
-  is the catalog's own newest-first order, so the groups come out newest first without a second sort.
-  """
-  entries = chooser_entries(params, kind)
-  starred = favorites(params)
-  order: list[str] = []
-  buckets: dict[str, list[dict | None]] = {}
-
-  def add(group: str, entry: dict | None) -> None:
-    if group not in buckets:
-      buckets[group] = []
-      order.append(group)
-    buckets[group].append(entry)
-
-  for entry in entries:
-    selection = "" if entry is None else selection_of(entry)
-    group = entry_group(entry)
-    add(group, entry)
-    if selection in starred and group != GROUP_FAVORITES:
-      add(GROUP_FAVORITES, entry)
-  leading = [group for group in (GROUP_STOCK, GROUP_FAVORITES) if group in buckets]
-  return [(group, buckets[group]) for group in leading + [group for group in order if group not in leading]]
-
-
-def entry_display(entry: dict | None, kind: str) -> str:
-  """One row's name. The catalog owns it; the only edit is dropping the kind prefix a generated name
-  repeats, because the picker is already scoped to one kind."""
-  if entry is None:
-    return BUNDLED_LABEL
-  name = str(entry.get("name", ""))
-  prefix = f"{KIND_TITLES.get(kind, '')} · "
-  if entry.get("name_kind") == "generated" and name.startswith(prefix):
-    name = name[len(prefix):]
-  return name or selection_of(entry)[:12]
-
-
-def _subsequence(query: str, text: str) -> bool:
-  """`query` in `text`, casefolded, as substring or as a subsequence -- so `wsplit` finds
-  `WMI V12`. The iterator is the trick: `in` on an iterator consumes up to the match."""
-  query, text = query.casefold().strip(), text.casefold()
-  if not query:
-    return True
-  if query in text:
-    return True
-  rest = iter(text)
-  return all(character in rest for character in query)
-
-
-def matches_query(entry: dict | None, query: str, kind: str = DRIVING) -> bool:
-  """Whether one row matches the picker's search: its short code, its name, its group or its date."""
-  if not query.strip():
-    return True
-  if entry is None:
-    return _subsequence(query, BUNDLED_LABEL)
-  haystacks = (str(entry.get("short_name", "")), entry_display(entry, kind), entry_group(entry), str(entry.get("updated_at", "")))
-  return any(_subsequence(query, text) for text in haystacks)
-
-
-def search_groups(groups: Sequence[tuple[str, list]], query: str, kind: str = DRIVING) -> list[tuple[str, list]]:
-  """The groups with their matching rows, and no group left empty. An empty query is the list
-  unchanged -- searching never hides a group that has rows."""
-  if not query.strip():
-    return list(groups)
-  result = []
-  for label, rows in groups:
-    kept = [row for row in rows if matches_query(row, query, kind)]
-    if kept:
-      result.append((label, kept))
-  return result
-
-
-def chooser_hint(entry: dict | None, kind: str, params: Any, offroad: bool) -> str:
-  """The picker's one-line footer: what choosing the highlighted row does. A tree has no room for a
-  verdict on every row, so the row under the driver's finger carries the sentence instead."""
-  if entry is None:
-    return CHOOSER_HINT_STOCK
-  if entry.get("state") != "built":
-    return CHOOSER_HINT_INSTALL
-  if selection_of(entry) == desired(params, kind):
-    return CHOOSER_HINT_SELECTED
-  return CHOOSER_HINT_BUILT if offroad else f"{CHOOSER_HINT_BUILT} {CHOOSER_HINT_OFFROAD}"
-
-
-def admitted_entries(kind: str) -> list[dict]:
-  """The admitted catalog rows of one kind, newest first.
-
-  No memo of its own: `browse()` is already keyed on the index file's stat, and the pickers filter
-  once per rebuild rather than once per row per frame, so a second cache here would only be a way to
-  serve a stale list."""
-  return [entry for entry in browse()["entries"] if entry.get("admitted") and entry.get("kind") == kind]
-
-
-def page_item(items: Sequence, page: int, rows: int, index: int, missing: Any = None) -> Any:
-  """Row `index` of page `page`, or `missing` past the end of `items`. The installed lists are the
-  only paged ones left: the pickers are trees, and a tree scrolls."""
-  position = page * rows + index
-  return items[position] if position < len(items) else missing
-
-
-def entry_detail(entry: dict) -> str:
-  """The catalog row's description: roles, size, and the honest limits of a protocol match. The
-  catalog's own findings ride along verbatim -- `semantics_unverified`, `requires_runner_check`,
-  `qualification` -- because a protocol match proves structures agree and nothing more."""
-  parts = [f"roles: {', '.join(entry.get('roles', []))}", f"{human_size(int(entry.get('size', 0)))}", str(entry.get("protocol", ""))]
-  if entry.get("updated_at"):
-    parts.append(f"catalogued {str(entry['updated_at'])[:10]}")
-  if entry.get("notes"):
-    parts.extend(str(note) for note in entry["notes"])
-  if entry.get("reason"):
-    parts.append(str(entry["reason"]))
-  return ". ".join(p for p in parts if p) + "."

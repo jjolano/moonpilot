@@ -1,7 +1,7 @@
 """mici sign-in dialog: the tailscale login URL as a QR code, plus the URL itself as text.
 
-Same job as moonpilot/ui/tailscale_qr.py, sharing its QrTexture, on the mici tree, which renders on
-the dark theme, hence `_qr_inverted` — `inverted=True` is what upstream's mici pairing dialog passes.
+The shared QR texture and unavailable-state drawing live in `moonpilot/ui/panel_common.py`; the mici
+dialog inverts the code for its dark background.
 
     OPENPILOT_PREFIX=tssmoke python3 moonpilot/ui/tailscale_qr_mici.py
 """
@@ -9,12 +9,12 @@ the dark theme, hence `_qr_inverted` — `inverted=True` is what upstream's mici
 import pyray as rl
 
 from openpilot.selfdrive.ui.ui_state import ui_state
-from openpilot.system.ui.lib.application import FontWeight, gui_app
+from openpilot.system.ui.lib.application import FontWeight
 from openpilot.system.ui.widgets.label import UnifiedLabel
 from openpilot.system.ui.widgets.nav_widget import NavWidget
 
 from moonpilot import tailscale
-from moonpilot.ui.tailscale_qr import QrTexture
+from moonpilot.ui.panel_common import QrTexture, render_qr
 
 
 class TailscaleSignInDialogMici(QrTexture, NavWidget):
@@ -35,7 +35,7 @@ class TailscaleSignInDialogMici(QrTexture, NavWidget):
 
   def _render(self, rect: rl.Rectangle):
     self._update_qr(tailscale.auth_url(ui_state.params))
-    self._render_qr()
+    render_qr(self._qr, rl.Rectangle(self._rect.x + 8, self._rect.y, self._rect.height, self._rect.height))
 
     label_x = self._rect.x + 8 + self._rect.height + 24
     self._title.set_max_width(int(self._rect.width - label_x))
@@ -46,38 +46,7 @@ class TailscaleSignInDialogMici(QrTexture, NavWidget):
     self._url_label.set_position(label_x, self._rect.y + 16 + self._title.rect.height + 16)
     self._url_label.render()
 
-  def _render_qr(self) -> None:
-    if self._qr is None:
-      # The URL text beside the code is still usable, so say what happened instead of a blank box.
-      rl.draw_text_ex(
-        gui_app.font(FontWeight.BOLD), "QR unavailable", rl.Vector2(self._rect.x + 20, self._rect.y + self._rect.height // 2 - 15), 30, 0.0, rl.RED
-      )
-      return
-
-    scale = self._rect.height / self._qr.height
-    rl.draw_texture_ex(self._qr, rl.Vector2(round(self._rect.x + 8), round(self._rect.y)), 0.0, scale, rl.WHITE)
 
 
-class _Background(NavWidget):
-  """Stand-in for the settings panel this dialog is pushed over when running standalone.
-
-  Without it the nav stack holds only the dialog, and pop_widget() refuses to empty the stack
-  (application.py:412-415) — which is where NavWidget.dismiss() ends up — so the self-closing path
-  this dialog exists for cannot be watched.
-  """
-
-  def _render(self, rect: rl.Rectangle):
-    rl.clear_background(rl.BLACK)
-    return -1
 
 
-if __name__ == "__main__":
-  gui_app.init_window("tailscale sign in")
-  gui_app.push_widget(_Background())
-  dialog = TailscaleSignInDialogMici()
-  gui_app.push_widget(dialog)
-  try:
-    for _ in gui_app.render():
-      pass
-  finally:
-    del dialog

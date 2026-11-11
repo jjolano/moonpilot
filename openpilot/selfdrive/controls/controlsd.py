@@ -24,7 +24,7 @@ from openpilot.selfdrive.locationd.helpers import PoseCalibrator, Pose
 from moonpilot.latcontrol import moonpilot_latcontrol  # moonpilot seam, see AGENTS.md
 from moonpilot.curvature import moonpilot_curvature, moonpilot_path_smooth  # moonpilot seam, see AGENTS.md
 from moonpilot.longcontrol import moonpilot_longcontrol  # moonpilot seam, see AGENTS.md
-from moonpilot.engage import moonpilot_actuator_gate  # moonpilot seam, see AGENTS.md
+from moonpilot.engage import ActuatorGate  # moonpilot seam, see AGENTS.md
 from moonpilot.models import boot_configuration  # moonpilot seam, see AGENTS.md
 
 State = log.SelfdriveState.OpenpilotState
@@ -58,7 +58,7 @@ class Controls:
     self.calibrated_pose: Pose | None = None
 
     self.LoC = moonpilot_longcontrol(self.CP) or LongControl(self.CP)  # moonpilot seam, see AGENTS.md
-    self.moonpilot_gate = moonpilot_actuator_gate(self.CP)  # moonpilot seam, see AGENTS.md
+    self.moonpilot_gate = ActuatorGate(self.CP)  # moonpilot seam, see AGENTS.md
     self.curvature_reference = moonpilot_curvature()  # moonpilot seam, see AGENTS.md
     # The runtime's own smoothing, out of the same boot snapshot modeld decodes with, rather than
     # modeld's module default: a selection that declares one gets a model whose action horizon and

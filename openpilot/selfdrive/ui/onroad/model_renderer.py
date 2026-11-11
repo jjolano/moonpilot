@@ -9,7 +9,8 @@ from openpilot.selfdrive.locationd.calibrationd import HEIGHT_INIT
 from openpilot.selfdrive.ui.ui_state import ui_state
 from openpilot.system.ui.lib.shader_polygon import draw_polygon, Gradient
 from openpilot.system.ui.widgets import Widget
-from moonpilot.lead import lead_path_line  # moonpilot seam, see AGENTS.md
+from moonpilot.ui.onroad import draw_lead_path, lead_path_line  # moonpilot seam, see AGENTS.md
+from moonpilot.state import moonpilot_state  # moonpilot seam, see AGENTS.md
 
 CLIP_MARGIN = 500
 MIN_DRAW_DISTANCE = 10.0
@@ -115,8 +116,7 @@ class ModelRenderer(Widget):
       self._update_model(lead_one, path_x_array)
       if render_lead_indicator:
         self._update_leads(radar_state, path_x_array)
-      moonpilot_state = sm['moonpilotState'] if sm.valid['moonpilotState'] and sm.alive['moonpilotState'] else None  # moonpilot seam, see AGENTS.md
-      self._update_lead_path(moonpilot_state, path_x_array)
+      self._update_lead_path(moonpilot_state(sm), path_x_array)  # moonpilot seam, see AGENTS.md
       self._transform_dirty = False
 
     # Draw elements
@@ -286,16 +286,7 @@ class ModelRenderer(Widget):
     self._lead_path = ModelPoints(raw, projected)
 
   def _draw_lead_path(self):  # moonpilot seam, see AGENTS.md
-    """Draw the lead's predicted path: a line that thickens with the model's own yStd, faded by the
-    in-path probability the planner acts on."""
-    points = self._lead_path.projected_points
-    if points.shape[0] < 2:
-      return
-
-    alpha = int(np.clip(self._lead_in_path, 0.0, 1.0) * 90)
-    color = rl.Color(218, 202, 37, alpha)
-    for (x0, y0), (x1, y1), w in zip(points[:-1], points[1:], self._lead_path_widths[1:], strict=True):
-      rl.draw_line_ex(rl.Vector2(float(x0), float(y0)), rl.Vector2(float(x1), float(y1)), float(w), color)
+    draw_lead_path(self)
 
   def _draw_lead_indicator(self):
     # Draw lead vehicles if available

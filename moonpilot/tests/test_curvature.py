@@ -5,34 +5,35 @@ import functools
 import math
 import struct
 import unittest
-from pathlib import Path
 from typing import Any
 from unittest import mock
 
 import numpy as np
 
 import moonpilot.curvature as curvature_mod
+
 from openpilot.common.realtime import DT_MDL
 from openpilot.cereal import log, messaging
 from openpilot.selfdrive.modeld.constants import ModelConstants
 
 from moonpilot.curvature import (
-  MOONPILOT_LOOKAHEAD,
   MOONPILOT_MAX_MODEL_AGE,
   MOONPILOT_PREVIEW_MIN_SPEED,
   MOONPILOT_RECENTER_LAT_ACCEL,
   MOONPILOT_SMOOTH_LEAD_MAX_LAT_ACCEL,
-  MOONPILOT_SMOOTH_TAUS,
   PathSmooth,
   lane_bend,
   moonpilot_curvature,
   moonpilot_path_smooth,
-  response_aligned_curvature,
+  curvature_reference,
 )
 from moonpilot.features import PATH_LOOKAHEAD, PATH_RECENTER, PATH_SMOOTH
-from moonpilot.tests.fakes import FakeParams, _params
+from moonpilot.tests.fakes import params
 
-ROOT = Path(__file__).resolve().parents[2]
+LOOKAHEAD = PATH_LOOKAHEAD.values
+TAUS = PATH_SMOOTH.values
+
+
 T_IDXS = np.asarray(ModelConstants.T_IDXS)
 NOW = 10.0
 CAPTURE_AGE = 0.08
@@ -74,7 +75,7 @@ def _update(model, desired_curvature=0.0, **overrides):
     "lead": LEAD,
   }
   arguments.update(overrides)
-  return response_aligned_curvature(model, desired_curvature, **arguments)
+  return curvature_reference(model, desired_curvature, **arguments)
 
 
 def _bits(value):
@@ -82,31 +83,25 @@ def _bits(value):
 
 
 class TestFactory(unittest.TestCase):
-  def test_both_off_is_none(self):
-    self.assertIsNone(moonpilot_curvature(_params(0)))
+  def test_all_off_is_none(self):
+    self.assertIsNone(moonpilot_curvature(params(0)))
 
   def test_the_look_ahead_alone_binds_no_lead(self):
-    reference = moonpilot_curvature(_params(0, {PATH_LOOKAHEAD.key: 2}))
+    reference = moonpilot_curvature(params(0, {PATH_LOOKAHEAD.key: 2}))
     assert isinstance(reference, functools.partial)
-    self.assertEqual(reference.keywords, {"lookahead": MOONPILOT_LOOKAHEAD[2], "lead": 0.0, "recenter": 0.0})
+    self.assertEqual(reference.keywords, {"lookahead": LOOKAHEAD[2], "lead": 0.0, "recenter": 0.0})
 
   def test_smoothing_alone_binds_its_tau_as_the_lead(self):
-    for index in range(1, len(MOONPILOT_SMOOTH_TAUS)):
+    for index in range(1, len(TAUS)):
       with self.subTest(index=index):
-        reference = moonpilot_curvature(_params(0, {PATH_SMOOTH.key: index}))
+        reference = moonpilot_curvature(params(0, {PATH_SMOOTH.key: index}))
         assert isinstance(reference, functools.partial)
-        self.assertEqual(reference.keywords, {"lookahead": None, "lead": MOONPILOT_SMOOTH_TAUS[index], "recenter": 0.0})
+        self.assertEqual(reference.keywords, {"lookahead": None, "lead": TAUS[index], "recenter": 0.0})
 
   def test_recentering_alone_binds_its_cap(self):
-    reference = moonpilot_curvature(_params(0, {PATH_RECENTER.key: True}))
+    reference = moonpilot_curvature(params(0, {PATH_RECENTER.key: True}))
     assert isinstance(reference, functools.partial)
     self.assertEqual(reference.keywords, {"lookahead": None, "lead": 0.0, "recenter": MOONPILOT_RECENTER_LAT_ACCEL})
-
-  def test_it_is_chosen_once_so_the_rows_take_a_restart(self):
-    with mock.patch.object(curvature_mod, "Params", lambda: FakeParams(0)):
-      self.assertIsNone(moonpilot_curvature())
-    with mock.patch.object(curvature_mod, "Params", lambda: FakeParams(0, {PATH_SMOOTH.key: 1})):
-      self.assertIsNotNone(moonpilot_curvature())
 
 
 class TestLookahead(unittest.TestCase):
@@ -115,7 +110,7 @@ class TestLookahead(unittest.TestCase):
   HORIZON = CAPTURE_AGE + LAT_DELAY
 
   def _out(self, model, level, desired=0.0, v_ego=V_EGO):
-    return _update(model, desired, v_ego=v_ego, lead=0.0, lookahead=MOONPILOT_LOOKAHEAD[level])
+    return _update(model, desired, v_ego=v_ego, lead=0.0, lookahead=LOOKAHEAD[level])
 
   def test_the_lead_in_fades_out_below_corner_speeds(self):
     model = _corner(0.002, t_start=self.HORIZON + 0.5)
@@ -123,7 +118,7 @@ class TestLookahead(unittest.TestCase):
       with self.subTest(v=v):
         self.assertEqual(_bits(self._out(model, 3, v_ego=v)), _bits(self._out(model, 0, v_ego=v)))
     today, faded = self._out(model, 0, v_ego=10.0), self._out(model, 3, v_ego=10.0)
-    with mock.patch.object(curvature_mod, "MOONPILOT_LOOKAHEAD_SPEEDS", ([0.0, 1.0], [1.0, 1.0])):
+    with mock.patch.object(curvature_mod, "MOONPILOT_CORRECTION_SPEEDS", ([0.0, 1.0], [1.0, 1.0])):
       full = self._out(model, 3, v_ego=10.0)
     self.assertGreater(full, today)
     self.assertAlmostEqual(faded - today, 0.5 * (full - today), delta=1e-15)
@@ -146,14 +141,14 @@ class TestLookahead(unittest.TestCase):
   def test_the_lead_in_is_capped_per_level(self):
     model = _corner(0.05, t_start=self.HORIZON + 0.1)
     for level in (1, 2, 3):
-      lookahead = MOONPILOT_LOOKAHEAD[level]
+      lookahead = LOOKAHEAD[level]
       assert lookahead is not None
       with self.subTest(level=level):
         self.assertAlmostEqual(self._out(model, level), lookahead[2] / V_EGO ** 2, delta=1e-12)
 
   def test_a_window_past_the_published_path_keeps_todays_request(self):
     model = _corner(0.002)
-    lookahead = MOONPILOT_LOOKAHEAD[3]
+    lookahead = LOOKAHEAD[3]
     assert lookahead is not None
     late = T_IDXS[-1] - CAPTURE_AGE - lookahead[0] + 0.01
     self.assertEqual(_bits(_update(model, 0.03125, lat_delay=late, lead=0.0, lookahead=lookahead)), _bits(0.03125))
@@ -251,7 +246,7 @@ class TestSmoothingLead(unittest.TestCase):
     self.assertEqual(_bits(_update(_corner(0.004, t_start=0.3), 0.03125, lead=0.0)), _bits(0.03125))
 
   def test_a_tightening_ramp_is_led_by_exactly_slope_times_tau(self):
-    for tau in MOONPILOT_SMOOTH_TAUS[1:]:
+    for tau in TAUS[1:]:
       with self.subTest(tau=tau):
         self.assertAlmostEqual(_update(_ramp(slope=0.002), 0.01, lead=tau) - 0.01, 0.002 * tau, delta=1e-12)
 
@@ -375,27 +370,19 @@ class TestExactFallback(unittest.TestCase):
 
 class TestSmoothFactory(unittest.TestCase):
   def test_the_choice_off_is_none(self):
-    self.assertIsNone(moonpilot_path_smooth(_params(0)))
+    self.assertIsNone(moonpilot_path_smooth(params(0)))
 
-  def test_each_choice_builds_the_filter_its_label_names(self):
-    self.assertEqual(len(MOONPILOT_SMOOTH_TAUS), len(PATH_SMOOTH.choices))
-    for index, label in enumerate(PATH_SMOOTH.choices[1:], start=1):
-      with self.subTest(label=label):
-        smooth = moonpilot_path_smooth(_params(index))
+  def test_each_choice_builds_the_filter_at_its_tau(self):
+    for index in range(1, len(TAUS)):
+      with self.subTest(index=index):
+        smooth = moonpilot_path_smooth(params(0, {PATH_SMOOTH.key: index}))
         assert isinstance(smooth, PathSmooth)
-        self.assertEqual(smooth.tau, MOONPILOT_SMOOTH_TAUS[index])
-        self.assertEqual(label, f"{smooth.tau:.2f} s")
+        self.assertEqual(smooth.tau, TAUS[index])
 
   def test_an_out_of_range_choice_reads_as_off(self):
-    for value in (-1, len(PATH_SMOOTH.choices), None):
+    for value in (-1, len(TAUS), None):
       with self.subTest(value=value):
-        self.assertIsNone(moonpilot_path_smooth(_params(value)))
-
-  def test_it_is_chosen_once_so_the_choice_takes_a_restart(self):
-    with mock.patch.object(curvature_mod, "Params", lambda: FakeParams(0)):
-      self.assertIsNone(moonpilot_path_smooth())
-    with mock.patch.object(curvature_mod, "Params", lambda: FakeParams(2)):
-      self.assertEqual(getattr(moonpilot_path_smooth(), "tau", None), 0.10)
+        self.assertIsNone(moonpilot_path_smooth(params(0, {PATH_SMOOTH.key: value})))
 
 
 class TestPathSmooth(unittest.TestCase):

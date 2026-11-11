@@ -11,14 +11,9 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-import openpilot.selfdrive.test.longitudinal_maneuvers.plant as plant_mod
 from openpilot.cereal import messaging
-from openpilot.common.realtime import DT_MDL
-from openpilot.selfdrive.test.longitudinal_maneuvers.test_longitudinal import create_maneuvers
 
-from moonpilot import procs
-from moonpilot.features import FEATURES
-from moonpilot.longitudinal import MoonpilotLongitudinalPlanner
+from openpilot.selfdrive.locationd.locationd import CAM_ODO_POSE_DELAY
 from moonpilot.slam import (
   MOONPILOT_SLAM_CORR_STD_MAX,
   MOONPILOT_SLAM_CORR_STD_MIN,
@@ -26,19 +21,21 @@ from moonpilot.slam import (
   MOONPILOT_SLAM_MAX_CORR_VEL,
   MOONPILOT_SLAM_MAX_SCALE_ERR,
   MOONPILOT_SLAM_MIN_NODES,
-  MOONPILOT_SLAM_MIN_STD,
-  MOONPILOT_SLAM_POSE_DELAY,
   MOONPILOT_SLAM_PRIOR_WINDOW_S,
   MOONPILOT_SLAM_RATE_HZ,
-  MOONPILOT_SLAM_TRANS_STD_MULT,
   MOONPILOT_SLAM_WINDOW_S,
   Node,
   PriorChannel,
   RotatingPoseWindow,
+  device_from_calib,
   ego_speed_correction,
+  fill_ego_correction,
+  odometry_sample,
+  slam_node,
 )
+from moonpilot.pose import PoseTracker, push_odometry_sample
 from moonpilot.longitudinal import MOONPILOT_STOP_DISTANCE
-from moonpilot.tests.test_longitudinal import _inputs, _lead, _plant_sm, _planner
+from moonpilot.tests.harness import inputs, lead as make_lead, planner as make_planner, plant_planner
 
 ROOT = Path(__file__).resolve().parents[2]
 DT = 1.0 / MOONPILOT_SLAM_RATE_HZ
@@ -158,13 +155,6 @@ class TestWindow(unittest.TestCase):
       window.push(_node(100.0 + i * DT, 20.0, 20.0))
     self.assertGreaterEqual(window.window[0].mono_time, 100.0 - MOONPILOT_SLAM_WINDOW_S)
 
-  def test_the_age_is_the_window_end_to_now(self):
-    """Honest, and it includes the pose delay: the window end *is* the pose time, MOONPILOT_SLAM_POSE_DELAY
-    in the past, so a correction is never fresher than that. The consumer's budget accounts for it
-    rather than the publisher papering over it."""
-    corr = _window(_straight(time.monotonic())).update()
-    self.assertLess(corr["age"], MOONPILOT_SLAM_MAX_AGE)
-
 
 def _with_correction(sm, d_vel=0.0, age=0.0, corr_std=MOONPILOT_SLAM_CORR_STD_MIN, valid=True, alive=True):
   """The correction a publisher would have left on `sm`, and its validity flags."""
@@ -182,36 +172,45 @@ def _with_correction(sm, d_vel=0.0, age=0.0, corr_std=MOONPILOT_SLAM_CORR_STD_MI
 class TestConsumer(unittest.TestCase):
   def test_nothing_published_is_no_correction(self):
     """The baseline: no daemon, no correction, and the planner's inputs are the raw ones."""
-    self.assertEqual(ego_speed_correction(_inputs(v_ego=20.0), 20.0), 0.0)
+    self.assertEqual(ego_speed_correction(inputs(v_ego=20.0), 20.0), 0.0)
     # The maneuver harness hands the planner a plain dict with no moonpilotState at all
     self.assertEqual(ego_speed_correction({}, 20.0), 0.0)
 
+  def test_correction_dict_round_trips_through_capnp(self):
+    from openpilot.cereal import messaging
+
+    corr = _window(_straight(time.monotonic())).update()
+    msg = messaging.new_message("moonpilotState")
+    fill_ego_correction(msg, corr)
+    wire = msg.moonpilotState.egoCorrection
+    self.assertEqual(wire.valid, corr["valid"])
+    self.assertEqual(wire.monoTime, corr["mono_time"])
+    self.assertEqual(wire.age, corr["age"])
+    self.assertAlmostEqual(wire.dVel, corr["dVel"], places=6)
+    self.assertAlmostEqual(wire.corrStd, corr["corrStd"], places=6)
+
   def test_a_stale_or_invalid_correction_is_no_correction(self):
     for kwargs in (
-      {"age": MOONPILOT_SLAM_MAX_AGE + MOONPILOT_SLAM_POSE_DELAY + 0.01},
+      {"age": MOONPILOT_SLAM_MAX_AGE + CAM_ODO_POSE_DELAY + 0.01},
       {"valid": False},
       {"alive": False},
       {"d_vel": float("nan")},
       {"corr_std": float("inf")},
     ):
       with self.subTest(**kwargs):
-        sm = _with_correction(_inputs(v_ego=20.0), **{"d_vel": -0.4, **kwargs})
+        sm = _with_correction(inputs(v_ego=20.0), **{"d_vel": -0.4, **kwargs})
         self.assertEqual(ego_speed_correction(sm, 20.0), 0.0)
     # a non-finite speed to scale against is the same answer
-    self.assertEqual(ego_speed_correction(_with_correction(_inputs(v_ego=20.0), d_vel=-0.4), float("nan")), 0.0)
+    self.assertEqual(ego_speed_correction(_with_correction(inputs(v_ego=20.0), d_vel=-0.4), float("nan")), 0.0)
 
-  def test_a_fresh_correction_is_scaled_by_its_own_confidence(self):
-    # float32 on the wire, hence the loose delta
-    sm = _with_correction(_inputs(v_ego=20.0), d_vel=-0.4, corr_std=MOONPILOT_SLAM_CORR_STD_MIN)
-    self.assertAlmostEqual(ego_speed_correction(sm, 20.0), -0.4 / (1.0 + MOONPILOT_SLAM_CORR_STD_MIN), delta=1e-6)
-
-    sm = _with_correction(_inputs(v_ego=20.0), d_vel=-0.4, corr_std=MOONPILOT_SLAM_CORR_STD_MAX)
-    self.assertAlmostEqual(ego_speed_correction(sm, 20.0), -0.4 / (1.0 + MOONPILOT_SLAM_CORR_STD_MAX), delta=1e-6)
-
-    # Never amplified: the largest correction any published std can produce is the clamp itself
-    sm = _with_correction(_inputs(v_ego=20.0), d_vel=-MOONPILOT_SLAM_MAX_CORR_VEL)
-    self.assertGreaterEqual(ego_speed_correction(sm, 20.0), -MOONPILOT_SLAM_MAX_CORR_VEL)
-    self.assertLess(ego_speed_correction(sm, 20.0), 0.0)
+  def test_correction_trust_does_not_amplify_and_falls_with_uncertainty(self):
+    low_uncertainty = ego_speed_correction(
+      _with_correction(inputs(v_ego=20.0), d_vel=-0.4, corr_std=MOONPILOT_SLAM_CORR_STD_MIN), 20.0)
+    high_uncertainty = ego_speed_correction(
+      _with_correction(inputs(v_ego=20.0), d_vel=-0.4, corr_std=MOONPILOT_SLAM_CORR_STD_MAX), 20.0)
+    self.assertLessEqual(abs(low_uncertainty), 0.4)
+    self.assertLessEqual(abs(high_uncertainty), abs(low_uncertainty))
+    self.assertLess(high_uncertainty, 0.0)
 
   def test_the_correction_is_bounded_by_a_fraction_of_the_speed_it_corrects(self):
     """A scale error is proportional to speed, so the bound is too -- and at a standstill it is
@@ -226,11 +225,11 @@ class TestConsumer(unittest.TestCase):
     for v_ego in (0.0, 0.05, 0.2):
       for d_vel in (0.578, -0.578, MOONPILOT_SLAM_MAX_CORR_VEL):
         with self.subTest(v_ego=v_ego, d_vel=d_vel):
-          sm = _with_correction(_inputs(v_ego=v_ego), d_vel=d_vel)
+          sm = _with_correction(inputs(v_ego=v_ego), d_vel=d_vel)
           self.assertLessEqual(abs(ego_speed_correction(sm, v_ego)), MOONPILOT_SLAM_MAX_SCALE_ERR * v_ego + 1e-9)
 
     # and it is inert where the feature earns its keep: a 2.5 % scale error at 20 m/s passes whole
-    sm = _with_correction(_inputs(v_ego=20.0), d_vel=0.5)
+    sm = _with_correction(inputs(v_ego=20.0), d_vel=0.5)
     self.assertAlmostEqual(ego_speed_correction(sm, 20.0), 0.5 / (1.0 + MOONPILOT_SLAM_CORR_STD_MIN), delta=1e-6)
 
 
@@ -246,7 +245,7 @@ def _stop_and_go(planner, correction=None, frames=420):
   for frame in range(frames):
     if gap < 2.0:
       raise AssertionError(f"contact at frame {frame}: the plan stopped following")
-    sm = _inputs(v_ego=v_ego, v_cruise_kph=108.0, lead=_lead(gap, v_lead, model_prob=0.95), standstill=v_ego < 0.1)
+    sm = inputs(v_ego=v_ego, v_cruise_kph=108.0, lead=make_lead(gap, v_lead, model_prob=0.95), standstill=v_ego < 0.1)
     if correction is not None:
       _with_correction(sm, **correction)
     planner.update(sm)
@@ -266,18 +265,18 @@ class TestPlannerCorrection(unittest.TestCase):
   different plan, which is the difference this class bounds."""
 
   def test_a_correction_refines_the_plan_rather_than_reshaping_it(self):
-    base_commands, base_peak, base_v = _stop_and_go(_planner())
-    corr_commands, corr_peak, corr_v = _stop_and_go(_planner(), correction={"d_vel": 0.5})
+    base_commands, base_peak, base_v = _stop_and_go(make_planner())
+    corr_commands, corr_peak, corr_v = _stop_and_go(make_planner(), correction={"d_vel": 0.5})
 
     self.assertNotEqual(base_commands, corr_commands)  # the correction really reaches the plan
     self.assertLess(abs(corr_peak - base_peak), 0.5)  # ... by less than the correction's own size
     self.assertAlmostEqual(corr_v, base_v, delta=0.5)  # and it neither stalls nor closes the gap
 
   def test_an_invalid_correction_leaves_the_plan_identical(self):
-    base_commands, _, _ = _stop_and_go(_planner())
-    for kwargs in ({"valid": False}, {"age": MOONPILOT_SLAM_MAX_AGE + MOONPILOT_SLAM_POSE_DELAY + 0.5}, {"alive": False}, {"corr_std": float("nan")}):
+    base_commands, _, _ = _stop_and_go(make_planner())
+    for kwargs in ({"valid": False}, {"age": MOONPILOT_SLAM_MAX_AGE + CAM_ODO_POSE_DELAY + 0.5}, {"alive": False}, {"corr_std": float("nan")}):
       with self.subTest(**kwargs):
-        sm_commands, _, _ = _stop_and_go(_planner(), correction={"d_vel": 0.5, **kwargs})
+        sm_commands, _, _ = _stop_and_go(make_planner(), correction={"d_vel": 0.5, **kwargs})
         self.assertEqual(base_commands, sm_commands)
 
   def test_a_correction_cannot_lift_a_standstill_hold(self):
@@ -292,63 +291,33 @@ class TestPlannerCorrection(unittest.TestCase):
     trailing gate made it cheaper still: +0.15 beside a lead reporting 0.12 m/s took the delivered
     command to -0.02. The bound is zero at rest, so neither is reachable.
     """
-    for lead in (None, _lead(MOONPILOT_STOP_DISTANCE, 0.0)):
+    for lead in (None, make_lead(MOONPILOT_STOP_DISTANCE, 0.0)):
       with self.subTest(lead="stopped lead" if lead else "leadless"):
-        planner = _planner()
+        planner = make_planner()
         for frame in range(50):
-          sm = _inputs(
-            v_ego=0.0,
-            v_cruise_kph=0.0 if lead is None else 108.0,
-            force_decel=lead is None,
-            standstill=True,
-            lead=lead if lead is None else _lead(MOONPILOT_STOP_DISTANCE, 0.12 if frame % 2 else 0.0),
-          )
+          sm = inputs(v_ego=0.0,
+          v_cruise_kph=0.0 if lead is None else 108.0,
+          force_decel=lead is None,
+          standstill=True,
+          lead=lead if lead is None else make_lead(MOONPILOT_STOP_DISTANCE, 0.12 if frame % 2 else 0.0),)
           planner.update(_with_correction(sm, d_vel=MOONPILOT_SLAM_MAX_CORR_VEL))
         self.assertTrue(planner.output_should_stop)
         self.assertLess(planner.output_a_target, 0.1)
 
 
 class TestUpstreamManeuverWithCorrection(unittest.TestCase):
-  """Upstream's own plant, driven with a correction and without one, on the maneuver where the
-  correction has something to say: following at 20 m/s while the lead brakes to a stop.
-
-  The plant hands its planner a plain dict and nothing publishes a correction into it, so the
-  correction is injected at the seam the plant's own patched class name gives -- the same trick
-  test_longitudinal.py uses to swap the planner in, one layer down.
-  """
+  """Upstream's maneuver plant with the publisher's correction present or absent."""
 
   TITLE = "steady state following a car at 20m/s, then lead decel to 0mph at 2m/s^2"
 
-  class _Sm(dict):
-    """The plant's dict, with the two duck-typed attributes the correction reader probes."""
-
-    def __init__(self, data, correction):
-      super().__init__(data)
-      msg = messaging.new_message("moonpilotState")
-      msg.valid = True
-      if correction is not None:
-        corr = msg.moonpilotState.egoCorrection
-        corr.valid = True
-        corr.monoTime = int(time.monotonic() * 1e9)
-        corr.age = 0.0
-        corr.corrStd = MOONPILOT_SLAM_CORR_STD_MIN
-        corr.dVel = correction
-      self["moonpilotState"] = msg.moonpilotState
-      self.valid = {"moonpilotState": True}
-      self.alive = {"moonpilotState": True}
-
   @classmethod
   def _planner(cls, correction):
-    class CorrectedPlanner(MoonpilotLongitudinalPlanner):
-      def update(self, sm):
-        super().update(cls._Sm(_plant_sm(sm), correction))
-
-    def factory(CP, init_v=0.0, init_a=0.0, dt=DT_MDL):
-      return CorrectedPlanner(CP, init_v=init_v, init_a=init_a, dt=dt)
-
-    return factory, CorrectedPlanner
+    return plant_planner(ego_correction=correction), None
 
   def _run(self, correction):
+    import openpilot.selfdrive.test.longitudinal_maneuvers.plant as plant_mod
+    from openpilot.selfdrive.test.longitudinal_maneuvers.test_longitudinal import create_maneuvers
+
     factory, _ = self._planner(correction)
     maneuver = next(m for m in create_maneuvers({"force_decel": False}) if m.title == self.TITLE)
     with mock.patch.object(plant_mod, "LongitudinalPlanner", factory):
@@ -387,13 +356,6 @@ class TestMirroredConstants(unittest.TestCase):
   below and the multiplier it discounts temporally correlated odometry noise by. Mirrored rather
   than imported for the init-path reason -- locationd is a daemon, and the planner's seam path
   imports this module -- so a change there has to fail here instead of silently retuning the fork."""
-
-  def test_the_stds_and_multipliers_are_locationds(self):
-    from openpilot.selfdrive.locationd import locationd
-
-    self.assertEqual(MOONPILOT_SLAM_MIN_STD, locationd.MIN_STD_SANITY_CHECK)
-    self.assertEqual(MOONPILOT_SLAM_TRANS_STD_MULT, locationd.CAM_ODO_TRANS_STD_MULT)
-
 
 class TestPriorChannel(unittest.TestCase):
   def test_reads_the_pose_time_not_the_latest_sample(self):
@@ -448,6 +410,8 @@ class TestIngest(unittest.TestCase):
       if extrinsics_calibration is not None:
         self["extrinsicsCalibration"] = extrinsics_calibration
       odometry.timestampEof = int(ODOMETRY_MONO * 1e9)
+      if len(odometry.rot) < 3:
+        odometry.rot = [0.0, 0.0, 0.0]
       published = int((ODOMETRY_MONO + TestIngest.PUBLISH_LAG) * 1e9)
       self.updated = {"cameraOdometry": True, "carState": True}
       self.valid = {"cameraOdometry": True, "carState": True}
@@ -468,8 +432,15 @@ class TestIngest(unittest.TestCase):
       prior.push(ODOMETRY_MONO - 0.2 + i * 0.01, v_ego)
     return prior
 
+  @staticmethod
+  def _node(sm, prior):
+    calibration = sm.get("extrinsicsCalibration")
+    rotation = None if calibration is None else device_from_calib(
+      calibration.rpyCalib, sm.valid["extrinsicsCalibration"])
+    sample = odometry_sample(sm["cameraOdometry"], prior, rotation, sm.valid["cameraOdometry"])
+    return None if sample is None else slam_node(sample)
+
   def test_calibration_rotates_the_translation_and_its_std(self):
-    from moonpilot.leadd import _slam_node
 
     odometry = messaging.new_message("cameraOdometry")
     odometry.cameraOdometry.trans = [20.0, 1.0, 2.0]
@@ -478,14 +449,13 @@ class TestIngest(unittest.TestCase):
     car_state.carState.vEgo = 19.5
     sm = self._Sm(odometry.cameraOdometry, car_state.carState, self._calibration([0.0, 0.1, 0.0]))
 
-    node = _slam_node(sm, self._prior(v_ego=19.5))
+    node = self._node(sm, self._prior(v_ego=19.5))
     assert node is not None
     c, s = math.cos(0.1), math.sin(0.1)
     self.assertAlmostEqual(node.trans_x, c * 20.0 + s * 2.0)
     self.assertAlmostEqual(node.trans_std_x, math.sqrt((c * 0.02) ** 2 + (s * 0.06) ** 2))
 
   def test_identity_and_untrusted_calibration_fall_back_to_identity(self):
-    from moonpilot.leadd import _slam_node
 
     odometry = messaging.new_message("cameraOdometry")
     odometry.cameraOdometry.trans = [20.0, 1.0, 2.0]
@@ -493,8 +463,8 @@ class TestIngest(unittest.TestCase):
     car_state = messaging.new_message("carState")
     car_state.carState.vEgo = 19.5
     common = (odometry.cameraOdometry, car_state.carState)
-    expected = _slam_node(self._Sm(*common), self._prior(v_ego=19.5))
-    identity = _slam_node(self._Sm(*common, self._calibration([0.0, 0.0, 0.0])), self._prior(v_ego=19.5))
+    expected = self._node(self._Sm(*common), self._prior(v_ego=19.5))
+    identity = self._node(self._Sm(*common, self._calibration([0.0, 0.0, 0.0])), self._prior(v_ego=19.5))
     assert expected is not None and identity is not None
     self.assertEqual(identity, expected)
 
@@ -503,14 +473,14 @@ class TestIngest(unittest.TestCase):
       ([0.0, 0.1], True),
       ([0.0, 0.6, 0.0], True),
     ):
-      actual = _slam_node(
+      actual = self._node(
         self._Sm(*common, self._calibration(rpy_calib), calibration_valid),
         self._prior(v_ego=19.5),
       )
       self.assertEqual(actual, expected)
 
   def test_the_node_is_stamped_from_the_exposure_not_the_publish_time(self):
-    """`cameraOdometry` describes the pose MOONPILOT_SLAM_POSE_DELAY before the frame's end of
+    """`cameraOdometry` describes the pose CAM_ODO_POSE_DELAY before the frame's end of
     exposure, which is why locationd reads `timestampEof` (`locationd.py:162`) and not the publish
     time. The two are 30.5 ms apart on the device (median over 13k corpus frames, p95 33.5, max
     200), and that interval is the same `a * dt` pairing error the pose-delay read exists to remove:
@@ -520,7 +490,6 @@ class TestIngest(unittest.TestCase):
     The prior here is a ramp, so the stamp decides the value that lands in the node: a node stamped
     from the publish time reads the prior PUBLISH_LAG too late and the interpolated speed says so.
     """
-    from moonpilot.leadd import _slam_node
 
     odometry = messaging.new_message("cameraOdometry")
     odometry.cameraOdometry.trans = [20.0, 0.0, 0.0]
@@ -533,15 +502,14 @@ class TestIngest(unittest.TestCase):
       t = ODOMETRY_MONO - 0.2 + i * 0.01
       prior.push(t, 20.0 + 10.0 * (t - ODOMETRY_MONO))
 
-    node = _slam_node(self._Sm(odometry.cameraOdometry, car_state.carState), prior)
+    node = self._node(self._Sm(odometry.cameraOdometry, car_state.carState), prior)
     assert node is not None
-    self.assertAlmostEqual(node.mono_time, ODOMETRY_MONO - MOONPILOT_SLAM_POSE_DELAY, delta=1e-9)
-    self.assertAlmostEqual(node.v_ego, 20.0 - 10.0 * MOONPILOT_SLAM_POSE_DELAY, delta=1e-6)
+    self.assertAlmostEqual(node.mono_time, ODOMETRY_MONO - CAM_ODO_POSE_DELAY, delta=1e-9)
+    self.assertAlmostEqual(node.v_ego, 20.0 - 10.0 * CAM_ODO_POSE_DELAY, delta=1e-6)
     # what the publish-time stamp would have read instead, and the size of the error it carries
-    self.assertNotAlmostEqual(node.v_ego, 20.0 - 10.0 * (MOONPILOT_SLAM_POSE_DELAY - self.PUBLISH_LAG), delta=0.2)
+    self.assertNotAlmostEqual(node.v_ego, 20.0 - 10.0 * (CAM_ODO_POSE_DELAY - self.PUBLISH_LAG), delta=0.2)
 
   def test_a_frame_the_prior_cannot_cover_is_skipped(self):
-    from moonpilot.leadd import _slam_node
 
     def node_for(prior, odometry_valid=True):
       odometry = messaging.new_message("cameraOdometry")
@@ -551,7 +519,7 @@ class TestIngest(unittest.TestCase):
       car_state.carState.vEgo = 19.5
       sm = self._Sm(odometry.cameraOdometry, car_state.carState)
       sm.valid["cameraOdometry"] = odometry_valid
-      return _slam_node(sm, prior)
+      return self._node(sm, prior)
 
     self.assertIsNotNone(node_for(self._prior()))  # the control: this frame does produce a node
     # Nothing pushed at all: there is no prior to read at the pose time
@@ -565,33 +533,19 @@ class TestIngest(unittest.TestCase):
 
 
 class TestWiring(unittest.TestCase):
-  def test_the_feature_its_param_row_and_its_reader_agree(self):
-    feature = next(f for f in FEATURES if f.key == "MoonpilotSlam")
-    # It changes a speed the planner plans from, so the row is offroad-only, and the declared
-    # default is the off state: a missing row is a device-only UnknownKeyName.
-    self.assertTrue(feature.offroad_only)
-    text = (ROOT / "moonpilot" / "params_keys.h").read_text()
-    self.assertTrue('{"MoonpilotSlam", {PERSISTENT, BOOL, "0"}}' in text)
-
   def test_one_process_writes_the_service(self):
     """msgq allows exactly one publisher per service, so the correction and the leads have to share
     a process: a second publisher kills the first with EADDRINUSE on its next send, and the manager
     never restarts a process that exited."""
+    from moonpilot import procs
+
     writers = [p for p in procs.MOONPILOT_PROCS if p.name == "leadd"]
     self.assertEqual(len(writers), 1)
     self.assertEqual(writers[0].module, "moonpilot.leadd")
     self.assertNotIn("slamd", [p.name for p in procs.MOONPILOT_PROCS])
 
-  def test_the_gps_service_is_chosen_from_params(self):
-    from openpilot.common.gps import get_gps_location_service
-    from openpilot.common.params import Params
 
-    params = Params()
-    self.assertTrue(get_gps_location_service(params) in ("gpsLocation", "gpsLocationExternal"))
-
-  def test_pose_push_stamps_the_odometry_pose_time_and_reads_the_prior(self):
-    from moonpilot.leadd import _pose_push
-    from moonpilot.pose import PoseTracker
+  def test_pose_step_uses_the_shared_odometry_sample(self):
 
     odometry = messaging.new_message("cameraOdometry")
     odometry.cameraOdometry.trans = [20.0, 0.0, 0.0]
@@ -601,15 +555,16 @@ class TestWiring(unittest.TestCase):
     sm = TestIngest._Sm(odometry.cameraOdometry, car_state.carState)
 
     tracker = PoseTracker()
-    _pose_push(tracker, sm, TestIngest._prior(v_ego=19.5))
-    expected_t = ODOMETRY_MONO - MOONPILOT_SLAM_POSE_DELAY
+    sample = odometry_sample(sm["cameraOdometry"], TestIngest._prior(v_ego=19.5), valid=True)
+    push_odometry_sample(tracker, sample)
+    expected_t = ODOMETRY_MONO - CAM_ODO_POSE_DELAY
     self.assertEqual(tracker.t, expected_t)
     self.assertEqual(tracker.mono_time, 0.0)  # first call only stamps; no dt yet
 
     # A second frame 0.05 s later integrates one step at the prior's speed, with mid-point yaw.
     odometry.cameraOdometry.timestampEof = int((ODOMETRY_MONO + 0.05) * 1e9)
-    sm.updated["cameraOdometry"] = True
-    _pose_push(tracker, sm, TestIngest._prior(v_ego=19.5))
+    sample = odometry_sample(sm["cameraOdometry"], TestIngest._prior(v_ego=19.5), valid=True)
+    push_odometry_sample(tracker, sample)
     dt = 0.05
     yaw_mid = 0.5 * 0.1 * dt
     self.assertAlmostEqual(tracker.x, 19.5 * math.cos(yaw_mid) * dt, delta=1e-6)

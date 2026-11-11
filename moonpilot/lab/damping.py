@@ -14,22 +14,21 @@ import os
 
 import numpy as np
 
+from openpilot.common.constants import ACCELERATION_DUE_TO_GRAVITY
 from openpilot.common.realtime import DT_CTRL
 from openpilot.tools.lib.logreader import LogReader
 
-from moonpilot.lab import DEFAULT_CACHE, cached, expand, lag_s, runs, segments
+from moonpilot.lab import DEFAULT_CACHE, cached, expand, lag_s, moving_mean, runs, segments
 from moonpilot.lab.lateral import as_driven, extract, fidelity, replay_torque
-from moonpilot.latcontrol import MOONPILOT_DAMPING_SPEEDS, MOONPILOT_DAMPING_T
+from moonpilot.features import STEER_DAMPING
+from moonpilot.latcontrol import MOONPILOT_DAMPING_SPEEDS
 
+from moonpilot.lab.routes import add_routes_arg
 EXTRACT_VERSION = 1  # bump whenever _yaw_build changes what it stores
 REPLAY_VERSION = 1  # bump whenever the replay cache's arrays change meaning
-ROUTE_SETS = {
-  # The routes the claims cite (AGENTS.md: 151 min manual, 100 min engaged); routes without rlogs are skipped.
-  "curve": tuple(f"0000{i:04x}" for i in range(0x3F8, 0x411)),
-}
 WINDOW = 600  # frames (6 s), stepped by 300
 STEP = 300
-G = 9.81
+LEVELS = STEER_DAMPING.values  # derivative time per choice, s
 
 
 def _yaw_build(segs: list[str]) -> dict[str, np.ndarray]:
@@ -60,13 +59,13 @@ def _replays(d: dict[str, np.ndarray], route: str, root: str):
   cfg = as_driven(route, root)
   names = [os.path.basename(os.path.dirname(s)) for s in segments(route, root)]
   path = os.path.join(DEFAULT_CACHE, f"{route}.damping-replay.v{REPLAY_VERSION}.npz")
-  key = np.array([cfg.hysteresis, cfg.delay_offset, *MOONPILOT_DAMPING_T])
+  key = np.array([cfg.hysteresis, cfg.delay_offset, *LEVELS])
   if os.path.exists(path):
     z = dict(np.load(path))
     if z["segments"].tolist() == names and np.array_equal(z["cfg"], key):
       return cfg, z
-  z = {k: np.zeros((len(MOONPILOT_DAMPING_T), len(d["t"]))) for k in ("p", "i", "d", "f", "setpoint", "torque")}
-  for level, t in enumerate(MOONPILOT_DAMPING_T):
+  z = {k: np.zeros((len(LEVELS), len(d["t"]))) for k in ("p", "i", "d", "f", "setpoint", "torque")}
+  for level, t in enumerate(LEVELS):
     logs = []
     z["torque"][level] = replay_torque(d, cfg._replace(damping_t=t), lac_out=logs)
     for k, field in (("p", "p"), ("i", "i"), ("d", "d"), ("f", "f"), ("setpoint", "desiredLateralAccel")):
@@ -124,8 +123,6 @@ def _split(x: np.ndarray):
   return tuple(float(np.sqrt(np.mean(np.fft.irfft(X * band, len(x)) ** 2))) for band in (f < 1, (f >= 1) & (f <= 5)))
 
 
-def _smooth(x: np.ndarray, n: int = 20) -> np.ndarray:
-  return np.convolve(x, np.ones(n) / n, mode="same")
 
 
 def _curve_windows(d: dict[str, np.ndarray], la: np.ndarray) -> list[int]:
@@ -183,7 +180,7 @@ def _shape(la: np.ndarray, t: np.ndarray, k: int, step: int, mask: np.ndarray):
 
 def _rate_lag(angle: np.ndarray, rate: np.ndarray):
   """How far the rate sensor trails the angle's derivative, and their correlation there."""
-  deriv = np.gradient(np.convolve(angle, np.ones(5) / 5, mode="same"), DT_CTRL)
+  deriv = np.gradient(moving_mean(angle, 5), DT_CTRL)
   lag = lag_s(deriv, rate, np.ones(len(angle), dtype=bool), max_lag=0.3)
   i = max(int(round(lag / DT_CTRL)), 0)
   a, b = deriv[10:len(deriv) - 10 - i], rate[10 + i:len(rate) - 10]
@@ -192,22 +189,22 @@ def _rate_lag(angle: np.ndarray, rate: np.ndarray):
 
 def _plan_ff(d: dict[str, np.ndarray], sl: slice) -> np.ndarray:
   """The plan feedforward the claims measure D against, in lateral-acceleration units."""
-  return d["curvature"][sl] * d["v_ego"][sl] ** 2 - d["roll"][sl] * G - d["tp_offset"][sl]
+  return d["curvature"][sl] * d["v_ego"][sl] ** 2 - d["roll"][sl] * ACCELERATION_DUE_TO_GRAVITY - d["tp_offset"][sl]
 
 
 def _damping(args):
-  weave = {t: [] for t in MOONPILOT_DAMPING_T}
-  buzz = {t: [] for t in MOONPILOT_DAMPING_T}
-  entry = {t: [] for t in MOONPILOT_DAMPING_T}
-  exit_ = {t: [] for t in MOONPILOT_DAMPING_T}
+  weave = {t: [] for t in LEVELS}
+  buzz = {t: [] for t in LEVELS}
+  entry = {t: [] for t in LEVELS}
+  exit_ = {t: [] for t in LEVELS}
   release = {"manual": [], "op": []}
-  for name in expand(args.routes, ROUTE_SETS):
+  for name in expand(args.routes, args.root):
     got = _load(name, args.root)
     if got is None:
       continue
     d, la, masks, cfg, z = got
-    las = _smooth(la)
-    i_as = MOONPILOT_DAMPING_T.index(cfg.damping_t)
+    las = moving_mean(la, 20)
+    i_as = LEVELS.index(cfg.damping_t)
     active = d["lat_active"]
     for cls in ("manual", "op"):  # before the guard: an all-manual drive still counts toward the driver's release
       for k in _turns(las, masks[cls]):
@@ -224,7 +221,7 @@ def _damping(args):
     print(f"{name}: as driven T={cfg.damping_t:.2f}s, replay vs logged p99 |err| {err:.4f} (median {can:.1f} CAN), {len(windows)} curve windows")
     for s in windows:
       sl = slice(s, s + WINDOW)
-      for level, t in enumerate(MOONPILOT_DAMPING_T):
+      for level, t in enumerate(LEVELS):
         weave[t].append(_band_rms(z["d"][level][sl], 1, 2) / max(_band_rms(z["p"][level][sl], 1, 2), 1e-12))
         buzz[t].append(_band_rms(z["torque"][level][sl], 5, 50))
     for k in _turns(las, masks["op"]):
@@ -236,10 +233,10 @@ def _damping(args):
         push = float(np.sum(np.abs(_plan_ff(d, sl))))
         if push < 1e-6:
           continue
-        for level, t in enumerate(MOONPILOT_DAMPING_T):
+        for level, t in enumerate(LEVELS):
           (entry if side == "entry" else exit_)[t].append(float(np.sum(turn * z["d"][level][sl]) / push))
   off = float(np.median(buzz[0.0]))
-  for t in MOONPILOT_DAMPING_T:
+  for t in LEVELS:
     med_entry = 100 * float(np.median(entry[t])) if entry[t] else float("nan")
     p10 = 100 * float(np.percentile(entry[t], 10)) if entry[t] else float("nan")
     pos, n_exit = sum(x > 0 for x in exit_[t]), len(exit_[t])
@@ -250,7 +247,7 @@ def _damping(args):
   op = float(np.median(release["op"])) if release["op"] else float("nan")
   print(f"steepest release / peak at 3-10 m/s (median): manual {man:.2f} (n={len(release['manual'])}), "
         + f"openpilot {op:.2f} (n={len(release['op'])})")
-  lead = [f"{np.degrees(np.arctan(2 * np.pi * 1.2 * t)):.1f}" for t in MOONPILOT_DAMPING_T[1:]]
+  lead = [f"{np.degrees(np.arctan(2 * np.pi * 1.2 * t)):.1f}" for t in LEVELS[1:]]
   print(f"analytic feedback lead at 1.2 Hz: {' / '.join(lead)} degrees; damping speed schedule {MOONPILOT_DAMPING_SPEEDS}")
 
 
@@ -260,12 +257,12 @@ def _weave(args):
   flutter = []
   lags, corrs, fids = [], [], []
   minutes = {"manual": 0.0, "op": 0.0}
-  for name in expand(args.routes, ROUTE_SETS):
+  for name in expand(args.routes, args.root):
     got = _load(name, args.root)
     if got is None:
       continue
     d, la, masks, cfg, z = got
-    i_as = MOONPILOT_DAMPING_T.index(cfg.damping_t)
+    i_as = LEVELS.index(cfg.damping_t)
     if d["lat_active"].any():
       err = fidelity(d, z["torque"][i_as])
       fids.append(err)
@@ -324,17 +321,17 @@ def _release(args):
   from moonpilot.lab.lateral import action
   shapes = {k: [] for k in ("manual car", "openpilot car", "model action", "request", "torque", "wheel angle")}
   terms = {k: [] for k in ("pid sum", "p", "i", "d", "friction", "request", "setpoint", "car")}
-  for name in expand(args.routes, ROUTE_SETS):
+  for name in expand(args.routes, args.root):
     got = _load(name, args.root)
     if got is None:
       continue
     d, la, masks, cfg, z = got
-    t, v, level = d["t"], d["v_ego"], MOONPILOT_DAMPING_T.index(cfg.damping_t)
-    las, request = _smooth(la), d["curvature"] * v ** 2
+    t, v, level = d["t"], d["v_ego"], LEVELS.index(cfg.damping_t)
+    las, request = moving_mean(la, 20), d["curvature"] * v ** 2
     p, i, dd, f, sp = (z[k][level] for k in ("p", "i", "d", "f", "setpoint"))
     command = p + i + dd + f
     series = {"model action": np.abs(action(d) * v ** 2), "request": np.abs(request), "torque": np.abs(d["torque"]), "wheel angle": np.abs(d["angle"])}
-    series = {n: _smooth(x) for n, x in series.items()}
+    series = {n: moving_mean(x, 20) for n, x in series.items()}
     for cls in ("manual", "op"):
       for k in _turns(las, masks[cls]):
         if not 3 <= v[k] < 10 or (s := _shape(las, t, k, 1, masks[cls])) is None:
@@ -367,5 +364,5 @@ def register(sub):
     ("release", _release, "where a low-speed turn's release comes from: driver vs openpilot, request, torque and the command's terms"),
   ):
     p = sub.add_parser(name, help=help_)
-    p.add_argument("--routes", nargs="+", default=["curve"], help="route names or sets: curve (routes 3f8-410)")
+    add_routes_arg(p, ["curve"])
     p.set_defaults(fn=fn)

@@ -7,6 +7,7 @@ reading of the UI state both call, which is what keeps the row and the gesture i
 """
 
 from moonpilot import offroad
+from moonpilot.ui.panel_common import enter, parked, toggle
 from openpilot.common.params import Params
 from openpilot.selfdrive.ui.ui_state import ui_state
 from openpilot.system.ui.lib.application import gui_app
@@ -15,9 +16,6 @@ from openpilot.system.ui.widgets.confirm_dialog import ConfirmDialog
 from openpilot.system.ui.widgets.list_view import ListItem, button_item
 
 
-def parked() -> bool:
-  """Whether the mode may be entered now, read off the UI state the panel and the road view share."""
-  return offroad.can_enter(ui_state.started, ui_state.sm["carState"].vEgo, ui_state.engaged)
 
 
 def row(params: Params) -> ListItem:
@@ -33,10 +31,6 @@ def row(params: Params) -> ListItem:
   )
 
 
-def toggle(params: Params) -> None:
-  offroad.set_requested(
-    params, not offroad.requested(params), ui_state.started, ui_state.sm["carState"].vEgo, ui_state.engaged
-  )
 
 
 def long_press() -> None:
@@ -48,5 +42,3 @@ def long_press() -> None:
   gui_app.push_widget(ConfirmDialog(offroad.CONFIRM_TEXT, "Go offroad", callback=lambda result: enter() if result == DialogResult.CONFIRM else None))
 
 
-def enter() -> None:
-  offroad.set_requested(ui_state.params, True, ui_state.started, ui_state.sm["carState"].vEgo, ui_state.engaged)

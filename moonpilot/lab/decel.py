@@ -7,8 +7,11 @@ from functools import partial
 
 import numpy as np
 from openpilot.common.realtime import DT_MDL
+from moonpilot.lab import route_moving_mean
 from moonpilot.lab.driver import _decel_line, _fly_stages, _load
 from moonpilot.lab.planner import _calibration, _decel_jobs, _hard_brake_run
+import moonpilot.jerk as jerk
+from moonpilot.lab.routes import add_calibration_arg
 
 DRIVER_KEYS = ("t", "manual", "v", "a", "brake", "lead", "gap", "v_lead")
 BUILD_SPAN_S, BUILD_WINDOW_S, MIN_BUILD_SPEED = 0.5, 2.0, 5.0  # the change over this span, this far into the press, above this speed
@@ -38,18 +41,17 @@ def _driver_build(d):
 
 def _down_rate(a_cmd, v_ego=10.0, lead_braking=False):
   """`jerk_limit`'s own down rate at one ask, read back off its output rather than restated."""
-  from moonpilot.longitudinal import jerk_limit
+  from moonpilot.jerk import jerk_limit
   return (0.05 - jerk_limit(a_cmd, 0.05, DT_MDL, v_ego, lead_braking=lead_braking)) / DT_MDL
 
 
 def _fly_one(job, onset):
   """One lead-caused decel flown through the planner with `MOONPILOT_JERK_ONSET` set to `onset`."""
-  import moonpilot.longitudinal as longitudinal
-  saved, longitudinal.MOONPILOT_JERK_ONSET = longitudinal.MOONPILOT_JERK_ONSET, onset
+  saved, jerk.MOONPILOT_JERK_ONSET = jerk.MOONPILOT_JERK_ONSET, onset
   try:
     return _fly_stages(job)
   finally:
-    longitudinal.MOONPILOT_JERK_ONSET = saved
+    jerk.MOONPILOT_JERK_ONSET = saved
 
 
 def _decel_ramp(args):
@@ -69,11 +71,11 @@ def _decel_ramp(args):
       print(f"  {name:22s} n {m.sum():4d}  build {np.median(x[m, 1]):.2f} ({np.percentile(x[m, 1], 75):.2f}) m/s^3  "
             + f"peak {np.median(x[m, 2]):.2f} m/s^2, rising at {np.median(x[m, 3]):.2f}")
   print("planner at 10 m/s, no lead braking: " + ", ".join(f"ask {a:+.1f}: {_down_rate(a):.2f} m/s^3" for a in DEPTHS)
-        + f", ACCEL_MIN: {_down_rate(longitudinal.ACCEL_MIN):.2f}; below {longitudinal.MOONPILOT_JERK_LAUNCH_SPEED:g} m/s or while any"
+        + f", ACCEL_MIN: {_down_rate(longitudinal.ACCEL_MIN):.2f}; below {jerk.MOONPILOT_JERK_LAUNCH_SPEED:g} m/s or while any"
         + f" lead brakes: {_down_rate(-2.0, lead_braking=True):.2f}")
 
-  a_s = np.concatenate([np.convolve(d["a"][d["route_id"] == r], np.ones(10) / 10, mode="same") for r in np.unique(d["route_id"])])
   d["route"] = d["route_id"]  # `_decel_jobs` groups by route; `_load` names drives by id, not by name
+  a_s = route_moving_mean(d, 10)
   jobs, drv = _decel_jobs(d, a_s)
   if not jobs:
     print("lead-caused decels: none")
@@ -83,12 +85,12 @@ def _decel_ramp(args):
   for onset in args.onsets:
     with ProcessPoolExecutor(max_workers=4) as pool:
       flown = list(pool.map(partial(_fly_one, onset=onset), [(*job, calibration) for job in jobs]))
-    saved = longitudinal.MOONPILOT_JERK_ONSET
-    longitudinal.MOONPILOT_JERK_ONSET = onset
+    saved = jerk.MOONPILOT_JERK_ONSET
+    jerk.MOONPILOT_JERK_ONSET = onset
     try:
       gap = _hard_brake_run("fork+engine", 20.0, -3.5, True)[0]
     finally:
-      longitudinal.MOONPILOT_JERK_ONSET = saved
+      jerk.MOONPILOT_JERK_ONSET = saved
     print(f"  {onset:4.2f}  " + _decel_line(flown, drv) + f"  |  hard brake 20 m/s -3.5: gap {gap:.2f} m")
   print("  an onset well under the driver's own shallow build brakes slower than he does; a hard brake's gap is set by the deep"
         + " asks, so what a shallower shallow onset changes is felt in the gentle brake, not bought back in the stop")
@@ -97,5 +99,5 @@ def _decel_ramp(args):
 def register(sub):
   parser = sub.add_parser("decel-ramp", help="the braking schedule: the driver's brake build by depth, jerk_limit's rates, decels at each onset")
   parser.add_argument("--onsets", nargs="+", type=float, default=[1.0, 0.5], help="shallow onsets to fly, m/s^3")
-  parser.add_argument("--calibration", default="00000451", help="drive whose recorded lag and radar latency seed the flights")
+  add_calibration_arg(parser)
   parser.set_defaults(fn=_decel_ramp)

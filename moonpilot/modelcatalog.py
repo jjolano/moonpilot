@@ -1,8 +1,9 @@
 """The catalog side of the model marketplace: read it, decide what this device can run.
 
-`moonpilot/models.py` holds the rules about a *stored* model; this module holds the rules about a
-*catalog* one, and it is the only importer of the vendored SDK (`moonpilot/vendor/openmodels/`).
-Three things are worth knowing.
+`moonpilot/models.py` holds the stored-model rules; `moonpilot/modelprotocols.py` owns the protocol
+table and admission rules, while this module handles catalog access through the vendored SDK
+(`moonpilot/vendor/openmodels/`).
+Two things are worth knowing.
 
 **The catalog is a feed, not an authority.** It publishes bytes and a structural identity and owns
 no activation, scheduling or qualification, so a recipe is only "selectable" here because this
@@ -16,23 +17,21 @@ browsable and not selectable, with the reason the panel prints.
 `slice` in the embedded pickle -- and `verify_downloaded` compares that with what the recipe
 recorded, so the artifact a build compiles is the artifact the admission decision was made about.
 
-`admit` is the worker's and the panels' shared answer: it decides whether a catalog recipe is
-runnable here and carries the reason and technical notes the panels show.
+
 """
 
 import os
 from typing import Any
 
-from moonpilot import models
+from moonpilot import modelprotocols, modelstatus, models
 from moonpilot.vendor.openmodels import client, contracts, metadata
 
 CATALOG_PUBKEY: str = ""
 SIGNATURE_SUFFIX = ".sig"
 
 
-def verify_signature(payload: bytes, signature: bytes, pubkey_pem: str | None = None) -> None:
-  """Verify a catalog sidecar with the pinned Ed25519 key."""
-  key = CATALOG_PUBKEY if pubkey_pem is None else pubkey_pem
+def verify_signature(payload: bytes, signature: bytes) -> None:
+  key = CATALOG_PUBKEY
   if not key:
     raise ValueError("catalog signature requirement cannot be met: no public key is pinned")
   try:
@@ -54,10 +53,10 @@ INTERFACE_MISMATCH = "downloaded artifact does not match its recorded interface"
 ARTIFACT_UNAVAILABLE = "artifact {availability}: this catalog has no bytes for it"
 
 
-def load_catalog(path: str | None = None):
+def load_catalog():
   """The snapshot this device holds. No stale-cache fallback: a file that does not validate raises,
   and the caller decides what to do about it (the worker keeps the previous one)."""
-  return client.Catalog.load(path or models.catalog_file())
+  return client.Catalog.load(models.catalog_file())
 
 
 def refresh(url: str = CATALOG_URL, *, timeout: int = 30, require_signature: bool = False):
@@ -95,8 +94,7 @@ def _entry_dates(catalog) -> dict[str, str]:
 
 
 def _members_with_dates(catalog, recipe_object, dates: dict[str, str]) -> dict[str, dict]:
-  """`{role: member_view}` for one recipe, with `published_at` added so `models.member_reason` can
-  check the action head's era."""
+  """`{role: member_view}` for one recipe, with `published_at` added for protocol admission."""
   views = {}
   for role, member in recipe_object.data["members"].items():
     view = models.member_view(member)
@@ -123,7 +121,9 @@ def admit(catalog, recipe: str) -> dict:
 
   notes = []
   try:
-    findings = recipe_object.check(target={"backend": "QCOM", "hardware": "comma3x", "os": "moonpilot", "runtime": "local-build", "options": {}})
+    findings = recipe_object.check(
+      target={"backend": modelprotocols.QCOM_TARGET, "hardware": "comma3x", "os": "moonpilot", "runtime": "local-build", "options": {}}
+    )
   except contracts.ContractError as exc:
     result["reason"] = str(exc)
     return result
@@ -147,9 +147,9 @@ def admit(catalog, recipe: str) -> dict:
 
   dates = _entry_dates(catalog)
   members = _members_with_dates(catalog, recipe_object, dates)
-  proto = models.protocol_for_roles(members)
+  proto = modelprotocols.protocol_for_roles(members)
   if proto is None:
-    result["reason"] = f"{models.UNKNOWN_ROLE}: {', '.join(sorted(members))}"
+    result["reason"] = f"{modelprotocols.UNKNOWN_ROLE}: {', '.join(sorted(members))}"
     return result
   result["protocol"] = proto.id
 
@@ -157,10 +157,10 @@ def admit(catalog, recipe: str) -> dict:
     if member.get("availability") != "available":
       result["reason"] = ARTIFACT_UNAVAILABLE.format(availability=member.get("availability", "unknown"))
       return result
-    if member["size"] > models.MAX_ARTIFACT_BYTES:
-      result["reason"] = models.TOO_LARGE
+    if member["size"] > modelstatus.MAX_ARTIFACT_BYTES:
+      result["reason"] = modelstatus.TOO_LARGE
       return result
-  if (reason := models.set_reason(proto, members)) is not None:
+  if (reason := modelprotocols.set_reason(proto, members)) is not None:
     result["reason"] = reason
     return result
 
@@ -180,16 +180,9 @@ def _model_row(candidates: list[dict]) -> dict | None:
 
 
 def browse_index(catalog) -> dict:
-  """The display index the panels page: one entry per *model group* -- the admitted variant when
-  any of its recipes admit, else the newest -- sorted newest first, with the verdict the panel
-  prints and, in `variants`, every recipe of the group so a variant the row does not show still has
-  its name. The catalog groups recipe variants under one model id; a flat per-recipe list showed the
-  same name many times and put every refused twin in front of a driver who can only pick one.
+  """The display index: one row per model group, newest first, with the verdict and variants.
 
-  `folder`, `short_name` and `name_kind` are the catalog's own presentation claims, carried when the
-  published naming record has them and empty when it does not: a device holding an older snapshot
-  reads every row through the same keys and falls back to grouping by protocol and model class.
-  """
+  Catalog naming claims are carried when present; older snapshots fall back to protocol and model class."""
   entries = []
   for model in catalog.models(include_archive=True):
     candidates = []
@@ -208,13 +201,9 @@ def browse_index(catalog) -> dict:
           "name_kind": str(model.get("name_kind", "")),
           "folder": str(model.get("folder", "")),
           "kind": str(model.get("kind", "")),
-          "family": str(model.get("family", "")),
           "model_class": str(model.get("model_class", "")),
-          "archived": bool(model.get("archived", False)),
           "roles": sorted(recipe_object.data["members"]),
           "size": int(variant.get("size", 0)),
-          "targets": sorted(str(target) for target in variant.get("targets", [])),
-          "available": bool(variant.get("available", False)),
           "updated_at": str(variant.get("updated_at", "")),
           "protocol": verdict["protocol"],
           "admitted": verdict["admitted"],
@@ -238,15 +227,14 @@ def write_browse(catalog) -> dict:
 def verify_onnx(path: str) -> dict:
   """The interface a downloaded ONNX actually declares, read from its bytes.
 
-  Structural only, and deliberately dependency-free: nothing here executes anything in the file, and
-  the embedded `output_slices` pickle is decoded by an unpickler that can construct nothing but
-  `slice`. This is the only safe way to read a downloaded artifact -- and never `pickle.load` one."""
+  Structural and dependency-free: nothing here executes anything in the file, and the embedded
+  `output_slices` pickle is decoded by an unpickler that can construct nothing but `slice`."""
   record = metadata.parse(path)
   if record.get("output_slices_error") is not None:
     raise ValueError(f"{os.path.basename(path)}: {record['output_slices_error']}")
   if record.get("output_slices") is None:
     raise ValueError(f"{os.path.basename(path)}: no output_slices in metadata")
-  return {"input_shapes": record["input_shapes"], "slices": record["output_slices"], "output_shapes": record.get("output_shapes") or {}}
+  return {"input_shapes": record["input_shapes"], "slices": record["output_slices"]}
 
 
 def _canonical_slice_bounds(value: Any) -> tuple[int | None, int | None, int | None] | None:
@@ -256,7 +244,7 @@ def _canonical_slice_bounds(value: Any) -> tuple[int | None, int | None, int | N
   return (None if start is None else int(start), None if stop is None else int(stop), None if step is None else int(step))
 
 
-def verify_downloaded(catalog, recipe: str) -> str | None:
+def verify_downloaded(recipe: str) -> str | None:
   """Re-derive every member's interface from the bytes on disk and compare it with what the recipe
   recorded. `None` when they agree; the mismatch reason otherwise.
 
@@ -265,7 +253,7 @@ def verify_downloaded(catalog, recipe: str) -> str | None:
   """
   package = models.load_package(recipe)
   if package is None:
-    return models.NOT_INSTALLED
+    return modelprotocols.NOT_INSTALLED
   stored = models.package_members(recipe, package["recipe"])
   for role, member in package["recipe"]["members"].items():
     path = (stored.get(role) or {}).get("path")

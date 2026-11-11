@@ -8,9 +8,10 @@ from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
 from openpilot.common.realtime import DT_CTRL, DT_MDL
-from moonpilot.lab import expand, runs
-from moonpilot.lab.bursts import _burst_starts, extract_chain
-from moonpilot.lab.planner import ROUTE_SETS, _details_arrays, _launch_frames, extract, replay
+from moonpilot.lab import burst_starts, expand, runs
+from moonpilot.lab.bursts import extract_chain
+from moonpilot.lab.planner import _launch_frames, extract, replay
+from moonpilot.lab.routes import ROUTE_SETS
 
 LAUNCH_RAMP_GAP = 25.0  # m; a lead nearer than this when the ego moves is the one launched behind (MOONPILOT_JERK_RAMP_GAP)
 
@@ -37,18 +38,18 @@ def _replay(job):
   """One drive, replayed in its own configuration through today's planner or (`old`) with `jerk_limit`'s positive side
   patched back to the up-jerk the ramp replaced."""
   import moonpilot.longitudinal as longitudinal
+  import moonpilot.jerk as jerk
   route, root, old = job
-  saved, details = longitudinal.jerk_limit, []
+  saved = jerk.jerk_limit
   if old:
     def jerk_limit(a_cmd, a_prev, dt, v_ego, comfort_scale=1.0, lead_braking=False, ramp=None):
       return saved(a_cmd, a_prev, dt, v_ego, comfort_scale, lead_braking, float(np.interp(v_ego, [2.5, 5.0], [4.0, 1.5])))
     longitudinal.jerk_limit = jerk_limit  # ty: ignore[invalid-assignment]  # the replaced arm, same call shape
   try:
-    replayed, *_ = replay(route, extract(route, root), root, details_out=details)
+    replayed, _, _, details = replay(route, extract(route, root), root, details=True)
   finally:
     longitudinal.jerk_limit = saved
-  d = _details_arrays(details)
-  return {"t": d["t"], "v": d["v_ego"], "active": d["long_active"], "logged": d["logged_a_target"], "lead": d["lead_present"],
+  return {"t": details["t"], "v": details["v_ego"], "active": details["long_active"], "logged": details["logged_a_target"], "lead": details["lead_present"],
           "cmd": np.asarray(replayed)}
 
 
@@ -81,7 +82,7 @@ def _accel_ramp(args):
             + f"peak {np.median(x[m, 4]):.2f} ({np.percentile(x[m, 4], 75):.2f}) m/s^2")
 
   engaged, n35 = [], round(3.5 / DT_CTRL)
-  for route in expand(args.engaged, ROUTE_SETS):
+  for route in expand(args.engaged, args.root):
     c = extract_chain(route, args.root)
     t, v, a = c["t"] * 1e-9, c["v_ego"], c["a_ego"]
     for j in _rest_launches(t, v, c["long_active"] > 0, np.zeros(len(t)), DT_CTRL, n35):
@@ -110,7 +111,7 @@ def _accel_ramp(args):
           cmd = f["cmd"][k:k + n5]
           out.append((f["lead"][k], _steepest_rise(cmd, DT_MDL, 5.0, start_s=0.0), cmd[n2], cmd[round(2.5 / DT_MDL)]))
       fast = f["active"] & (f["v"] > 5.0)
-      bursts, frames = bursts + len(_burst_starts(f["cmd"], fast)), frames + int(fast.sum())
+      bursts, frames = bursts + len(burst_starts(f["cmd"], fast)), frames + int(fast.sum())
     y = np.asarray(out, dtype=float).reshape(-1, 4)
     cells = [f"{label} (n {m.sum()}) {np.median(y[m, 1]):.2f} / {np.median(y[m, 2]):+.2f} / {np.median(y[m, 3]):+.2f}"
              for label, m in (("all", np.ones(len(y), bool)), ("no lead", y[:, 0] == 0), ("lead", y[:, 0] > 0)) if m.any()]
@@ -120,5 +121,5 @@ def _accel_ramp(args):
 def register(sub):
   parser = sub.add_parser("accel-ramp", help="the positive ramp: launch build-up by lead launch, engaged aEgo, today's ramp against the replaced up-jerk")
   parser.add_argument("--routes", nargs="*", default=[], help=f"manual route names or sets: {', '.join(ROUTE_SETS)}; default every drive with rlogs")
-  parser.add_argument("--engaged", nargs="+", default=["engaged"], help=f"engaged route names or sets: {', '.join(ROUTE_SETS)}")
+  parser.add_argument("--engaged", nargs="+", default=["longitudinal-engaged"], help=f"engaged route names or sets: {', '.join(ROUTE_SETS)}")
   parser.set_defaults(fn=_accel_ramp)

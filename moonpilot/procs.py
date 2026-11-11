@@ -1,55 +1,36 @@
 from openpilot.system.manager.process import DaemonProcess, NativeProcess, PythonProcess
 
-from moonpilot import deps, features, models
+from moonpilot import deps, features, modelstatus
 
 
 def _only_onroad(started: bool, params, CP) -> bool:
-  # Same predicate as process_config.only_onroad. Defined here rather than imported: that module
-  # imports MOONPILOT_PROCS from this one, so importing back would be circular.
+  # Same predicate as process_config.only_onroad, and local for the same reason every predicate here is:
+  # `process_config` imports this table, so importing back would be circular. `ensure_running` does not
+  # restart an exited child while `should_run` remains true; the manager retries only after a later evaluation.
   return started
 
 
 def _deps_missing(started: bool, params, CP) -> bool:
-  # Onroad and offroad: a package can only be fetched where there is a network, which is usually
-  # parked. Top-level `moonpilot.deps` import is fine — it is stdlib-only and imports nothing that
-  # reaches back here, so neither the init-path rule nor _only_onroad's circularity applies.
+  # Onroad and offroad: a package can only be fetched where there is a network, which is usually parked.
   return len(deps.missing()) > 0
 
 
 def _tailscale_wanted(started: bool, params, CP) -> bool:
   # Onroad and offroad: remote access is wanted while driving too, and the toggle defaults off.
-  # Same top-level-import reasoning as _deps_missing, for `moonpilot.features`.
   return features.enabled(features.TAILSCALE, params)
 
 
-def _models_wanted(started: bool, params, CP) -> bool:
-  # Onroad and offroad: a request can arrive anywhere, and the first start of a boot is this
-  # process's only chance to publish the store listing the panels page. Then it is reaped -- see
-  # moonpilot/modelsd.py. `moonpilot.models` is stdlib-only on purpose, so this stays a top-level
-  # import like the two above.
-  return params.get(models.REQUEST_KEY) is not None or params.get(models.STATUS_KEY) is None
-
 
 # moonpilot processes, merged into upstream's procs by moonpilot_procs in openpilot/system/manager/process_config.py.
-# Constructors: NativeProcess(name, cwd, cmdline, should_run, enabled=True) /
-#               PythonProcess(name, module, should_run, enabled=True) / DaemonProcess(name, module, param_name)
-# Typed as the same union upstream's literal list infers, so the merged list stays well-typed.
 MOONPILOT_PROCS: list[DaemonProcess | NativeProcess | PythonProcess] = [
-  # Normalizes the model's lead trajectories onto moonpilotState, and the fork's rolling-window ego
-  # correction with them: msgq allows one publisher per service, so the correction rides this
-  # process rather than a second one. Observation only, so no config_realtime_process; see
-  # moonpilot/lead.py and moonpilot/slam.py.
+  # One publisher carries both lead trajectories and the rolling-window ego correction.
   PythonProcess("leadd", "moonpilot.leadd", _only_onroad),
   # Installs the external Python packages a feature declares, once the device has a network.
-  # Stopped by the manager as soon as nothing is missing; see moonpilot/depsd.py.
   PythonProcess("depsd", "moonpilot.depsd", _deps_missing),
-  # Installs and supervises tailscaled, and publishes MoonpilotTailscaleStatus for the panels.
-  # Started and stopped by the toggle; see moonpilot/tailscaled.py.
+  # Installs and supervises tailscaled, publishing MoonpilotTailscaleStatus for the panels.
   PythonProcess("tailscaled", "moonpilot.tailscaled", _tailscale_wanted),
-  # The model marketplace's worker: fetches, verifies and compiles what the driver picked, and
-  # publishes MoonpilotModelsStatus. Runs while a request is waiting or until this boot has
-  # published a status at all, then the manager reaps it; see moonpilot/modelsd.py.
-  PythonProcess("modelsd", "moonpilot.modelsd", _models_wanted),
+  # The marketplace worker fetches and compiles requests, then publishes MoonpilotModelsStatus.
+  PythonProcess("modelsd", "moonpilot.modelsd", lambda _started, params, _CP: modelstatus.worker_wanted(params)),
 ]
 
 

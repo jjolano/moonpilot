@@ -11,8 +11,10 @@ from moonpilot.lagd import (
   MOONPILOT_LAT_LAG_KEY,
   MOONPILOT_LAT_LAG_MAX_APPLIED,
   MoonpilotLagEstimator,
-  persisted_blocks,
+  cached_lag_blocks,
 )
+from moonpilot.tests.fakes import FakeParams
+
 
 DT = 0.05
 FINGERPRINT = "TOYOTA_RAV4_TSS2"
@@ -42,17 +44,12 @@ def _feed(estimator, v_ego, lag_frames=7, seconds=None):
     estimator.update_estimate()
 
 
-class _Params:
-  def __init__(self, values):
-    self.values = values
-
-  def get(self, key):
-    return self.values.get(key)
-
 
 def _cache(msg, fingerprint=FINGERPRINT):
-  return _Params({MOONPILOT_LAT_LAG_KEY: msg.to_bytes(),
-                  "CarParamsPrevRoute": car.CarParams.new_message(carFingerprint=fingerprint).to_bytes()})
+  return FakeParams(on=False, overrides={
+    MOONPILOT_LAT_LAG_KEY: msg.to_bytes(),
+    "CarParamsPrevRoute": car.CarParams.new_message(carFingerprint=fingerprint).to_bytes(),
+  })
 
 
 class TestLagd(unittest.TestCase):
@@ -83,7 +80,7 @@ class TestLagd(unittest.TestCase):
     self.assertEqual(msg.lateralDelay.status, "estimated")
     self.assertAlmostEqual(msg.lateralDelay.lateralDelay, np.mean(blocks), delta=1e-6)
 
-    restored = persisted_blocks(_cache(msg), _cp())
+    restored = cached_lag_blocks(_cache(msg), _cp())
     np.testing.assert_allclose(restored, blocks, atol=1e-6)
     again = MoonpilotLagEstimator(_cp(), DT)
     again.restore(restored)
@@ -119,11 +116,11 @@ class TestLagd(unittest.TestCase):
       "stock lagd's cache": _cache(stock_msg),
       "another car": _cache(good.get_msg(True), fingerprint="HONDA_CIVIC"),
       "a block outside the ROI": _cache(out_of_range),
-      "nothing cached": _Params({}),
+      "nothing cached": FakeParams(on=False),
     }
     for name, params in cases.items():
       with self.subTest(name):
-        self.assertEqual(persisted_blocks(params, _cp()), [])
+        self.assertEqual(cached_lag_blocks(params, _cp()), [])
 
   def test_the_lagd_row_runs_the_fork_estimator(self):
     from openpilot.system.manager.process_config import managed_processes, only_onroad

@@ -1,5 +1,4 @@
 """lagd replays: the fork estimator per route, the stock estimator per speed band, and the closed loop."""
-import glob
 import math
 
 import numpy as np
@@ -15,10 +14,8 @@ from openpilot.tools.lib.logreader import LogReader
 from moonpilot.lagd import MoonpilotLagEstimator
 from moonpilot.lab import DEFAULT_ROOT, cached, drive_config, expand, lag_s
 from moonpilot.lab.lateral import action, extract as lateral_extract
+from moonpilot.lab.routes import add_routes_arg
 
-CLAIMS = tuple(f"{i:08x}" for i in range(0x3F3, 0x40B))
-ROUTE_SETS = {"claims": tuple(r for r in CLAIMS if glob.glob(f"{DEFAULT_ROOT}/{r}--*/rlog.zst")),  # 000003fb has no rlogs
-              "closed-loop": ("00000408", "0000040e", "0000040d")}
 INPUTS = ("deviceMotion", "extrinsicsCalibration", "carState", "controlsState", "carControl", "lateralDelay")
 BANDS = ((10.0, 17.0), (17.0, 22.0), (22.0, math.inf), (0.0, 10.0))
 EXTRACT_VERSION = 3  # v2 stores the CarParams payload (as lagd reads it); v3 adds the carState speed beside each event
@@ -89,14 +86,19 @@ def _replay(route: str, root: str, stock: bool = False, band: tuple[float, float
           "valid": int(out.validBlocks), "blocks": _blocks(learner), "logged": logged, "commit": drive_config(route, root)[0]}
 
 
+def _print_replay(route, r):
+  last = r["logged"][-1] if r["logged"] else (float("nan"), float("nan"), 0, 0)
+  err = f"{abs(r['applied'] - last[0]):.3f}" if last[3] == 1000 else "n/a"
+  nb, est, applied, unc = len(r["blocks"]), r["est"], r["applied"], r["uncapped"]
+  lg = f"{last[0]:.3f}({last[2]})"
+  print(f"{route} {r['commit'][:9]}: blocks={nb} est={est:.3f} applied={applied:.3f} uncapped={unc:.3f} logged={lg} v{last[3]} error={err}")
+  return last, err
+
+
 def _command(args):
-  for route in expand(args.routes, ROUTE_SETS):
+  for route in expand(args.routes, args.root):
     r = _replay(route, args.root)
-    last = r["logged"][-1] if r["logged"] else (float("nan"), float("nan"), 0, 0)
-    err = f"{abs(r['applied'] - last[0]):.3f}" if last[3] == 1000 else "n/a"
-    nb, est, applied, unc = len(r["blocks"]), r["est"], r["applied"], r["uncapped"]
-    lg = f"{last[0]:.3f}({last[2]})"
-    print(f"{route} {r['commit'][:9]}: blocks={nb} est={est:.3f} applied={applied:.3f} uncapped={unc:.3f} logged={lg} v{last[3]} error={err}")
+    last, _ = _print_replay(route, r)
     # The estimator the drive itself ran (version 1 is stock's), from an empty cache, against its logged value.
     s = _replay(route, args.root, stock=last[3] == 1)
     who = "fork" if last[3] == 1000 else "stock"
@@ -104,7 +106,7 @@ def _command(args):
 
 
 def _bands(args):
-  routes = expand(args.routes, ROUTE_SETS)
+  routes = expand(args.routes, args.root)
   for low, high in BANDS:
     pooled, estimates, rows = [], [], 0
     for route in routes:
@@ -120,12 +122,10 @@ def _bands(args):
 
 
 def _closed(args):
-  for route in expand(args.routes, ROUTE_SETS):
+  for route in expand(args.routes, args.root):
     r = _replay(route, args.root)
-    last = r["logged"][-1] if r["logged"] else (float("nan"), float("nan"), 0, 0)
-    err = f"{abs(r['applied'] - last[0]):.3f}" if last[3] == 1000 else "n/a"
+    last, err = _print_replay(route, r)
     first = next((row for row in r["logged"] if row[2] > 0), None)
-    peak = max((row for row in r["logged"] if row[2] < 5), key=lambda row: row[1], default=None)
     d = lateral_extract(route, args.root)
     CP = messaging.log_from_bytes(d["cp"].tobytes(), car.CarParams)
     vm = VehicleModel(CP)
@@ -153,8 +153,10 @@ def _closed(args):
     yr, ym = (LateralLagEstimator.actuator_delay(np.asarray(ref, float), np.asarray(vehicle, float), mask, DT_CTRL, MIN_LAG, MAX_LAG)[0]
               for ref in (d["curvature"], action(d)))
     nb, est, applied, unc = len(r["blocks"]), r["est"], r["applied"], r["uncapped"]
+    peak = max((abs(row[1]) for row in r["logged"] if row[2] == 0), default=float("nan"))
     lg = f"{last[0]:.3f}({last[2]})"
-    print(f"{route} {r['commit'][:9]}: blocks={nb} est={est:.3f} applied={applied:.3f} uncapped={unc:.3f} logged={lg} v{last[3]} error={err}")
+    print(f"{route} {r['commit'][:9]}: blocks={nb} est={est:.3f} applied={applied:.3f} uncapped={unc:.3f} "
+          + f"logged={lg} v{last[3]} error={err}")
     print(f"  wheel lag: rms request={wheel:.3f}s model={model:.3f}s xcorr request={xr:.3f}s model={xm:.3f}s frames={int(mask.sum())}")
     print(f"  yaw ncc: request={yr:.3f}s model={ym:.3f}s")
     print(f"  logged: first_block={first} unestimated_peak={peak}")
@@ -163,5 +165,5 @@ def _closed(args):
 def register(sub):
   for name, fn, default in (("lagd", _command, "claims"), ("lagd-bands", _bands, "claims"), ("lagd-loop", _closed, "closed-loop")):
     p = sub.add_parser(name)
-    p.add_argument("--routes", nargs="+", default=[default])
+    add_routes_arg(p, [default])
     p.set_defaults(fn=fn)

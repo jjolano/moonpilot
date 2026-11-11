@@ -58,18 +58,17 @@ struct MoonpilotState @0x81c2f05a394cf4af {  # moonpilot seam: upstream's reserv
 
   struct EgoCorrection {
     valid @0 :Bool;
-    monoTime @1 :UInt64;  # ns; publisher logMonoTime of the window end the correction describes
-    age @2 :Float32;      # s; the window end to now. Reject past MAX_AGE + MOONPILOT_SLAM_POSE_DELAY
+    monoTime @1 :UInt64;  # ns; the odometry pose time at the correction window end
+    age @2 :Float32;      # s; the window end to now; consumer also accounts for the sensor pose delay
     dPos @3 :Float32;     # unused: no longer populated, kept for the ordinal
     dVel @4 :Float32;     # m/s, ego speed correction, + forward
     dYaw @5 :Float32;     # unused: no longer populated, kept for the ordinal
     corrStd @6 :Float32;  # m, 1-sigma of the window's accumulated along-track position; a consumer scales its trust by 1 / (1 + corrStd)
   }
 
-  # moonpilot seam, see AGENTS.md. Observation-only GPS-gated dead-reckon pose (moonpilot/pose.py),
-  # filled by the same moonpilotState publisher when MoonpilotSlam is on. valid is false until the
-  # first accepted fix has set the origin; x/y are meters east/north of that fix, yaw is rad CCW from
-  # east.
+  # moonpilot seam, see AGENTS.md. GPS-gated dead-reckon pose (moonpilot/pose.py), filled by the same
+  # moonpilotState publisher when MoonpilotSlam is on. valid is false until the first accepted fix;
+  # x/y are meters east/north of that fix, yaw is rad CCW from east.
   egoPose @2 :EgoPose;
 
   struct EgoPose {

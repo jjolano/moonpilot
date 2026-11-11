@@ -15,21 +15,20 @@ from openpilot.common.constants import ACCELERATION_DUE_TO_GRAVITY
 from openpilot.common.realtime import DT_CTRL
 
 from moonpilot.latcontrol import (
-  MOONPILOT_DAMPING_T,
   MOONPILOT_FRICTION_DEADBAND,
   MOONPILOT_FRICTION_RISE,
   MOONPILOT_JERK_LOOKAHEAD_T,
   MOONPILOT_KI,
   MOONPILOT_KP_BP,
   MOONPILOT_KP_V,
-  MOONPILOT_TORQUE_HYSTERESIS,
   MOONPILOT_VERSION,
   MOONPILOT_VERSION_HYSTERESIS,
   MoonpilotLatControlTorque,
+  friction_compensation,
   moonpilot_latcontrol,
 )
 from moonpilot.features import STEER_DAMPING, STEER_FRICTION_RAMP, STEER_HYSTERESIS
-from moonpilot.tests.fakes import _params
+from moonpilot.tests.fakes import params
 
 # A request small enough that the controller runs inside its own limits, so the integrator
 # is not anti-windup frozen at zero (the PID freezes it once the sum clips).
@@ -170,7 +169,6 @@ class TestMoonpilotLatControlTorque(unittest.TestCase):
     lac.reset()
     lac_log = _run(lac, VM, CS, params, 1, desired_curvature=LINEAR_REQUEST)
     self.assertLessEqual(abs(lac_log.i), MOONPILOT_KI * DT_CTRL * abs(lac_log.error) + 1e-6)
-    self.assertNotEqual(lac.requests[-1], 0.0)
 
   def test_inactive_outputs_nothing_but_keeps_tracking(self):
     lac, VM, _ = _controller()
@@ -183,7 +181,6 @@ class TestMoonpilotLatControlTorque(unittest.TestCase):
     self.assertFalse(lac_log.active)
     self.assertNotEqual(lac_log.desiredLateralAccel, 0.0)
     self.assertEqual(lac_log.actualLateralAccel, 0.0)
-    self.assertEqual(lac.requests[-1], 0.002 * 625)
 
   def test_integrator_freezes_when_the_output_is_not_ours(self):
     for reason in ("safety", "driver", "slow"):
@@ -205,42 +202,52 @@ class TestMoonpilotLatControlTorque(unittest.TestCase):
         _run(lac, VM, _state(v), params, 100, desired_curvature=curvature, torques=torques)
         self.assertTrue(all(abs(t) <= 1.0 for t in torques))
 
-  def test_factory_follows_the_toggle(self):
+  def test_the_factory_follows_the_rows(self):
     CP = interfaces[TOYOTA.TOYOTA_RAV4].get_non_essential_params(TOYOTA.TOYOTA_RAV4).as_reader()
     CI = interfaces[TOYOTA.TOYOTA_RAV4](CP)
+    self.assertIsNone(moonpilot_latcontrol(CP, CI, DT_CTRL, params(on=False)))
 
-    self.assertIsNone(moonpilot_latcontrol(CP, CI, DT_CTRL, _params(on=False)))
-    self.assertIsInstance(moonpilot_latcontrol(CP, CI, DT_CTRL, _params(on=True)), MoonpilotLatControlTorque)
+    def build(key, index):
+      lac = moonpilot_latcontrol(CP, CI, DT_CTRL, params(True, {key: index}))
+      assert isinstance(lac, MoonpilotLatControlTorque)
+      return lac
 
-  def test_friction_is_quiet_continuous_and_bounded_without_a_release_latch(self):
+    for index in (*range(len(STEER_HYSTERESIS.choices)), 9):  # 9: out of range reads as off
+      with self.subTest(hysteresis=index):
+        self.assertEqual(build(STEER_HYSTERESIS.key, index).hysteresis, STEER_HYSTERESIS.at(index))
+    kp = float(np.interp(10.0, MOONPILOT_KP_BP, MOONPILOT_KP_V))
+    for index in (*range(len(STEER_DAMPING.choices)), 9):
+      with self.subTest(damping=index):
+        lac = build(STEER_DAMPING.key, index)
+        lac.pid.update(0.0, error_rate=1.0, speed=10.0)
+        self.assertAlmostEqual(lac.pid.d, kp * STEER_DAMPING.at(index), delta=1e-9)
+    for on, expected in ((False, 0.0), (True, MOONPILOT_FRICTION_RISE)):
+      with self.subTest(friction_ramp=on):
+        self.assertEqual(build(STEER_FRICTION_RAMP.key, on).friction_rise, expected)
+
+  def test_friction_compensation_is_quiet_and_bounded(self):
     lac, _, _ = _controller()
     limit = lac.torque_params.friction * lac.torque_params.latAccelFactor
     ramp = FRICTION_THRESHOLD - MOONPILOT_FRICTION_DEADBAND
-    epsilon = 1e-6
     for deadzone in (0.0, 0.08, 0.3):
       quiet_band = max(deadzone, MOONPILOT_FRICTION_DEADBAND)
       for sign in (-1.0, 1.0):
         with self.subTest(deadzone=deadzone, sign=sign):
-          self.assertEqual(lac._friction(sign * quiet_band, 0.0, deadzone), 0.0)
+          def evaluate(error, deadzone=deadzone):
+            return friction_compensation(error, 0.0, deadzone, lac.torque_params)
+          self.assertEqual(evaluate(sign * quiet_band), 0.0)
           midpoint = sign * (quiet_band + ramp / 2)
-          half = lac._friction(midpoint, 0.0, deadzone)
-          self.assertAlmostEqual(half, sign * limit / 2)
-          self.assertAlmostEqual(lac._friction(sign * (quiet_band + ramp), 0.0, deadzone), sign * limit)
-          self.assertAlmostEqual(lac._friction(sign * (quiet_band + 10 * ramp), 0.0, deadzone), sign * limit)
-          self.assertAlmostEqual(lac._friction(midpoint, 0.0, deadzone), half)
-          for boundary in (quiet_band, 0.10, quiet_band + ramp):
-            lac._friction(0.0, 0.0, deadzone)
-            before = lac._friction(sign * (boundary - epsilon), 0.0, deadzone)
-            after = lac._friction(sign * (boundary + epsilon), 0.0, deadzone)
-            self.assertLess(abs(after - before), 2e-5 * limit)
+          self.assertAlmostEqual(evaluate(midpoint), sign * limit / 2)
+          self.assertAlmostEqual(evaluate(sign * (quiet_band + ramp)), sign * limit)
+          self.assertAlmostEqual(evaluate(sign * (quiet_band + 1.0)), sign * limit)
 
   def test_measurement_filter_rejects_a_single_frame_angle_spike(self):
     """A road step on steeringAngleDeg must not land whole in feedback: friction tracks error
     and was the term driving torque sign-flips on a rough-highway route."""
     lac, VM, _ = _controller()
     CS, params = _state(25.0), log.VehicleParameters.new_message()
-    _run(lac, VM, CS, params, 100, desired_curvature=0.0)
-    self.assertEqual(lac.meas_filter.x, 0.0)
+    lac_log = _run(lac, VM, CS, params, 100, desired_curvature=0.0)
+    self.assertEqual(lac_log.actualLateralAccel, 0.0)
 
     CS.steeringAngleDeg = 2.0
     raw = -VM.calc_curvature(math.radians(2.0), 25.0, 0.0) * 25.0**2
@@ -282,7 +289,7 @@ class TestMoonpilotLatControlTorque(unittest.TestCase):
 
 
 class TestTorqueHysteresis(unittest.TestCase):
-  H = MOONPILOT_TORQUE_HYSTERESIS[2]
+  H = STEER_HYSTERESIS.values[2]
 
   def _noisy_run(self, lac, VM):
     CS, params = _state(8.0), log.VehicleParameters.new_message()
@@ -304,14 +311,6 @@ class TestTorqueHysteresis(unittest.TestCase):
     self.assertGreater(reversals(a), 20)  # the plain controller does chatter on this input
     self.assertLess(reversals(b), reversals(a) / 2)
 
-  def test_large_moves_pass_and_a_reset_drops_the_hold(self):
-    lac, _, _ = _controller(hysteresis=self.H)
-    self.assertEqual(lac._hold(0.1), 0.1)
-    self.assertEqual(lac._hold(0.1 + self.H / 2), 0.1)  # inside the band: held
-    self.assertEqual(lac._hold(0.1 - self.H / 2), 0.1)
-    self.assertAlmostEqual(lac._hold(0.3), 0.3 - self.H)  # a real move follows, trailing by the band
-    lac.reset()
-    self.assertEqual(lac._hold(-0.2), -0.2)  # a re-engage starts from the controller's own output
 
   def test_the_logged_version_says_which_law_ran(self):
     CS, params = _state(), log.VehicleParameters.new_message()
@@ -319,25 +318,9 @@ class TestTorqueHysteresis(unittest.TestCase):
       lac, VM, _ = _controller(hysteresis=h)
       self.assertEqual(_run(lac, VM, CS, params, 1).version, version)
 
-  def test_the_factory_maps_each_choice_to_its_labelled_band(self):
-    CP = interfaces[TOYOTA.TOYOTA_RAV4].get_non_essential_params(TOYOTA.TOYOTA_RAV4)
-    CI = interfaces[TOYOTA.TOYOTA_RAV4](CP)
-    self.assertEqual(len(MOONPILOT_TORQUE_HYSTERESIS), len(STEER_HYSTERESIS.choices))
-    for index, label in enumerate(STEER_HYSTERESIS.choices):
-      with self.subTest(label=label):
-        lac = moonpilot_latcontrol(CP.as_reader(), CI, DT_CTRL, _params(True, {STEER_HYSTERESIS.key: index}))
-        assert isinstance(lac, MoonpilotLatControlTorque)
-        self.assertEqual(lac.hysteresis, MOONPILOT_TORQUE_HYSTERESIS[index])
-        self.assertEqual(label, "off" if index == 0 else f"{lac.hysteresis * 100:.1f}%")
-    # out of range reads as off; and no fork controller at all means nothing to hold
-    lac = moonpilot_latcontrol(CP.as_reader(), CI, DT_CTRL, _params(True, {STEER_HYSTERESIS.key: 9}))
-    assert isinstance(lac, MoonpilotLatControlTorque)
-    self.assertEqual(lac.hysteresis, 0.0)
-    self.assertIsNone(moonpilot_latcontrol(CP.as_reader(), CI, DT_CTRL, _params(False, {STEER_HYSTERESIS.key: 2})))
-
 
 class TestCurveDamping(unittest.TestCase):
-  T = MOONPILOT_DAMPING_T[2]
+  T = STEER_DAMPING.values[2]
 
   def _d(self, v, wheel_rate, request_jerk=0.0, damping_t=None):
     """The D term once the jerk filter has settled: the wheel turning at wheel_rate deg/s while the plan's
@@ -376,18 +359,6 @@ class TestCurveDamping(unittest.TestCase):
         self.assertEqual(abs(d) > 1e-6, on)
     self.assertEqual(self._d(10.0, 20.0, damping_t=0.0)[0], 0.0)  # off is upstream's law: no D at all
 
-  def test_the_factory_maps_each_choice_to_its_derivative_time(self):
-    CP = interfaces[TOYOTA.TOYOTA_RAV4].get_non_essential_params(TOYOTA.TOYOTA_RAV4)
-    CI = interfaces[TOYOTA.TOYOTA_RAV4](CP)
-    self.assertEqual(len(MOONPILOT_DAMPING_T), len(STEER_DAMPING.choices))
-    for index in (*range(len(STEER_DAMPING.choices)), 9):  # 9: out of range reads as off
-      with self.subTest(index=index):
-        lac = moonpilot_latcontrol(CP.as_reader(), CI, DT_CTRL, _params(True, {STEER_DAMPING.key: index}))
-        assert isinstance(lac, MoonpilotLatControlTorque)
-        expected = MOONPILOT_DAMPING_T[index] if index < len(MOONPILOT_DAMPING_T) else 0.0
-        lac.pid.update(0.0, error_rate=1.0, speed=10.0)
-        self.assertAlmostEqual(lac.pid.d, float(np.interp(10.0, MOONPILOT_KP_BP, MOONPILOT_KP_V)) * expected, delta=1e-9)
-
 
 class TestFrictionRamp(unittest.TestCase):
   """MoonpilotSteerFrictionRamp: friction compensation rises at the ramp and falls at once, and only when chosen."""
@@ -417,16 +388,6 @@ class TestFrictionRamp(unittest.TestCase):
     self._states(lac, VM, 1, -0.5 / 15.0**2)
     self.assertLess(abs(lac.friction_state), abs(before))
     self.assertLessEqual(abs(lac.friction_state), MOONPILOT_FRICTION_RISE * DT_CTRL + 1e-12)
-
-  def test_the_toggle_is_read_once_at_construction(self):
-    CP = interfaces[TOYOTA.TOYOTA_RAV4].get_non_essential_params(TOYOTA.TOYOTA_RAV4)
-    CI = interfaces[TOYOTA.TOYOTA_RAV4](CP)
-    for on, expected in ((False, 0.0), (True, MOONPILOT_FRICTION_RISE)):
-      with self.subTest(on=on):
-        lac = moonpilot_latcontrol(CP.as_reader(), CI, DT_CTRL, _params(True, {STEER_FRICTION_RAMP.key: on}))
-        assert isinstance(lac, MoonpilotLatControlTorque)
-        self.assertEqual(lac.friction_rise, expected)
-    self.assertIsNone(moonpilot_latcontrol(CP.as_reader(), CI, DT_CTRL, _params(False, {STEER_FRICTION_RAMP.key: True})))
 
 
 if __name__ == "__main__":

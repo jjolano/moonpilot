@@ -8,9 +8,8 @@ may log the device out. On PC, a legacy state file can migrate to `<persist_root
 instead. This module is the shared vocabulary for both, plus the encode/decode of the one string
 param the supervisor and the settings panels talk through.
 
-It is imported by the UI and by the supervisor, so: standard library plus `openpilot` modules
-only, and nothing here creates a directory or runs a process — the path helpers are computed,
-the same rule and the same reason as deps.site_dir().
+It is imported by the UI and by the supervisor, so it imports only standard library and `openpilot`
+modules. Directory creation and process management belong to the installer and supervisor.
 
 """
 
@@ -22,8 +21,8 @@ import shutil
 from openpilot.common.hardware import PC
 from openpilot.common.params import Params
 
-from moonpilot import paths
-from moonpilot.features import TAILSCALE
+from moonpilot import paths, status
+from moonpilot.features import TAILSCALE, wanted
 
 # The stable track. The supervisor resolves it via `latest_release()` at upgrade time; no
 # checkout change is needed to move the device's client forward.
@@ -35,9 +34,8 @@ BINARIES = ("tailscale", "tailscaled")
 HOSTNAME = "moonpilot"  # control suffixes a collision inside one tailnet, so no dongle id is sent
 
 STATUS_KEY = "MoonpilotTailscaleStatus"
-ENABLE_KEY = TAILSCALE.key
 
-# Status param shape: "<state>" or "<state> <detail>". Decoded by read_status().
+
 OFFLINE = "offline"
 INSTALLING = "installing"
 STARTING = "starting"
@@ -77,7 +75,7 @@ def _persist_writable() -> bool:
 
 
 def bin_dir() -> str:
-  """Where `install()` puts the two binaries."""
+  """Return the installed binary directory."""
   return os.path.join(root(), "bin")
 
 
@@ -142,21 +140,18 @@ def marker_version() -> str:
     return ""
 
 
-def installed() -> bool:
-  """Is there a pair to run at all?"""
-  return binaries() is not None
 
 
-def latest_release(timeout: float = 10.0) -> tuple[str, str, str]:
+def latest_release() -> tuple[str, str, str]:
   """`(version, tarball_url, sha256)` of the latest `TRACK` release for `ARCH`. Raises."""
   import urllib.request
 
-  with urllib.request.urlopen(f"{PKGS_BASE}/{TRACK}/?mode=json&os=linux", timeout=timeout) as r:
+  with urllib.request.urlopen(f"{PKGS_BASE}/{TRACK}/?mode=json&os=linux", timeout=10.0) as r:
     payload = json.loads(r.read().decode())
   version = payload["TarballsVersion"]
   asset = payload["Tarballs"][ARCH]
   url = f"{PKGS_BASE}/{TRACK}/{asset}"
-  with urllib.request.urlopen(f"{url}.sha256", timeout=timeout) as r:
+  with urllib.request.urlopen(f"{url}.sha256", timeout=10.0) as r:
     sha256 = r.read().decode().strip()
   return version, url, sha256
 
@@ -174,7 +169,7 @@ def upgrade_available(latest: str) -> bool:
 
 def install(version: str, url: str, sha256: str) -> None:
   """Download the given tarball and put both binaries in `bin_dir()`. Raises; the caller handles it."""
-  from moonpilot import fetch  # fetch's heavy stdlib stays behind this import
+  from moonpilot import fetch
 
   paths.data_dir("tailscale")  # the one place this tree is created
   fetch.extract(fetch.download(url, sha256), BINARIES, bin_dir())
@@ -193,7 +188,7 @@ def sudo() -> list[str]:
 
 
 def daemon_args() -> list[str]:
-  """argv for tailscaled."""
+  """Arguments for tailscaled."""
   pair = binaries()
   assert pair is not None, "daemon_args() called with no tailscaled installed"
   # `--statedir` is passed rather than left to be derived. Derivation is conditional: without it
@@ -213,7 +208,7 @@ def daemon_args() -> list[str]:
 
 
 def cli_args(*args: str) -> list[str]:
-  """argv for the tailscale CLI, against our own socket."""
+  """Arguments for the tailscale CLI using our socket."""
   pair = binaries()
   assert pair is not None, "cli_args() called with no tailscale installed"
   return [*sudo(), pair[0], "--socket", socket_path(), *args]
@@ -244,14 +239,11 @@ def parse_status(payload: str) -> tuple[str, str]:
 
 
 def put_status(params: Params, state: str, detail: str = "") -> None:
-  """Publish `(state, detail)` for the panels."""
-  params.put(STATUS_KEY, f"{state} {detail}".strip())
+  status.put(params, STATUS_KEY, state, detail)
 
 
 def read_status(params: Params) -> tuple[str, str]:
-  """`(state, detail)` as last published, or `("", "")` when nothing has been."""
-  state, _, detail = (params.get(STATUS_KEY) or "").partition(" ")
-  return state, detail
+  return status.read(params, STATUS_KEY)
 
 
 def status_text(params: Params) -> tuple[str, str]:
@@ -259,7 +251,7 @@ def status_text(params: Params) -> tuple[str, str]:
 
   The toggle is checked first, so a supervisor that stopped never leaves a stale state on screen.
   """
-  if not params.get(ENABLE_KEY, return_default=True):
+  if not wanted(TAILSCALE, params):
     return "off", "Turn on to join this device to your tailnet."
 
   state, detail = read_status(params)
@@ -273,6 +265,8 @@ def status_text(params: Params) -> tuple[str, str]:
     return detail or "running", f"Connected as {detail}." if detail else ""
   if state == ERROR:
     return "error", detail
+  if state == STOPPED:
+    return "stopped", ""
   return "starting", ""
 
 
@@ -284,7 +278,7 @@ def auth_url(params: Params) -> str:
   would offer a sign-in for a daemon that is not running. It also closes an open dialog the moment
   the toggle goes off, without waiting for the process to notice.
   """
-  if not params.get(ENABLE_KEY, return_default=True):
+  if not wanted(TAILSCALE, params):
     return ""
   state, detail = read_status(params)
   return detail if state == LOGIN and detail.startswith("https://") else ""

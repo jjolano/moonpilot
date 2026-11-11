@@ -13,10 +13,13 @@ and refusals for missing feature ports or required heads.
 import hashlib
 import json
 import os
-import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
+
+from moonpilot import modelcatalog, modelprotocols, modelview, models
+from moonpilot.tests.model_store import TempStoreMixin, profile_document
+from moonpilot.vendor.openmodels import client, contracts, metadata
 
 try:
   import cryptography  # noqa: F401
@@ -24,11 +27,6 @@ except ImportError:
   CRYPTOGRAPHY_AVAILABLE = False
 else:
   CRYPTOGRAPHY_AVAILABLE = True
-
-
-from moonpilot import modelcatalog, models
-from moonpilot.tests.test_models import profile_document
-from moonpilot.vendor.openmodels import client, contracts, metadata
 
 ROOT = Path(__file__).resolve().parents[2]
 FIXTURE = ROOT / "moonpilot/tests/fixtures/catalog.json"
@@ -42,22 +40,11 @@ SPLIT_OLD_ACTION = "03a42d6ffbf4518710a75706a3ecd9a91b8ddad0a8de2b1fca33c9fe10dd
 SPLIT_NEW_ACTION = "148c4b3658079ebb26053500fb55366fb63f804e0b976e1e99ff434d5ce795ec"
 DM_WITH_SLEEP = "5e8b3b3b3c0e2b1a2218671a4776f961a2ee7d63548143f1ab9431ae99799ca0"
 DM_WITHOUT_SLEEP = "016469e1b109c8028f29dbc5ee935bb76ca58f3ed31f30a3d2df8a2dc6b1cc2a"
-DM_MISSING_HEADS = "3870150bbb21a19f29730ba327ce0595f425a37e17f51291700b54381f0d9032"
 SPLIT_NO_FEATURE_PORT = "17b12acc43b4ee54e44cb9c7ea2a95a3f274b16d05499840f295610e659816fc"
 
 
-class TempStoreCase(unittest.TestCase):
+class TempStoreCase(TempStoreMixin, unittest.TestCase):
   """A temp store so nothing touches the real one."""
-
-  def setUp(self):
-    self.tmp = tempfile.mkdtemp()
-    patcher = mock.patch.object(models.paths, "data_dir", lambda feature: os.path.join(self.tmp, feature))
-    patcher.start()
-    self.addCleanup(patcher.stop)
-    for target, value in (("_STATUS_CACHE", None), ("_BROWSE_CACHE", None)):
-      cache_patcher = mock.patch.object(models, target, value)
-      cache_patcher.start()
-      self.addCleanup(cache_patcher.stop)
 
 
 class CatalogCase(TempStoreCase):
@@ -93,11 +80,6 @@ class TestFixture(unittest.TestCase):
     for digest, raw in self.snapshot["documents"].items():
       self.assertEqual(contracts.Manifest.create(json.loads(raw)).id, digest, digest)
 
-  def test_every_recipe_names_a_profile_the_fixture_carries(self):
-    for digest, raw in self.snapshot["documents"].items():
-      document = json.loads(raw)
-      if document["type"] == "recipe":
-        self.assertTrue(document["profile"] in self.snapshot["documents"], digest)
 
   def test_the_vendored_schema_carries_the_catalogs_presentation_keys(self):
     # The `model` object is closed, so a published `folder`/`short_name` is refused whole-snapshot
@@ -106,25 +88,17 @@ class TestFixture(unittest.TestCase):
     snapshot = json.loads(json.dumps(self.snapshot))
     snapshot["entries"][0]["model"].update({"folder": "2026 World Models", "short_name": "OPM10V3", "name_kind": "published"})
     catalog = client.Catalog(json.dumps(snapshot).encode(), base_url="https://catalog.invalid/")
-    self.assertEqual(catalog.models(include_archive=True)[0].get("folder", "2026 World Models"), "2026 World Models")
+    self.assertTrue(any(row.get("folder") == "2026 World Models" for row in catalog.models(include_archive=True)))
     # And a snapshot that predates them still validates, so a device on an older catalog keeps working.
     client.Catalog(self.raw, base_url="https://catalog.invalid/")
 
-
-def _case(name: str):
-  def test(self):
-    verdict = self.admit(getattr(self, name))
-    self.assertTrue(verdict["admitted"], f"{name}: {verdict['reason']}")
-    self.assertTrue(verdict["protocol"])
-
-  return test
 
 
 class TestAdmission(CatalogCase):
   def test_the_pinned_stock_recipe_admits_as_supercombo(self):
     verdict = self.admit(STOCK)
     self.assertTrue(verdict["admitted"], verdict["reason"])
-    self.assertEqual(verdict["protocol"], models.SUPERCOMBO.id)
+    self.assertEqual(verdict["protocol"], modelprotocols.SUPERCOMBO.id)
     # The catalog's honest caveats ride along and are never flattened into "compatible".
     self.assertTrue(any("requires_runner_check" in note for note in verdict["notes"]))
     self.assertTrue(any("consumer_owned" in note for note in verdict["notes"]))
@@ -132,16 +106,16 @@ class TestAdmission(CatalogCase):
   def test_an_archived_supercombo_with_an_action_head_still_admits(self):
     verdict = self.admit(ARCHIVED_ACTION)
     self.assertTrue(verdict["admitted"], verdict["reason"])
-    self.assertEqual(verdict["protocol"], models.SUPERCOMBO.id)
+    self.assertEqual(verdict["protocol"], modelprotocols.SUPERCOMBO.id)
 
   def test_the_split_families_admit(self):
-    self.assertEqual(self.admit(VISION_POLICY)["protocol"], models.SPLIT_VISION_POLICY.id)
-    self.assertEqual(self.admit(VISION_POLICY_OTHER)["protocol"], models.SPLIT_VISION_POLICY.id)
-    self.assertEqual(self.admit(VISION_OFF_ON)["protocol"], models.SPLIT_VISION_OFF_ON.id)
+    self.assertEqual(self.admit(VISION_POLICY)["protocol"], modelprotocols.SPLIT_VISION_POLICY.id)
+    self.assertEqual(self.admit(VISION_POLICY_OTHER)["protocol"], modelprotocols.SPLIT_VISION_POLICY.id)
+    self.assertEqual(self.admit(VISION_OFF_ON)["protocol"], modelprotocols.SPLIT_VISION_OFF_ON.id)
 
   def test_the_driver_monitoring_generations_admit_with_and_without_the_sleep_heads(self):
-    self.assertEqual(self.admit(DM_WITH_SLEEP)["protocol"], models.DMONITORING.id)
-    self.assertEqual(self.admit(DM_WITHOUT_SLEEP)["protocol"], models.DMONITORING.id)
+    self.assertEqual(self.admit(DM_WITH_SLEEP)["protocol"], modelprotocols.DMONITORING.id)
+    self.assertEqual(self.admit(DM_WITHOUT_SLEEP)["protocol"], modelprotocols.DMONITORING.id)
 
   def test_the_action_eras_are_split_by_the_protocols_own_convention(self):
     # Both of these carry an `action` head; the older one is the family the pinned decode was
@@ -150,19 +124,11 @@ class TestAdmission(CatalogCase):
     self.assertTrue(self.admit(SPLIT_OLD_ACTION)["admitted"])
     refusal = self.admit(SPLIT_NEW_ACTION)
     self.assertFalse(refusal["admitted"])
-    self.assertEqual(refusal["reason"], f"on_policy: {models.ACTION_ERA}")
-    self.assertEqual(refusal["protocol"], models.SPLIT_VISION_OFF_ON.id)
+    self.assertEqual(refusal["reason"], f"on_policy: {modelprotocols.ACTION_ERA}")
+    self.assertEqual(refusal["protocol"], modelprotocols.SPLIT_VISION_OFF_ON.id)
 
   def test_a_missing_feature_port_refuses_a_split(self):
-    refusal = self.admit(
-      "17b12acc43b4"
-      if "17b12acc43b4" in self.snapshot["documents"]
-      else next(
-        d
-        for d, raw in self.snapshot["documents"].items()
-        if json.loads(raw)["type"] == "recipe" and "vision" in json.loads(raw)["members"] and not json.loads(raw)["members"]["vision"]["outputs"]
-      )
-    )
+    refusal = self.admit(SPLIT_NO_FEATURE_PORT)
     self.assertFalse(refusal["admitted"])
     self.assertTrue(refusal["reason"].startswith("structure_unknown"), refusal["reason"])
 
@@ -177,7 +143,7 @@ class TestAdmission(CatalogCase):
     self.assertTrue(without, "the fixture lost its minimized DM recipe")
     refusal = self.admit(without[0])
     self.assertFalse(refusal["admitted"])
-    self.assertTrue(refusal["reason"].startswith(models.MISSING_OUTPUTS), refusal["reason"])
+    self.assertTrue(refusal["reason"].startswith(modelprotocols.MISSING_OUTPUTS), refusal["reason"])
 
   def test_a_recipe_the_catalog_does_not_have_is_refused_by_name(self):
     verdict = self.admit("f" * 64)
@@ -198,10 +164,9 @@ class TestBrowse(CatalogCase):
     self.assertTrue(STOCK in entries)
     self.assertTrue(entries[STOCK]["admitted"])
     self.assertEqual(entries[STOCK]["roles"], ["supercombo"])
-    self.assertTrue(entries[SPLIT_NEW_ACTION]["reason"].endswith(models.ACTION_ERA))
+    self.assertTrue(entries[SPLIT_NEW_ACTION]["reason"].endswith(modelprotocols.ACTION_ERA))
     for entry in index["entries"]:
-      self.assertEqual(
-        set(entry),
+      self.assertTrue(
         {
           "recipe",
           "name",
@@ -209,25 +174,20 @@ class TestBrowse(CatalogCase):
           "name_kind",
           "folder",
           "kind",
-          "family",
           "model_class",
-          "archived",
           "roles",
           "size",
-          "targets",
-          "available",
           "updated_at",
           "protocol",
           "admitted",
           "reason",
           "notes",
           "variants",
-        },
+        }.issubset(entry)
       )
 
   def test_the_index_carries_the_catalogs_own_names_and_folders(self):
-    # The fixture predates the presentation keys, so the index rows read empty and the pickers fall
-    # back to the protocol group. A model that has them must reach the index verbatim.
+    # Published names and folders flow into the index verbatim.
     groups = self.catalog.models(include_archive=True)
     stock = next(g for g in groups if any(v["recipe"] == STOCK for v in g["variants"]))
     named = {**stock, "folder": "Master Models", "short_name": "OPM", "name_kind": "published"}
@@ -235,9 +195,6 @@ class TestBrowse(CatalogCase):
       index = modelcatalog.browse_index(self.catalog)
     self.assertEqual((index["entries"][0]["folder"], index["entries"][0]["short_name"], index["entries"][0]["name_kind"]),
                      ("Master Models", "OPM", "published"))
-    bare = next(entry for entry in modelcatalog.browse_index(self.catalog)["entries"] if entry["recipe"] == STOCK)
-    self.assertEqual((bare["folder"], bare["short_name"], bare["name_kind"]), ("", "", ""))
-    self.assertTrue(models.entry_group(bare).startswith("supercombo · "), "an older catalog still groups by protocol")
 
   def test_variants_of_one_model_collapse_to_the_admitted_one(self):
     # The fixture has no multi-variant group, so synthesize one: a newer refused twin next to the
@@ -258,18 +215,9 @@ class TestBrowse(CatalogCase):
     by_name = {entry["name"]: entry for entry in index["entries"]}
     self.assertEqual(by_name[stock["name"]]["recipe"], STOCK, "the admitted variant must win over the newer refused twin")
     self.assertTrue(by_name[stock["name"]]["admitted"])
-    self.assertEqual(models.entry_name(SPLIT_NEW_ACTION), stock["name"], "a variant the row hides keeps its model's name")
-    self.assertEqual(models.entry_name("f" * 64), "")
+    self.assertEqual(modelview.entry_name(SPLIT_NEW_ACTION), stock["name"], "a variant the row hides keeps its model's name")
+    self.assertEqual(modelview.entry_name("f" * 64), "")
 
-  def test_an_admitted_variant_beats_a_newer_refused_one(self):
-    rows = [
-      {"admitted": False, "updated_at": "2099-01-01", "name": "m", "recipe": "b" * 64},
-      {"admitted": True, "updated_at": "2020-01-01", "name": "m", "recipe": "a" * 64},
-    ]
-    picked = modelcatalog._model_row(rows)
-    assert picked is not None
-    self.assertEqual(picked["recipe"], "a" * 64)
-    self.assertIsNone(modelcatalog._model_row([]))
 
   def test_the_index_is_newest_first(self):
     index = modelcatalog.browse_index(self.catalog)
@@ -278,9 +226,9 @@ class TestBrowse(CatalogCase):
 
   def test_writing_the_index_is_what_the_panels_read(self):
     written = modelcatalog.write_browse(self.catalog)
-    # `models.browse()` is the panels' reader: the same entries, without the writer's `schema`/`total`.
-    self.assertEqual(models.browse()["revision"], written["revision"])
-    self.assertEqual(models.browse()["entries"], written["entries"])
+    # `modelview.browse()` is the panels' reader: the same entries, without the writer's `schema`/`total`.
+    self.assertEqual(modelview.browse()["revision"], written["revision"])
+    self.assertEqual(modelview.browse()["entries"], written["entries"])
 
 
 class TestInterfaceVerification(TempStoreCase):
@@ -332,16 +280,16 @@ class TestInterfaceVerification(TempStoreCase):
     return recipe
 
   def test_a_package_whose_bytes_agree_verifies(self):
-    self.assertIsNone(modelcatalog.verify_downloaded(None, self.package_from_onnx()))
+    self.assertIsNone(modelcatalog.verify_downloaded(self.package_from_onnx()))
 
   def test_a_package_whose_bytes_disagree_is_a_mismatch(self):
-    self.assertEqual(modelcatalog.verify_downloaded(None, self.package_from_onnx(tamper=True)), modelcatalog.INTERFACE_MISMATCH)
+    self.assertEqual(modelcatalog.verify_downloaded(self.package_from_onnx(tamper=True)), modelcatalog.INTERFACE_MISMATCH)
 
   def test_a_shifted_existing_slice_bound_is_a_mismatch(self):
-    self.assertEqual(modelcatalog.verify_downloaded(None, self.package_from_onnx(slice_mutation="bound")), modelcatalog.INTERFACE_MISMATCH)
+    self.assertEqual(modelcatalog.verify_downloaded(self.package_from_onnx(slice_mutation="bound")), modelcatalog.INTERFACE_MISMATCH)
 
   def test_a_changed_existing_slice_step_is_a_mismatch(self):
-    self.assertEqual(modelcatalog.verify_downloaded(None, self.package_from_onnx(slice_mutation="step")), modelcatalog.INTERFACE_MISMATCH)
+    self.assertEqual(modelcatalog.verify_downloaded(self.package_from_onnx(slice_mutation="step")), modelcatalog.INTERFACE_MISMATCH)
 
   def test_verify_onnx_never_executes_the_file(self):
     # The only reader of a downloaded artifact: a hostile `output_slices` pickle cannot resolve

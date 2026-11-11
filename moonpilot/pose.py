@@ -1,13 +1,7 @@
-"""moonpilot's observation-only 2D ego pose: dead-reckon, gated by GPS.
+"""moonpilot's GPS-gated dead-reckoned 2D ego pose.
 
-Phase 1 of the true-SLAM path (`moonpilot/docs/slam-spike.md`). Short-horizon pose is
-`cameraOdometry` alone — excellent over ~60 s and useless over minutes — so this tracker
-dead-reckons the body at 20 Hz (wheel speed forward, VO lateral and yaw) and soft-corrects
-position against a GPS fix whenever one clears the gate. Nothing here is in the control path:
-`moonpilot/leadd.py` fills `moonpilotState.egoPose` from this tracker when `MoonpilotSlam` is on,
-and a replay can score chained-pose RMSE against LLK the way `test_slam.py` scores speed
-(`python -m moonpilot.lab pose`; the drives in this checkout's cache carry qcom `gpsLocation` and no
-`gpsLocationExternal`/LLK, so there it scores against that, 9.3 / 6.2 m chained RMSE on 43f/43e).
+Short-horizon pose uses `cameraOdometry` (wheel speed forward, VO lateral and yaw) and soft-corrects
+position against accepted GPS fixes. The pose feeds the planner's pose-stitched corridor history.
 
 Four things that are not obvious:
 
@@ -20,13 +14,9 @@ Four things that are not obvious:
   The rebase drops position history on purpose: absolute continuity before the first fix is
   not something this module can honestly claim.
 - **Yaw is steered by GPS course-over-ground while moving, not only seeded once.** `wz` from
-  the VO is a rate: it cannot discover a wrong absolute heading, and a first fix too slow to
-  trust bearing leaves yaw at 0 forever — the route-corpus chain headed south-west while yaw
-  sat on east, position soft-corrects held for ~130 s, then the 50 m radius gate rejected
-  every remaining fix with no way back. So every fix at or above
-  `MOONPILOT_POSE_BEARING_MIN_SPEED` blends yaw toward course (qcom's `bearingDeg` matches
-  displacement-derived course to ~1° median when moving), and a streak of radius rejects
-  rebases position instead of dying in the gate.
+  the VO is a rate and cannot discover a wrong absolute heading. Each accepted moving fix blends
+  yaw toward course, and a streak of radius rejects rebases position instead of leaving the
+  estimate stuck behind a lost dead-reckon.
 - **The gate is `hasFix` plus a horizontal-accuracy ceiling, with a radius reject on top.**
   `horizontalAccuracy == 0` is treated as unknown rather than perfect — qcom's `gpsLocation`
   reports 0 on every corpus sample — so it passes the ceiling and leans on `hasFix` alone.
@@ -37,11 +27,11 @@ Four things that are not obvious:
 
 import math
 
-R_EARTH = 6378137.0  # m; WGS84 equatorial radius, same constant the spike used
+R_EARTH = 6378137.0  # m; WGS84 equatorial radius
 
 # Fork-owned tuning. Tune by replaying a route and watching chained RMSE against LLK
 # (`python -m moonpilot.lab pose`; the cached drives carry gpsLocation only).
-MOONPILOT_POSE_MAX_HACC = 15.0  # m; worse than this is not a gate we trust. 0 passes as unknown.
+MOONPILOT_POSE_MAX_HACC = 15.0  # m; worse than this is not a gate we trust
 MOONPILOT_POSE_GATE_RADIUS = 50.0  # m; reject a fix this far from the dead-reckon as an outlier
 MOONPILOT_POSE_GPS_ALPHA = 0.25  # per-fix blend toward GPS ENU; 1 Hz ≈ 4 s time constant
 MOONPILOT_POSE_MIN_DT = 1e-3  # s; below this the odom step is a repeat, not an interval
@@ -75,8 +65,6 @@ class PoseTracker:
     self.lat0: float | None = None
     self.lon0: float | None = None
     self.t: float | None = None  # s; last odom stamp
-    self.n_gps = 0  # accepted fixes (first one rebases)
-    self.n_rebase = 0  # streak rebases after the first (diagnostic for replays)
     self._reject_streak = 0
     self.mono_time = 0.0  # s; last odom pose time, for the published message's stamp
 
@@ -84,6 +72,7 @@ class PoseTracker:
   @property
   def has_origin(self) -> bool:
     return self.lat0 is not None
+
 
   def push_odom(self, mono_time: float, v_forward: float, yaw_rate: float, v_lateral: float = 0.0) -> None:
     """One body-frame step at the odometry's pose time (seconds, monotonic)."""
@@ -104,7 +93,7 @@ class PoseTracker:
     self.yaw += yaw_rate * dt
     self.mono_time = mono_time
 
-  def push_gps(self, mono_time: float, lat: float, lon: float, horizontal_accuracy: float | None = None,
+  def push_gps(self, lat: float, lon: float, horizontal_accuracy: float | None = None,
                has_fix: bool = True, bearing_deg: float | None = None, speed: float | None = None) -> bool:
     """Gate and apply one GPS fix. True when the fix moved the estimate (rebase, blend, or streak rebase)."""
     if not has_fix:
@@ -113,10 +102,8 @@ class PoseTracker:
       return False
     h_acc = MOONPILOT_POSE_MAX_HACC if horizontal_accuracy is None else float(horizontal_accuracy)
     if not math.isfinite(h_acc) or h_acc < 0.0 or h_acc > MOONPILOT_POSE_MAX_HACC:
-      # Negative is nonsense; above the ceiling is untrusted. Zero falls through as unknown.
       return False
 
-    # Course-over-ground is only steering-grade at speed; below that it is receiver noise.
     steer = (
       bearing_deg is not None and speed is not None
       and math.isfinite(bearing_deg) and math.isfinite(speed)
@@ -131,7 +118,6 @@ class PoseTracker:
         # GPS bearing is course-over-ground, degrees clockwise from true north; local yaw is
         # CCW from east.
         self.yaw = math.pi / 2.0 - math.radians(bearing_deg)
-      self.n_gps = 1
       return True
 
     # Yaw is steered even when the position gate below rejects: a multipath jump moves the
@@ -140,30 +126,28 @@ class PoseTracker:
       target = math.pi / 2.0 - math.radians(bearing_deg)
       self.yaw += MOONPILOT_POSE_YAW_ALPHA * _wrap_pi(target - self.yaw)
 
-    lat0, lon0 = self.lat0, self.lon0
-    if lat0 is None or lon0 is None:
-      return False  # unreachable: the rebase above is the only path that leaves origin unset
-    gx, gy = latlon_to_enu(lat, lon, lat0, lon0)
+    assert self.lat0 is not None and self.lon0 is not None  # the first fix above is what sets them
+    gx, gy = latlon_to_enu(lat, lon, self.lat0, self.lon0)
     if math.hypot(gx - self.x, gy - self.y) > MOONPILOT_POSE_GATE_RADIUS:
       self._reject_streak += 1
       if self._reject_streak < MOONPILOT_POSE_REBASE_STREAK:
         return False
-      # Sustained disagreement: the dead-reckon lost it (wrong absolute yaw was the corpus
-      # case). Trust the fix for position; yaw has been blending from course above.
+      # Sustained disagreement means the dead-reckon lost position; trust the fix.
       self.x, self.y = gx, gy
       self._reject_streak = 0
-      self.n_gps += 1
-      self.n_rebase += 1
       return True
 
     self._reject_streak = 0
     self.x += MOONPILOT_POSE_GPS_ALPHA * (gx - self.x)
     self.y += MOONPILOT_POSE_GPS_ALPHA * (gy - self.y)
-    self.n_gps += 1
     return True
 
+def push_odometry_sample(tracker, sample) -> None:
+  tracker.push_odom(sample.mono_time, v_forward=sample.v_ego if sample.v_ego is not None else float(sample.trans[0]),
+                    yaw_rate=float(sample.rot[2]), v_lateral=float(sample.trans[1]))
 
-def fill_ego_pose(message, tracker: PoseTracker, now: float | None = None) -> None:
+
+def fill_ego_pose(message, tracker: PoseTracker, now: float) -> None:
   """Write one pose onto a `moonpilotState` message. The publisher's half of the contract.
 
   `valid` is false until the first accepted fix has set the origin, and when `now` says the last
@@ -178,6 +162,18 @@ def fill_ego_pose(message, tracker: PoseTracker, now: float | None = None) -> No
   field.x = tracker.x
   field.y = tracker.y
   field.yaw = tracker.yaw
-  if now is not None:
-    age = now - tracker.mono_time
-    field.valid = 0.0 <= age <= MOONPILOT_POSE_MAX_DT
+  age = now - tracker.mono_time
+  field.valid = 0.0 <= age <= MOONPILOT_POSE_MAX_DT
+
+
+def read_ego_pose(state, now_ns: int) -> tuple[float, float, float] | None:
+  """`(x, y, yaw)` from a `moonpilotState` whose pose is valid, fresh and finite, or None. The consumer's half."""
+  if state is None or not state.egoPose.valid:
+    return None
+  pose = state.egoPose
+  age = now_ns - pose.monoTime
+  if age < 0 or age > MOONPILOT_POSE_MAX_DT * 1e9:
+    return None
+  if not all(math.isfinite(v) for v in (pose.x, pose.y, pose.yaw)):
+    return None
+  return (pose.x, pose.y, pose.yaw)

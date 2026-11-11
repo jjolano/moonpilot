@@ -2,6 +2,7 @@ import unittest
 
 import numpy as np
 
+from moonpilot.lab import burst_starts
 from moonpilot.lab.bursts import _transition
 
 N, LEAD_IN, K = 100, 40, 300  # a burst second, the delay lead-in and the burst start, in 100 Hz frames
@@ -18,6 +19,14 @@ def _chain(active_from=None, active_until=None, gas_until=None):
   if gas_until is not None:
     gas[:gas_until] = 1
   return {"long_active": active, "gas": gas, "brake": np.zeros(n)}
+
+
+class TestBurstStarts(unittest.TestCase):
+  def test_masked_bursts_stay_inside_each_segment(self):
+    a = np.zeros(9)
+    a[[2, 6]] = 0.5
+    mask = np.array([1, 1, 1, 0, 1, 1, 1, 0, 0], dtype=bool)
+    self.assertEqual(burst_starts(a, mask, dt=0.5), [0, 4])
 
 
 class TestControlTransition(unittest.TestCase):

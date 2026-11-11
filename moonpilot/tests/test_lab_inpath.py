@@ -1,14 +1,14 @@
 import unittest
 
 import numpy as np
-from openpilot.cereal import custom
+
 from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.realtime import DT_MDL
 
 from moonpilot.lab.inpath import emulate_t_follow, raw_in_path
-from moonpilot.lead import MOONPILOT_INPATH_GRID, MOONPILOT_INPATH_RC, _rise_hold, lead_in_path
+from moonpilot.lead import MOONPILOT_INPATH_GRID, MOONPILOT_INPATH_RC, rise_hold, lead_in_path
 from moonpilot.longitudinal import MOONPILOT_T_FOLLOW
-from moonpilot.tests.test_longitudinal import _inputs, _lead, _planner
+from moonpilot.tests.harness import inputs, lead, planner as make_planner, slot
 
 
 class TestInPathEmulation(unittest.TestCase):
@@ -26,7 +26,7 @@ class TestInPathEmulation(unittest.TestCase):
     self.assertAlmostEqual(float(mine[0]), real, places=9)
 
   def test_the_emulated_latch_is_the_planners(self):
-    """Rise-hold filter, hysteresis latch and slew, frame for frame against the real `_t_follow`."""
+    """Rise-hold filter, hysteresis latch and slew, frame for frame against the real `time_gap`."""
     raw = np.array([1.0] * 5 + [0.02] * 60 + [0.2] * 5 + [0.6] * 3 + [0.0] * 50 + [0.9] * 60 + [0.05] * 70)
     n = len(raw)
     d = {
@@ -35,11 +35,10 @@ class TestInPathEmulation(unittest.TestCase):
     }
     tf, leaving = emulate_t_follow(raw, d, np.ones(n, dtype=bool))
 
-    planner, filt = _planner(), FirstOrderFilter(1.0, MOONPILOT_INPATH_RC, DT_MDL)
+    planner, filt = make_planner(), FirstOrderFilter(1.0, MOONPILOT_INPATH_RC, DT_MDL)
     for i in range(n):
-      slot = custom.MoonpilotState.LeadTrajectory.new_message()
-      slot.present, slot.inPath = True, _rise_hold(float(raw[i]), filt)
-      self.assertAlmostEqual(planner._t_follow(_inputs(lead=_lead(35.0, 20.0), moonpilot_leads=[slot])), tf[i], places=9, msg=f"frame {i}")
+      trajectory = slot(rise_hold(float(raw[i]), filt))
+      self.assertAlmostEqual(planner.time_gap(inputs(lead=lead(35.0, 20.0), moonpilot_leads=[trajectory])), tf[i], places=9, msg=f"frame {i}")
       self.assertEqual(planner.lead_leaving, bool(leaving[i]), f"frame {i}")
     self.assertTrue(leaving.any() and not leaving.all())
 

@@ -13,16 +13,16 @@ import hashlib
 import os
 import shutil
 import tarfile
-import tempfile
+import io
 import urllib.request
 
 
-def download(url: str, sha256: str, timeout: float = 120.0) -> bytes:
+def download(url: str, sha256: str) -> bytes:
   """The payload at `url`, or ValueError if it is not the artifact `sha256` names.
 
   The check is not a nicety: what comes back is executed, usually as root.
   """
-  with urllib.request.urlopen(url, timeout=timeout) as resp:
+  with urllib.request.urlopen(url, timeout=120.0) as resp:
     payload = resp.read()
 
   digest = hashlib.sha256(payload).hexdigest()
@@ -44,27 +44,22 @@ def extract(payload: bytes, names: tuple[str, ...], dest: str) -> None:
   os.makedirs(dest, mode=0o775, exist_ok=True)
   missing = set(names)
 
-  with tempfile.TemporaryDirectory() as tmp:
-    archive = os.path.join(tmp, "payload.tar")
-    with open(archive, "wb") as f:
-      f.write(payload)
+  with tarfile.open(fileobj=io.BytesIO(payload)) as tar:
+    for member in tar.getmembers():
+      name = os.path.basename(member.name)
+      if not member.isfile() or name not in missing:
+        continue
 
-    with tarfile.open(archive) as tar:
-      for member in tar.getmembers():
-        name = os.path.basename(member.name)
-        if not member.isfile() or name not in missing:
-          continue
+      source = tar.extractfile(member)
+      if source is None:
+        continue
 
-        source = tar.extractfile(member)
-        if source is None:
-          continue
-
-        staged = os.path.join(dest, name + ".new")
-        with open(staged, "wb") as f:
-          shutil.copyfileobj(source, f)
-        os.chmod(staged, 0o755)
-        os.replace(staged, os.path.join(dest, name))
-        missing.discard(name)
+      staged = os.path.join(dest, name + ".new")
+      with open(staged, "wb") as f:
+        shutil.copyfileobj(source, f)
+      os.chmod(staged, 0o755)
+      os.replace(staged, os.path.join(dest, name))
+      missing.discard(name)
 
   if missing:
     raise ValueError(f"missing from archive: {sorted(missing)}")

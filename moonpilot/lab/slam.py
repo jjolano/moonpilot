@@ -4,12 +4,11 @@ import numpy as np
 from openpilot.tools.lib.logreader import LogReader
 
 from moonpilot.lab import DEFAULT_ROOT, cached, expand
-from moonpilot.leadd import _gps_push, _pose_push, _slam_node
-from moonpilot.pose import PoseTracker, latlon_to_enu
-from moonpilot.slam import PriorChannel, RotatingPoseWindow
+from moonpilot.pose import PoseTracker, latlon_to_enu, push_odometry_sample
+from moonpilot.slam import PriorChannel, RotatingPoseWindow, device_from_calib, odometry_sample, slam_node
+from moonpilot.lab.routes import add_routes_arg
 
 EXTRACT_VERSION = 2
-ROUTE_SETS: dict[str, tuple[str, ...]] = {"latest": ("0000043f", "0000043e")}
 
 
 class ReplaySM:
@@ -23,6 +22,7 @@ class ReplaySM:
 def _build(segs: list[str]) -> dict[str, np.ndarray]:
   sm = ReplaySM()
   prior, window, tracker = PriorChannel(), RotatingPoseWindow(), PoseTracker()
+  sample = None
   latest_a_ego, latest_long_active, latest_onroad = float("nan"), False, True
   truth_service, gps_origin = None, None
   truth, logged, poses, slam, lags = [], [], [], [], []
@@ -36,8 +36,8 @@ def _build(segs: list[str]) -> dict[str, np.ndarray]:
                      bool(state.egoPose.valid), float(state.egoPose.x), float(state.egoPose.y)))
       continue
     if service == "modelV2":
-      if sm.updated.get("cameraOdometry"):
-        node = _slam_node(sm, prior)
+      if sample is not None:
+        node = slam_node(sample)
         if node is not None:
           window.push(node)
           corr = window.update()
@@ -46,6 +46,7 @@ def _build(segs: list[str]) -> dict[str, np.ndarray]:
           prior_diff = node.v_ego - v_publish if v_publish is not None else np.nan
           slam.append((node.mono_time, node.v_ego, node.v_ego + corr["dVel"], corr["dVel"],
                        corr["valid"], prior_diff, latest_a_ego, latest_long_active, latest_onroad))
+      sample = None
       for key in sm.updated:
         sm.updated[key] = False
       continue
@@ -82,7 +83,8 @@ def _build(segs: list[str]) -> dict[str, np.ndarray]:
             gps_origin = (lat, lon)
           x, y = latlon_to_enu(lat, lon, *gps_origin)
           truth.append((t, x, y, float(getattr(g, "speed", np.nan))))
-        _gps_push(tracker, sm, service)
+        tracker.push_gps(float(g.latitude), float(g.longitude), horizontal_accuracy=float(g.horizontalAccuracy),
+                         has_fix=bool(g.hasFix), bearing_deg=float(g.bearingDeg), speed=float(g.speed))
       continue
     if service == "liveLocationKalman" and truth_service is None:
       g = msg.liveLocationKalman
@@ -94,7 +96,11 @@ def _build(segs: list[str]) -> dict[str, np.ndarray]:
         truth.append((t, x, y, np.nan))
       continue
     if service == "cameraOdometry":
-      _pose_push(tracker, sm, prior)
+      calibration = sm.data.get("extrinsicsCalibration")
+      rotation = None if calibration is None else device_from_calib(calibration.rpyCalib, sm.valid["extrinsicsCalibration"])
+      sample = odometry_sample(sm["cameraOdometry"], prior, rotation, sm.valid["cameraOdometry"])
+      if sample is not None:
+        push_odometry_sample(tracker, sample)
       if tracker.has_origin:
         poses.append((tracker.mono_time, tracker.x, tracker.y))
   slam_arr = np.asarray(slam, dtype=float).reshape((-1, 9))
@@ -185,12 +191,12 @@ def _report(route: str, args):
 
 
 def _run(args):
-  for route in expand(args.routes, ROUTE_SETS):
+  for route in expand(args.routes, args.root):
     _report(route, args)
 
 
 def register(sub):
   for name in ("slam", "pose"):
     p = sub.add_parser(name, help=f"replay {name} against recorded drives")
-    p.add_argument("--routes", nargs="+", default=["latest"])
+    add_routes_arg(p, ["latest"])
     p.set_defaults(fn=_run, replay=name)

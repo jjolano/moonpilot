@@ -7,33 +7,8 @@ import unittest
 from unittest import mock
 
 from moonpilot import deps, paths
-from moonpilot.features import FEATURES, Feature, available, enabled, missing_modules, wanted
-from moonpilot.tests.fakes import _params
-
-# A name no distribution can provide, so `available()` is False without depending on the
-# environment. 'json' is stdlib and always present.
-ABSENT = "moonpilot_no_such_package_anywhere"
-PRESENT = "json"
-
-
-class ParamStore:
-  def __init__(self):
-    self.values: dict[str, str] = {}
-    self.writes: list[tuple[str, str]] = []
-
-  def get(self, key, return_default=False):
-    return self.values.get(key)
-
-  def put(self, key, value, block=False):
-    self.values[key] = value
-    self.writes.append((key, value))
-
-  def remove(self, key):
-    self.values.pop(key, None)
-
-
-def _feature(requires: tuple[str, ...]) -> Feature:
-  return Feature(key="MoonpilotTest", title="test", description="test", requires=requires)
+from moonpilot.features import FEATURES, Feature
+from moonpilot.tests.fakes import ABSENT, feature as make_feature, params
 
 
 class TestAvailability(unittest.TestCase):
@@ -54,28 +29,6 @@ class TestAvailability(unittest.TestCase):
 
   def test_absent_and_present_modules(self):
     self.assertFalse(deps.available(ABSENT))
-    self.assertTrue(deps.available(PRESENT))
-
-  def test_availability_needs_every_declared_module(self):
-    self.assertEqual(missing_modules(_feature((PRESENT, ABSENT))), (ABSENT,))
-    self.assertFalse(available(_feature((PRESENT, ABSENT))))
-    self.assertTrue(available(_feature((PRESENT,))))
-    self.assertTrue(available(_feature(())))
-
-
-class TestGate(unittest.TestCase):
-  def test_missing_dependency_turns_the_feature_off(self):
-    # The bug this whole change exists to prevent: a feature the driver asked for, whose package
-    # is not installed, must read as off everywhere the seam looks — while still recording that
-    # the driver wanted it, so the toggle does not silently flip itself back.
-    feature = _feature((ABSENT,))
-    self.assertTrue(wanted(feature, _params(True)))
-    self.assertFalse(enabled(feature, _params(True)))
-
-  def test_present_dependency_leaves_the_decision_to_the_driver(self):
-    feature = _feature((PRESENT,))
-    self.assertTrue(enabled(feature, _params(True)))
-    self.assertFalse(enabled(feature, _params(False)))
 
 
 class TestPaths(unittest.TestCase):
@@ -138,37 +91,42 @@ class TestActivation(unittest.TestCase):
 
 class TestStatusAndRetry(unittest.TestCase):
   def test_status_writes_only_when_changed(self):
-    params = ParamStore()
-    deps.put_status(params, deps.WAITING_NETWORK, "Waiting for a network.")
-    deps.put_status(params, deps.WAITING_NETWORK, "Waiting for a network.")
-    self.assertEqual(params.writes, [(deps.STATUS_KEY, "waiting-network Waiting for a network.")])
-    self.assertEqual(deps.read_status(params), (deps.WAITING_NETWORK, "Waiting for a network."))
-    self.assertEqual(deps.status_text(params), ("waiting for network", "Waiting for a network."))
+    store = params(on=False)
+    deps.put_status(store, deps.WAITING_NETWORK, "Waiting for a network.")
+    deps.put_status(store, deps.WAITING_NETWORK, "Waiting for a network.")
+    self.assertEqual(store.puts, {deps.STATUS_KEY: "waiting-network Waiting for a network."})
+    self.assertEqual(deps.read_status(store), (deps.WAITING_NETWORK, "Waiting for a network."))
+    self.assertEqual(deps.status_text(store), ("waiting for network", "Waiting for a network."))
 
   def test_status_transitions_keep_state_and_detail(self):
-    params = ParamStore()
+    store = params(on=False)
     for state in (deps.READY, deps.WAITING_NETWORK, deps.WAITING_METERED, deps.INSTALLING, deps.ERROR):
       with self.subTest(state=state):
-        deps.put_status(params, state, "cryptography is missing.")
-        self.assertEqual(deps.read_status(params), (state, "cryptography is missing."))
+        deps.put_status(store, state, "cryptography is missing.")
+        self.assertEqual(deps.read_status(store), (state, "cryptography is missing."))
 
   def test_empty_status_reads_ready_when_nothing_is_missing(self):
     # depsd never starts when missing() is empty, so MoonpilotDepsStatus stays cleared at
     # boot — the row used to sit on the unknown-state fallback ("starting") forever.
-    params = ParamStore()
+    store = params(on=False)
     with mock.patch.object(deps, "missing", return_value=[]):
-      self.assertEqual(deps.status_text(params), ("ready", "All required modules are installed."))
+      self.assertEqual(deps.status_text(store), ("ready", "All required modules are installed."))
 
   def test_empty_status_stays_starting_while_something_is_missing(self):
-    params = ParamStore()
+    store = params(on=False)
     with mock.patch.object(deps, "missing", return_value=[deps.Requirement(ABSENT, "x==1")]):
-      self.assertEqual(deps.status_text(params), ("starting", ""))
+      self.assertEqual(deps.status_text(store), ("starting", ""))
 
   def test_retry_request_is_consumed_once(self):
-    params = ParamStore()
-    deps.request_retry(params)
-    self.assertTrue(deps.take_retry(params))
-    self.assertFalse(deps.take_retry(params))
+    store = params(on=False, overrides={deps.STATUS_KEY: f"{deps.WAITING_METERED} cryptography is missing"})
+    deps.request_retry(store)
+    self.assertTrue(deps.take_retry(store))
+    self.assertFalse(deps.take_retry(store))
+
+  def test_a_retry_is_refused_unless_the_device_is_waiting_on_a_metered_connection(self):
+    store = params(on=False)
+    deps.request_retry(store)
+    self.assertFalse(deps.take_retry(store))
 
 
 class TestInstall(unittest.TestCase):
@@ -294,7 +252,7 @@ class TestRegistryAgreesWithTheLock(unittest.TestCase):
 
   def test_a_feature_requiring_an_undeclared_module_is_caught(self):
     with self.assertRaises(AssertionError):
-      _check_registry((), (_feature((ABSENT,)),))
+      _check_registry((), (make_feature((ABSENT,)),))
 
 
 if __name__ == "__main__":

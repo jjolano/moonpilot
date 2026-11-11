@@ -3,12 +3,13 @@ import math
 
 import numpy as np
 
+from moonpilot.lab import moving_mean
 from moonpilot.lab.driver import _pumps
 from moonpilot.lab.planner import _fly_lagged
 
 
-def _flight_peak(f):
-  felt = np.convolve(f["a"], np.ones(10) / 10, mode="same")
+def flight_peak(f):
+  felt = moving_mean(f["a"], 10)
   moving = felt[f["v"] > 2.0]
   return float(moving.min()) if len(moving) else math.nan
 
@@ -45,7 +46,7 @@ def _scorecard_checks(results, hard_rows):
       else:
         add(f"{split} stop pumps", None, f"skipped ({stops} stops)")
       driver_peak = np.nanmedian(dec["drv"][:, 1])
-      planner_peak = np.nanmedian([_flight_peak(f) for f in dec["flown"]])
+      planner_peak = np.nanmedian([flight_peak(f) for f in dec["flown"]])
       add(f"{split} decel peak", not np.isfinite(planner_peak) or planner_peak >= driver_peak - 0.6,
           f"{planner_peak:.2f} vs driver {driver_peak:.2f} m/s^2")
     if r.get("launches") and r["launches"]["keep"]:

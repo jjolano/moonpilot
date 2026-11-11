@@ -4,7 +4,7 @@ The in-lane reference never touches leadd: the radar lead's lateral offset from 
 `|yRel + path_y(dRel + RADAR_TO_CAMERA)|` (radarState yRel is left-positive, modelV2.position.y right-positive, so the sum
 is the offset; the header line prints the check that the sum, not the difference, is the one that vanishes on followed
 leads). The claim under test is the logged `moonpilotState.leads[0].inPath`; the latch and time gap are the planner's own
-`_t_follow`, run on the drive's rows.
+`time_gap`, run on the drive's rows.
 
 Clock: seconds since the route's first log message, the one the drive reports quote.
 """
@@ -18,9 +18,17 @@ from openpilot.common.realtime import DT_MDL
 from openpilot.tools.lib.logreader import LogReader
 from opendbc.car.structs import car
 
+from moonpilot.lab.routes import add_routes_arg
 from moonpilot.lab import DEFAULT_ROOT, cached, drive_config, expand, runs
 from moonpilot.lab import planner as lab_planner
-from moonpilot.lead import MOONPILOT_INPATH_RC, MOONPILOT_INPATH_YSTD_FLOOR, MOONPILOT_MIN_Y_STD, MOONPILOT_PATH_HALF_WIDTH, MOONPILOT_RADAR_TO_CAMERA
+from moonpilot.lead import (
+  MOONPILOT_INPATH_RC,
+  MOONPILOT_INPATH_YSTD_FLOOR,
+  MOONPILOT_MIN_Y_STD,
+  MOONPILOT_PATH_HALF_WIDTH,
+  MOONPILOT_RADAR_TO_CAMERA,
+  RADAR_ONLY_MODEL_PROB,
+)
 from moonpilot.longitudinal import (
   MOONPILOT_OUT_OF_PATH_ENTER,
   MOONPILOT_OUT_OF_PATH_LEAVE,
@@ -33,15 +41,10 @@ from moonpilot.longitudinal import (
 
 EXTRACT_VERSION = 2
 LATCH_VERSION = 1
-ROUTE_SETS = {
-  # The engaged drives, plus the one the report is about.
-  "longitudinal": (*lab_planner.ROUTE_SETS["longitudinal"], "0000044d"),
-  "manual-approach": lab_planner.ROUTE_SETS["manual-approach"],
-}
 N_PATH, N_LEAD = 33, 6  # modelV2.position's grid; a leadd slot's native t grid
 # The grid the logged drives' leadd evaluated (`MOONPILOT_INPATH_HORIZON` was 4 s on every one): pinned here rather than imported,
 # so the counterfactual stays a replay of those drives after the shipped horizon changes. The cached latch is code-dependent, so
-# bump LATCH_VERSION when `_t_follow` or its constants change.
+# bump LATCH_VERSION when `time_gap` or its constants change.
 DRIVE_GRID = np.arange(0.0, 4.0 + 1e-9, 0.25)
 LANE, ADJACENT = 1.0, (2.5, 5.0)  # m: the reference's in-lane bound, and its adjacent-lane band
 BINS = (0.0, 30.0, 60.0, 90.0, 130.0)  # m of dRel
@@ -57,8 +60,7 @@ SCALARS = (
 def _build(segs, root, route):
   first = min(m.logMonoTime for m in islice(LogReader(segs[0], sort_by_time=False), 500))
   data = lab_planner.extract(route, root)
-  blob, offsets = data["blob"], data["offsets"]
-  index = {k: 1 + i * 3 for i, k in enumerate(lab_planner.MESSAGES)}
+  reader = lab_planner.ExtractReader(data)
   cols = {k: [] for k in (*SCALARS, "lx", "ly", "lystd", "lt", "my", "mystd", "px", "py")}
 
   def pad(values, n):
@@ -66,18 +68,15 @@ def _build(segs, root, route):
     out[: min(len(values), n)] = list(values)[:n]
     return out
 
-  for row in offsets:
-    def read(kind, row=row):
-      start, size = row[index[kind]], row[index[kind] + 1]
-      return messaging.log_from_bytes(blob[start:start + size].tobytes())
-    cs, cc, lead = read("carState").carState, read("carControl").carControl, read("radarState").radarState.leadOne
-    mp, model, sd = read("moonpilotState").moonpilotState, read("modelV2").modelV2, read("selfdriveState").selfdriveState
+  for mono, messages, stamps, _ in reader.rows():
+    cs, cc, lead = messages["carState"].carState, messages["carControl"].carControl, messages["radarState"].radarState.leadOne
+    mp, model, sd = messages["moonpilotState"].moonpilotState, messages["modelV2"].modelV2, messages["selfdriveState"].selfdriveState
     slot = mp.leads[0] if len(mp.leads) else None
     s = {
-      "t": row[0] * 1e-9, "v_ego": cs.vEgo, "long_active": cc.longActive, "lead": lead.present, "d_rel": lead.dRel, "y_rel": lead.yRel,
-      "radar_only": lead.radar and lead.modelProb == 0.0, "personality": sd.personality.raw,
+      "t": mono * 1e-9, "v_ego": cs.vEgo, "long_active": cc.longActive, "lead": lead.present, "d_rel": lead.dRel, "y_rel": lead.yRel,
+      "radar_only": lead.radar and lead.modelProb == RADAR_ONLY_MODEL_PROB, "personality": sd.personality.raw,
       "mp_present": slot is not None and slot.present, "mp_in_path": slot.inPath if slot is not None else 1.0,
-      "mp_source": SOURCES[str(slot.source)] if slot is not None else 0, "mp_age": (row[0] - row[index["moonpilotState"] + 2]) * 1e-9,
+      "mp_source": SOURCES[str(slot.source)] if slot is not None else 0, "mp_age": (mono - stamps["moonpilotState"]) * 1e-9,
     }
     for k in SCALARS:
       cols[k].append(float(s[k]))
@@ -113,23 +112,17 @@ def _replay_env(route, root):
 
 
 def _latch_build(_segs, root, route):
-  """The planner's own `_t_follow` on every row of the drive: returns (t_follow, lead_leaving). Only that method runs,
+  """The planner's own `time_gap` on every row of the drive: returns (t_follow, lead_leaving). Only that method runs,
   which is every state it has, so the numbers equal a full replay's at a hundredth of the cost."""
   data = lab_planner.extract(route, root)
   cp = messaging.log_from_bytes(data["cp"].tobytes(), car.CarParams)
-  blob, offsets = data["blob"], data["offsets"]
-  index = {k: 1 + i * 3 for i, k in enumerate(lab_planner.MESSAGES)}
+  reader = lab_planner.ExtractReader(data)
   out = []
   with _replay_env(route, root) as clock:
     planner = MoonpilotLongitudinalPlanner(cp)
-    for row in offsets:
-      messages, stamps = {}, {}
-      for kind in ("radarState", "selfdriveState", "moonpilotState"):
-        start, size, stamp = row[index[kind]:index[kind] + 3]
-        messages[kind], stamps[kind] = messaging.log_from_bytes(blob[start:start + size].tobytes()), int(stamp)
-      clock.now_ns = int(row[0])
-      out.append((planner._t_follow(lab_planner.ReplaySubMaster(messages, stamps, clock.now_ns)), planner.lead_leaving))
-  return {"t_follow": np.asarray([o[0] for o in out]), "leaving": np.asarray([o[1] for o in out], dtype=bool)}
+    for mono, messages, stamps, _ in reader.rows():
+      clock.now_ns = mono
+      out.append((planner.time_gap(lab_planner.ReplaySubMaster(messages, stamps, mono)), planner.lead_leaving))
 
 
 def latch(route, root=DEFAULT_ROOT):
@@ -193,7 +186,7 @@ def raw_in_path(y, s, path, half_width=MOONPILOT_PATH_HALF_WIDTH, weights="inver
 def emulate_t_follow(raw, d, vision, in_path_rc=MOONPILOT_INPATH_RC):
   """leadd's rise-hold filter and the planner's latch + slew over a pooled frame set, given each frame's raw in-path
   (`raw[i]` is read only where `vision[i]`). Returns (t_follow, leaving). Mirrors `lead.lead_in_path`'s filter and
-  `MoonpilotLongitudinalPlanner._t_follow`; `test_lab_inpath` pins the second against the real method."""
+  `MoonpilotLongitudinalPlanner.time_gap`; `test_lab_inpath` pins the second against the real method."""
   alpha = DT_MDL / (in_path_rc + DT_MDL)
   n = len(raw)
   tf, leaving = np.empty(n), np.zeros(n, dtype=bool)
@@ -407,7 +400,7 @@ def _adjacent_episodes(d, results):
 
 
 def _inpath(args):
-  routes = list(dict.fromkeys(expand(args.routes, ROUTE_SETS)))
+  routes = expand(args.routes, args.root)
   d = pooled(routes, args.root)
   print(f"routes {len(routes)}: " + ", ".join(f"{r}:{drive_config(r, args.root)[0][:9]}" for r in routes))
   followed = d["valid"] & (d["v_ego"] > 10) & (d["d_rel"] > 20) & (d["d_rel"] < 80)
@@ -425,7 +418,7 @@ def _inpath(args):
 
 def register(sub):
   parser = sub.add_parser("inpath", help="leadd's inPath on in-lane vs adjacent radar leads, and what the lead-lateral latch cost")
-  parser.add_argument("--routes", nargs="+", default=["longitudinal"], help=f"route names or sets: {', '.join(ROUTE_SETS)}")
+  add_routes_arg(parser, ["longitudinal-inpath"])
   parser.add_argument("--window-routes", nargs="+", default=["0000044d"], help="routes to print row by row")
   parser.add_argument("--start", type=float, default=205.0)
   parser.add_argument("--end", type=float, default=245.0)

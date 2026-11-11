@@ -10,24 +10,17 @@ from types import SimpleNamespace
 
 import numpy as np
 
+from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.tools.lib.logreader import LogReader
 
 from moonpilot.curvature import MOONPILOT_RECENTER_FIT_X, MOONPILOT_RECENTER_LAT_ACCEL, lane_bend, recentered
 from moonpilot.lab import DEFAULT_ROOT, cached, expand
+from moonpilot.lab.routes import LURCH_EVENT, add_routes_arg
 
 VERSION = 2  # v2 keeps the road edges at the car and their stds, which the recovery-side guard reads
 N_X = int(np.searchsorted(ModelConstants.X_IDXS, MOONPILOT_RECENTER_FIT_X, side="right"))
-DT = 0.05
-ROUTE_SETS = {
-  # Drives with openpilot steering above 10 m/s (moonpilot.lab lateral's `lanes` with steering there), the two
-  # all-manual drives for the driver's own reference, and the drive that lurched past an intersection.
-  "recenter": ("000003f8", "000003f9", "000003fc", "000003fe", "00000400", "00000401", "00000408", "0000040d", "0000040e", "0000040f",
-               "00000410", "00000413", "00000414", "00000417", "00000418", "0000043e", "0000043f", "0000044d", "0000044e", "0000044f",
-               "0000046b--fbae8b11b5"),
-}
-# 0000046b's lurch: route time 640-644 s (segment 10), as logMonoTime seconds.
-EVENT = ("0000046b--fbae8b11b5", 667.85, 671.85)
+
 
 
 def _build(segs):
@@ -92,7 +85,7 @@ def _recenter(args):
   curves and out, and the lurch before and after."""
   from concurrent.futures import ProcessPoolExecutor
   with ProcessPoolExecutor(3) as pool:  # each worker holds a decoded segment
-    results = list(pool.map(_route, [(r, args.root, args.cap) for r in expand(args.routes, ROUTE_SETS)]))
+    results = list(pool.map(_route, [(r, args.root, args.cap) for r in expand(args.routes, args.root)]))
   done = {route: r for route, r, _ in results if r is not None}
   for route, _, err in results:
     if err is not None:
@@ -105,19 +98,19 @@ def _recenter(args):
   beyond_request = np.abs(cat(lambda r: r["action"]) - bend) * v**2
   beyond_driver = np.abs(cat(lambda r: r["curvature"]) - bend) * v**2
   print(f"{len(done)} drives; on well-seen lanes above 12 m/s, |curvature - lane bend| * v^2, p50 / p90 / p99 / p99.9 (m/s^2):")
-  print(f"  openpilot's request ({ours.sum() * DT / 60:.0f} min): {_q(beyond_request[ours])}")
-  print(f"  the driver's own    ({driver.sum() * DT / 60:.0f} min): {_q(beyond_driver[driver])}")
+  print(f"  openpilot's request ({ours.sum() * DT_MDL / 60:.0f} min): {_q(beyond_request[ours])}")
+  print(f"  the driver's own    ({driver.sum() * DT_MDL / 60:.0f} min): {_q(beyond_driver[driver])}")
 
   removed = np.abs(cat(lambda r: r["action"]) - cat(lambda r: r["capped"])) * v**2
   curve = np.abs(bend) * v**2 >= 0.5
   steer = (v > 12.0) & (cat(lambda r: r["lat"]) > 0) & (cat(lambda r: r["pressed"]) == 0)
-  print(f"\ncap {args.cap} m/s^2, openpilot steering above 12 m/s ({steer.sum() * DT / 60:.0f} min):")
+  print(f"\ncap {args.cap} m/s^2, openpilot steering above 12 m/s ({steer.sum() * DT_MDL / 60:.0f} min):")
   for name, m in (("straight-ish (bend < 0.5 m/s^2)", steer & ~curve), ("curves (bend >= 0.5 m/s^2)", steer & curve)):
     r = removed[m]
-    print(f"  {name}: the request lowered by > 0.05 m/s^2 on {np.mean(r > 0.05) * 100:.2f}% of {m.sum() * DT / 60:.0f} min, "
+    print(f"  {name}: the request lowered by > 0.05 m/s^2 on {np.mean(r > 0.05) * 100:.2f}% of {m.sum() * DT_MDL / 60:.0f} min, "
           + f"by p99 {np.percentile(r, 99):.2f}, max {r.max():.2f}")
 
-  route, lo, hi = EVENT
+  route, lo, hi = LURCH_EVENT
   if route in done:
     e = done[route]
     win = (e["t"] >= lo) & (e["t"] <= hi)
@@ -131,6 +124,6 @@ def _recenter(args):
 
 def register(sub):
   p = sub.add_parser("recenter", help="MoonpilotPathRecenter: the request beyond the lane's bend, openpilot against the driver, and the cap")
-  p.add_argument("--routes", nargs="+", default=["recenter"], help=f"route names or sets: {', '.join(ROUTE_SETS)}")
+  add_routes_arg(p, ["recenter"])
   p.add_argument("--cap", type=float, default=MOONPILOT_RECENTER_LAT_ACCEL, help="m/s^2 beyond the lane's bend")
   p.set_defaults(fn=_recenter)

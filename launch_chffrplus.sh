@@ -59,7 +59,7 @@ function launch {
         if [ ! -d /data/safe_staging/old_openpilot ]; then
           echo "Valid overlay update found, installing"
           LAUNCHER_LOCATION="${BASH_SOURCE[0]}"
-          printf '%s\n' "$(< "${MOONPILOT_BOOT_ID_PATH:-/proc/sys/kernel/random/boot_id}")" > "${STAGING_ROOT}/moonpilot_swap"  # moonpilot seam, see AGENTS.md
+          bash "${DIR}/moonpilot/boot.sh" mark-swap "$STAGING_ROOT"  # moonpilot seam, see AGENTS.md
           mv "$DIR" /data/safe_staging/old_openpilot
           mv "${STAGING_ROOT}/finalized" "$DIR"
           cd "$DIR"

@@ -3,8 +3,7 @@
 is offroad-only — the settings rows gated on `ui_state.is_offroad()`, uploads, a software update, the
 SSH and tailscale sessions — is reachable without turning the car off and waiting for the device to
 power down. Upstream already has the whole decision in one place: `hardwared`'s `onroad_conditions`,
-where every member is a reason the device *may* be onroad (`hardwared.py:206-210`) and
-`should_start = all(onroad_conditions.values())` (`:386`) is what reads them, so the mechanism there
+where every member is a reason the device *may* be onroad, and `should_start()` reads them, so the mechanism there
 is one dict member and the line that refreshes it. Everything downstream follows
 `deviceState.started` with no fork edit: the manager stops `card`, `controlsd`, `selfdrived` and
 `loggerd`, `updated` starts, `IsOffroad` flips, and both UI trees switch to their offroad layout.
@@ -13,10 +12,10 @@ is one dict member and the line that refreshes it. Everything downstream follows
   (the fork's rule: `get_bool` ignores the declared default), declared
   `CLEAR_ON_MANAGER_START | CLEAR_ON_IGNITION_ON`. Both flags are cleared by upstream's manager, not
   by fork code — `manager_init()` for the first, and the ignition **rising** edge its 1 Hz loop sees
-  for the second (`manager.py:30,33,135`) — which is what makes a reboot and a new ignition cycle the
+  for the second (the manager's ignition-edge handling) — which is what makes a reboot and a new ignition cycle the
   two automatic ends of the mode. The row deliberately does **not** carry
   `CLEAR_ON_OFFROAD_TRANSITION`: entering the mode *is* an offroad transition, so that flag would
-  clear the request one frame after it was written. `moonpilot/tests/test_offroad.py` pins the flags.
+  clear the request one frame after it was written.
 - **The seam is the dict member and the refresh.** `onroad_conditions["moonpilot_onroad"]` is
   `onroad_condition(params)` — the inverse of the request — and the refresh sits above `ign_edge`, so
   a flip of the param is published on that tick rather than at the next 2 Hz one. No subscription is
@@ -24,7 +23,7 @@ is one dict member and the line that refreshes it. Everything downstream follows
 - **Two entries, one gate.** The moonpilot panel's row and a hold on the driving view both reach
   `can_enter` through their tree's own `parked()`: the car is on (`ui_state.started`, which is
   `deviceState.started` *and* the ignition), it is not being driven (`v_ego` under
-  `MOONPILOT_OFFROAD_SPEED`, the fork's standstill convention, pinned equal to the planner's own two),
+  `MOONPILOT_OFFROAD_SPEED`, the fork's standstill threshold),
   and openpilot is not engaged. The row is a `button_item` in `moonpilot/ui/settings.py` and a pushed
   `BigButton` in `moonpilot/ui/settings_mici.py`; the gesture is tizi's
   `moonpilot/ui/offroad_mode.py` and mici's `moonpilot/ui/offroad_mode_mici.py`, each with its own
@@ -57,7 +56,5 @@ is one dict member and the line that refreshes it. Everything downstream follows
   `deviceState.started` is false, so a parked car with the ignition on and no onroad processes cannot
   be commanded.
 
-`moonpilot/tests/test_offroad.py` pins the policy, the four labels, both directions of the gate, the
-speed against the planner's own constants, and the two literals in `hardwared.py` — nothing in this
-tree imports that file, so a merge that drops them deletes the feature silently.
+
 

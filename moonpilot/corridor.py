@@ -25,6 +25,9 @@ Three things that are not obvious:
 from collections import deque
 
 import numpy as np
+from openpilot.cereal import log
+from moonpilot.features import PATH_OUTSIDE, enabled
+from moonpilot.curve import MOONPILOT_CURVE_ACCEL_MIN
 
 from opendbc.car.interfaces import ACCEL_MAX
 
@@ -38,12 +41,12 @@ MOONPILOT_CORRIDOR_MARGIN = 0.15  # m; path this close to an edge still counts a
 MOONPILOT_SQUEEZE_LOOKAHEAD = 40.0  # m ahead of the car (after the path re-reference)
 MOONPILOT_SQUEEZE_FULL_WIDTH = 4.0  # m; below this the corridor is under ~2 car widths
 MOONPILOT_SQUEEZE_MIN_WIDTH = 2.0  # m; at or under one car body the floor is already applied
-MOONPILOT_SQUEEZE_ACCEL_MIN = -1.5  # m/s^2; same bound as the curve terms, well above ACCEL_MIN
+MOONPILOT_SQUEEZE_ACCEL_MIN = MOONPILOT_CURVE_ACCEL_MIN
 # Path-outside banner (`MoonpilotPathOutside`): among known path samples in the near horizon,
 # this fraction outside the free corridor is enough to warn. One sample is model noise; a quarter
 # of the near path is a trajectory that actually leaves the road. Lookahead matches squeeze so
 # the banner and the brake look at the same stretch of road.
-MOONPILOT_PATH_OUTSIDE_LOOKAHEAD = 40.0  # m
+MOONPILOT_PATH_OUTSIDE_LOOKAHEAD = MOONPILOT_SQUEEZE_LOOKAHEAD
 MOONPILOT_PATH_OUTSIDE_MIN_FRAC = 0.25  # of known samples in the lookahead that must be outside
 # Pose-stitched history (`egoPose` frame, Phase 3): how long past free-space strips are kept and
 # warped into the current device frame. Short enough that a hard cut or a rebase cannot leave
@@ -118,25 +121,11 @@ def corridor_width(edge_a, edge_b, sample_x):
   return np.where(np.isfinite(width) & (width >= 0.0), width, np.nan)
 
 
-def squeeze_accel(edge_a, edge_b, sample_x, x_ego=0.0):
-  """Bounded braking for a corridor that pinches over the next `MOONPILOT_SQUEEZE_LOOKAHEAD` meters.
-
-  `sample_x` is the edges' own x frame (the model path's absolute distances); `x_ego` is how far
-  the car has already covered of that frame — the same re-reference the curve targets take, so the
-  window is meters *ahead of the car now*. Deepest known finite width in the window wins. Wide
-  enough, unknown, or empty → `ACCEL_MAX` (the inactive sentinel `policy` leaves the cruise term
-  alone for); otherwise a linear ramp from 0 at `FULL_WIDTH` down to `ACCEL_MIN` (this module's
-  squeeze floor) at `MIN_WIDTH` and no deeper. Pure geometry: no toggle, no messaging."""
-  sample_x = np.asarray(sample_x, dtype=float)
-  d = sample_x - float(x_ego)
-  window = (d >= 0.0) & (d <= MOONPILOT_SQUEEZE_LOOKAHEAD)
-  if not window.any():
-    return ACCEL_MAX
-  w = corridor_width(edge_a, edge_b, sample_x[window])
-  known = np.isfinite(w)
+def _squeeze_from_widths(widths) -> float:
+  known = np.isfinite(widths) & (widths >= 0.0)
   if not known.any():
     return ACCEL_MAX
-  w_min = float(np.min(w[known]))
+  w_min = float(np.min(widths[known]))
   if w_min >= MOONPILOT_SQUEEZE_FULL_WIDTH:
     return ACCEL_MAX
   span = MOONPILOT_SQUEEZE_FULL_WIDTH - MOONPILOT_SQUEEZE_MIN_WIDTH
@@ -144,40 +133,36 @@ def squeeze_accel(edge_a, edge_b, sample_x, x_ego=0.0):
   return MOONPILOT_SQUEEZE_ACCEL_MIN * frac
 
 
-def path_outside_fraction(path_x, path_y, edge_a, edge_b, lookahead=MOONPILOT_PATH_OUTSIDE_LOOKAHEAD):
-  """Fraction of *known* path samples in `[0, lookahead]` that sit outside the free corridor.
+def _squeeze_accel(left, right, sample_x, x_ego=0.0):
+  sample_x = np.asarray(sample_x, dtype=float)
+  d = sample_x - float(x_ego)
+  window = (d >= 0.0) & (d <= MOONPILOT_SQUEEZE_LOOKAHEAD)
+  return ACCEL_MAX if not window.any() else _squeeze_from_widths((right - left)[window])
 
-  Unknown samples (edges do not span that x) are excluded from both numerator and denominator:
-  a path the model has not painted edges for is not evidence the path left the road. Returns
-  0.0 when nothing in the window is known — no answer, not free.
-  """
+
+def squeeze_accel(edge_a, edge_b, sample_x, x_ego=0.0):
+  left, right = corridor_bounds(edge_a, edge_b, sample_x)
+  return _squeeze_accel(left, right, sample_x, x_ego)
+
+
+def _outside_fraction(flags, path_x, lookahead):
+  window = (path_x >= 0.0) & (path_x <= lookahead)
+  known = window & np.isfinite(flags)
+  n_known = int(np.count_nonzero(known))
+  return 0.0 if n_known == 0 else float(np.count_nonzero(flags[known] == 0.0)) / n_known
+
+
+def path_outside_fraction(path_x, path_y, edge_a, edge_b, lookahead=MOONPILOT_PATH_OUTSIDE_LOOKAHEAD):
+  """Fraction of known path samples in the near horizon outside the free corridor."""
   path_x = np.asarray(path_x, dtype=float)
   path_y = np.asarray(path_y, dtype=float)
   if path_x.size == 0 or path_y.size != path_x.size:
     return 0.0
-  flags = path_in_corridor(path_x, path_y, edge_a, edge_b)
-  window = (path_x >= 0.0) & (path_x <= lookahead)
-  known = window & np.isfinite(flags)
-  n_known = int(np.count_nonzero(known))
-  if n_known == 0:
-    return 0.0
-  return float(np.count_nonzero(flags[known] == 0.0)) / n_known
+  return _outside_fraction(path_in_corridor(path_x, path_y, edge_a, edge_b), path_x, lookahead)
 
 
-def path_outside_alert(sm, params=None) -> int | None:
-  """selfdrived's banner: `EventName.pathOutside` when the model path leaves the free corridor.
-
-  Same shape as `turn_desire_alert`: feature gate, then the one thing modeld does not check —
-  `carControl.latActive`, so a disengaged car (or half-engagement latched off) does not get a
-  banner for a path nobody is following. Distinct from LDW (lane lines / desire) and from the
-  turn-desire banner (blinker): this is the model's own trajectory leaving `roadEdges`.
-  """
-  from openpilot.cereal import log
-  from openpilot.common.params import Params
-  from moonpilot.features import PATH_OUTSIDE, enabled
-
-  if params is None:
-    params = Params()
+def path_outside_alert(sm, params) -> int | None:
+  """selfdrived's banner when the active model path leaves the free corridor."""
   if not enabled(PATH_OUTSIDE, params):
     return None
   if not sm["carControl"].latActive:
@@ -187,9 +172,9 @@ def path_outside_alert(sm, params=None) -> int | None:
   if len(edges) < 2:
     return None
   frac = path_outside_fraction(model.position.x, model.position.y, edges[0], edges[1])
-  if frac >= MOONPILOT_PATH_OUTSIDE_MIN_FRAC:
-    return log.OnroadEvent.EventName.pathOutside
-  return None
+  return log.OnroadEvent.EventName.pathOutside if frac >= MOONPILOT_PATH_OUTSIDE_MIN_FRAC else None
+
+
 
 
 def _warp_xy(x, y, from_pose, to_pose):
@@ -230,14 +215,9 @@ class RollingCorridor:
   def clear(self) -> None:
     self._hist.clear()
 
-  def push(self, mono_s: float, pose, edge_a, edge_b, now: float | None = None) -> None:
-    """Record one frame's free-space strip at `pose`. `now` defaults to `mono_s` (no expiry yet)."""
-    if pose is None:
-      self.clear()
-      return
-    t_now = mono_s if now is None else now
+  def push(self, mono_s: float, pose, edge_a, edge_b) -> None:
     self._hist.append((mono_s, tuple(pose), edge_a, edge_b))
-    cutoff = t_now - MOONPILOT_CORRIDOR_HISTORY_S
+    cutoff = mono_s - MOONPILOT_CORRIDOR_HISTORY_S
     while self._hist and (self._hist[0][0] < cutoff or len(self._hist) > MOONPILOT_CORRIDOR_HISTORY_MAX):
       self._hist.popleft()
 
@@ -273,38 +253,6 @@ class RollingCorridor:
     return left_acc, right_acc
 
   def squeeze_accel(self, pose, sample_x, x_ego=0.0):
-    """Same contract as the free function, over the pose-stitched intersection."""
-    if pose is None or not self._hist:
-      return ACCEL_MAX
     left, right = self.fused_bounds(pose, sample_x)
-    sample_x = np.asarray(sample_x, dtype=float)
-    d = sample_x - float(x_ego)
-    window = (d >= 0.0) & (d <= MOONPILOT_SQUEEZE_LOOKAHEAD)
-    if not window.any():
-      return ACCEL_MAX
-    w = right[window] - left[window]
-    known = np.isfinite(w) & (w >= 0.0)
-    if not known.any():
-      return ACCEL_MAX
-    w_min = float(np.min(w[known]))
-    if w_min >= MOONPILOT_SQUEEZE_FULL_WIDTH:
-      return ACCEL_MAX
-    span = MOONPILOT_SQUEEZE_FULL_WIDTH - MOONPILOT_SQUEEZE_MIN_WIDTH
-    frac = float(np.clip((MOONPILOT_SQUEEZE_FULL_WIDTH - w_min) / span, 0.0, 1.0))
-    return MOONPILOT_SQUEEZE_ACCEL_MIN * frac
+    return _squeeze_accel(left, right, sample_x, x_ego)
 
-  def path_outside_fraction(self, pose, path_x, path_y, lookahead=MOONPILOT_PATH_OUTSIDE_LOOKAHEAD):
-    """Same contract as the free function, over the pose-stitched intersection."""
-    if pose is None or not self._hist:
-      return 0.0
-    path_x = np.asarray(path_x, dtype=float)
-    path_y = np.asarray(path_y, dtype=float)
-    if path_x.size == 0 or path_y.size != path_x.size:
-      return 0.0
-    left, right = self.fused_bounds(pose, path_x)
-    known = (path_x >= 0.0) & (path_x <= lookahead) & np.isfinite(left) & np.isfinite(right) & np.isfinite(path_y)
-    n_known = int(np.count_nonzero(known))
-    if n_known == 0:
-      return 0.0
-    inside = (path_y >= left - MOONPILOT_CORRIDOR_MARGIN) & (path_y <= right + MOONPILOT_CORRIDOR_MARGIN)
-    return float(np.count_nonzero(~inside[known])) / n_known

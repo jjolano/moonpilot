@@ -40,12 +40,6 @@ _bad_since = None
 _good_since = None
 
 
-def reset() -> None:
-  """Forget the latch: the next false read opens a new window. For a state machine restart."""
-  global _bad_since, _good_since
-  _bad_since = None
-  _good_since = None
-
 
 def moonpilot_locationd_ok(inputs_ok: bool, now: float | None = None) -> bool:
   """Whether `locationdTemporaryError` should stay unraised for this frame.

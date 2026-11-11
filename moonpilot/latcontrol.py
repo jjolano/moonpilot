@@ -5,25 +5,8 @@ PI on the delay-matched error, friction compensation — because that is the par
 for. What the fork owns is the code and every number in it, so tuning happens here instead of in
 an upstream file.
 
-Five mechanisms are deliberately not upstream's:
-
-  - the setpoint is read out of the request buffer at a fractional frame, so a lateralDelay that
-    is not a whole number of frames (it moves continuously) does not step the setpoint by a whole
-    10 ms as it drifts;
-  - the desired jerk is a centered difference at the same fractional resolution as the setpoint, one
-    0.19 s lookahead ahead of it, rather than at an integer frame index derived from the delay. The
-    two agree while the delay is near 0.2 s; only the fractional form holds the lookahead at 0.19 s
-    on a car whose estimated delay is larger;
-  - friction compensation has a continuous soft deadband instead of switching off and back on
-    at a nonzero torque, so small corrections do not acquire a release-threshold kick;
-  - an optional hysteresis (backlash) on the output: the command only moves once the controller's
-    torque has left a band of ±h around it, so frame-to-frame reversals smaller than 2h never reach
-    the car, and the command never differs from the controller's by more than h;
-  - optional damping (a D term) on how fast the wheel departs from the plan's own rate, so a weave in
-    a curve is resisted while a turn the plan asks for is not.
-
-The controller is picked once, at construction, so the toggle needs a restart, and it only runs
-on a car whose lateralTuning is torque — angle and curvature cars never reach the seam.
+Seven mechanisms differ from upstream: fractional delay interpolation, fractional jerk lookahead, continuous friction deadband,
+an 8 Hz steering-angle filter, output hysteresis, plan-rate damping and a rising friction-compensation ramp.
 """
 
 import math
@@ -39,7 +22,7 @@ from openpilot.common.params import Params
 from openpilot.common.pid import PIDController
 from openpilot.selfdrive.controls.lib.latcontrol import LatControl
 
-from moonpilot.features import STEER_DAMPING, STEER_FRICTION_RAMP, STEER_HYSTERESIS, TORQUE_LATERAL, choice, enabled
+from moonpilot.features import STEER_DAMPING, STEER_FRICTION_RAMP, STEER_HYSTERESIS, TORQUE_LATERAL, enabled, value
 
 # Error correction runs in lateral-acceleration space, where the same curvature error means less
 # lateral acceleration the slower the car goes; the speed schedule is what puts that back. These
@@ -63,20 +46,17 @@ MOONPILOT_FRICTION_DEADBAND = 0.05  # m/s^2; keep near-zero noise out of frictio
 MOONPILOT_FRICTION_RISE = 0.3
 MOONPILOT_VERSION = 1001  # logged; a fork band upstream's counter will not reach
 MOONPILOT_VERSION_HYSTERESIS = 1002  # the same law with output hysteresis on
-# Half-widths in normalized steer torque per MoonpilotSteerHysteresis choice. On a RAV4 (STEER_MAX 1500)
-# these are ~4.5 / 10.5 / 19.5 CAN units; `python -m moonpilot.lab torque` cuts torque reversals on 40d/40e
-# from 14.2/15.9 per s to 4.3/5.6 at 0.7%.
-MOONPILOT_TORQUE_HYSTERESIS = (0.0, 0.003, 0.007, 0.013)
-# Derivative time per MoonpilotSteerDamping choice: P + D = KP * (error + T * error_rate), a lead of T
-# seconds on the feedback. In hands-off curves at 3-17 m/s (routes 3f8-410, matched by speed and turn
-# size against the same driver's manual curves) 22-24% of the wheel's motion was above 1 Hz against the
-# driver's 4-10%, and P carried it: P's 1-5 Hz content equalled its turn-scale correction and moved with
-# the wheel at r = 0.9, 81% of it at 1-2 Hz. At 1.2 Hz these are 21 / 37 / 48 degrees of lead.
-# `python -m moonpilot.lab damping` replays the levels: they put 42 / 83 / 125% of P's 1-2 Hz action into D.
-MOONPILOT_DAMPING_T = (0.0, 0.05, 0.10, 0.15)  # s
-# Where the weave was measured, and where the angle and rate sensors are fine enough to damp: off below
-# 3 m/s (KP 30 and up), full from 5 to 15 m/s, faded out by 20 m/s, where the wheel already matched the driver.
+# Where the weave was measured, and where the angle and rate sensors are fine enough to damp (the levels are
+# STEER_DAMPING's choices): off below 3 m/s (KP 30 and up), full from 5 to 15 m/s, faded out by 20 m/s, where the
+# wheel already matched the driver.
 MOONPILOT_DAMPING_SPEEDS = ([3.0, 5.0, 15.0, 20.0], [0.0, 1.0, 1.0, 0.0])
+
+
+def friction_compensation(error: float, desired_jerk: float, deadzone: float, torque_params) -> float:
+  friction_input = error + MOONPILOT_JERK_GAIN * desired_jerk
+  quiet_band = max(deadzone, MOONPILOT_FRICTION_DEADBAND)
+  friction_input = math.copysign(max(abs(friction_input) - quiet_band, 0.0), friction_input)
+  return get_friction(friction_input, 0.0, FRICTION_THRESHOLD - MOONPILOT_FRICTION_DEADBAND, torque_params)
 
 
 class MoonpilotLatControlTorque(LatControl):
@@ -137,7 +117,6 @@ class MoonpilotLatControlTorque(LatControl):
     return newer_accel + (frames - whole) * (older_accel - newer_accel)
 
   def _hold(self, torque: float) -> float:
-    # Backlash: move only when the controller's torque leaves the ±hysteresis band around the command.
     if self.held_torque is None:
       self.held_torque = torque
     elif torque > self.held_torque + self.hysteresis:
@@ -146,19 +125,10 @@ class MoonpilotLatControlTorque(LatControl):
       self.held_torque = torque + self.hysteresis
     return self.held_torque
 
-  def _desired_jerk(self, lat_delay: float) -> float:
-    # Read one lookahead ahead of the setpoint, not at the newest request: with the buffer read at a
-    # fractional frame this is upstream's centered difference exactly, and it keeps the anticipation
-    # at the lookahead on a car whose estimated delay is large (lagd publishes up to 0.65 s).
-    delay = max(lat_delay - MOONPILOT_JERK_LOOKAHEAD_T, self.dt)
+  def _desired_jerk(self, lookahead_delay: float) -> float:
+    delay = max(lookahead_delay, self.dt)
     return self.jerk_filter.update((self._setpoint(delay - self.dt) - self._setpoint(delay + self.dt)) / (2 * self.dt))
 
-  def _friction(self, error, desired_jerk, deadzone):
-    """Ramp from zero outside the quiet band, without a history-dependent torque step."""
-    friction_input = error + MOONPILOT_JERK_GAIN * desired_jerk
-    quiet_band = max(deadzone, MOONPILOT_FRICTION_DEADBAND)
-    friction_input = math.copysign(max(abs(friction_input) - quiet_band, 0.0), friction_input)
-    return get_friction(friction_input, 0.0, FRICTION_THRESHOLD - MOONPILOT_FRICTION_DEADBAND, self.torque_params)
 
   def update(self, active, CS, VM, params, steer_limited_by_safety, desired_curvature, curvature_limited, lat_delay):
     torque_log = log.ControlsState.LateralTorqueState.new_message()
@@ -169,13 +139,13 @@ class MoonpilotLatControlTorque(LatControl):
     measured_lat_accel_raw = measured_curvature * CS.vEgo**2
     measured_lat_accel = self.meas_filter.update(measured_lat_accel_raw)
     desired_lat_accel = desired_curvature * CS.vEgo**2
-    # Fed whether or not lateral is active, so the delay line is warm on engage.
     self.requests.append(desired_lat_accel)
 
     # Feedback follows the delayed request while tightening. Unwind can start at the jerk-lookahead
     # sample, but a sign change only releases the old turn: opposite feedback still waits for the plant.
     delayed_setpoint = self._setpoint(lat_delay)
-    lookahead_setpoint = self._setpoint(max(lat_delay - MOONPILOT_JERK_LOOKAHEAD_T, 0.0))
+    lookahead_delay = max(lat_delay - MOONPILOT_JERK_LOOKAHEAD_T, 0.0)
+    lookahead_setpoint = self._setpoint(lookahead_delay)
     if delayed_setpoint * lookahead_setpoint < 0:
       setpoint = 0.0
     elif abs(lookahead_setpoint) < abs(delayed_setpoint):
@@ -183,33 +153,28 @@ class MoonpilotLatControlTorque(LatControl):
     else:
       setpoint = delayed_setpoint
     error = setpoint - measured_lat_accel
-    desired_jerk = self._desired_jerk(lat_delay)
+    desired_jerk = self._desired_jerk(lookahead_delay)
     # The wheel's own rate from the rate sensor (it trails the angle's derivative by ~20 ms on this car and
     # does not differentiate the angle's 0.1 deg steps), against the plan's rate: zero while the wheel
     # follows a turn the plan asks for, so only a departure from it is damped.
     measured_jerk = -VM.calc_curvature(math.radians(CS.steeringRateDeg), CS.vEgo, 0.0) * CS.vEgo**2
     error_rate = desired_jerk - measured_jerk
 
-    # Friction only applies outside the steering's own deadzone, in lateral acceleration units.
     curvature_deadzone = abs(VM.calc_curvature(math.radians(self.steering_angle_deadzone_deg), CS.vEgo, 0.0))
     deadzone = curvature_deadzone * CS.vEgo**2
 
-    # Feedforward: what the plan asks for, less the lateral acceleration the road's own bank
-    # already supplies, less the learned bias in that roll estimate, plus enough to move the
-    # steering against its friction.
     feedforward = desired_lat_accel - params.roll * ACCELERATION_DUE_TO_GRAVITY - self.torque_params.latAccelOffset
-    friction = self._friction(error, desired_jerk, deadzone)
+    friction = friction_compensation(error, desired_jerk, deadzone, self.torque_params)
     if self.friction_rise > 0.0 and active:
       step = self.friction_rise * self.dt
       if friction == 0.0:
         self.friction_state = 0.0
       elif friction * self.friction_state > 0.0:
         if abs(friction) <= abs(self.friction_state):
-          self.friction_state = friction  # falling: release at once
+          self.friction_state = friction
         else:
           self.friction_state += math.copysign(min(abs(friction) - abs(self.friction_state), step), friction)
       else:
-        # A reversal or a start from zero: the old direction is released at once, the new one begins from zero.
         self.friction_state = math.copysign(min(abs(friction), step), friction)
     else:
       self.friction_state = friction
@@ -219,7 +184,6 @@ class MoonpilotLatControlTorque(LatControl):
       output_torque = 0.0
       torque_log.active = False
     else:
-      # Integrating is only honest while the output is ours and the measurement is usable.
       freeze_integrator = steer_limited_by_safety or CS.steeringPressed or CS.vEgo < MOONPILOT_INTEGRATOR_MIN_SPEED
       command = self.pid.update(error, error_rate=error_rate, speed=CS.vEgo, feedforward=feedforward, freeze_integrator=freeze_integrator)
       # Clipped here as well as by the PID's limits: a car's torque map need not be monotonic.
@@ -247,12 +211,9 @@ class MoonpilotLatControlTorque(LatControl):
 
 
 def moonpilot_latcontrol(CP, CI, dt, params: Params | None = None) -> LatControl | None:
-  """The seam's fork side: the fork controller when the driver wants it, None to leave upstream's
-  in place. The params are read once, here, so the toggle and the hysteresis and damping choices take a restart."""
+  """The fork controller when the driver wants it, None to leave upstream's in place; read once, so a restart."""
   params = params or Params()
   if not enabled(TORQUE_LATERAL, params):
     return None
-  hysteresis = MOONPILOT_TORQUE_HYSTERESIS[choice(STEER_HYSTERESIS, params)] if enabled(STEER_HYSTERESIS, params) else 0.0
-  damping_t = MOONPILOT_DAMPING_T[choice(STEER_DAMPING, params)] if enabled(STEER_DAMPING, params) else 0.0
   friction_rise = MOONPILOT_FRICTION_RISE if enabled(STEER_FRICTION_RAMP, params) else 0.0
-  return MoonpilotLatControlTorque(CP, CI, dt, hysteresis, damping_t, friction_rise)
+  return MoonpilotLatControlTorque(CP, CI, dt, value(STEER_HYSTERESIS, params), value(STEER_DAMPING, params), friction_rise)

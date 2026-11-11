@@ -10,12 +10,12 @@ import unittest
 from unittest import mock
 
 import numpy as np
-from openpilot.cereal import custom, log
+from openpilot.common.realtime import DT_MDL
+from openpilot.cereal import log
 
 import moonpilot.longitudinal as longitudinal
 from moonpilot.brake_band import MOONPILOT_BRAKE_BAND_ENTER_LEAD
 from moonpilot.longitudinal import (
-  MOONPILOT_BRAKE_EXIT_JERK,
   MOONPILOT_FAST_ACCEL_BP,
   MOONPILOT_FAST_ACCEL_V,
   MOONPILOT_FAST_CRAWL,
@@ -30,7 +30,8 @@ from moonpilot.longitudinal import (
   lead_accel,
   policy,
 )
-from moonpilot.tests.test_longitudinal import DT_MDL, _cp, _fly, _inputs, _lead, _planner
+from moonpilot.jerk import MOONPILOT_BRAKE_EXIT_JERK
+from moonpilot.tests.harness import car_params, fly, inputs, lead as make_lead, planner as make_planner, slot
 
 Personality = log.LongitudinalPersonality
 
@@ -41,7 +42,7 @@ class TestFollowPolicy(unittest.TestCase):
     the lead's own candidate."""
     v_ego, v_cruise = 20.0, 25.0
     t_follow = MOONPILOT_T_FOLLOW[int(Personality.standard)]
-    cp = _cp()
+    cp = car_params()
     source = log.LongitudinalPlan.LongitudinalPlanSource
     slow = float(np.interp(v_ego, MOONPILOT_LADDER_V_BP, MOONPILOT_SLOW_ACCEL_V))
     fast = cruise_accel(v_ego, v_cruise, False, 0.0, cp, -0.3, True)
@@ -70,7 +71,7 @@ class TestFollowPolicy(unittest.TestCase):
 
   def test_a_slow_lead_that_stops_later_finishes_without_contact(self):
     """A lead that slows to 3 m/s and then stops is followed to rest with a gap left."""
-    s = _fly(12.0, 43.2, 80.0, 3.0, lambda t: -1.5 if t > 4.0 else 0.0, 50.0)
+    s = fly(12.0, 43.2, 80.0, 3.0, lambda t: -1.5 if t > 4.0 else 0.0, 50.0)
     self.assertFalse(s["contact"])
     self.assertGreater(s["min_gap"], MOONPILOT_MIN_SLACK)
     self.assertLess(s["v"][-1], 0.05)
@@ -80,7 +81,7 @@ class TestFollowPolicy(unittest.TestCase):
     # braking must retain its authority inside the last meter.
     for gap0, min_gap in ((0.5, 0.1), (0.8, 0.4)):
       with self.subTest(gap0=gap0):
-        s = _fly(0.68, 108.0, gap0, 0.0, lambda t: 0.0, 10.0)
+        s = fly(0.68, 108.0, gap0, 0.0, lambda t: 0.0, 10.0)
         self.assertGreater(s["min_gap"], min_gap)
         self.assertEqual(s["v"][-1], 0.0)
 
@@ -93,13 +94,13 @@ class TestFollowPolicy(unittest.TestCase):
     plus the band's own room and the car is right to sit, and it moves once the gap opens."""
     for model_go, held in ((0.05, False), (0.0, True)):
       with self.subTest(model_go=model_go):
-        planner = _planner()
-        planner.update(_inputs(v_ego=8.0, v_cruise_kph=62.0, model_accel=-1.5, lead=_lead(30.0, 0.0)))
+        planner = make_planner()
+        planner.update(inputs(v_ego=8.0, v_cruise_kph=62.0, model_accel=-1.5, lead=make_lead(30.0, 0.0)))
         for _ in range(40):
-          planner.update(_inputs(v_ego=0.0, v_cruise_kph=62.0, model_accel=-0.05, lead=_lead(5.2, 0.0), standstill=True))
+          planner.update(inputs(v_ego=0.0, v_cruise_kph=62.0, model_accel=-0.05, lead=make_lead(5.2, 0.0), standstill=True))
         self.assertTrue(planner.output_should_stop)
         for _ in range(4):
-          planner.update(_inputs(v_ego=0.0, v_cruise_kph=62.0, model_accel=model_go, lead=_lead(5.4, 0.7), standstill=True))
+          planner.update(inputs(v_ego=0.0, v_cruise_kph=62.0, model_accel=model_go, lead=make_lead(5.4, 0.7), standstill=True))
         self.assertEqual(planner.output_should_stop, held)
         self.assertEqual(planner.output_a_target > 0.1, not held)
 
@@ -110,12 +111,12 @@ class TestFollowPolicy(unittest.TestCase):
     `MOONPILOT_BRAKE_EXIT_JERK`, inside the launch band too, where a launch ramps at that same pace."""
     for v_ego in (10.0, 2.0):
       with self.subTest(v_ego=v_ego):
-        planner = _planner()
+        planner = make_planner()
         for _ in range(20):
-          planner.update(_inputs(v_ego=v_ego, v_cruise_kph=62.0, model_accel=-1.5))
+          planner.update(inputs(v_ego=v_ego, v_cruise_kph=62.0, model_accel=-1.5))
         cmds = []
         for _ in range(60):
-          planner.update(_inputs(v_ego=v_ego, v_cruise_kph=62.0, model_accel=0.3))  # the model asks to go
+          planner.update(inputs(v_ego=v_ego, v_cruise_kph=62.0, model_accel=0.3))  # the model asks to go
           cmds.append(planner.output_a_target)
         release = next(i for i, c in enumerate(cmds) if c >= -0.5)
         ramp = [MOONPILOT_BRAKE_EXIT_JERK * (k - release) * DT_MDL for k in range(len(cmds))]
@@ -130,16 +131,16 @@ class TestFollowPolicy(unittest.TestCase):
     for v0, expected_factor in ((0.0, 0.786), (8.0, 1.0), (20.0, 1.0)):
       with self.subTest(v0=v0):
         measured = float(np.interp(v0, MOONPILOT_FAST_ACCEL_BP, MOONPILOT_FAST_ACCEL_V))
-        asked = cruise_accel(v0, v0 + 5.0, False, 0.0, _cp(), -0.3, True)
+        asked = cruise_accel(v0, v0 + 5.0, False, 0.0, car_params(), -0.3, True)
         self.assertAlmostEqual(asked, measured * expected_factor, places=6)
     for v0 in (1.0, 3.0, 4.5, 12.0):
       measured = float(np.interp(v0, MOONPILOT_FAST_ACCEL_BP, MOONPILOT_FAST_ACCEL_V))
-      self.assertLessEqual(cruise_accel(v0, v0 + 5.0, False, 0.0, _cp(), -0.3, True), measured)
+      self.assertLessEqual(cruise_accel(v0, v0 + 5.0, False, 0.0, car_params(), -0.3, True), measured)
     # Above the band the ask *is* the measured rung, so a merge at speed keeps the authority the driver
     # measured; the taper after 3.5 m/s is the ladder's own, not the factor's.
     for v0 in (6.0, 9.0, 13.0):
       measured = float(np.interp(v0, MOONPILOT_FAST_ACCEL_BP, MOONPILOT_FAST_ACCEL_V))
-      self.assertAlmostEqual(cruise_accel(v0, v0 + 5.0, False, 0.0, _cp(), -0.3, True), measured, places=6)
+      self.assertAlmostEqual(cruise_accel(v0, v0 + 5.0, False, 0.0, car_params(), -0.3, True), measured, places=6)
 
   def test_the_out_of_path_headway_is_a_latched_claim_not_a_scale(self):
     """`inPath` at highway speed is a weak signal, and the measured table is on
@@ -150,16 +151,10 @@ class TestFollowPolicy(unittest.TestCase):
     failure direction is the safe one - inPath that says nothing leaves the car at its own headway."""
     base = MOONPILOT_T_FOLLOW[Personality.standard]
     reduced = base * MOONPILOT_OUT_OF_PATH_T_FOLLOW
-    lead = _lead(35.0, 20.0)
-
-    def at(in_path):
-      traj = custom.MoonpilotState.LeadTrajectory.new_message()
-      traj.present = True
-      traj.inPath = float(in_path)
-      return traj
+    lead = make_lead(35.0, 20.0)
 
     def reads(in_path, planner=None):
-      return (planner or _planner())._t_follow(_inputs(lead=lead, moonpilot_leads=[at(in_path)]))
+      return (planner or make_planner()).time_gap(inputs(lead=lead, moonpilot_leads=[slot(in_path)]))
 
     # an ordinary in-lane lead - its measured median, and everything down to its p10 and through the
     # hysteresis band - is not evidence of leaving
@@ -167,7 +162,7 @@ class TestFollowPolicy(unittest.TestCase):
       self.assertAlmostEqual(reads(in_path), base, delta=1e-9)
 
     # positive evidence latches, and the latch then holds across the whole band
-    planner = _planner()
+    planner = make_planner()
     self.assertAlmostEqual(reads(0.0, planner), reduced, delta=1e-9)
     for in_path in (MOONPILOT_OUT_OF_PATH_ENTER, 0.20, MOONPILOT_OUT_OF_PATH_LEAVE - 0.01):
       self.assertAlmostEqual(reads(in_path, planner), reduced, delta=1e-9)
@@ -186,18 +181,18 @@ class TestFollowPolicy(unittest.TestCase):
     the closing command -0.5 <-> +0.1. The last radar lead stays a candidate for
     `MOONPILOT_RADAR_HOLD_T`, so neither a swap nor a dropout lifts the brake — and it is released
     once the hold runs out. Flown at 70 m behind a 14 m/s lead at 22.5 m/s, so the lead law brakes."""
-    vision = _lead(80.0, 21.0)
+    vision = make_lead(80.0, 21.0)
     vision.radar = False
-    absent = _lead(0.0, 0.0, present=False)
+    absent = make_lead(0.0, 0.0, present=False)
 
     def fly(swap, hold_t):
       with mock.patch.object(longitudinal, "MOONPILOT_RADAR_HOLD_T", hold_t):
-        planner = _planner()
+        planner = make_planner()
         for _ in range(40):
-          planner.update(_inputs(v_ego=22.5, lead=_lead(70.0, 14.0)))
+          planner.update(inputs(v_ego=22.5, lead=make_lead(70.0, 14.0)))
         braking = planner.output_a_target
         for _ in range(20):  # 1 s inside the hold
-          planner.update(_inputs(v_ego=22.5, lead=swap))
+          planner.update(inputs(v_ego=22.5, lead=swap))
         return braking, planner
 
     for name, swap in (("vision", vision), ("dropout", absent)):
@@ -209,7 +204,7 @@ class TestFollowPolicy(unittest.TestCase):
         self.assertGreater(released.output_a_target, braking + 0.5)  # what the swap did without the hold
     planner = fly(absent, longitudinal.MOONPILOT_RADAR_HOLD_T)[1]
     for _ in range(round(longitudinal.MOONPILOT_RADAR_HOLD_T / DT_MDL)):
-      planner.update(_inputs(v_ego=22.5, lead=absent))
+      planner.update(inputs(v_ego=22.5, lead=absent))
     self.assertEqual(planner.source, longitudinal.LongitudinalPlanSource.cruise)
 
   def test_throttle_returns_only_past_the_release_probability(self):
@@ -217,21 +212,21 @@ class TestFollowPolicy(unittest.TestCase):
     on and off a frame at a time. Throttle is lost under 0.4 at once and returns only once the
     probability has held over 0.5 for `MOONPILOT_ALLOW_THROTTLE_RETURN_T` — route 0000040e's swings
     (0.31 -> 0.53 -> 0.38 -> 0.66 inside 0.2 s) crossed both thresholds a frame at a time."""
-    planner = _planner()
+    planner = make_planner()
     hold = round(longitudinal.MOONPILOT_ALLOW_THROTTLE_RETURN_T / DT_MDL)
     for prob, allowed in ((0.45, True), (0.35, False), (0.45, False)):
-      planner.update(_inputs(v_ego=20.0, throttle_prob=prob))
+      planner.update(inputs(v_ego=20.0, throttle_prob=prob))
       self.assertEqual(planner.allow_throttle, allowed, prob)
     for _ in range(hold - 1):
-      planner.update(_inputs(v_ego=20.0, throttle_prob=0.55))
+      planner.update(inputs(v_ego=20.0, throttle_prob=0.55))
       self.assertFalse(planner.allow_throttle)
-    planner.update(_inputs(v_ego=20.0, throttle_prob=0.38))  # one dip restarts the hold
+    planner.update(inputs(v_ego=20.0, throttle_prob=0.38))  # one dip restarts the hold
     for _ in range(hold - 1):
-      planner.update(_inputs(v_ego=20.0, throttle_prob=0.66))
+      planner.update(inputs(v_ego=20.0, throttle_prob=0.66))
       self.assertFalse(planner.allow_throttle)
-    planner.update(_inputs(v_ego=20.0, throttle_prob=0.66))
+    planner.update(inputs(v_ego=20.0, throttle_prob=0.66))
     self.assertTrue(planner.allow_throttle)
-    planner.update(_inputs(v_ego=20.0, throttle_prob=0.45))
+    planner.update(inputs(v_ego=20.0, throttle_prob=0.45))
     self.assertTrue(planner.allow_throttle)
 
   def test_a_settled_follow_does_not_step_on_radar_noise(self):
@@ -243,11 +238,11 @@ class TestFollowPolicy(unittest.TestCase):
     for seed in (0, 1):
       with self.subTest(seed=seed):
         rng = np.random.default_rng(seed)
-        planner = _planner()
+        planner = make_planner()
         v, gap, a, cmds = 20.0, t_follow * 20.0, 0.0, []
         for _ in range(round(40.0 / DT_MDL)):
-          lead = _lead(gap + rng.normal(0.0, 0.3), 20.0 + rng.normal(0.0, 0.05))
-          planner.update(_inputs(v_ego=v, v_cruise_kph=108.0, a_ego=a, lead=lead))
+          lead = make_lead(gap + rng.normal(0.0, 0.3), 20.0 + rng.normal(0.0, 0.05))
+          planner.update(inputs(v_ego=v, v_cruise_kph=108.0, a_ego=a, lead=lead))
           a = float(planner.output_a_target)
           cmds.append(a)
           v += a * DT_MDL
@@ -264,7 +259,7 @@ class TestFollowPolicy(unittest.TestCase):
     t_follow = MOONPILOT_T_FOLLOW[int(Personality.standard)]
     for extra_gap in (0.0, 10.0):
       with self.subTest(extra_gap=extra_gap):
-        s = _fly(20.0, 108.0, t_follow * 20.0 + extra_gap, 20.0, lambda t: -1.0 if 1.0 <= t < 6.0 else 0.0, 40.0)
+        s = fly(20.0, 108.0, t_follow * 20.0 + extra_gap, 20.0, lambda t: -1.0 if 1.0 <= t < 6.0 else 0.0, 40.0)
         self.assertFalse(s["contact"])
         self.assertAlmostEqual(s["v"][-1], 15.0, delta=0.2)
         tail = np.array(s["cmd"][int(np.argmin(s["cmd"])) :])

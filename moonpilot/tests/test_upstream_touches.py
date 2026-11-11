@@ -1,3 +1,4 @@
+import re
 import subprocess
 import unittest
 from pathlib import Path
@@ -47,7 +48,7 @@ ALLOWED = {
   "openpilot/selfdrive/controls/plannerd.py": "moonpilotState subscription; moonpilot longitudinal planner",
   "openpilot/selfdrive/controls/lib/longitudinal_planner.py": "lead danger factor from moonpilot",
   "openpilot/selfdrive/controls/lib/longitudinal_mpc_lib/long_mpc.py": "lead_danger_factor kwarg, solve through moonpilot.long_mpc",
-  "openpilot/selfdrive/controls/controlsd.py": "moonpilot torque lateral controller, response-aligned curvature, acceleration controller, and actuator gate",
+  "openpilot/selfdrive/controls/controlsd.py": "moonpilot lateral and acceleration controllers, curvature reference, actuator gate, boot configuration",
   "openpilot/selfdrive/pandad/pandad.cc": "lateral-controls health flag",
   "openpilot/selfdrive/selfdrived/selfdrived.py": "engagement, panda checks, startup/turn/path banners, bounded locationd ride-through",
   "openpilot/selfdrive/selfdrived/events.py": "the half-engagement banner; the turn-desire banner; the path-outside banner",
@@ -183,6 +184,23 @@ class TestUpstreamTouches(unittest.TestCase):
         self.assertTrue((ROOT / path.rstrip("/")).exists(), f"{path} is gone upstream; re-point this guard")
     reaching = sorted(row for row in ALLOWED if any(row.startswith(path) for path in NEVER_ALLOWED))
     assert not reaching, "an ALLOWED row reaches a path docs/SAFETY.md forbids nerfing:\n  " + "\n  ".join(reaching)
+
+
+class TestSeamTable(unittest.TestCase):
+  def test_the_seam_table_names_the_same_paths_as_the_allowlist(self):
+    """`ALLOWED` and the AGENTS.md seam table are the same list kept twice, and nothing else compares
+    them: a row added to one and not the other is either a seam with no sanction or a sanction with
+    no explanation, and both read as fine in either file alone."""
+    lines = (ROOT / "AGENTS.md").read_text().splitlines()
+    start = lines.index("## Seams")
+    end = next(i for i in range(start + 1, len(lines)) if lines[i].startswith("## "))
+    table = set()
+    for line in lines[start:end]:
+      match = re.match(r"\| `([^`]+)`", line)
+      if match:
+        table.add(match.group(1))
+    self.assertEqual(sorted(table - set(ALLOWED)), [], "AGENTS.md names seams ALLOWED does not sanction")
+    self.assertEqual(sorted(set(ALLOWED) - table), [], "ALLOWED sanctions seams AGENTS.md does not name")
 
 
 class TestSeamMarkers(unittest.TestCase):

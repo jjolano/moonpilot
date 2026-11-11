@@ -55,6 +55,48 @@ import pyray as rl
 
 from openpilot.selfdrive.ui.ui_state import UIStatus
 
+import numpy as np
+
+from moonpilot.features import LEAD_LATERAL, enabled
+from moonpilot.lead import MOONPILOT_INPATH_HORIZON, MOONPILOT_LEAD_PATH_PX_PER_M, MOONPILOT_LEAD_PATH_WIDTH, MOONPILOT_MIN_Y_STD
+
+_NO_LEAD_LINE = (np.empty((0, 3), dtype=np.float32), np.empty((0, 2), dtype=np.float32), np.empty((0,), dtype=np.float32), 1.0)
+
+
+def lead_path_line(renderer, state, path_x, params):
+  lead = state.leads[0] if state is not None and len(state.leads) else None
+  if lead is None or not lead.present or not len(lead.t) == len(lead.x) == len(lead.y) >= 2 or not enabled(LEAD_LATERAL, params):
+    return _NO_LEAD_LINE
+  t_dense = np.arange(0.0, MOONPILOT_INPATH_HORIZON + 1e-9, 0.5)
+  x_d = np.interp(t_dense, lead.t, lead.x)
+  y_d = -np.interp(t_dense, lead.t, lead.y)
+  s_d = np.interp(t_dense, lead.t, lead.yStd) if len(lead.yStd) == len(lead.t) else np.full(t_dense.shape, MOONPILOT_MIN_Y_STD)
+  z = np.array([renderer._path.raw_points[renderer._get_path_length_idx(path_x, x), 2] for x in x_d], dtype=np.float32)
+  clip = renderer._clip_region
+  points = []
+  for x, y, zi in zip(x_d, y_d, z, strict=True):
+    pt = renderer._car_space_transform @ np.array([x, y, zi + renderer._path_offset_z], dtype=np.float32)
+    if abs(pt[2]) < 1e-6:
+      break
+    sx, sy = float(pt[0] / pt[2]), float(pt[1] / pt[2])
+    if not (clip.x <= sx <= clip.x + clip.width and clip.y <= sy <= clip.y + clip.height):
+      break
+    points.append((sx, sy))
+  widths = np.clip(s_d[: len(points)] * MOONPILOT_LEAD_PATH_PX_PER_M, *MOONPILOT_LEAD_PATH_WIDTH).astype(np.float32)
+  return np.array([x_d, y_d, z], dtype=np.float32).T, np.array(points, dtype=np.float32).reshape(-1, 2), widths, float(lead.inPath)
+
+
+def draw_lead_path(renderer, offset=(0.0, 0.0)):
+  points = renderer._lead_path.projected_points
+  if points.shape[0] < 2:
+    return
+  alpha = int(np.clip(renderer._lead_in_path, 0.0, 1.0) * 90)
+  color = rl.Color(218, 202, 37, alpha)
+  offset = np.asarray(offset, dtype=np.float32)
+  for (x0, y0), (x1, y1), width in zip(points[:-1], points[1:], renderer._lead_path_widths[1:], strict=True):
+    rl.draw_line_ex(rl.Vector2(float(x0 + offset[0]), float(y0 + offset[1])),
+                    rl.Vector2(float(x1 + offset[0]), float(y1 + offset[1])), float(width), color)
+
 # Saturated mid blue: the classic reading of "assist is active, but only partly", and distinct
 # from upstream's engaged green and its two neutral grays.
 HALF_ENGAGED = rl.Color(0x1E, 0x76, 0xD2, 0xFF)

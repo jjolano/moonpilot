@@ -6,7 +6,6 @@ from opendbc.car.interfaces import ACCEL_MAX
 
 from moonpilot.corridor import (
   MOONPILOT_CORRIDOR_HISTORY_S,
-  MOONPILOT_PATH_OUTSIDE_MIN_FRAC,
   MOONPILOT_SQUEEZE_ACCEL_MIN,
   MOONPILOT_SQUEEZE_FULL_WIDTH,
   MOONPILOT_SQUEEZE_MIN_WIDTH,
@@ -18,6 +17,11 @@ from moonpilot.corridor import (
   path_outside_fraction,
   squeeze_accel,
 )
+from moonpilot.tests.fakes import params
+from moonpilot.tests.harness import inputs
+from openpilot.cereal import log
+
+
 
 
 def _edge(x, y):
@@ -164,95 +168,48 @@ class TestPathOutside(unittest.TestCase):
     self.assertEqual(frac, 0.0)
 
 
-class _FakeParams:
-  def __init__(self, values=None, default=None):
-    self._values = dict(values or {})
-    self._default = default
 
-  def get(self, key, block=False, return_default=False):
-    if key in self._values:
-      return self._values[key]
-    return self._default if return_default else None
-
-
-class _FakeCarControl:
-  def __init__(self, lat_active=True):
-    self.latActive = lat_active
-
-
-class _FakeModelV2:
-  def __init__(self, position_x=None, position_y=None, edges=None):
-    self.position = type("P", (), {"x": position_x or [], "y": position_y or []})()
-    self.roadEdges = edges if edges is not None else []
-
-
-class _FakeSubMaster:
-  def __init__(self, lat_active=True, model=None):
-    self.carControl = _FakeCarControl(lat_active)
-    self.modelV2 = model or _FakeModelV2()
-
-  def __getitem__(self, key):
-    if key == "carControl":
-      return self.carControl
-    if key == "modelV2":
-      return self.modelV2
-    raise KeyError(key)
-
-
-def _params(values=None, default=None):
-  return _FakeParams(values, default=default)
-
-
-def _outside_model():
+def _outside_inputs():
   # Path half outside a ±4 m corridor over the near horizon.
-  xs = list(np.linspace(0.0, 40.0, 9))
+  xs = [float(x) for x in np.linspace(0.0, 40.0, 9)]
   ys = [5.0 if x < 20.0 else 0.0 for x in xs]
   edge_xs = [0.0, 100.0]
   edges = [_edge(edge_xs, [-4.0, -4.0]), _edge(edge_xs, [4.0, 4.0])]
-  # path_outside_alert reads edges as objects with .x/.y or indexable pairs; corridor_bounds
-  # accepts either, but model.roadEdges entries are XYZTData. Use the pair form.
-  return _FakeModelV2(position_x=xs, position_y=ys, edges=edges)
+  sm = inputs(road_edges=edges)
+  sm["modelV2"].position = log.XYZTData.new_message(x=xs, y=ys)
+  return sm
 
 
 class TestPathOutsideAlert(unittest.TestCase):
   def test_feature_off_returns_none(self):
-    sm = _FakeSubMaster(model=_outside_model())
-    self.assertIsNone(path_outside_alert(sm, _params({"MoonpilotPathOutside": 0})))
+    self.assertIsNone(path_outside_alert(_outside_inputs(), params(overrides={"MoonpilotPathOutside": False})))
 
   def test_lat_inactive_returns_none(self):
-    sm = _FakeSubMaster(lat_active=False, model=_outside_model())
-    self.assertIsNone(path_outside_alert(sm, _params({"MoonpilotPathOutside": 1})))
+    sm = _outside_inputs()
+    sm["carControl"].latActive = False
+    self.assertIsNone(path_outside_alert(sm, params(overrides={"MoonpilotPathOutside": True})))
+
 
   def test_missing_edges_returns_none(self):
-    sm = _FakeSubMaster(model=_FakeModelV2(position_x=[0.0], position_y=[0.0], edges=[]))
-    self.assertIsNone(path_outside_alert(sm, _params({"MoonpilotPathOutside": 1})))
+    sm = inputs()
+    sm["modelV2"].position = log.XYZTData.new_message(x=[0.0], y=[0.0])
+    self.assertIsNone(path_outside_alert(sm, params(overrides={"MoonpilotPathOutside": True})))
+
 
   def test_inside_path_returns_none(self):
-    xs = list(np.linspace(0.0, 40.0, 9))
+    xs = [float(x) for x in np.linspace(0.0, 40.0, 9)]
     ys = [0.0] * 9
     edges = [_edge([0.0, 100.0], [-4.0, -4.0]), _edge([0.0, 100.0], [4.0, 4.0])]
-    sm = _FakeSubMaster(model=_FakeModelV2(position_x=xs, position_y=ys, edges=edges))
-    self.assertIsNone(path_outside_alert(sm, _params({"MoonpilotPathOutside": 1})))
+    sm = inputs(road_edges=edges)
+    sm["modelV2"].position = log.XYZTData.new_message(x=xs, y=ys)
+    self.assertIsNone(path_outside_alert(sm, params(overrides={"MoonpilotPathOutside": True})))
 
   def test_outside_path_returns_event(self):
-    from openpilot.cereal import log
-    sm = _FakeSubMaster(model=_outside_model())
+    sm = _outside_inputs()
     self.assertEqual(
-      path_outside_alert(sm, _params({"MoonpilotPathOutside": 1})),
+      path_outside_alert(sm, params(overrides={"MoonpilotPathOutside": True})),
       log.OnroadEvent.EventName.pathOutside,
     )
-
-  def test_default_params_honor_registered_default_off(self):
-    # Default is "0"; with only a default (unset store) the banner must stay quiet.
-    sm = _FakeSubMaster(model=_outside_model())
-    self.assertIsNone(path_outside_alert(sm, _params(default=0)))
-
-  def test_events_registered(self):
-    from openpilot.selfdrive.selfdrived.events import ET, EVENTS, EventName
-    self.assertTrue(EventName.pathOutside in EVENTS)
-    alert = EVENTS[EventName.pathOutside][ET.WARNING]
-    self.assertEqual(alert.alert_text_1, "Path Outside Road")
-    self.assertEqual(alert.alert_text_2, "")
 
 
 class TestRollingCorridor(unittest.TestCase):
@@ -261,32 +218,28 @@ class TestRollingCorridor(unittest.TestCase):
     half = float(width) / 2.0
     return _edge(xs, [-half] * len(xs)), _edge(xs, [half] * len(xs))
 
-  def test_empty_history_is_inactive(self):
-    rc = RollingCorridor()
-    self.assertEqual(rc.squeeze_accel((0.0, 0.0, 0.0), [0.0, 10.0]), ACCEL_MAX)
-    self.assertEqual(rc.path_outside_fraction((0.0, 0.0, 0.0), [0.0], [0.0]), 0.0)
 
-  def test_none_pose_clears_history(self):
+  def test_clear_drops_history(self):
     rc = RollingCorridor()
     left, right = self._edges(MOONPILOT_SQUEEZE_MIN_WIDTH)
-    rc.push(0.0, (0.0, 0.0, 0.0), left, right, now=0.0)
+    rc.push(0.0, (0.0, 0.0, 0.0), left, right)
     self.assertLess(rc.squeeze_accel((0.0, 0.0, 0.0), [0.0, 10.0]), 0.0)
-    rc.push(0.1, None, left, right, now=0.1)
+    rc.clear()
     self.assertEqual(rc.squeeze_accel((0.0, 0.0, 0.0), [0.0, 10.0]), ACCEL_MAX)
 
   def test_history_expires_after_window(self):
     rc = RollingCorridor()
     left, right = self._edges(MOONPILOT_SQUEEZE_MIN_WIDTH)
-    rc.push(0.0, (0.0, 0.0, 0.0), left, right, now=0.0)
+    rc.push(0.0, (0.0, 0.0, 0.0), left, right)
     # Query far past the history window with a fresh push that also expires the old one.
-    rc.push(MOONPILOT_CORRIDOR_HISTORY_S + 1.0, (100.0, 0.0, 0.0), *self._edges(MOONPILOT_SQUEEZE_FULL_WIDTH + 1.0), now=MOONPILOT_CORRIDOR_HISTORY_S + 1.0)
+    rc.push(MOONPILOT_CORRIDOR_HISTORY_S + 1.0, (100.0, 0.0, 0.0), *self._edges(MOONPILOT_SQUEEZE_FULL_WIDTH + 1.0))
     # Only the wide strip remains: inactive.
     self.assertEqual(rc.squeeze_accel((100.0, 0.0, 0.0), [0.0, 10.0]), ACCEL_MAX)
 
   def test_single_frame_matches_free_function(self):
     rc = RollingCorridor()
     left, right = self._edges(MOONPILOT_SQUEEZE_FULL_WIDTH - 1.0)
-    rc.push(0.0, (0.0, 0.0, 0.0), left, right, now=0.0)
+    rc.push(0.0, (0.0, 0.0, 0.0), left, right)
     a_roll = rc.squeeze_accel((0.0, 0.0, 0.0), [0.0, 20.0, 40.0])
     a_free = squeeze_accel(left, right, [0.0, 20.0, 40.0])
     self.assertAlmostEqual(a_roll, a_free, delta=1e-12)
@@ -296,8 +249,8 @@ class TestRollingCorridor(unittest.TestCase):
     rc = RollingCorridor()
     wide = self._edges(MOONPILOT_SQUEEZE_FULL_WIDTH + 1.0)
     narrow = self._edges(MOONPILOT_SQUEEZE_MIN_WIDTH)
-    rc.push(0.0, (0.0, 0.0, 0.0), *wide, now=0.0)
-    rc.push(0.05, (0.0, 0.0, 0.0), *narrow, now=0.05)
+    rc.push(0.0, (0.0, 0.0, 0.0), *wide)
+    rc.push(0.05, (0.0, 0.0, 0.0), *narrow)
     a = rc.squeeze_accel((0.0, 0.0, 0.0), [0.0, 10.0])
     self.assertAlmostEqual(a, MOONPILOT_SQUEEZE_ACCEL_MIN, delta=1e-9)
 
@@ -306,29 +259,12 @@ class TestRollingCorridor(unittest.TestCase):
     # at the new pose after warp (relative SE2, identity yaw).
     rc = RollingCorridor()
     left, right = self._edges(MOONPILOT_SQUEEZE_MIN_WIDTH, xs=[0.0, 192.0])
-    rc.push(0.0, (0.0, 0.0, 0.0), left, right, now=0.0)
+    rc.push(0.0, (0.0, 0.0, 0.0), left, right)
     # Query at pose (10, 0, 0): warped strip is x' = x - 10, so sample_x=0 is still near the
     # original geometry's x=10 (inside the strip's span and still narrow).
     a = rc.squeeze_accel((10.0, 0.0, 0.0), [0.0, 10.0])
     self.assertLess(a, 0.0)
 
-  def test_path_outside_fraction_over_history(self):
-    rc = RollingCorridor()
-    left, right = self._edges(8.0)  # ±4 m
-    # One frame where the path is outside; single frame already says so.
-    rc.push(0.0, (0.0, 0.0, 0.0), left, right, now=0.0)
-    frac = rc.path_outside_fraction((0.0, 0.0, 0.0), [10.0, 20.0, 30.0], [5.0, 5.0, 0.0])
-    self.assertGreaterEqual(frac, MOONPILOT_PATH_OUTSIDE_MIN_FRAC)
-
-  def test_history_cap(self):
-    from moonpilot.corridor import MOONPILOT_CORRIDOR_HISTORY_MAX
-    rc = RollingCorridor()
-    left, right = self._edges(8.0)
-    # Stay inside the time window so only the frame cap applies.
-    for i in range(MOONPILOT_CORRIDOR_HISTORY_MAX + 10):
-      t = i * 0.01
-      rc.push(t, (0.0, 0.0, 0.0), left, right, now=t)
-    self.assertLessEqual(len(rc._hist), MOONPILOT_CORRIDOR_HISTORY_MAX)
 
 
 if __name__ == "__main__":

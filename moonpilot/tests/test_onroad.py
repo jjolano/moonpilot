@@ -8,11 +8,15 @@ that decides it.
 """
 
 import unittest
+from types import SimpleNamespace
+
+import numpy as np
 
 import pyray as rl
 
 from openpilot.selfdrive.ui.ui_state import UIStatus
-from moonpilot.ui.onroad import HALF_ENGAGED, lateral_only, moonpilot_status_color
+from moonpilot.tests.fakes import params
+from moonpilot.ui.onroad import HALF_ENGAGED, lateral_only, lead_path_line, moonpilot_status_color
 
 
 class _PandaState:
@@ -102,6 +106,28 @@ class TestStatusColor(unittest.TestCase):
     upstream = rl.Color(0x16, 0x7F, 0x40, 0xFF)
     self.assertEqual(moonpilot_status_color(_UIState(ENGAGED, [_PandaState()]), PALETTE) or upstream, upstream)
     self.assertEqual(moonpilot_status_color(_UIState(ENGAGED, GRANTED), PALETTE) or upstream, HALF_ENGAGED)
+
+class TestLeadPathProjection(unittest.TestCase):
+  def test_projects_the_published_lead_on_the_ui_horizon(self):
+    lead = SimpleNamespace(
+      present=True, t=[0.0, 2.0, 4.0, 6.0, 8.0, 10.0],
+      x=[10.0, 20.0, 30.0, 40.0, 50.0, 60.0],
+      y=[0.0] * 6, yStd=[1.0] * 6, inPath=0.75,
+    )
+    renderer = SimpleNamespace(
+      _path=SimpleNamespace(raw_points=np.array([[x, 0.0, 1.0] for x in range(61)], dtype=np.float32)),
+      _get_path_length_idx=lambda path_x, x: int(round(x)),
+      _clip_region=rl.Rectangle(-100.0, -100.0, 200.0, 200.0),
+      _car_space_transform=np.eye(3, dtype=np.float32),
+      _path_offset_z=0.0,
+    )
+    state = SimpleNamespace(leads=[lead])
+    raw, points, widths, in_path = lead_path_line(renderer, state, np.arange(61), params(overrides={"MoonpilotLeadLateral": True}))
+    self.assertEqual(raw.shape, (9, 3))
+    self.assertEqual(points.shape, (9, 2))
+    self.assertEqual(widths.shape, (9,))
+    self.assertEqual(float(raw[-1, 0]), 30.0)
+    self.assertEqual(in_path, 0.75)
 
 
 if __name__ == "__main__":

@@ -19,25 +19,13 @@ from openpilot.common.realtime import DT_CTRL
 from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.tools.lib.logreader import LogReader
 
-from moonpilot.curvature import MOONPILOT_PREVIEW_MIN_SPEED, MOONPILOT_SMOOTH_TAUS, PathSmooth, response_aligned_curvature
+from moonpilot.curvature import MOONPILOT_PREVIEW_MIN_SPEED, PathSmooth, curvature_reference
+from moonpilot.features import PATH_SMOOTH, STEER_DAMPING, STEER_FRICTION_RAMP, STEER_HYSTERESIS
 from moonpilot.lab import DEFAULT_ROOT, cached, drive_config, expand, lag_s, param_index, predates, reversals_per_s
-from moonpilot.latcontrol import MOONPILOT_DAMPING_T, MOONPILOT_FRICTION_RISE, MOONPILOT_TORQUE_HYSTERESIS, MoonpilotLatControlTorque
+from moonpilot.latcontrol import MOONPILOT_FRICTION_RISE, MoonpilotLatControlTorque
+from moonpilot.lab.routes import LURCH_EVENT, add_routes_arg
 
 EXTRACT_VERSION = 2  # bump whenever _build() changes what it stores; v1's steer_limited paired the wrong frames
-ROUTE_SETS = {
-  # MoonpilotSteerHysteresis's claim; both drove PathSmooth before d8b15bd1b, which the as-driven config reconstructs.
-  "hysteresis": ("0000040d--b31ecdf74b", "0000040e--20803b67bd"),
-  # MoonpilotPathSmooth's lag table (moonpilot/docs/curvature.md).
-  "smooth": ("00000413--e204529ce6", "00000414--32736d038c", "00000417--e0a9135c4e", "00000418--c554e5658b"),
-  # Engaged lateral drives (3f8-418, 43e, 43f, 44d) beside the two all-manual drives 44e/44f, for lane-position.
-  "lanes": (*(f"0000{i:04x}" for i in range(0x3F8, 0x411)), "00000413", "00000414", "00000417", "00000418", "0000043e", "0000043f",
-            "0000044d", "0000044e", "0000044f"),
-  # MoonpilotSteerFrictionRamp: every engaged drive above 10 m/s and the drive that lurched past an intersection.
-  "stick": (*(f"0000{i:04x}" for i in range(0x3F8, 0x411)), "00000413", "00000414", "00000417", "00000418", "0000043e", "0000043f",
-            "0000044d", "0000046b--fbae8b11b5"),
-}
-# 0000046b's lurch: route time 640-644 s (segment 10), as logMonoTime seconds.
-STICK_EVENT = ("0000046b--fbae8b11b5", 667.85, 671.85)
 LANE_VERSION = 1
 SMOOTH_IN_DELAY_UNTIL = "d8b15bd1b"  # before this commit controlsd added PathSmooth's tau to the controller's lat_delay
 
@@ -114,12 +102,12 @@ def as_driven(route: str, root: str = DEFAULT_ROOT) -> TorqueConfig:
   """replay_torque's settings as the drive had them, from its initData params and commit.
   Ceiling: a marketplace model's LAT_SMOOTH_SECONDS is not reconstructed (the bundled model's is 0)."""
   commit, params = drive_config(route, root)
-  tau = MOONPILOT_SMOOTH_TAUS[min(param_index(params, "MoonpilotPathSmooth"), len(MOONPILOT_SMOOTH_TAUS) - 1)]
+  tau = PATH_SMOOTH.at(param_index(params, PATH_SMOOTH.key))
   return TorqueConfig(
-    hysteresis=MOONPILOT_TORQUE_HYSTERESIS[min(param_index(params, "MoonpilotSteerHysteresis"), len(MOONPILOT_TORQUE_HYSTERESIS) - 1)],
-    damping_t=MOONPILOT_DAMPING_T[min(param_index(params, "MoonpilotSteerDamping"), len(MOONPILOT_DAMPING_T) - 1)],
+    hysteresis=STEER_HYSTERESIS.at(param_index(params, STEER_HYSTERESIS.key)),
+    damping_t=STEER_DAMPING.at(param_index(params, STEER_DAMPING.key)),
     delay_offset=tau if predates(commit, SMOOTH_IN_DELAY_UNTIL) else 0.0,
-    friction_rise=MOONPILOT_FRICTION_RISE if param_index(params, "MoonpilotSteerFrictionRamp") else 0.0,
+    friction_rise=MOONPILOT_FRICTION_RISE if param_index(params, STEER_FRICTION_RAMP.key) else 0.0,
   )
 
 
@@ -162,6 +150,12 @@ def model_at(d: dict[str, np.ndarray], i: int) -> SimpleNamespace:
                          orientationRate=SimpleNamespace(z=d["m_yaw_rate"][i], t=d["m_grid"][i]))
 
 
+def reference_at(d: dict[str, np.ndarray], k: int, i: int, request: float, *, lookahead=None, lead: float = 0.0) -> float:
+  return curvature_reference(model_at(d, i), request, v_ego=float(d["v_ego"][k]), lat_delay=float(d["lat_delay"][k]),
+                             model_recv_time=float(d["m_t"][i]), now=float(d["now"][k]), model_valid=bool(d["m_valid"][i]),
+                             lookahead=lookahead, lead=lead)
+
+
 def replay_smooth(d: dict[str, np.ndarray], tau: float, lead: bool) -> np.ndarray:
   """The curvature request after MoonpilotPathSmooth at `tau`, with or without the reference's lead of `tau`."""
   request = action(d)
@@ -171,37 +165,36 @@ def replay_smooth(d: dict[str, np.ndarray], tau: float, lead: bool) -> np.ndarra
   for k, i in enumerate(d["model_idx"]):
     active, u = bool(d["lat_active"][k]), float(request[k])
     if lead and active:
-      u = response_aligned_curvature(model_at(d, i), u, v_ego=float(d["v_ego"][k]), lat_delay=float(d["lat_delay"][k]),
-                                     model_recv_time=float(d["m_t"][i]), now=float(d["now"][k]), model_valid=bool(d["m_valid"][i]), lead=tau)
+      u = reference_at(d, k, i, u, lead=tau)
     out[k] = smooth.update(u, active)
   return out
 
 
 def _torque(args):
-  for route in expand(args.routes, ROUTE_SETS):
+  for route in expand(args.routes, args.root):
     d, cfg = extract(route, args.root), as_driven(route, args.root)
     active = d["lat_active"]
     err = fidelity(d, replay_torque(d, cfg))
     print(f"{route}: {active.sum() * DT_CTRL:.0f} s steering, as driven {cfg}, replay vs logged p99 |err| {err:.4f}, "
           + f"logged {reversals_per_s(d['torque'], active):.1f} reversals/s")
-    for h in MOONPILOT_TORQUE_HYSTERESIS:
+    for h in STEER_HYSTERESIS.values:
       print(f"  hysteresis {h * 100:.1f}%: {reversals_per_s(replay_torque(d, cfg._replace(hysteresis=h)), active):5.1f} reversals/s")
 
 
 def _smooth(args):
   pad = int(round(0.5 / DT_CTRL)) + 1  # keeps the lag search from pairing frames across two routes
   parts: dict[str, list[np.ndarray]] = {}
-  for route in expand(args.routes, ROUTE_SETS):
+  for route in expand(args.routes, args.root):
     d = extract(route, args.root)
     series = {"mask": d["lat_active"] & (d["v_ego"] > MOONPILOT_PREVIEW_MIN_SPEED), "action": action(d)}
-    for tau in MOONPILOT_SMOOTH_TAUS[1:]:
+    for tau in PATH_SMOOTH.values[1:]:
       series[f"{tau} no lead"] = replay_smooth(d, tau, lead=False)
       series[f"{tau} lead"] = replay_smooth(d, tau, lead=True)
     for k, v in series.items():
       parts.setdefault(k, []).extend((v, np.zeros(pad, dtype=v.dtype)))
   s = {k: np.concatenate(v) for k, v in parts.items()}
   print(f"{s['mask'].sum() * DT_CTRL:.0f} s steering above {MOONPILOT_PREVIEW_MIN_SPEED:.0f} m/s; lag behind the model's action:")
-  for tau in MOONPILOT_SMOOTH_TAUS[1:]:
+  for tau in PATH_SMOOTH.values[1:]:
     no_lead, led = (lag_s(s["action"], s[f"{tau} {k}"], s["mask"]) * 1e3 for k in ("no lead", "lead"))
     print(f"  tau {tau:.2f} s: {no_lead:4.0f} ms no lead, {led:4.0f} ms lead tau")
 
@@ -223,7 +216,7 @@ def _stick(args):
   snapping is a drive's answer, because the replay holds the recorded wheel."""
   from concurrent.futures import ProcessPoolExecutor
   with ProcessPoolExecutor(3) as pool:
-    results = list(pool.map(_stick_route, [(r, args.root, tuple(args.rise)) for r in expand(args.routes, ROUTE_SETS)]))
+    results = list(pool.map(_stick_route, [(r, args.root, tuple(args.rise)) for r in expand(args.routes, args.root)]))
   done = [(route, r) for route, r, _ in results if r is not None]
   for route, _, err in results:
     if err is not None:
@@ -234,7 +227,7 @@ def _stick(args):
     dd = np.concatenate([np.abs(r["arms"][rise] - r["base"])[r["mask"]] for _, r in done])
     print(f"  rise {rise}: >0.02 {np.mean(dd > 0.02) * 100:5.2f}%  >0.05 {np.mean(dd > 0.05) * 100:5.2f}%  >0.10 {np.mean(dd > 0.10) * 100:5.2f}%  "
           + f"p99 {np.percentile(dd, 99):.3f}")
-  route, lo, hi = STICK_EVENT
+  route, lo, hi = LURCH_EVENT
   event = next((r for name, r in done if name == route), None)
   if event is not None:
     w = (event["t"] >= lo) & (event["t"] <= hi)
@@ -268,7 +261,7 @@ def _lane_position(args):
   offset left of the lane center on straights, and toward the inside of curves (by the path's lateral accel), left and
   right turns apart: the camera mount's own offset adds to one direction's inside and takes from the other's."""
   parts = []
-  for r in expand(args.routes, ROUTE_SETS):
+  for r in expand(args.routes, args.root):
     try:
       parts.append(cached(r, "lanes", LANE_VERSION, args.root, _lane_build))
     except FileNotFoundError as e:
@@ -298,7 +291,7 @@ def register(sub):
     ("lane-position", _lane_position, "lanes", "where in the lane the car sits: openpilot steering against the driver"),
   ):
     p = sub.add_parser(name, help=help_text, description=help_text)
-    p.add_argument("--routes", nargs="+", default=[default], help=f"route names or sets: {', '.join(ROUTE_SETS)}")
+    add_routes_arg(p, [default])
     if name == "stick":
       p.add_argument("--rise", nargs="+", type=float, default=[MOONPILOT_FRICTION_RISE], help="friction rise, m/s^2 per second")
     p.set_defaults(fn=fn)

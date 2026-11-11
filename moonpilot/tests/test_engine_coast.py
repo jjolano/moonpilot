@@ -2,41 +2,29 @@
 that turns it on, and the planner coasting to it — with the default untouched when it is off."""
 
 import unittest
-from unittest import mock
 
 import numpy as np
 from opendbc.car.moonpilot.engine_coast import ENGINE_COAST_BP, ENGINE_COAST_EXIT, ENGINE_COAST_V, EngineCoast, engine_coast_floor
-from opendbc.car.toyota.interface import CarInterface
+from opendbc.car.honda.values import CAR as HondaCar
 from opendbc.car.toyota.values import CAR, ToyotaFlags
 
-from moonpilot.engage import car_unavailable_reason, moonpilot_engage_safety_param
-from moonpilot.features import ENGINE_COAST
-from moonpilot.longitudinal import MOONPILOT_COASTING_BP, MOONPILOT_COASTING_V, MoonpilotLongitudinalPlanner
-from moonpilot.tests.fakes import _params
-from moonpilot.tests.test_engage import _cp
-from moonpilot.tests.test_longitudinal import DT_MDL, _inputs, _lead
+from moonpilot.engage import moonpilot_engage_safety_param
+from moonpilot.features import ENGINE_COAST, car_reason
+from moonpilot.longitudinal import MOONPILOT_COASTING_BP, MOONPILOT_COASTING_V
+from moonpilot.tests.fakes import params
+from moonpilot.tests.harness import car_params, inputs, lead, planner as make_planner
+from openpilot.common.realtime import DT_MDL
 
 FLAG = int(ToyotaFlags.MOONPILOT_ENGINE_COAST)
 
 
-def _planner(flag: bool, overrides: dict | None = None) -> MoonpilotLongitudinalPlanner:
-  CP = CarInterface.get_non_essential_params(CAR.TOYOTA_RAV4_TSS2)
-  CP.openpilotLongitudinalControl = True
-  if flag:
-    CP.flags |= FLAG
-  fake = _params(on=True, overrides=overrides)
-  with mock.patch("moonpilot.longitudinal.Params", lambda: fake):
-    planner = MoonpilotLongitudinalPlanner(CP)
-  planner.params = fake
-  return planner
-
 
 def _follow(flag: bool, v_lead: float, gap: float, brake: float = 0.0) -> list[float]:
   """3 s behind a lead at 20 m/s ego, the lead braking at `brake` from the second second."""
-  planner, v_ego, out = _planner(flag), 20.0, []
+  planner, v_ego, out = make_planner(flag, car=CAR.TOYOTA_RAV4_TSS2), 20.0, []
   for i in range(60):
     v_lead = max(v_lead + (brake * DT_MDL if i >= 20 else 0.0), 0.0)
-    planner.update(_inputs(v_ego=v_ego, v_cruise_kph=108.0, lead=_lead(gap, v_lead)))
+    planner.update(inputs(v_ego=v_ego, v_cruise_kph=108.0, lead=lead(gap, v_lead)))
     out.append(planner.output_a_target)
     gap -= (v_ego - v_lead) * DT_MDL
   return out
@@ -66,10 +54,10 @@ class TestEngineCoast(unittest.TestCase):
       ("honda", True, True, False),
     ):
       with self.subTest(brand=brand, op_long=op_long, toggle=toggle):
-        cp = _cp(brand=brand, openpilot_longitudinal=op_long)
-        moonpilot_engage_safety_param(cp, _params(on=False, overrides={ENGINE_COAST.key: toggle}))
+        cp = car_params(CAR.TOYOTA_RAV4_TSS2 if brand == "toyota" else HondaCar.HONDA_CIVIC, openpilot_longitudinal=op_long)
+        moonpilot_engage_safety_param(cp, params(on=False, overrides={ENGINE_COAST.key: toggle}))
         self.assertEqual(bool(cp.flags & FLAG), flagged)
-        self.assertEqual(car_unavailable_reason(ENGINE_COAST, cp) is None, brand == "toyota" and op_long)
+        self.assertEqual(car_reason(ENGINE_COAST, cp) is None, brand == "toyota" and op_long)
 
   def test_the_planner_coasts_to_the_engine_where_it_fits_and_brakes_where_it_does_not(self):
     floor = engine_coast_floor(20.0)
@@ -84,13 +72,13 @@ class TestEngineCoast(unittest.TestCase):
 
   def test_the_flag_means_nothing_on_another_brand(self):
     """Bit 20 belongs to `ToyotaFlags` only; the same bit on another brand's flags is that brand's own."""
-    planner = _planner(False)
+    planner = make_planner(False, car=CAR.TOYOTA_RAV4_TSS2)
     planner.CP.brand = "hyundai"
     planner.CP.flags |= FLAG
     out = []
     v_lead, gap = 19.0, 26.0
     for _ in range(60):
-      planner.update(_inputs(v_ego=20.0, v_cruise_kph=108.0, lead=_lead(gap, v_lead)))
+      planner.update(inputs(v_ego=20.0, v_cruise_kph=108.0, lead=lead(gap, v_lead)))
       out.append(planner.output_a_target)
       gap -= (20.0 - v_lead) * DT_MDL
     self.assertEqual(out, _follow(False, 19.0, 26.0))

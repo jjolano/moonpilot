@@ -9,15 +9,13 @@ Both directions are pinned here, because the whole feature is the claim that a b
 be taken out of a safety gate and nothing else: ridden for a transient, still raised for anything
 that outlives the window, and the latch never starved by a flapping signal.
 
-The window edge is asserted to the frame, not to an exact index. A monotonic clock in the thousands
-of seconds cannot represent 1000.3 exactly, so the elapsed time read at the nominal boundary is
-0.29999999999995 and the comparison closes one frame later -- 46 ns against a 0.3 s window, below
-anything the fork can act on and not worth pinning as an exact index.
+The boundary is tested within one frame because floating-point timestamps need not represent the
+window duration exactly.
 """
 
+import time
 import unittest
 
-from moonpilot import locationd
 from moonpilot.locationd import MOONPILOT_LOCATION_RIDE_THROUGH_S, moonpilot_locationd_ok
 
 DT = 0.01  # selfdrived runs at 100 Hz
@@ -57,7 +55,11 @@ def _first_raise(decisions: list[bool]) -> int:
 
 class TestLocationdRideThrough(unittest.TestCase):
   def setUp(self):
-    locationd.reset()
+    global START
+    now = max(START + 10.0, time.monotonic())
+    moonpilot_locationd_ok(True, now=now)
+    moonpilot_locationd_ok(True, now=now + MOONPILOT_LOCATION_RIDE_THROUGH_S + 1.0)
+    START = now + MOONPILOT_LOCATION_RIDE_THROUGH_S + 2.0
 
   def assert_window_edge(self, decisions: list[bool], expected: int, msg: str = "") -> int:
     """The window closes at its own length to within a frame, and stays closed after it.
@@ -134,13 +136,8 @@ class TestLocationdRideThrough(unittest.TestCase):
     # With no dropout in progress the seam is upstream's predicate verbatim: good in, True out.
     f = Frames()
     self.assertTrue(all(f.feed([True] * 20)))
-    self.assertTrue(moonpilot_locationd_ok(True, 5000.0))
+    self.assertTrue(moonpilot_locationd_ok(True, START + 1.0))
 
-  def test_reset_clears_the_latch(self):
-    f = Frames()
-    f.feed([False] * (WINDOW_FRAMES + 1))
-    locationd.reset()
-    self.assertTrue(all(f.feed([False] * 5)), "after a reset the next dropout starts a new window")
 
 
 if __name__ == "__main__":

@@ -21,17 +21,33 @@ import importlib
 import os
 import pkgutil
 import subprocess
-import sys
-from collections.abc import Mapping, Sequence
 from functools import cache
 
 import numpy as np
 
-from openpilot.common.realtime import DT_CTRL
+from openpilot.common.realtime import DT_CTRL, DT_MDL
 from openpilot.tools.lib.logreader import LogReader
+from moonpilot.lab.routes import DEFAULT_ROOT as DEFAULT_ROOT
+from moonpilot.lab.routes import expand as expand
 
-DEFAULT_ROOT = ".cache/moonpilot-logs"
 DEFAULT_CACHE = ".cache/moonpilot-extract"
+BURST_RISE, BURST_END, BURST_T = 0.4, 0.3, 1.0
+
+
+def moving_mean(x: np.ndarray, n: int) -> np.ndarray:
+  return np.convolve(x, np.ones(n) / n, mode="same")
+
+
+def route_moving_mean(data: dict, n: int) -> np.ndarray:
+  return np.concatenate([moving_mean(data["a"][data["route"] == r], n) for r in np.unique(data["route"])])
+
+
+def p95_abs_err(replayed: np.ndarray, logged: np.ndarray, mask: np.ndarray) -> float:
+  return float(np.percentile(np.abs(replayed[mask] - logged[mask]), 95)) if mask.any() else float("nan")
+
+
+def manual_authority(long_active, cruise_enabled, drive_gear):
+  return np.logical_not(long_active) & np.logical_not(cruise_enabled) & drive_gear
 
 
 def segments(route: str, root: str = DEFAULT_ROOT) -> list[str]:
@@ -93,6 +109,20 @@ def runs(mask: np.ndarray) -> list[slice]:
   return [slice(a, b) for a, b in zip(edges[::2], edges[1::2], strict=True)]
 
 
+def burst_starts(a: np.ndarray, mask: np.ndarray | None = None, dt: float = DT_MDL) -> list[int]:
+  n = round(BURST_T / dt)
+  out = []
+  for run in runs(mask) if mask is not None else (slice(0, len(a)),):
+    i = run.start
+    while i < run.stop - n:
+      if a[i + n] > BURST_END and a[i + n] - a[i] >= BURST_RISE:
+        out.append(i)
+        i += n
+      else:
+        i += 1
+  return out
+
+
 def reversals_per_s(x: np.ndarray, mask: np.ndarray, dt: float = DT_CTRL) -> float:
   """Direction changes of a command per second of masked time. A frame that holds still continues the last direction,
   so a held (hysteresis) output only counts the moves that reach the car."""
@@ -118,25 +148,18 @@ def lag_s(ref: np.ndarray, x: np.ndarray, mask: np.ndarray, dt: float = DT_CTRL,
   return i * dt
 
 
-def expand(names: list[str], sets: Mapping[str, Sequence[str]]) -> list[str]:
-  """Route names, with any set name replaced by its routes."""
-  return [r for n in names for r in sets.get(n, (n,))]
+
 
 
 def main(argv: list[str] | None = None):
   parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
   parser.add_argument("--root", default=DEFAULT_ROOT, help="directory of <route>--<seg>/rlog.zst")
   sub = parser.add_subparsers(required=True)
-  # Each submodule with a `register(sub)` adds its own subcommands, each setting `fn(args)`. One that fails to import
-  # costs its own subcommands, named on stderr, not the whole lab.
   for info in pkgutil.iter_modules(__path__):
     if info.name.startswith("_"):
       continue
-    try:
-      module = importlib.import_module(f"{__name__}.{info.name}")
-      if hasattr(module, "register"):
-        module.register(sub)
-    except Exception as e:
-      print(f"moonpilot.lab: skipping {info.name}: {e!r}", file=sys.stderr)
+    module = importlib.import_module(f"{__name__}.{info.name}")
+    if hasattr(module, "register"):
+      module.register(sub)
   args = parser.parse_args(argv)
   args.fn(args)

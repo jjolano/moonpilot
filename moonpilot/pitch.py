@@ -44,6 +44,7 @@ everything else is downstream of. Four things about it:
 """
 
 import math
+from typing import Any
 
 from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.realtime import DT_MDL
@@ -56,7 +57,6 @@ MOONPILOT_PITCH_RC = 600.0  # s of valid driving; long enough that one hill is n
 MOONPILOT_PITCH_MIN_SPEED = 5.0  # m/s; a parked or creeping car is a driveway, not a road
 MOONPILOT_PITCH_SANITY = math.radians(20.0)  # rad; past this the pose is broken, not steep
 MOONPILOT_PITCH_MIN_SAMPLES = 6000  # frames, 5 min at DT_MDL, before the offset is applied
-MOONPILOT_PITCH_PERSIST_EVERY = 1200  # frames, 60 s at DT_MDL
 
 
 class PitchOffsetEstimator:
@@ -70,6 +70,15 @@ class PitchOffsetEstimator:
     """Resume the last drive's offset, clamped, so the next boot corrects from its first frame."""
     self.filter.x = min(max(float(offset), -MOONPILOT_PITCH_OFFSET_MAX), MOONPILOT_PITCH_OFFSET_MAX)
     self.samples = int(samples)
+
+  def restore(self, params: Any) -> None:
+    offset = params.get(MOONPILOT_PITCH_OFFSET_KEY, return_default=True)
+    if offset != 0.0:
+      self.seed(offset, MOONPILOT_PITCH_MIN_SAMPLES)
+
+  def persist(self, params: Any) -> None:
+    if self.status == "estimated":
+      params.put(MOONPILOT_PITCH_OFFSET_KEY, round(self.applied(), 4))
 
   @property
   def status(self) -> str:

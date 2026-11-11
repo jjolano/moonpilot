@@ -3,7 +3,12 @@ one as one committed press. See `MOONPILOT_BRAKE_BAND_*` below and docs/longitud
 
 import math
 
-# Brake band: a shallow negative ask goes to the actuator as a coast, a deep one as a committed press.
+
+def hold_timer(elapsed: float, condition: bool, dt: float, duration: float) -> tuple[float, bool]:
+  elapsed = elapsed + dt if condition else 0.0
+  return elapsed, elapsed >= duration - 1e-9
+
+
 # On this car (RAV4 TSS2, `VSC1S07.BRKON` under openpilot-only control, 14 routes, 21 min above 5 m/s)
 # the brakes almost never switch on at a sent command of -0.10 or above (0.1 % per 50 ms at -0.10), switch
 # on at 3-18 % per 50 ms between -0.15 and -0.35, and once on drop out 6-8 % per 50 ms at -0.15..-0.20 but
@@ -34,8 +39,7 @@ MOONPILOT_BRAKE_BAND_RELEASE_T = 0.5  # s
 
 class BrakeBand:
   """Coast-or-press shaping of the negative ask, so the car's own brake arbitration is not left to
-  dither (see `MOONPILOT_BRAKE_BAND_*`). State: whether a press is committed, how long it has held, and how
-  long the ask has stayed above the release."""
+  dither (see `MOONPILOT_BRAKE_BAND_*`)."""
 
   def __init__(self):
     self.reset()
@@ -56,8 +60,8 @@ class BrakeBand:
       self.held += dt
       # The policy's ask is not rate-limited and jitters by hundredths a frame: one frame over the release
       # is not the need ending, and letting go on it re-lit the lamps 0.2 s later on route 0000042b.
-      self.above = self.above + dt if a_cmd > MOONPILOT_BRAKE_BAND_RELEASE + shift else 0.0
-      if a_cmd >= 0.0 or (self.held >= MOONPILOT_BRAKE_BAND_MIN_PRESS_T and self.above >= MOONPILOT_BRAKE_BAND_RELEASE_T - 1e-9):
+      self.above, released = hold_timer(self.above, a_cmd > MOONPILOT_BRAKE_BAND_RELEASE + shift, dt, MOONPILOT_BRAKE_BAND_RELEASE_T)
+      if a_cmd >= 0.0 or (self.held >= MOONPILOT_BRAKE_BAND_MIN_PRESS_T and released):
         self.reset()
       else:
         return min(a_cmd, MOONPILOT_BRAKE_BAND_HOLD + shift)

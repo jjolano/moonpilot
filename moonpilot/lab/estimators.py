@@ -1,25 +1,18 @@
 """Online longitudinal estimator replays on locally cached drives."""
-import glob
-import json
-import os
-from types import SimpleNamespace
+from openpilot.common.realtime import DT_MDL
 
 import numpy as np
 
-from openpilot.common.realtime import DT_MDL
 from openpilot.tools.lib.logreader import LogReader
 
-from moonpilot.lab import DEFAULT_ROOT, drive_config, expand, segments
+from moonpilot.lab import expand, segments
+from moonpilot.lab.planner import replay_params
+from moonpilot.lab.routes import add_routes_arg
 from moonpilot.lead import LeadAccelEstimator
-from moonpilot.latency import MOONPILOT_LAG_BLOCK_COUNT, MOONPILOT_LAG_ESTIMATE_EVERY, MOONPILOT_LAG_HISTORY_KEY, MOONPILOT_LAG_KEY, LongLagEstimator
-from moonpilot.pitch import MOONPILOT_PITCH_MIN_SAMPLES, MOONPILOT_PITCH_OFFSET_KEY, PitchOffsetEstimator
-from moonpilot.radar_latency import MOONPILOT_RADAR_LATENCY_KEY, MOONPILOT_RADAR_LATENCY_SAMPLES_KEY, RadarLatencyEstimator
+from moonpilot.latency import MOONPILOT_LAG_ESTIMATE_EVERY, LongLagEstimator
+from moonpilot.pitch import PitchOffsetEstimator
+from moonpilot.radar_latency import RadarLatencyEstimator
 
-# Default scope: the engaged local drives the estimator claims were re-measured on. "all" is every cached route.
-ROUTE_SETS = {
-  "engaged": ("000003f8", "000003fe", "00000400", "00000408", "0000040d", "0000040e", "00000410", "00000414", "0000043e", "0000043f"),
-  "all": tuple(sorted({os.path.basename(p).split("--", 1)[0] for p in glob.glob(os.path.join(DEFAULT_ROOT, "*--*", "rlog.zst"))})),
-}
 
 
 def _frames(route, root):
@@ -36,50 +29,13 @@ def _frames(route, root):
       yield m.logMonoTime * 1e-9, cp, cs, cc, controls, radar, m.longitudinalPlan
 
 
-def _lead(lead):
-  return SimpleNamespace(present=lead.present, radar=lead.radar, radarTrackId=lead.radarTrackId, dRel=lead.dRel, yRel=lead.yRel,
-                         vLead=lead.vLead, aLeadK=lead.aLeadK, aLeadTau=lead.aLeadTau)
-
-
-def _params(route, root):
-  return drive_config(route, root)[1]
-
-
-def _seed_radar(est, params):
-  try:
-    latency = float(params[MOONPILOT_RADAR_LATENCY_KEY])
-    samples = int(params.get(MOONPILOT_RADAR_LATENCY_SAMPLES_KEY, "0"))
-  except (KeyError, TypeError, ValueError):
-    return
-  if latency > 0.0 and samples > 0:
-    est.seed(latency, samples)
-
-
-def _lag_blocks(params):
-  history = params.get(MOONPILOT_LAG_HISTORY_KEY)
-  if history:
-    try:
-      blocks = json.loads(history)
-    except (TypeError, ValueError):
-      blocks = []
-    if isinstance(blocks, list) and blocks:
-      return [float(b) for b in blocks[:MOONPILOT_LAG_BLOCK_COUNT]]
-  try:
-    lag = float(params[MOONPILOT_LAG_KEY])
-    count = int(params.get("MoonpilotLongLagBlocks", "0"))
-  except (KeyError, TypeError, ValueError):
-    return []
-  return [lag] * min(max(count, 0), MOONPILOT_LAG_BLOCK_COUNT - 1)
 
 
 def _pitch(args):
-  for route in expand(args.routes, ROUTE_SETS):
+  for route in expand(args.routes, args.root):
     est = PitchOffsetEstimator()
-    params = _params(route, args.root)
-    try:
-      est.seed(float(params[MOONPILOT_PITCH_OFFSET_KEY]), MOONPILOT_PITCH_MIN_SAMPLES)
-    except (KeyError, TypeError, ValueError):
-      pass
+    params = replay_params(route, args.root)
+    est.restore(params)
     frames = valid = 0
     for _, _, cs, cc, _, _, _ in _frames(route, args.root):
       pose = cc.orientationNED
@@ -91,13 +47,13 @@ def _pitch(args):
 
 
 def _radar(args):
-  for route in expand(args.routes, ROUTE_SETS):
+  for route in expand(args.routes, args.root):
     est = RadarLatencyEstimator()
-    _seed_radar(est, _params(route, args.root))
+    est.restore(replay_params(route, args.root))
     frames = 0
     for _, _, cs, _, _, radar, _ in _frames(route, args.root):
       for lead in (radar.leadOne, radar.leadTwo):
-        est.update(_lead(lead), cs.aEgo)
+        est.update(lead, cs.aEgo)
       frames += 1
     applied_ms = est.applied() * 1000
     estimate_ms = est.estimate * 1000
@@ -105,7 +61,7 @@ def _radar(args):
 
 
 def _lead_replay(args):
-  for route in expand(args.routes, ROUTE_SETS):
+  for route in expand(args.routes, args.root):
     estimators = (LeadAccelEstimator(), LeadAccelEstimator())
     estimates = [[], []]
     speeds = [[], []]
@@ -113,7 +69,6 @@ def _lead_replay(args):
     present = [[], []]
     for _, _, _, _, _, radar, _ in _frames(route, args.root):
       for i, lead in enumerate((radar.leadOne, radar.leadTwo)):
-        lead = _lead(lead)
         estimate, _ = estimators[i].update(lead)
         estimates[i].append(estimate)
         speeds[i].append(lead.vLead)
@@ -149,13 +104,13 @@ def _lead_replay(args):
 def _lag(args):
   from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState
 
-  for route in expand(args.routes, ROUTE_SETS):
+  for route in expand(args.routes, args.root):
     estimator = None
     frames = attempts = 0
     for _, cp, cs, cc, controls, _, plan in _frames(route, args.root):
       if estimator is None:
         estimator = LongLagEstimator(cp, DT_MDL)
-        estimator.restore(_lag_blocks(_params(route, args.root)))
+        estimator.restore(replay_params(route, args.root))
       valid = (cc.longActive and controls.longControlState == LongCtrlState.pid and cs.vEgo > 5.0 and not cs.standstill
                and not cs.brakePressed and not cs.gasPressed and not controls.forceDecel)
       if estimator.frame % MOONPILOT_LAG_ESTIMATE_EVERY == 0:
@@ -174,5 +129,5 @@ def _lag(args):
 def register(sub):
   for name, fn in (("pitch", _pitch), ("radar-latency", _radar), ("lead-accel", _lead_replay), ("long-lag", _lag)):
     parser = sub.add_parser(name, help=f"Replay the {name} estimator per drive")
-    parser.add_argument("--routes", nargs="+", default=["engaged"], help=f"route names or sets: {', '.join(ROUTE_SETS)}")
+    add_routes_arg(parser, ["estimator-engaged"])
     parser.set_defaults(fn=fn)

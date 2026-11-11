@@ -31,16 +31,12 @@ achievable lateral accel band is shifted by ``g * roll``, so a banked left-hande
 right-hander less by the same amount. None of these numbers are upstream's, and they are all
 fork-owned starting points — the header constants carry the unit and the reason.
 
-`LatAccelBiasEstimator` is the per-car calibration, and it is one-sided on purpose: `applied()` may
-only ever return a scale of 1.0 or more. A car that realizes *more* lateral accel than its path
-predicted is in a tighter curve than the model thought and should slow more; the opposite direction
-would hand the feature *less* braking than the geometry justifies, which is the one direction this
-cannot be allowed to fail in.
+  The one-sided-scale argument is documented by `lat_accel_budget`.
 """
 
 import math
 from collections import deque
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import numpy as np
 
@@ -50,24 +46,13 @@ from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.modeld.constants import ModelConstants
 from opendbc.car.interfaces import ACCEL_MAX
 
-from moonpilot.lead import resample  # the fork's one interpolation entry point, shared rather than re-derived
-
-MOONPILOT_CURVE_T_IDX = np.array(ModelConstants.T_IDXS)  # the model path's own time grid
+MOONPILOT_CURVE_T_IDX = np.array(ModelConstants.T_IDXS)
 MOONPILOT_CURVE_A_LAT = 1.7  # m/s^2; lateral accel a curve is worth taking at
 MOONPILOT_CURVE_A_LAT_MIN = 1.0  # m/s^2; floor after the bank correction, so a large roll cannot zero the budget
 MOONPILOT_CURVE_J_LAT = 3.0  # m/s^3; lateral jerk the entry is shaped to, below upstream's 5.0 ISO command limit
-MOONPILOT_CURVE_JERK_STEP = 2.0  # m; the length the jerk ceiling's |dk/ds| is measured over, rather than
-# between the model's own samples. The model's spacing runs 0.1 m to 12 m along one path, so a
-# sample-scale gradient's value depends on where it happens to sit, and a single sample can carry a step
-# the trend around it does not have. Measured over 143,058 corpus frames, the frames where only this
-# ceiling asks for braking split by exactly that: the 33 % this window drops sit at a median 0.47 m
-# spacing with incoherent steps — net over summed |dk| 0.42, and |k| at 0.6x its own +/-5 m
-# neighbourhood — while the 67 % it keeps are coherent ramps at 1.7 m spacing with |k| at 1.7x its
-# neighbourhood, at full depth. 5 m dropped coherent ramps too (the dropped set's coherence median 1.0),
-# which is why this is sized to the sub-meter class rather than to the ramp the term exists for. The
-# derivative is a centered +/-STEP/2 difference clamped to the path's own ends and divided by the span
-# it actually used, so a linear ramp reads its own slope exactly wherever the window fits inside it,
-# and the cost is one-way: only structure narrower than the window reads shallow.
+# The centered derivative is measured over this window; measurements and rationale are in
+# `jerk_ceiling_speed`.
+MOONPILOT_CURVE_JERK_STEP = 2.0  # m
 MOONPILOT_CURVE_PREVIEW_T = 4.0  # s of path admitted; past this the prediction is not worth braking on
 MOONPILOT_CURVE_PATH_MAX_AGE = 2 * DT_MDL  # s; how old the path may be before `moonpilot/longitudinal.py`
 # stops re-referencing it. The path's `position.x` is measured from the pose of the frame the model
@@ -105,9 +90,8 @@ MOONPILOT_CURVE_EXIT_JERK = 0.25  # m/s^3; how fast the positive ask may rebuild
 # that ramp. It only caps the positive side, so it can never add braking.
 MOONPILOT_CURVE_EXIT_LAT_ACCEL = 1.0  # m/s^2 of measured lateral accel; at or above it the exit ramp
 # stays slow. Below it, and with no path sample that would brake at the set speed, the ramp rebuilds at
-# `MOONPILOT_BRAKE_EXIT_JERK` (moonpilot/longitudinal.py) instead: on route 00000408 a predicted
-# intersection turn the car never took asked -0.04..-0.32 m/s^2 for 0.7 s with the wheel at 3 degrees,
-# and the slow ramp then held a pull-away behind an accelerating lead near zero for 5 s.
+# `MOONPILOT_BRAKE_EXIT_JERK` is defined in `moonpilot/jerk.py`; on route 00000408 the fallback ramp
+# held a pull-away near zero for 5 s after a predicted turn the car never took.
 MOONPILOT_CURVE_BIAS_T = 1.0  # s between a prediction and the measurement it is scored against
 MOONPILOT_CURVE_BIAS_RC = 20.0  # s time constant of the ratio filter
 MOONPILOT_CURVE_BIAS_MIN_LAT_ACCEL = 1.0  # m/s^2; below this both signals are noise
@@ -116,14 +100,13 @@ MOONPILOT_CURVE_BIAS_MIN_SPEED = 10.0  # m/s
 MOONPILOT_CURVE_BIAS_MIN = 0.7  # clamp on a single ratio sample
 MOONPILOT_CURVE_BIAS_MAX = 1.4
 MOONPILOT_CURVE_BIAS_MIN_SAMPLES = 200  # paired frames before the scale is applied, 10 s of curve
-MOONPILOT_CURVE_BIAS_PERSIST_EVERY = 1200  # frames between param writes, 60 s at DT_MDL
 MOONPILOT_CURVE_BIAS_KEY = "MoonpilotCurveLatScale"
 
 
 def lat_accel_budget(direction, roll, scale=1.0):
   """The lateral acceleration a curve in `direction` (+1 left, -1 right) is worth taking at.
 
-  The bank is credited exactly the way `clip_curvature` credits it (`drive_helpers.py:36-39`): the
+  Mirrors `clip_curvature`'s roll compensation.
   achievable band is shifted by `g * roll`, so a positive roll adds budget to a left turn and takes
   it from a right one. `scale` is the learned realization bias and only ever divides — see
   `LatAccelBiasEstimator` for why it is clamped at 1.0.
@@ -172,7 +155,7 @@ def jerk_ceiling_speed(curv, x) -> np.ndarray:
   half = 0.5 * MOONPILOT_CURVE_JERK_STEP
   left = np.maximum(xs[0], xs - half)
   right = np.minimum(xs[-1], xs + half)
-  dk_ds = np.abs(resample(xs, cs, right) - resample(xs, cs, left)) / np.maximum(right - left, 1e-9)
+  dk_ds = np.abs(np.interp(right, xs, cs) - np.interp(left, xs, cs)) / np.maximum(right - left, 1e-9)
   v_jerk[finite] = np.cbrt(MOONPILOT_CURVE_J_LAT / np.maximum(dk_ds, 1e-9))
   return v_jerk
 
@@ -182,9 +165,7 @@ def curve_targets(model, allowed, roll=0.0, scale=1.0, ahead=0.0) -> CurveTarget
 
   Curvature is `orientationRate.z / velocity.x` over the model's own time grid, which is the same
   pair upstream's `get_curvature_from_plan` reads. The budget is the bank-corrected lateral accel for
-  the direction the path turns; the jerk ceiling is the same budget expressed as a speed, since
-  lateral jerk at constant speed is `v^3 * |dk/ds|` — and it is what makes a fast-tightening entry
-  slow *earlier* rather than harder, the one thing a measured lateral-accel limit cannot see.
+  The jerk ceiling (`jerk_ceiling_speed`) applies beside it; the lower speed wins.
 
   Only the derivative is windowed. The budget stays per-sample on purpose, and that is measured
   rather than assumed: over the corpus's 5,286 budget-binding frames the binding sample's |k| is
@@ -192,10 +173,7 @@ def curve_targets(model, allowed, roll=0.0, scale=1.0, ahead=0.0) -> CurveTarget
   because the deepest ask comes from the *nearest* binding sample of a sustained curve — which is
   what the budget is for — rather than from a single sample's step.
 
-  None means no candidate, which is the planner this fork had before any of this existed — a model
-  message with no path arrays takes that branch, which is why upstream's maneuver plant (it fills
-  `position` and `velocity` but never `orientationRate`) and every existing fork test are unaffected
-  whether the feature is on or off.
+  None means no path arrays.
 
   `ahead` is the distance the car has already covered since the frame this path was predicted from:
   `position.x` is measured from that pose, so subtracting the travel the caller can account for is
@@ -307,7 +285,7 @@ class LatAccelBiasEstimator:
     self.predicted: deque[float] = deque(maxlen=self.pair_len)
     self.filter = FirstOrderFilter(1.0, MOONPILOT_CURVE_BIAS_RC, dt)
     self.samples = 0
-    self.frames = 0  # every frame it was fed, not just the paired ones: the persistence cadence
+
 
   def seed(self, scale: float, samples: int) -> None:
     """Resume a persisted scale, the `lagd.reset` pattern: the filter starts at the value with
@@ -315,6 +293,16 @@ class LatAccelBiasEstimator:
     self.filter.x = float(scale)
     self.filter.initialized = True
     self.samples = int(samples)
+
+  def restore(self, params: Any) -> None:
+    scale = params.get(MOONPILOT_CURVE_BIAS_KEY, return_default=True)
+    if scale > 1.0:
+      self.seed(min(scale, MOONPILOT_CURVE_BIAS_MAX), MOONPILOT_CURVE_BIAS_MIN_SAMPLES)
+
+  def persist(self, params: Any) -> None:
+    if self.status == "estimated":
+      params.put(MOONPILOT_CURVE_BIAS_KEY, round(self.applied(), 3))
+
 
   @property
   def status(self) -> str:
@@ -327,13 +315,12 @@ class LatAccelBiasEstimator:
     return float(self.filter.x)
 
   def applied(self) -> float:
-    """The scale the curve targets are computed with. One-sided and bounded — see the docstring."""
+    """The scale used for curve targets."""
     if self.status != "estimated":
       return 1.0
     return min(max(self.estimate, 1.0), MOONPILOT_CURVE_BIAS_MAX)
 
   def update(self, predicted, measured, valid: bool) -> None:
-    self.frames += 1
     if not valid:
       self.predicted.clear()
       return

@@ -1,64 +1,44 @@
 #!/usr/bin/env python3
 """Compile a selection's members into the JIT the runtime loads.
 
-`moonpilot/modelsd.py` calls `build()` once per selection per resolution set, offroad, and this is
-the only module that runs tinygrad's compiler. Five things are not obvious.
+`moonpilot/modelsd.py` calls `build()` once per selection per resolution set, offroad. Tinygrad
+flags are set before its import because `DEV=` is read when a device opens. The import order is
+therefore part of the compiler contract.
 
-**The tinygrad flags are the SConscript's, and they must be in the environment before tinygrad is
-imported.** `openpilot/selfdrive/modeld/SConscript` prefixes its compile commands with them; this
-module sets the same ones, and `moonpilot/tests/test_modelruntime.py` fails if the two strings
-drift. The import order is why the flags are set at module import rather than in a function: `DEV=`
-is read when a device is opened.
+The supercombo path compiles the selected ONNX as one role. Split protocols run vision once and feed
+its `hidden_state` slice to each policy member; dmonitoring captures one `TinyJit`. Queue shapes,
+packed views and input keys are recorded in `model.pkl` metadata and rebuilt by the runtime.
+`build.json` is written only after a successful build; `models.build_state` requires both it and
+`model.pkl`. Compiler failures are recorded for the panel.
 
-**The families are compiled by different code, all of it fork-owned.** `comma.supercombo.v1` follows
-the deleted `openpilot/selfdrive/modeld/compile_modeld.py`, moved here verbatim, because the fork's
-runtime has to reproduce exactly the buffers and the recurrence that model was trained against.
-`comma.split-vision-policy.v1` and `comma.split-vision-off-on.v1` need the historical split glue,
-which no longer exists upstream: the vision member runs once, its `hidden_state` slice feeds each
-policy member's feature queue, and the JIT returns one flat tensor per role -- which is why the
-runtime merges per-role slices instead of slicing one buffer. `comma.dmonitoring.v1` is a single
-`TinyJit` over the model, pickled plainly.
-
-**Every queue and view is recorded, not re-derived.** The metadata written into `model.pkl` carries
-the exact shapes the JIT was captured against (`queue_shapes`, `npy_shapes`, `packed_npy_size`,
-`input_keys`), and `moonpilot/modelruntime.py` rebuilds the buffers from that record. One thing is
-deliberately *not* recorded: the packed buffer's size includes the camera's NV12 frame copy size,
-which differs per resolution, so the runtime computes it from the camera it was handed -- the same
-function the compiler uses (`models.nv12_copy_size`).
-
-**A half-finished build is never valid.** `build.json` is written last, from a temp directory inside
-the store, and `models.build_state` treats a build without it -- or without `model.pkl` -- as not
-built. A compiler failure is a record with `state: "failed"` and the message in `error`, never a
-silent fallback: the runtime falls back to the bundled model at load, and the panel says why.
-
-**Nothing here reads a downloaded file with a full unpickler.** Interfaces come from
-`moonpilot/vendor/openmodels/metadata.py`, which hand-decodes the ONNX protobuf and refuses anything
-but `slice` in the embedded metadata pickle. The only `pickle.load` in this file is of the model the
-*compiler itself* just wrote, or of an ONNX whose bytes the caller already checked.
+`modelcatalog.verify_onnx` handles downloaded ONNX metadata without executing it; this module only
+loads model pickles produced by the compiler or bytes already checked by the caller.
 """
 
 import argparse
-import datetime
-import io
 import math
 import os
+
+import numpy as np
 import pickle
 import platform
-import shutil
-import struct
 import tempfile
 import time
 from functools import partial
 from typing import Any, NamedTuple
 
-import numpy as np
+from openpilot.common.transformations.model import DM_INPUT_SIZE
+from openpilot.common.version import get_version
 
-from moonpilot import models
+from openpilot.selfdrive.modeld.modeld import LAT_SMOOTH_SECONDS, LONG_SMOOTH_SECONDS
 
-# Exactly the strings `openpilot/selfdrive/modeld/SConscript` compiles with; the test pins them.
+from moonpilot import modelprotocols, models
+from moonpilot.modelpickle import dump_oob, load_oob
+
+
 TG_FLAGS_QCOM = "DEV=QCOM IMAGE=1 FLOAT16=1 NOLOCALS=1 JIT_BATCH_SIZE=0 OPENPILOT_HACKS=1"
 TG_FLAGS_CPU = "DEV=CPU:LLVM"
-TG_FLAGS_METAL = "DEV=METAL JIT=2"  # JIT=2 disables graph batching, which mixes buffers up on Metal
+TG_FLAGS_METAL = "DEV=METAL JIT=2"
 
 
 def tg_flags() -> str:
@@ -281,10 +261,9 @@ def make_run_model(warp, run_policy, model_metadata, frame_copy_size):
   return run_model
 
 
-def compile_jit(jit, input_keys, make_queues, benchmark_runs):
-  if benchmark_runs < 1:
-    raise ValueError("benchmark_runs must be at least 1")
+BENCHMARK_RUNS = 1
 
+def compile_jit(jit, input_keys, make_queues):
   SEED = 42
   def random_inputs_run(fn, seed, n_runs, test_val=None, test_buffers=None, expect_match=True):
     input_queues, npy, frame_views = make_queues(Device.DEFAULT)
@@ -317,14 +296,13 @@ def compile_jit(jit, input_keys, make_queues, benchmark_runs):
 
   print("capture + replay")
   test_val, test_buffers = random_inputs_run(jit, SEED, 3)
-  print(f"pickle round trip ({benchmark_runs} runs per seed)")
+  print(f"pickle round trip ({BENCHMARK_RUNS} run per seed)")
   with tempfile.TemporaryFile(dir=_scratch_dir()) as f:
-    dump_oob(jit, f)
+    dump_oob(jit, f, _scratch_dir())
     f.seek(0)
-    from moonpilot.modelruntime import _load_fork_oob
-    loaded_jit = _load_fork_oob(f)
-  random_inputs_run(loaded_jit, SEED, benchmark_runs, test_val, test_buffers, expect_match=True)
-  random_inputs_run(loaded_jit, SEED+1, benchmark_runs, test_val, test_buffers, expect_match=False)
+    loaded_jit = load_oob(f)
+  random_inputs_run(loaded_jit, SEED, BENCHMARK_RUNS, test_val, test_buffers, expect_match=True)
+  random_inputs_run(loaded_jit, SEED+1, BENCHMARK_RUNS, test_val, test_buffers, expect_match=False)
   # Keep the original so per-resolution JITs share model weight buffers in the final pickle.
   return jit
 
@@ -333,28 +311,8 @@ from openpilot.system.camerad.cameras.nv12_info import get_nv12_info
 
 from moonpilot.vendor.openmodels import metadata as onnx_metadata
 
-BENCHMARK_RUNS = 1
 
 
-def dump_oob(obj: Any, handle) -> None:
-  """The fork's OOB writer, matching `moonpilot/modelruntime.py::_load_fork_oob`. The scratch file
-  lives in the store's temp directory, not the checkout: a checkout temp means writing the model's
-  buffers into git state (AGENTS.md, Storage)."""
-  with tempfile.TemporaryFile(dir=_scratch_dir()) as tmp:
-
-    def buffer_callback(pickle_buffer: pickle.PickleBuffer):
-      view = pickle_buffer.raw()
-      tmp.write(struct.pack("<q", view.nbytes))
-      tmp.write(view)
-      pickle_buffer.release()  # keep peak ram at ~1 buffer
-
-    stream = io.BytesIO()
-    pickle.Pickler(stream, protocol=5, buffer_callback=buffer_callback).dump(obj)
-    opcodes = stream.getvalue()
-    handle.write(struct.pack("<q", len(opcodes)))
-    handle.write(opcodes)
-    tmp.seek(0)
-    shutil.copyfileobj(tmp, handle)
 
 
 def _scratch_dir() -> str:
@@ -363,10 +321,6 @@ def _scratch_dir() -> str:
   return scratch
 
 
-def failure_record(error: str) -> dict:
-  """The `build.json` body for a failed build, so the worker and this module cannot disagree about
-  its shape. `models.build_state` reads `state` and `error` and nothing else."""
-  return {"schema": models.SCHEMA, "state": "failed", "error": error}
 
 
 def _interface(path: str) -> dict:
@@ -408,11 +362,8 @@ def _product(shape) -> int:
   return total
 
 
-def _sfx(role: str, name: str) -> str:
-  """A packed field's name for one role. Single-role families keep upstream's own names, so the
-  supercombo metadata is the metadata `make_input_queues` builds; a split namespaces them, because
-  two policy members have two `desire` views. `moonpilot/modelruntime.py` resolves either."""
-  return name if role == models.SUPERCOMBO.roles[0] else f"{name}_{role}"
+def _sfx(proto, role: str, name: str) -> str:
+  return proto.field(role, name)
 
 
 def effective_contract(proto, interfaces: dict[str, dict]) -> str:
@@ -421,17 +372,16 @@ def effective_contract(proto, interfaces: dict[str, dict]) -> str:
   slice is decoded from its plan, which is what the older family-C recipes need. Admission has
   already refused an action head on the wrong side of the change, so what is decided here is
   presence and nothing else."""
-  return proto.action_contract if any("action" in interface["slices"] for interface in interfaces.values()) else "plan"
+  return proto.action_contract if any("action" in interface["slices"] for interface in interfaces.values()) else modelprotocols.ACTION_PLAN
 
 
 def _family_metadata(
-  proto, interfaces: dict[str, dict], configuration: dict, npy_shapes: list, packed_npy_size: int, queue_shapes: list, input_keys: list[str]
+  proto, interfaces: dict[str, dict], npy_shapes: list, packed_npy_size: int, queue_shapes: list, input_keys: list[str]
 ) -> dict:
   return {
     "family": proto.id,
     "action_contract": effective_contract(proto, interfaces),
-    "frame_skip": int(configuration["frame_skip"]) if "frame_skip" in configuration else 0,
-    "features_role": models.features_role(proto),
+    "features_role": proto.features_role,
     "role_order": list(proto.roles),
     "roles": {
       role: {"input_shapes": interfaces[role]["input_shapes"], "slices": interfaces[role]["slices"], "index": proto.roles.index(role)} for role in proto.roles
@@ -467,11 +417,11 @@ def _compile_supercombo(proto, members: dict[str, str], interfaces: dict[str, di
     make_queues = partial(make_input_queues, input_shapes, frame_skip, frame_copy_size=frame_copy_size)
     warp = make_warp(nv12, model_w, model_h)
     jit = TinyJit(make_run_model(warp, run_policy, {"input_shapes": input_shapes}, frame_copy_size), prune=True)
-    payload["run_model"][(cam_w, cam_h)] = compile_jit(jit, MODELD_INPUTS, make_queues, BENCHMARK_RUNS)
+    payload["run_model"][(cam_w, cam_h)] = compile_jit(jit, MODELD_INPUTS, make_queues)
     if not queues:
       queues = _queue_shapes_for_record(input_shapes, frame_skip)
 
-  payload["metadata"] = _family_metadata(proto, interfaces, configuration, npy_shapes, packed_npy_size, queues, list(MODELD_INPUTS))
+  payload["metadata"] = _family_metadata(proto, interfaces, npy_shapes, packed_npy_size, queues, list(MODELD_INPUTS))
   # The runtime rebuilds the queues from the record, so they have to be the two the capture built.
   assert set(vision_input_names) == {"img", "big_img"}, vision_input_names
 
@@ -494,7 +444,7 @@ def _queue_shapes_for_record(input_shapes: dict, frame_skip: int) -> list[list[A
 
 def _compile_split(proto, members: dict[str, str], interfaces: dict[str, dict], configuration: dict,
                    camera_resolutions, payload: dict) -> None:
-  """The historical split glue, on the moved compiler helpers.
+  """Compile the split vision and policy roles into one runtime.
 
   The vision member runs once per frame; its `hidden_state` slice is the feature the policy members'
   queues carry -- one queue per policy role, because two policy members may declare different
@@ -509,7 +459,7 @@ def _compile_split(proto, members: dict[str, str], interfaces: dict[str, dict], 
   """
   from tinygrad.nn.onnx import OnnxRunner
 
-  vision_role = models.features_role(proto)
+  vision_role = proto.features_role
   policy_roles = [role for role in proto.roles if role != vision_role]
   frame_skip = int(configuration["frame_skip"])
   vision_shapes = interfaces[vision_role]["input_shapes"]
@@ -525,7 +475,7 @@ def _compile_split(proto, members: dict[str, str], interfaces: dict[str, dict], 
   role_fields: dict[str, list[list[Any]]] = {}
   for role in policy_roles:
     shapes, _sizes = _npy_layout(interfaces[role]["input_shapes"])
-    role_fields[role] = [[_sfx(role, name), shape] for name, shape in shapes]
+    role_fields[role] = [[_sfx(proto, role, name), shape] for name, shape in shapes]
     npy_shapes.extend(role_fields[role])
   sizes = [int(_product(shape)) for _name, shape in npy_shapes]
   packed_npy_size = sum(sizes) * 4
@@ -578,11 +528,11 @@ def _compile_split(proto, members: dict[str, str], interfaces: dict[str, dict], 
         inputs = {
           "features_buffer": shift_and_sample(feat_q, new_feature, sample_skip_fn).reshape(
             interfaces[role]["input_shapes"]["features_buffer"]),
-          "desire_pulse": shift_and_sample(desire_q, values[_sfx(role, "desire")].reshape(1, 1, -1), sample_desire_fn),
-          "traffic_convention": values[_sfx(role, "traffic_convention")],
+          "desire_pulse": shift_and_sample(desire_q, values[_sfx(proto, role, "desire")].reshape(1, 1, -1), sample_desire_fn),
+          "traffic_convention": values[_sfx(proto, role, "traffic_convention")],
         }
-        if _sfx(role, "action_t") in values:
-          inputs["action_t"] = values[_sfx(role, "action_t")]
+        if _sfx(proto, role, "action_t") in values:
+          inputs["action_t"] = values[_sfx(proto, role, "action_t")]
         declared = interfaces[role]["input_shapes"]
         if set(inputs) - set(declared):
           raise ValueError(f"{role}: packing inputs the model does not declare: {sorted(set(inputs) - set(declared))}")
@@ -599,10 +549,9 @@ def _compile_split(proto, members: dict[str, str], interfaces: dict[str, dict], 
     run_policy = make_split_run_policy(warp, frame_copy_size)
     make_queues = partial(_make_split_queues, queue_shapes, packed_npy_size, frame_copy_size)
     jit = TinyJit(run_policy, prune=True)
-    payload["run_model"][(cam_w, cam_h)] = compile_jit(jit, queue_keys + ["packed_npy_inputs"], make_queues, BENCHMARK_RUNS)
+    payload["run_model"][(cam_w, cam_h)] = compile_jit(jit, queue_keys + ["packed_npy_inputs"], make_queues)
 
-  payload["metadata"] = _family_metadata(proto, interfaces, configuration, npy_shapes, packed_npy_size, queue_shapes,
-                                         queue_keys + ["packed_npy_inputs"])
+  payload["metadata"] = _family_metadata(proto, interfaces, npy_shapes, packed_npy_size, queue_shapes, queue_keys + ["packed_npy_inputs"])
 
 
 def _make_split_queues(queue_shapes, packed_npy_size, frame_copy_size, device):
@@ -616,7 +565,7 @@ def _make_split_queues(queue_shapes, packed_npy_size, frame_copy_size, device):
   return queues
 
 
-def _compile_dmonitoring(proto, members: dict[str, str], interfaces: dict[str, dict], configuration: dict, camera_resolutions, payload: dict) -> None:
+def _compile_dmonitoring(proto, members: dict[str, str], interfaces: dict[str, dict], payload: dict) -> None:
   """One JIT over the model, warm, pickled plainly -- the shape `dmonitoringmodeld` loads today.
 
   The warp is not compiled here: it maps the camera's NV12 frame to the model's input size and does
@@ -628,9 +577,8 @@ def _compile_dmonitoring(proto, members: dict[str, str], interfaces: dict[str, d
   role = proto.roles[0]
   input_shapes = interfaces[role]["input_shapes"]
   input_img = input_shapes.get("input_img")
-  if input_img is None or int(_product(input_img)) != int(_product(models.DM_INPUT_SIZE)):
-    raise ValueError(f"input_img {input_img} is not the {models.DM_INPUT_SIZE} the DM warp produces")
-
+  if input_img is None or int(_product(input_img)) != int(_product(DM_INPUT_SIZE)):
+    raise ValueError(f"input_img {input_img} is not the {DM_INPUT_SIZE} the DM warp produces")
   runner = OnnxRunner(members[role])
 
   # The parameter names and their order are the runtime's: `dmonitoringmodeld` calls the loaded JIT
@@ -646,7 +594,7 @@ def _compile_dmonitoring(proto, members: dict[str, str], interfaces: dict[str, d
     jit(calib=dummy_calib, input_img=dummy_img).numpy()
 
   payload["model_run"] = jit
-  payload["metadata"] = {"input_shapes": input_shapes, "slices": interfaces[role]["slices"], "output_slices": interfaces[role]["slices"]}
+  payload["metadata"] = {"input_shapes": input_shapes, "slices": interfaces[role]["slices"]}
   payload["input_devices"] = {"model": Device.DEFAULT}
   payload.pop("run_model", None)
 
@@ -655,10 +603,8 @@ def build(
   proto,
   members: dict[str, str],
   configuration: dict,
-  camera_resolutions=models.CAMERA_RESOLUTIONS,
-  out_dir: str | None = None,
-  *,
-  selection: str = "",
+  camera_resolutions,
+  out_dir: str,
 ) -> str:
   """Compile one selection and write its build directory. Returns the directory.
 
@@ -669,25 +615,31 @@ def build(
   """
   interfaces = {role: _interface(path) for role, path in members.items()}
   views = {
-    role: {"input_shapes": interfaces[role]["input_shapes"], "slices": interfaces[role]["slices"], "format": "onnx", "targets": ["QCOM"]} for role in interfaces
+    role: {
+      "input_shapes": interfaces[role]["input_shapes"],
+      "slices": interfaces[role]["slices"],
+      "format": "onnx",
+      "targets": [modelprotocols.QCOM_TARGET],
+    }
+    for role in interfaces
   }
   # No `published_at`: the action head's era is admission's decision, made against the catalog's
   # recorded publication dates, and a build only ever runs a selection that already passed it.
-  if (reason := models.set_reason(proto, views)) is not None:
+  if (reason := modelprotocols.set_reason(proto, views)) is not None:
     raise ValueError(reason)
 
-  directory = out_dir or models.build_dir(selection, proto.id, camera_resolutions)
+  directory = out_dir
   os.makedirs(directory, exist_ok=True)
   payload: dict[str, Any] = {"metadata": {}, "input_devices": {"model": Device.DEFAULT}, "run_model": {}}
 
-  if proto.id == models.SUPERCOMBO.id:
+  if proto.family == "supercombo":
     _compile_supercombo(proto, members, interfaces, configuration, camera_resolutions, payload)
-  elif proto.id in (models.SPLIT_VISION_POLICY.id, models.SPLIT_VISION_OFF_ON.id):
+  elif proto.family == "split":
     _compile_split(proto, members, interfaces, configuration, camera_resolutions, payload)
-  elif proto.id == models.DMONITORING.id:
-    _compile_dmonitoring(proto, members, interfaces, configuration, camera_resolutions, payload)
+  elif proto.family == "dmonitoring":
+    _compile_dmonitoring(proto, members, interfaces, payload)
   else:
-    raise ValueError(f"no compiler for {proto.id}")
+    raise ValueError(f"no compiler for {proto.family}")
 
   model_path = os.path.join(directory, "model.pkl")
   # Staged inside the build directory, not in the store's scratch space: `os.replace` is only atomic
@@ -697,8 +649,8 @@ def build(
   staging.close()
   try:
     with open(staging.name, "wb") as handle:
-      if proto.kind == models.DRIVING:
-        dump_oob(payload, handle)
+      if proto.kind == modelprotocols.DRIVING:
+        dump_oob(payload, handle, _scratch_dir())
       else:
         pickle.dump(payload, handle)
     os.replace(staging.name, model_path)
@@ -707,52 +659,11 @@ def build(
       os.remove(staging.name)
 
   key = os.path.basename(directory)
-  models.write_json(
-    models.build_record(key),
-    {
-      "schema": models.SCHEMA,
-      "state": "built",
-      "error": None,
-      "selection": selection,
-      "protocol": proto.id,
-      "roles": list(proto.roles),
-      "members": {role: _member_record(members[role]) for role in members},
-      "configuration": {key: configuration[key] for key in proto.required_configuration if key in configuration},
-      # Wall clock, from a clock the repo's lint rule trusts (`time.time` is banned tree-wide).
-      "created_at": datetime.datetime.now(datetime.UTC).timestamp(),
-      "provenance": {"version": _fork_version(), "tinygrad": _tinygrad_revision(), "flags": TG_FLAGS},
-      "camera_resolutions": [[w, h] for w, h in camera_resolutions],
-      "action_contract": effective_contract(proto, interfaces),
-    },
-  )
+  models.write_build_record(key, proto.id, effective_contract(proto, interfaces), get_version())
   return directory
 
 
-def _member_record(path: str) -> dict:
-  """One member as the record keeps it: the digest and the size of the bytes that were compiled."""
-  import hashlib
 
-  with open(path, "rb") as handle:
-    return {"sha256": hashlib.file_digest(handle, "sha256").hexdigest(), "size": os.path.getsize(path)}
-
-
-def _fork_version() -> str:
-  from moonpilot import features
-
-  return features.version()
-
-
-def _tinygrad_revision() -> str:
-  """The tinygrad the build was compiled with, if this checkout can tell. Informational: nothing
-  invalidates a build on a version bump (moonpilot/modelsd.py)."""
-  import subprocess
-
-  root = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tinygrad_repo")
-  try:
-    result = subprocess.run(["git", "-C", root, "rev-parse", "HEAD"], capture_output=True, text=True, timeout=10, check=False)
-    return result.stdout.strip() or "unknown"
-  except (OSError, subprocess.SubprocessError):
-    return "unknown"
 
 
 def smoke(onnx_path: str, protocol_id: str | None, camera: tuple[int, int], build_dir: str | None) -> int:
@@ -768,31 +679,30 @@ def smoke(onnx_path: str, protocol_id: str | None, camera: tuple[int, int], buil
   if protocol_id is None:
     inputs = interface["input_shapes"]
     if "input_img" in inputs:
-      protocol_id = models.DMONITORING.id
+      protocol_id = modelprotocols.DMONITORING.id
     elif "features_buffer" in inputs and "action_t" in inputs:
-      protocol_id = models.SUPERCOMBO.id
+      protocol_id = modelprotocols.SUPERCOMBO.id
     else:
       print(f"cannot tell which family {onnx_path} is; pass --protocol")
       return 2
-  proto = models.protocol(protocol_id)
+  proto = modelprotocols.protocol(protocol_id)
   if proto is None:
     print(f"unknown protocol {protocol_id}")
     return 2
 
   role = proto.roles[0]
   members = {role: onnx_path}
-  configuration = {"frame_skip": 4, "LAT_SMOOTH_SECONDS": 0.0, "LONG_SMOOTH_SECONDS": 0.3}
+  configuration = {"frame_skip": 4, "LAT_SMOOTH_SECONDS": LAT_SMOOTH_SECONDS, "LONG_SMOOTH_SECONDS": LONG_SMOOTH_SECONDS}
   directory = build_dir or tempfile.mkdtemp(prefix="mp-smoke-")
   print(f"building {proto.id} into {directory} with {TG_FLAGS}")
   started = time.monotonic()
-  build(proto, members, configuration, models.CAMERA_RESOLUTIONS, directory, selection="smoke")
+  build(proto, members, configuration, models.CAMERA_RESOLUTIONS, directory)
   print(f"built in {time.monotonic() - started:.0f}s, {os.path.getsize(os.path.join(directory, 'model.pkl')) / 1e6:.1f} MB")
   print("record:", models.load_build(os.path.basename(directory)))
 
-  entry = {"kind": "custom", "id": "smoke", "protocol": proto.id, "build": directory, "members": members, "configuration": configuration}
-  import numpy as np
+  entry = {"kind": modelprotocols.CUSTOM, "id": "smoke", "protocol": proto.id, "build": directory, "members": members, "configuration": configuration}
 
-  if proto.kind == models.DRIVING:
+  if proto.kind == modelprotocols.DRIVING:
     runtime = modelruntime.DriverRuntime(entry, {"action_contract": proto.action_contract}, None)
     model = runtime.create_model(camera[0], camera[1])
     if model is None:
@@ -818,13 +728,13 @@ def smoke(onnx_path: str, protocol_id: str | None, camera: tuple[int, int], buil
     for key in sorted(out):
       value = out[key]
       print(f"  {key:24s} {value.shape} finite={bool(np.all(np.isfinite(value)))}")
-    required = sorted(models.DRIVING_SLICES)
+    required = sorted(modelprotocols.DRIVING_SLICES)
     missing = [name for name in required if name not in out]
     if missing:
       print("missing required outputs:", missing)
       return 1
   else:
-    runtime = modelruntime.MonitoringRuntime(entry, {}, None)
+    runtime = modelruntime.MonitoringRuntime(entry, None)
     model = runtime.create_model(camera[0], camera[1])
     if model is None:
       print("model failed to load")
@@ -834,7 +744,7 @@ def smoke(onnx_path: str, protocol_id: str | None, camera: tuple[int, int], buil
     sliced = {name: flat[np.newaxis, bounds] for name, bounds in model.output_slices.items()}
     parsed = runtime.parse(sliced, model)
     print("parsed heads:", sorted(parsed))
-    missing = [name for name in sorted(models.DM_SLICES) if name not in parsed]
+    missing = [name for name in sorted(modelprotocols.DM_SLICES) if name not in parsed]
     if missing:
       print("missing required heads:", missing)
       return 1

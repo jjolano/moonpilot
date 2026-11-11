@@ -1,5 +1,12 @@
 #!/usr/bin/env bash
 
+mark_swap() {
+  local staging_root="${1:-}"
+  local boot_id_path="${MOONPILOT_BOOT_ID_PATH:-/proc/sys/kernel/random/boot_id}"
+  [ -n "$staging_root" ] && [ -r "$boot_id_path" ] || return 1
+  printf '%s\n' "$(< "$boot_id_path")" > "${staging_root}/moonpilot_swap"
+}
+
 recover() {
   local action="${1:-}"
   local staging_root="${2:-}"
@@ -70,4 +77,7 @@ recover() {
   echo restart
 }
 
-recover "$@"
+case "${1:-}" in
+  recover) recover "$@" ;;
+  mark-swap) shift; mark_swap "$@" ;;
+esac

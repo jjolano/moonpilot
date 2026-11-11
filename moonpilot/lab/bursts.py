@@ -8,12 +8,14 @@ Command-path evidence: the car is held as recorded.
 import math
 
 import numpy as np
-from openpilot.cereal import messaging
+from openpilot.common.constants import CV
 from openpilot.common.realtime import DT_CTRL, DT_MDL
 from openpilot.tools.lib.logreader import LogReader
+from moonpilot.features import HANDBACK_EASE
 from moonpilot.longitudinal import LongitudinalPlanSource
-from moonpilot.lab import DEFAULT_ROOT, cached, expand, lag_s, runs
-from moonpilot.lab.planner import MESSAGES, ROUTE_SETS, _details_arrays, extract, replay
+from moonpilot.lab import BURST_RISE, BURST_T, DEFAULT_ROOT, burst_starts, cached, expand, lag_s, moving_mean, runs
+from moonpilot.lab.planner import ExtractReader, extract, replay
+from moonpilot.lab.routes import add_routes_arg
 
 
 CHAIN_VERSION = 1
@@ -92,20 +94,15 @@ def _chain_bursts(job):
   mask = (c["long_active"] > 0) & (c["gas"] == 0) & (c["brake"] == 0) & (c["v_ego"] > 5.0) & np.isfinite(c["a_ego"])
   if mask.sum() < round(30.0 / DT_CTRL):
     return route, None, [(float(t), None) for t in event_t]
-  a = np.convolve(c["a_ego"], np.ones(smooth) / smooth, mode="same")
+  a = moving_mean(c["a_ego"], smooth)
   max_lag = 1.0
   lag_plan = lag_s(c["a_target"], a, mask, DT_CTRL, max_lag)
   lag_out = lag_s(c["output"], a, mask, DT_CTRL, max_lag)
   lp, lo = round(lag_plan / DT_CTRL), round(lag_out / DT_CTRL)
   rows = []
   for r in runs(mask):
-    i = r.start + max(lp, lo)
-    while i < r.stop - n:
-      if a[i + n] > BURST_END and a[i + n] - a[i] >= BURST_RISE:
-        rows.append(_chain_window(c, a, i, lp, lo, n))
-        i += n
-      else:
-        i += 1
+    start = r.start + max(lp, lo)
+    rows.extend(_chain_window(c, a, i + start, lp, lo, n) for i in burst_starts(a[start:r.stop], dt=DT_CTRL))
   events, t_ns = [], c["t"]
   for t in event_t:
     k = int(np.searchsorted(t_ns, t * 1e9))
@@ -148,7 +145,7 @@ def _burst_chain(args):
   then, separately, every burst the chain itself finds. A burst no stage rose behind is the measurement's alone — the
   PCM, the road's grade or the aEgo estimate, which this cannot tell apart."""
   from concurrent.futures import ProcessPoolExecutor
-  routes = list(dict.fromkeys(expand(args.routes, ROUTE_SETS)))
+  routes = expand(args.routes, args.root)
   with ProcessPoolExecutor(3, max_tasks_per_child=1) as pool:
     results = list(pool.map(_chain_bursts, [(route, args.root) for route in routes]))
   events = [(route, t, row) for route, _, ev in results for t, row in ev]
@@ -177,7 +174,6 @@ def _burst_chain(args):
   _chain_classes(x)
 
 
-BURST_RISE, BURST_END, BURST_T = 0.4, 0.3, 1.0  # `driver._bursts`' definition: a rise of 0.4 m/s^2 in 1 s that ends above +0.3
 BURST_FAR_MIN_GAP = 50.0  # m; `--far-headway` drops a lead only past this as well, so a slow-speed lead is never far
 
 
@@ -210,52 +206,32 @@ def _burst_replay(job):
 
   longitudinal.policy, longitudinal.MoonpilotLongitudinalPlanner.update = policy, update  # ty: ignore[invalid-assignment]
   try:
-    details = []
-    replayed, logged, active, _ = replay(route, extract(route, root), root, details_out=details)
+    replayed, logged, active, details = replay(route, extract(route, root), root, details=True)
   finally:
     longitudinal.policy, longitudinal.MoonpilotLongitudinalPlanner.update = policy0, update0
-  return replayed, logged, active, _details_arrays(details), frames
+  return replayed, logged, active, details, frames
 
 
-def _burst_starts(a, mask):
-  """Where each burst starts, inside `mask` (engaged, above 5 m/s) only and never across its edge."""
-  n, out = round(BURST_T / DT_MDL), []
-  for r in runs(mask):
-    i = r.start
-    while i < r.stop - n:
-      if a[i + n] > BURST_END and a[i + n] - a[i] >= BURST_RISE:
-        out.append(i)
-        i += n
-      else:
-        i += 1
-  return out
 
 
 def _unmatched_starts(logged, a_ego, v_ego, active):
   """Measured bursts (aEgo over 0.5 s) no logged-command burst starts within `BURST_T` of, engaged above 5 m/s: unmatched,
   not a cause — a smaller or slower command ramp, a response delayed past the window, or aEgo noise reads the same."""
   mask = active & np.isfinite(logged) & (v_ego > 5.0)
-  car = np.convolve(a_ego, np.ones(10) / 10, mode="same")
-  commanded, n = _burst_starts(logged, mask), round(BURST_T / DT_MDL)
-  return [c for c in _burst_starts(car, mask) if not any(abs(c - k) <= n for k in commanded)]
+  car = moving_mean(a_ego, 10)
+  commanded, n = burst_starts(logged, mask), round(BURST_T / DT_MDL)
+  return [c for c in burst_starts(car, mask) if not any(abs(c - k) <= n for k in commanded)]
 
 
 def _logged_frames(route, root=DEFAULT_ROOT):
   """The logged command and the car, one row per planner tick of the route's extract, read without replaying: the same
   values `replay`'s details carry for them."""
   data = extract(route, root)
-  blob, offsets = data["blob"], data["offsets"]
-  index = {k: 1 + i * 3 for i, k in enumerate(MESSAGES)}
-  plan_col = 1 + len(MESSAGES) * 3
   rows = []
-  for row in offsets:
-    def read(kind, row=row):
-      start, size = row[index[kind]], row[index[kind] + 1]
-      return messaging.log_from_bytes(blob[start:start + size].tobytes())
-    cs, cc = read("carState").carState, read("carControl").carControl
-    start, size = row[plan_col], row[plan_col + 1]
-    a_target = float(messaging.log_from_bytes(blob[start:start + size].tobytes()).longitudinalPlan.aTarget) if size else np.nan
-    rows.append((int(row[0]) * 1e-9, a_target, cs.aEgo, cs.vEgo, cc.longActive))
+  for mono, messages, _, plan in ExtractReader(data).rows():
+    cs, cc = messages["carState"].carState, messages["carControl"].carControl
+    a_target = float(plan.longitudinalPlan.aTarget) if plan is not None else np.nan
+    rows.append((mono * 1e-9, a_target, cs.aEgo, cs.vEgo, cc.longActive))
   t, logged, a_ego, v_ego, active = (np.asarray(c, dtype=float) for c in zip(*rows, strict=True))
   return {"t": t, "logged": logged, "a_ego": a_ego, "v_ego": v_ego, "active": active > 0}
 
@@ -288,7 +264,7 @@ def _burst_kind(f0, f1, m, i, n, far_headway):
       kind += " (throttle permission returned)"
     elif f0[0] >= f0[6] - 0.05 and f1[0] >= f1[6] - 0.05:
       kind += " (the set-speed ladder)"
-      deficit = m["v_cruise"][i] / 3.6 - m["v_ego"][i]
+      deficit = m["v_cruise"][i] / CV.MS_TO_KPH - m["v_ego"][i]
     else:
       kind += " (unresolved)"
   return kind, far, deficit
@@ -303,7 +279,7 @@ def _accel_bursts(args):
   candidates are the ones that produced it; the rest are counted, unexplained. Today's own bursts, and today's with leads
   past `--far-headway` (and `BURST_FAR_MIN_GAP`) ignored, are counterfactual counts. Command path only."""
   from concurrent.futures import ProcessPoolExecutor
-  routes = list(dict.fromkeys(expand(args.routes, ROUTE_SETS)))
+  routes = expand(args.routes, args.root)
   n = round(BURST_T / DT_MDL)
   totals, kinds = {"logged": 0, "car": 0, "today (counterfactual)": 0, "today, far leads ignored": 0}, {}
   minutes, errs, deficits, car_only, reproduced, far_count = 0.0, [], [], 0, 0, 0
@@ -316,10 +292,10 @@ def _accel_bursts(args):
       continue
     errs.append(np.abs(replayed[mask] - logged[mask]))
     minutes += mask.sum() * DT_MDL / 60
-    car = np.convolve(m["a_ego"], np.ones(10) / 10, mode="same")
-    commanded = _burst_starts(logged, mask)
+    car = moving_mean(m["a_ego"], 10)
+    commanded = burst_starts(logged, mask)
     for key, series in (("logged", logged), ("car", car), ("today (counterfactual)", replayed), ("today, far leads ignored", dropped)):
-      totals[key] += len(_burst_starts(series, mask))
+      totals[key] += len(burst_starts(series, mask))
     car_only += len(_unmatched_starts(logged, m["a_ego"], m["v_ego"], active))  # the same selection `burst-chain` places
     for i in commanded:
       if np.max(np.abs(replayed[i:i + n + 1] - logged[i:i + n + 1])) > BURST_REPRO_TOL or frames[i] is None or frames[i + n] is None:
@@ -350,9 +326,8 @@ HANDBACK_WINDOW_S, HANDBACK_GAS_S = 4.0, 0.5
 
 def _handback_replay(job):
   route, root, on = job
-  details = []
-  replayed, logged, active, _ = replay(route, extract(route, root), root, overrides={"MoonpilotHandbackEase": int(on)}, details_out=details)
-  return replayed, logged, active, _details_arrays(details)
+  replayed, logged, active, details = replay(route, extract(route, root), root, overrides={HANDBACK_EASE.key: int(on)}, details=True)
+  return replayed, logged, active, details
 
 
 def _handback_edges(active, gas, v_ego, t):
@@ -376,7 +351,7 @@ def _handback(args):
   command at +1 s, its peak and its mean (the speed it buys). The off arm against the logged command is the gate: those
   drives had no ease. Command path only: the car is held as recorded, so the ease's own effect on speed is not flown."""
   from concurrent.futures import ProcessPoolExecutor
-  routes = list(dict.fromkeys(expand(args.routes, ROUTE_SETS)))
+  routes = expand(args.routes, args.root)
   with ProcessPoolExecutor(3, max_tasks_per_child=1) as pool:
     off = list(pool.map(_handback_replay, [(r, args.root, False) for r in routes]))
     on = list(pool.map(_handback_replay, [(r, args.root, True) for r in routes]))
@@ -390,7 +365,7 @@ def _handback(args):
       inside[w] = True
       for arm, cmd in (("off", cmd_off), ("on", cmd_on)):
         c = cmd[w]
-        rows[arm].append((float(np.max(c[one:] - c[:-one])), len(_burst_starts(cmd, inside)), c[one], c.max(), c.mean()))
+        rows[arm].append((float(np.max(c[one:] - c[:-one])), len(burst_starts(cmd, inside)), c[one], c.max(), c.mean()))
   if not rows["off"]:
     print(f"no gas-led hand-backs on {len(routes)} drives")
     return
@@ -405,13 +380,13 @@ def _handback(args):
 
 def register(sub):
   parser = sub.add_parser("accel-bursts", help="engaged positive accel bursts and what they come from; far leads ignored as an arm")
-  parser.add_argument("--routes", nargs="+", default=["engaged", "00000468"], help=f"route names or sets: {', '.join(ROUTE_SETS)}")
+  add_routes_arg(parser, ["longitudinal-plus-468"])
   parser.add_argument("--far-headway", type=float, default=4.0, help="s of headway past which a lead counts as far (and is ignored in the arm)")
   parser.set_defaults(fn=_accel_bursts)
   parser = sub.add_parser("burst-chain", help="each measured engaged accel burst against the delay-aligned plan, controller and PCM command")
-  parser.add_argument("--routes", nargs="+", default=["engaged", "00000468"], help=f"route names or sets: {', '.join(ROUTE_SETS)}")
+  add_routes_arg(parser, ["longitudinal-plus-468"])
   parser.set_defaults(fn=_burst_chain)
   parser.add_argument("--list", action="store_true", help="every placed unmatched event, by class, drive and time")
   parser = sub.add_parser("handback", help="gas-led hand-backs replayed with MoonpilotHandbackEase off and on")
-  parser.add_argument("--routes", nargs="+", default=["engaged", "00000468"], help=f"route names or sets: {', '.join(ROUTE_SETS)}")
+  add_routes_arg(parser, ["longitudinal-plus-468"])
   parser.set_defaults(fn=_handback)

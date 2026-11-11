@@ -18,26 +18,24 @@ from openpilot.common.realtime import DT_CTRL
 from openpilot.selfdrive.controls.lib.drive_helpers import clip_curvature
 
 from moonpilot import curvature as curvature_mod
-from moonpilot.curvature import MOONPILOT_LOOKAHEAD, MOONPILOT_SMOOTH_TAUS, PathSmooth, response_aligned_curvature
-from moonpilot.features import PATH_LOOKAHEAD
+from moonpilot.curvature import PathSmooth
+from moonpilot.features import PATH_LOOKAHEAD, PATH_SMOOTH
 from moonpilot.lab import drive_config, expand, param_index
-from moonpilot.lab.lateral import action, extract, model_at
+from moonpilot.lab.lateral import action, extract, reference_at
+from moonpilot.lab.routes import add_routes_arg
 
-ROUTE_SETS = {
-  # The claim's routes 000003f8-00000410, restricted to the drives that steered; 414 reuses lateral.py's extract.
-  "turns": ("000003f8", "00000400", "00000410", "00000414--32736d038c", "0000043e--d12558e19c", "0000043f--7b506ff942"),
-}
-LEVEL_NAMES = PATH_LOOKAHEAD.choices
+LEVEL_NAMES, LEVELS = PATH_LOOKAHEAD.labels, PATH_LOOKAHEAD.values
 BANDS = ("5-10", "10-17", ">17")
 DRIVER_LEAD = (1.5, 1.0, 1.5)  # the unoffered driver-lead variant the claim mentions
-UNFADED_SPEEDS = ([0.0, 1.0], [1.0, 1.0])  # MOONPILOT_LOOKAHEAD_SPEEDS with the low-speed fade disabled
+UNFADED_SPEEDS = ([0.0, 1.0], [1.0, 1.0])  # shared correction fade with the low-speed transition disabled
 
 
 def _config(route: str, root: str) -> SimpleNamespace:
   """The drive's smoothing tau and look-ahead level, from its own initData params."""
   _, params = drive_config(route, root)
-  tau = MOONPILOT_SMOOTH_TAUS[min(param_index(params, "MoonpilotPathSmooth"), len(MOONPILOT_SMOOTH_TAUS) - 1)]
-  level = min(param_index(params, "MoonpilotPathLookahead"), len(MOONPILOT_LOOKAHEAD) - 1)
+  tau = PATH_SMOOTH.at(param_index(params, PATH_SMOOTH.key))
+  level = param_index(params, PATH_LOOKAHEAD.key)
+  level = level if 0 <= level < len(LEVELS) else 0
   return SimpleNamespace(tau=tau, level=level)
 
 
@@ -46,14 +44,11 @@ def reference(d: dict, tau: float, lookahead, unfaded: bool = False) -> np.ndarr
   today's request at lookahead=None (the action plus the smoothing lead)."""
   request = action(d)
   out = np.array(request, copy=True)
-  ctx = mock.patch.object(curvature_mod, "MOONPILOT_LOOKAHEAD_SPEEDS", UNFADED_SPEEDS) if unfaded else nullcontext()
+  ctx = mock.patch.object(curvature_mod, "MOONPILOT_CORRECTION_SPEEDS", UNFADED_SPEEDS) if unfaded else nullcontext()
   with ctx:
     for k, i in enumerate(d["model_idx"]):
       if d["lat_active"][k]:
-        out[k] = response_aligned_curvature(model_at(d, int(i)), float(request[k]), v_ego=float(d["v_ego"][k]),
-                                            lat_delay=float(d["lat_delay"][k]), model_recv_time=float(d["m_t"][i]),
-                                            now=float(d["now"][k]), model_valid=bool(d["m_valid"][i]),
-                                            lookahead=lookahead, lead=tau)
+        out[k] = reference_at(d, k, int(i), float(request[k]), lookahead=lookahead, lead=tau)
   return out
 
 
@@ -67,9 +62,7 @@ def chain(d: dict, cfg: SimpleNamespace, lookahead) -> tuple[np.ndarray, np.ndar
   prev = 0.0
   for k, i in enumerate(d["model_idx"]):
     if d["lat_active"][k]:
-      u = response_aligned_curvature(model_at(d, int(i)), float(request[k]), v_ego=float(d["v_ego"][k]),
-                                     lat_delay=float(d["lat_delay"][k]), model_recv_time=float(d["m_t"][i]),
-                                     now=float(d["now"][k]), model_valid=bool(d["m_valid"][i]), lookahead=lookahead, lead=cfg.tau)
+      u = reference_at(d, k, int(i), float(request[k]), lookahead=lookahead, lead=cfg.tau)
       if smooth is not None:
         u = smooth.update(u, True)
       pre[k] = u
@@ -159,7 +152,7 @@ def _report(name: str, rows: list[tuple]):
 
 
 def _lookahead(args):
-  routes = expand(args.routes, ROUTE_SETS)
+  routes = expand(args.routes, args.root)
   rows: dict[str, list[tuple]] = {name: [] for name in LEVEL_NAMES[1:]}
   rows["driver"] = []
   unfaded_510: dict[str, list] = {name: [] for name in LEVEL_NAMES[1:]}
@@ -168,7 +161,7 @@ def _lookahead(args):
     d, cfg = extract(route, args.root), _config(route, args.root)
     mask = d["lat_active"] & d["m_valid"][d["model_idx"]]
     steering += int(mask.sum()) * DT_CTRL
-    pre, post = chain(d, cfg, MOONPILOT_LOOKAHEAD[cfg.level])
+    pre, post = chain(d, cfg, LEVELS[cfg.level])
     pre_err, post_err = fidelity(d, pre, post)
     errors.append(pre_err)
     print(f"  {route}: as-driven {LEVEL_NAMES[cfg.level]} + smooth {cfg.tau:.2f} s; median |err| pre-clip {pre_err:.2e}, post-clip {post_err:.2e} m/s²")
@@ -176,17 +169,17 @@ def _lookahead(args):
     print(f"  {route}: median |err| where the request was altered {altered:.2e} m/s²" if np.isfinite(altered) else
           f"  {route}: the reference altered no frame in this drive")
     today = reference(d, cfg.tau, None)
-    for level in range(1, len(MOONPILOT_LOOKAHEAD)):
+    for level in range(1, len(LEVELS)):
       name = LEVEL_NAMES[level]
-      rows[name].extend(turn_values(today, reference(d, cfg.tau, MOONPILOT_LOOKAHEAD[level]), d["v_ego"], mask))
-      full = reference(d, cfg.tau, MOONPILOT_LOOKAHEAD[level], unfaded=True)
+      rows[name].extend(turn_values(today, reference(d, cfg.tau, LEVELS[level]), d["v_ego"], mask))
+      full = reference(d, cfg.tau, LEVELS[level], unfaded=True)
       unfaded_510[name].extend(r[3] for r in turn_values(today, full, d["v_ego"], mask) if r[0] == BANDS[0])
     rows["driver"].extend(turn_values(today, reference(d, cfg.tau, DRIVER_LEAD), d["v_ego"], mask))
   print(f"lookahead: {len(routes)} routes, {steering:.0f} s steering; today's request (as-driven) reconstructed to {_med(errors):.2e} m/s² median")
   print(f"  route range {min(errors):.2e}-{max(errors):.2e} vs logged post-clip carControl.actuators.curvature, pre-clip where clip_curvature did not bind")
-  for level in range(1, len(MOONPILOT_LOOKAHEAD)):
+  for level in range(1, len(LEVELS)):
     name = LEVEL_NAMES[level]
-    _report(f"{name} {MOONPILOT_LOOKAHEAD[level]}", rows[name])
+    _report(f"{name} {LEVELS[level]}", rows[name])
     faded = _med([r[3] for r in rows[name] if r[0] == BANDS[0]])
     print(f"  {name}: 5-10 m/s inside drift with the fade disabled {_med(unfaded_510[name]):.3f} m vs faded {faded:.3f} m")
   _report(f"driver lead-in {DRIVER_LEAD}", rows["driver"])
@@ -194,5 +187,5 @@ def _lookahead(args):
 
 def register(sub):
   parser = sub.add_parser("lookahead", help="replay MoonpilotPathLookahead turn timing and drift")
-  parser.add_argument("--routes", nargs="+", default=["turns"], help=f"route names or sets: {', '.join(ROUTE_SETS)}")
+  add_routes_arg(parser, ["turns"])
   parser.set_defaults(fn=_lookahead)

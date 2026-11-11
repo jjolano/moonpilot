@@ -122,15 +122,8 @@ def manager_thread() -> None:
 
   params.put_bool("IsOffroad", True, block=True)
   ensure_running(managed_processes.values(), False, params=params, CP=sm['carParams'], not_run=ignore)
-  try:  # moonpilot seam, see AGENTS.md
-    from moonpilot import boot
-    boot.mark_boot_healthy()
-    rollback = boot.read_rollback()
-    if rollback:
-      params.put(boot.ROLLBACK_KEY, rollback, block=True)
-      cloudlog.warning(f"moonpilot rollback: {boot.rollback_text(params)}")
-  except Exception:  # moonpilot seam, see AGENTS.md
-    cloudlog.exception("failed to record moonpilot boot health")
+  from moonpilot import boot  # moonpilot seam, see AGENTS.md
+  boot.on_manager_ready(params)
 
   started_prev = False
   ignition_prev = False

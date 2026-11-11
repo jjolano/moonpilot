@@ -11,9 +11,11 @@ from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
 
+from openpilot.common.constants import CV
 import moonpilot.longitudinal as longitudinal
-from moonpilot.lab import driver
+from moonpilot.lab import driver, moving_mean
 from moonpilot.lab.planner import DT_MDL, _calibration, _fly_logged_lead
+from moonpilot.lab.routes import add_calibration_arg
 
 KEYS = ("t", "manual", "v", "a", "lead", "gap", "v_lead")
 ONSET_A = -0.3  # m/s^2 over 0.5 s: the braking run that ends at rest
@@ -30,7 +32,7 @@ def _stops(d):
   joined = np.r_[False, (np.abs(np.diff(gap)) <= 1.5) & (np.abs(np.diff(v_lead)) <= 1.0) & (rid[1:] == rid[:-1])
                  & (np.diff(d["t"]) <= 1.5 * DT_MDL)] & lead
   run = np.cumsum(~joined)
-  a_s = np.convolve(a, np.ones(10) / 10, mode="same")
+  a_s = moving_mean(a, 10)
   manual = d["manual"] > 0
   out = []
   for kr in np.flatnonzero((v[1:] < 0.1) & (v[:-1] >= 0.1)) + 1:
@@ -58,7 +60,7 @@ def _stops(d):
 def finish(v, a, gap):
   """From 2 m/s to 0.3 m/s: its time, the decel (0.5 s mean) passing 1.5 / 1.0 / 0.5 m/s, the gap at 0.3 m/s, and the
   peak decel before 2 m/s. None for a stop that never reaches 0.3 m/s."""
-  a_s = np.convolve(a, np.ones(10) / 10, mode="same")
+  a_s = moving_mean(a, 10)
   below2 = np.flatnonzero(v < 2.0)
   if not len(below2):
     return None
@@ -87,7 +89,7 @@ def _stop_finish(args):
   jobs = []
   for start, _on, kr, end in stops:
     w = slice(start, end)
-    jobs.append((d["v"][w], d["gap"][w], d["v_lead"][w], float(d["a"][start]), calibration, max(d["v"][start:kr].max(), 1.0) * 3.6 + 5.0,
+    jobs.append((d["v"][w], d["gap"][w], d["v_lead"][w], float(d["a"][start]), calibration, max(d["v"][start:kr].max(), 1.0) * CV.MS_TO_KPH + 5.0,
                  np.zeros(end - start)))
   print(f"{len(stops)} manual stops behind a lead at rest; flown from up to {PRE_S:g} s before the driver's onset, lead law only")
   print(f"  {'':18s}   n  2 -> 0.3 m/s       decel at 1.5 / 1.0 / 0.5 m/s   gap at 0.3   peak above 2 m/s")
@@ -108,5 +110,5 @@ def register(sub):
                      description=_stop_finish.__doc__)
   p.add_argument("--min-t", nargs="+", type=float, default=[longitudinal.MOONPILOT_ARRIVE_MIN_T, longitudinal.MOONPILOT_ARRIVE_MIN_T_REST],
                  help="MOONPILOT_ARRIVE_MIN_T_REST values to fly, s (the first default is the moving-lead value, the law before it)")
-  p.add_argument("--calibration", default="00000451", help="drive whose recorded lag and radar latency seed the flights")
+  add_calibration_arg(p)
   p.set_defaults(fn=_stop_finish)

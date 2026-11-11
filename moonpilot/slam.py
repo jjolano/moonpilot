@@ -10,21 +10,11 @@ already on the bus, no new vision frontend, no new service, so it runs on the de
 
 Two things about it are not obvious.
 
-- **What the window buys is lag, not accumulation.** With independent per-tick errors, inverse-
-  variance weights are constant and the window length would not matter. Errors that are *not*
-  independent are what matters, and they are exactly the error this exists to correct: a wheel-speed
-  scale error (a 2 % error at 20 m/s is 0.4 m/s of the planner's own input, 1.2 m of gap over a 3 s
-  approach). The window is how long an estimate of that is allowed to lag.
-- **The prior is read at the odometry's pose time, not at the frame's own.** `cameraOdometry`'s
-  `trans`/`rot` describe the pose as of `timestampEof - MOONPILOT_SLAM_POSE_DELAY` (locationd's own
-  `CAM_ODO_POSE_DELAY`, and the reason it computes its observation time that way). Pairing "latest
-  odometry" with "latest carState" instead puts an `a * 0.1 s` error on every interval -- 0.15-0.35
-  m/s while braking, the same order as the signal this file measures and correlated with exactly the
-  approach regime the planner's gap terms live in. So `PriorChannel` samples the wheel speed with
-  its own message times and interpolates it onto that third time, and a frame whose pose time
-  the prior cannot span is skipped rather than extrapolated. The exposure stamp is what the message
-  carries the pose for; the publish time is 30.5 ms later on the device and reading the prior there
-  gives back 30 % of the error, so `moonpilot/leadd.py` stamps the node from `timestampEof`.
+- **What the window buys is lag, not accumulation.** With independent per-tick errors, inverse-variance weights are
+  constant; correlated wheel-speed scale error is what the window estimates.
+- **The prior is read at the odometry's pose time.** `cameraOdometry` describes the pose at
+  `timestampEof - CAM_ODO_POSE_DELAY`; `leadd` stamps nodes from `timestampEof`, and `PriorChannel`
+  interpolates wheel speed from its message times without extrapolating. Replay measurements are in `docs/slam.md`.
 
 Two approximations are stage-1 on purpose. **The device frame is still treated as the car frame**:
 for each newly ingested pose, trusted `extrinsicsCalibration.rpyCalib` rotates `trans` from the
@@ -46,46 +36,69 @@ from collections import deque
 from typing import NamedTuple
 
 import numpy as np
+from openpilot.common.transformations.orientation import rot_from_euler
+from openpilot.selfdrive.locationd.helpers import rotate_std
+from openpilot.selfdrive.locationd.locationd import (
+  CALIB_RPY_SANITY_CHECK,
+  CAM_ODO_POSE_DELAY,
+  CAM_ODO_TRANS_STD_MULT,
+  MIN_STD_SANITY_CHECK,
+)
 
-from moonpilot.lead import resample
+from moonpilot.state import moonpilot_state
 
 # Starting points, fork-owned. Tune against logs: plot `egoCorrection` against `cameraOdometry` and the
 # wheel speed in PlotJuggler, and watch how often `valid` falls out.
 MOONPILOT_SLAM_WINDOW_S = 5.0  # s; how long an estimate of a motion error may lag
-MOONPILOT_SLAM_RATE_HZ = 20.0  # window nodes per second; cameraOdometry and carState both run here
-MOONPILOT_SLAM_MIN_NODES = 10  # below this the window says nothing, so it says nothing
+MOONPILOT_SLAM_RATE_HZ = 20.0  # nominal cameraOdometry sample rate
+MOONPILOT_SLAM_MIN_NODES = 10
 # How wrong the prior may be, in the same per-tick currency as the odometry stds. 1 m/s is ~5 % at
 # highway speed: the tyre wear, the grade and the slip a wheel-speed scale error is made of. Larger
 # means the correction leans further onto the model's odometry.
 MOONPILOT_SLAM_RAW_V_STD = 1.0  # m/s
-# Mirrors of locationd's own numbers, pinned by test_slam: the std floor it refuses below, and the
-# multiplier it discounts temporally correlated odometry noise by.
-MOONPILOT_SLAM_MIN_STD = 1e-5  # m/s; locationd.MIN_STD_SANITY_CHECK
-MOONPILOT_SLAM_TRANS_STD_MULT = 4  # locationd.CAM_ODO_TRANS_STD_MULT
-# s; locationd.CAM_ODO_POSE_DELAY. cameraOdometry's trans/rot describe the pose as of this long
-# before the message, and the prior is read there so both sides of an interval cover the same span.
-MOONPILOT_SLAM_POSE_DELAY = 0.1
-MOONPILOT_SLAM_PRIOR_WINDOW_S = 1.0  # s of prior samples kept; the pose time is 0.1 s behind at most
-MOONPILOT_SLAM_PRIOR_RATE_HZ = 100.0  # nominal carState rate
+MOONPILOT_SLAM_PRIOR_WINDOW_S = 1.0  # s of prior samples kept
 MOONPILOT_SLAM_MAX_CORR_VEL = 2.0  # m/s; hard clamp on |dVel|
-MOONPILOT_SLAM_MAX_AGE = 0.30  # s; the transport budget, on top of MOONPILOT_SLAM_POSE_DELAY: every
-# correction is that pose delay old by construction, and charging the consumer's budget for it would
-# spend a third of the staleness allowance on the sensor's own lag.
-MOONPILOT_SLAM_VEL_WINDOW_S = 1.0  # s of the window dVel speaks for; the whole window lags a change
-MOONPILOT_SLAM_CORR_STD_MIN = 0.02  # m; 1/(1 + corrStd) is the trust a consumer scales in, so the
-MOONPILOT_SLAM_CORR_STD_MAX = 2.0  # floor is nearly full trust and the ceiling is a third of it
+MOONPILOT_SLAM_MAX_AGE = 0.30  # s; transport budget, excluding pose delay
+MOONPILOT_SLAM_VEL_WINDOW_S = 1.0
+# Trust scale bounds, in m: near the floor is nearly full trust and at the ceiling it is a third.
+MOONPILOT_SLAM_CORR_STD_MIN = 0.02
+MOONPILOT_SLAM_CORR_STD_MAX = 2.0
 MOONPILOT_SLAM_MAX_SCALE_ERR = 0.1  # fraction of the speed being corrected, and the low-speed bound
-# A wheel-speed scale error is proportional to the speed it is measured on -- 2 % of 20 m/s is
-# 0.4 m/s, 2 % of 0 is 0 -- so the correction is bounded by a fraction of that speed rather than by
-# an absolute number alone. At a standstill the prior is exactly 0 and the weights hand ~90 % of the
-# answer to posenet, whose translation is least trustworthy there (locationd stops checking its
-# health below 5 m/s at all, `locationd.py:242`), and the result lands on the same `v_ego` both
-# standstill guards measure: MOONPILOT_SHOULD_STOP_SPEED in the planner's trailing gate and
-# upstream's 0.3 in `should_stop`. Replaying 988 s of genuinely parked corpus through the window
-# put a positive correction past 0.1 m/s on 0.05 % of frames, worst +0.578, which is enough to
-# clear should-stop and take the delivered command off `CP.stopAccel`. This bound is 0 there by
-# construction and inert where the feature earns its keep: 2 m/s of headroom at 20 m/s, against a
-# measured moving p99 of 0.19.
+# Parked and moving-route measurements are documented in `docs/slam.md`.
+
+class OdometrySample(NamedTuple):
+  mono_time: float
+  v_ego: float | None
+  trans: np.ndarray
+  trans_std: np.ndarray
+  rot: np.ndarray
+
+def device_from_calib(rpy_calib, valid=True):
+  if not valid:
+    return None
+  rpy_calib = np.asarray(rpy_calib, dtype=float)
+  if rpy_calib.shape != (3,) or not np.all(np.isfinite(rpy_calib)) or np.any(np.abs(rpy_calib) > CALIB_RPY_SANITY_CHECK):
+    return None
+  return None if not np.any(rpy_calib) else rot_from_euler(rpy_calib)
+
+
+def odometry_sample(odometry, prior: "PriorChannel", device_from_calib=None, valid=True) -> OdometrySample | None:
+  """Validate and align one camera-odometry message to its pose-time wheel-speed sample."""
+  if not valid or min(len(odometry.trans), len(odometry.transStd), len(odometry.rot)) < 3:
+    return None
+  mono_time = odometry.timestampEof * 1e-9 - CAM_ODO_POSE_DELAY
+  trans = np.asarray(odometry.trans, dtype=float)[:3]
+  trans_std = np.asarray(odometry.transStd, dtype=float)[:3]
+  if device_from_calib is not None:
+    trans = device_from_calib @ trans
+    trans_std = rotate_std(device_from_calib, trans_std)
+  return OdometrySample(mono_time, prior.at(mono_time), trans, trans_std, np.asarray(odometry.rot, dtype=float)[:3])
+
+
+def slam_node(sample: OdometrySample) -> "Node | None":
+  if sample.v_ego is None:
+    return None
+  return Node(sample.mono_time, sample.v_ego, float(sample.trans[0]), float(sample.trans_std[0]))
 
 
 class Node(NamedTuple):
@@ -103,21 +116,13 @@ class Node(NamedTuple):
 class PriorChannel:
   """One channel of the car's motion prior, sampled in time and read by interpolation.
 
-  A publisher pushes each sample with its own message time and reads it at the *odometry's* pose
-  time -- `timestampEof - MOONPILOT_SLAM_POSE_DELAY`, the exposure-stamped pose time the module
-  header explains -- which is why this exists instead of reading
-  the latest value off the subscription. `at` returns None rather than extrapolating: a pose time
-  the samples do not span is a frame the prior cannot speak for, and the window would rather skip a
-  sample than invent one.
-
-  Interpolation is `moonpilot.lead.resample` -- the fork's one time-alignment entry point -- on a
-  window short enough that its linear-on-purpose caveat does not apply: the samples are 10 ms apart,
-  not the model's 2 s.
+  The pose-time alignment is described in the module docstring. `at` returns None rather than
+  extrapolating when samples do not span the requested time.
   """
 
-  def __init__(self, window_s: float = MOONPILOT_SLAM_PRIOR_WINDOW_S, rate_hz: float = MOONPILOT_SLAM_PRIOR_RATE_HZ):
+  def __init__(self, window_s: float = MOONPILOT_SLAM_PRIOR_WINDOW_S):
     self.window_s = float(window_s)
-    self.window: deque[tuple[float, float]] = deque(maxlen=max(2, int(window_s * rate_hz) + 2))
+    self.window: deque[tuple[float, float]] = deque()
 
   def push(self, mono_time: float, value: float) -> None:
     if not (math.isfinite(mono_time) and math.isfinite(value)):
@@ -133,7 +138,7 @@ class PriorChannel:
     times = [sample[0] for sample in self.window]
     if not (times[0] <= mono_time <= times[-1]):
       return None
-    return float(resample(times, [sample[1] for sample in self.window], [mono_time])[0])
+    return float(np.interp(mono_time, times, [sample[1] for sample in self.window]))
 
 
 def invalid(mono_time: float = 0.0) -> dict:
@@ -148,16 +153,10 @@ def invalid(mono_time: float = 0.0) -> dict:
 
 
 class RotatingPoseWindow:
-  """The fixed-lag window: push a sample per frame, `update()` for the correction.
-
-  `push` drops anything non-finite and anything older than the window, so the window is never
-  poisoned by one bad frame and never grows: the maxlen and the time-based trim are the same rule
-  twice, the time-based one handling a gap and the maxlen handling a rate faster than RATE_HZ.
-  """
-
-  def __init__(self, window_s: float = MOONPILOT_SLAM_WINDOW_S, rate_hz: float = MOONPILOT_SLAM_RATE_HZ):
+  """The fixed-lag window: push a sample per frame, `update()` for the correction."""
+  def __init__(self, window_s: float = MOONPILOT_SLAM_WINDOW_S):
     self.window_s = float(window_s)
-    self.window = deque(maxlen=max(2, int(window_s * rate_hz)))
+    self.window = deque()
 
   def push(self, node: Node) -> None:
     if not all(math.isfinite(v) for v in node):
@@ -168,13 +167,7 @@ class RotatingPoseWindow:
       self.window.popleft()
 
   def update(self) -> dict:
-    """The correction at the end of the window, or an invalid one when the window cannot speak.
-
-    Per interval between consecutive nodes: the prior's increment (`vEgo`) and the odometry's
-    (`trans` x) are the same quantity in the same frame, so they are blended by inverse variance.
-    `dVel` is the blend minus the prior over the window's recent end, and `corrStd` is the 1-sigma
-    of the along-track position the blended increments accumulate over the whole window.
-    """
+    """The correction at the end of the window, or an invalid one when the window cannot speak."""
     nodes = list(self.window)
     if len(nodes) < MOONPILOT_SLAM_MIN_NODES:
       return invalid(nodes[-1].mono_time if nodes else 0.0)
@@ -182,7 +175,7 @@ class RotatingPoseWindow:
     t = np.array([n.mono_time for n in nodes], dtype=float)
     dt = np.diff(t)
     if not np.all(np.isfinite(dt)) or np.any(dt <= 0.0):
-      # Out-of-order or repeated timestamps: the window has no intervals to speak of.
+
       return invalid(t[-1])
 
     # The interval from node j to node j+1 carries node j's prior and node j+1's odometry: the
@@ -192,13 +185,13 @@ class RotatingPoseWindow:
     vo_vx = np.array([n.trans_x for n in vo], dtype=float)
     # The prior's weight is the std the driver's car state is plausible to, the odometry's is
     # posenet's inflated by the multiplier locationd discounts temporally correlated noise with.
-    vo_vx_std = np.maximum([n.trans_std_x for n in vo], MOONPILOT_SLAM_MIN_STD) * MOONPILOT_SLAM_TRANS_STD_MULT
+    vo_vx_std = np.maximum([n.trans_std_x for n in vo], MIN_STD_SANITY_CHECK) * CAM_ODO_TRANS_STD_MULT
 
     w_prior_v = 1.0 / (MOONPILOT_SLAM_RAW_V_STD * dt) ** 2
     w_vo_v = 1.0 / (vo_vx_std * dt) ** 2
 
     fused_v = (w_prior_v * prior_v + w_vo_v * vo_vx) / (w_prior_v + w_vo_v)
-    # The variance of each blended position increment; corrStd is their accumulated 1-sigma.
+
     var_v = 1.0 / (w_prior_v + w_vo_v)
     corr_std = float(np.sqrt(np.sum(var_v)))
 
@@ -237,23 +230,21 @@ def ego_speed_correction(sm, v_ego: float) -> float:
   case -- adding zero is the stock planner. Trust is scaled, never amplified: `corrStd` is the
   smoother's own 1-sigma, so a confident window is applied nearly whole and a doubtful one a third of
   the way (see MOONPILOT_SLAM_CORR_STD_*). The staleness budget is MOONPILOT_SLAM_MAX_AGE plus
-  MOONPILOT_SLAM_POSE_DELAY, because every correction carries the pose delay by construction.
+  CAM_ODO_POSE_DELAY, because every correction carries the pose delay by construction.
 
   `v_ego` is the raw wheel speed this correction is measured against, and the bound is a fraction of
   it (MOONPILOT_SLAM_MAX_SCALE_ERR): the error being corrected is a scale error, so it is zero at a
   standstill however confident the window is. Passed in rather than read off `carState` here so the
   bound is visible at the one call site that applies it.
 
-  getattr, not `sm.valid`: the longitudinal maneuver harness passes a plain dict as `sm`, the same
-  reason moonpilot/lead.py reads the leads that way. `alive` is what covers a daemon that died with
-  a fresh-looking message left in the socket: with no publisher, `alive` goes false in half a second
-  and `age` never moves again.
+
   """
-  if not (getattr(sm, "valid", {}).get("moonpilotState", False) and getattr(sm, "alive", {}).get("moonpilotState", False)):
+  state = moonpilot_state(sm)
+  if state is None:
     return 0.0
 
-  corr = sm["moonpilotState"].egoCorrection
-  if not corr.valid or corr.age > MOONPILOT_SLAM_MAX_AGE + MOONPILOT_SLAM_POSE_DELAY:
+  corr = state.egoCorrection
+  if not corr.valid or corr.age > MOONPILOT_SLAM_MAX_AGE + CAM_ODO_POSE_DELAY:
     return 0.0
   if not all(math.isfinite(v) for v in (corr.dVel, corr.corrStd, v_ego)):
     return 0.0

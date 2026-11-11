@@ -12,12 +12,9 @@ planner, so nothing may be learned from it — and `action_t` is the estimator's
 """
 
 import unittest
-from pathlib import Path
-from unittest import mock
 
 import numpy as np
 
-import moonpilot.longitudinal as longitudinal_mod
 from opendbc.car.honda.interface import CarInterface
 from opendbc.car.honda.values import CAR
 from openpilot.common.realtime import DT_MDL
@@ -28,15 +25,16 @@ from moonpilot.latency import (
   MOONPILOT_LAG_BLOCK_SIZE,
   MOONPILOT_LAG_HISTORY_KEY,
   MOONPILOT_LAG_MAX,
-  MOONPILOT_LAG_PERSIST_EVERY,
   MOONPILOT_LAG_WINDOW_SEC,
+  MOONPILOT_LAG_KEY,
   LongLagEstimator,
   applied_long_delay,
-  completed_blocks,
   persisted_seed,
 )
+from moonpilot.learned import PERSIST_EVERY, completed_blocks
 from moonpilot.longitudinal import MoonpilotLongitudinalPlanner
-from moonpilot.tests.test_longitudinal import _inputs, _lead, _planner
+from moonpilot.tests.fakes import params
+from moonpilot.tests.harness import inputs, lead, planner as make_planner
 
 CP = CarInterface.get_non_essential_params(CAR.HONDA_CIVIC)
 
@@ -84,7 +82,7 @@ class TestLongLagEstimator(unittest.TestCase):
     """`restore` is the persistence path and it takes whatever a drive left in the param: an absurd
     value is planned around no further than the ROI allows."""
     est = LongLagEstimator(CP)
-    est.restore([5.0] * MOONPILOT_LAG_BLOCKS_NEEDED)
+    est.restore(params(on=False, overrides={MOONPILOT_LAG_KEY: 5.0, MOONPILOT_LAG_BLOCKS_KEY: MOONPILOT_LAG_BLOCKS_NEEDED, MOONPILOT_LAG_HISTORY_KEY: None}))
     self.assertAlmostEqual(est.applied_delay(), MOONPILOT_LAG_MAX, delta=1e-9)
 
   def test_quasi_static_commands_are_not_identifiable(self):
@@ -142,15 +140,19 @@ class TestLongLagEstimator(unittest.TestCase):
     self.assertEqual(est.valid_blocks, before[0] + 1)
 
   def test_an_inconsistent_estimate_is_not_applied(self):
-    """Blocks that disagree by more than upstream's `MAX_LAG_STD` give `invalid`, which is what keeps
-    a drive that answered 0.05 s once and 0.55 s once from planning on their average."""
+    """A drive that answered 0.05 s once and 0.55 s once cannot plan on their average."""
     est = LongLagEstimator(CP)
-    est.restore([0.30] * MOONPILOT_LAG_BLOCKS_NEEDED)
+    est.restore(params(on=False, overrides={MOONPILOT_LAG_KEY: 0.30, MOONPILOT_LAG_BLOCKS_KEY: MOONPILOT_LAG_BLOCKS_NEEDED, MOONPILOT_LAG_HISTORY_KEY: None}))
     self.assertEqual(est.status, "estimated")
     est.block_avg.values[0] = 0.05
     est.block_avg.values[1] = 0.55
-    self.assertEqual(est.status, "invalid")
+    self.assertEqual(est.status, "unestimated")
     self.assertAlmostEqual(est.applied_delay(), CP.longitudinalActuatorDelay, delta=1e-9)
+
+
+def _lag_params(seed: float, blocks: int = MOONPILOT_LAG_BLOCKS_NEEDED, history=None):
+  """A store holding the learned lag as a drive would leave it: the value, its evidence, and optionally the blocks."""
+  return params(on=False, overrides={MOONPILOT_LAG_KEY: seed, MOONPILOT_LAG_BLOCKS_KEY: blocks, MOONPILOT_LAG_HISTORY_KEY: history})
 
 
 class TestPlannerWiring(unittest.TestCase):
@@ -161,24 +163,15 @@ class TestPlannerWiring(unittest.TestCase):
 
   @classmethod
   def _commands_at(cls, seed, v_ego, v_lead, d_rel, frames=80):
-    """Held at one state — the fork's own open-loop pattern — so both planners reach their level:
+    """Held at one state — the fork's own open-loop pattern — so a planner reaches its level:
     `jerk_limit` moves at most 0.1 m/s^2 per frame from a zero baseline."""
-    planner = _planner()
-    if seed is not None:
-      planner.long_lag.restore([seed] * MOONPILOT_LAG_BLOCKS_NEEDED)
-    sm = _inputs(v_ego=v_ego, v_cruise_kph=108.0, lead=_lead(d_rel, v_lead))
-    commands = []
-    for _ in range(frames):
-      planner.update(sm)
-      commands.append(planner.output_a_target)
-    return commands
+    return cls._commands(seed, frames=frames, state=(v_ego, v_lead, d_rel))[1]
 
   @classmethod
-  def _commands(cls, seed, frames=80):
-    planner = _planner()
-    if seed is not None:
-      planner.long_lag.restore([seed] * MOONPILOT_LAG_BLOCKS_NEEDED)
-    sm = _inputs(v_ego=cls.ONSET["v_ego"], v_cruise_kph=cls.ONSET["v_cruise_kph"], lead=_lead(cls.ONSET["d_rel"], cls.ONSET["v_lead"]))
+  def _commands(cls, seed, frames=80, state=None):
+    v_ego, v_lead, d_rel = state or (cls.ONSET["v_ego"], cls.ONSET["v_lead"], cls.ONSET["d_rel"])
+    planner = make_planner(params=_lag_params(seed) if seed is not None else params(on=False))
+    sm = inputs(v_ego=v_ego, v_cruise_kph=cls.ONSET["v_cruise_kph"], lead=lead(d_rel, v_lead))
     commands = []
     for _ in range(frames):
       planner.update(sm)
@@ -213,8 +206,8 @@ class TestPlannerWiring(unittest.TestCase):
     """Nothing is learned while the planner's command is not what moves the car. An unengaged car is
     the clearest case: `reset_state` holds, `output_a_target` is set to `a_ego`, and the estimator
     would be correlating the driver's own driving against itself."""
-    planner = _planner()
-    sm = _inputs(enabled=False)
+    planner = make_planner()
+    sm = inputs(enabled=False)
     for _ in range(600):
       planner.update(sm)
     self.assertEqual(planner.long_lag.valid_blocks, 0)
@@ -223,16 +216,13 @@ class TestPlannerWiring(unittest.TestCase):
   def test_a_persisted_value_is_seeded_on_construction(self):
     """Without a block history — a store written before `MoonpilotLongLagHistory` existed — a value the
     last drive left in `MoonpilotLongLag` is read
-    at construction and applied before the first frame. The `isinstance` guard is what keeps the
-    existing tests out of this path — their `FakeParams` answers every key with a bool, and a bool is
-    not a float — and what keeps the declared `"0.0"` default, below the ROI floor, from seeding."""
-    with mock.patch.object(longitudinal_mod, "Params", lambda: _StoredParams(0.45)):
-      seeded = MoonpilotLongitudinalPlanner(CP)
+    at construction and applied before the first frame. These cases use explicit typed overrides to
+    exercise persisted values and counts, while the declared `"0.0"` default stays below the ROI floor."""
+    seeded = MoonpilotLongitudinalPlanner(CP, params=_lag_params(0.45, blocks=0))
     self.assertEqual(seeded.long_lag.status, "estimated")
     self.assertAlmostEqual(seeded.action_t, 0.45 + DT_MDL, delta=1e-9)
 
-    with mock.patch.object(longitudinal_mod, "Params", lambda: _StoredParams(0.0)):
-      unmeasured = MoonpilotLongitudinalPlanner(CP)
+    unmeasured = MoonpilotLongitudinalPlanner(CP, params=_lag_params(0.0, blocks=0))
     self.assertEqual(unmeasured.long_lag.status, "unestimated")
     self.assertAlmostEqual(unmeasured.action_t, CP.longitudinalActuatorDelay + DT_MDL, delta=1e-9)
 
@@ -241,14 +231,12 @@ class TestPlannerWiring(unittest.TestCase):
     with too little engaged long control hand its block on instead of having it thrown away — and
     what keeps a mean from one block out of `action_t`. A value written before the count existed was
     only ever written when trusted, so a store that answers 0 for it still seeds as trusted."""
-    with mock.patch.object(longitudinal_mod, "Params", lambda: _StoredParams(0.45, 1)):
-      carried = MoonpilotLongitudinalPlanner(CP)
+    carried = MoonpilotLongitudinalPlanner(CP, params=_lag_params(0.45, blocks=1))
     self.assertEqual(carried.long_lag.valid_blocks, 1)
     self.assertEqual(carried.long_lag.status, "unestimated")
     self.assertAlmostEqual(carried.action_t, CP.longitudinalActuatorDelay + DT_MDL, delta=1e-9)
 
-    with mock.patch.object(longitudinal_mod, "Params", lambda: _StoredParams(0.45, MOONPILOT_LAG_BLOCKS_NEEDED)):
-      trusted = MoonpilotLongitudinalPlanner(CP)
+    trusted = MoonpilotLongitudinalPlanner(CP, params=_lag_params(0.45))
     self.assertEqual(trusted.long_lag.status, "estimated")
     self.assertAlmostEqual(trusted.action_t, 0.45 + DT_MDL, delta=1e-9)
 
@@ -256,16 +244,14 @@ class TestPlannerWiring(unittest.TestCase):
     """The history wins over the value and count: the blocks come back as they were, so their spread
     is still what `MAX_LAG_STD` judges, and the next persist writes them back out unchanged."""
     history = [0.40, 0.50, 0.40, 0.50, 0.45]
-    with mock.patch.object(longitudinal_mod, "Params", lambda: _StoredParams(0.45, MOONPILOT_LAG_BLOCKS_NEEDED, history)):
-      planner = MoonpilotLongitudinalPlanner(CP)
+    planner = MoonpilotLongitudinalPlanner(CP, params=_lag_params(0.45, history=history))
     np.testing.assert_allclose(completed_blocks(planner.long_lag.block_avg), history, atol=1e-9)
     self.assertAlmostEqual(planner.long_lag.block_avg.get()[1], float(np.std(history)), delta=1e-9)
     self.assertAlmostEqual(planner.action_t, 0.45 + DT_MDL, delta=1e-9)
 
-    planner = _planner()
-    planner.long_lag.restore(history)
-    for _ in range(MOONPILOT_LAG_PERSIST_EVERY):
-      planner.update(_inputs())
+    planner = make_planner(params=_lag_params(0.45, history=history))
+    for _ in range(PERSIST_EVERY):
+      planner.update(inputs())
     self.assertEqual(planner.params.puts.get(MOONPILOT_LAG_HISTORY_KEY), history)
 
   def test_evidence_accumulates_across_seeds(self):
@@ -274,7 +260,7 @@ class TestPlannerWiring(unittest.TestCase):
     restarting. The value stays inside the same gates — it is the *amount* of evidence that is being
     accumulated, not its quality."""
     est = LongLagEstimator(CP, DT_MDL)
-    est.restore([0.30] * (MOONPILOT_LAG_BLOCKS_NEEDED - 1))
+    est.restore(_lag_params(0.30, blocks=MOONPILOT_LAG_BLOCKS_NEEDED - 1))
     self.assertEqual(est.status, "unestimated")
     self.assertAlmostEqual(est.applied_delay(), CP.longitudinalActuatorDelay, delta=1e-9)
 
@@ -284,50 +270,47 @@ class TestPlannerWiring(unittest.TestCase):
     self.assertAlmostEqual(est.applied_delay(), 0.30, delta=DT_MDL)
 
 
-class _StoredParams:
-  """A param store holding the persisted lag, for the seeding path `FakeParams`'s bool cannot reach.
-  `blocks` answers the evidence key and `history` the block history; the value answers the rest."""
-
-  def __init__(self, value, blocks=None, history=None):
-    self.value = value
-    self.blocks = blocks
-    self.history = history
-
-  def get(self, key, block=False, return_default=False):
-    if key == MOONPILOT_LAG_BLOCKS_KEY:
-      return self.blocks if self.blocks is not None else 0
-    if key == MOONPILOT_LAG_HISTORY_KEY:
-      return self.history
-    return self.value
 
 
 class TestAppliedLongDelay(unittest.TestCase):
-  """The horizon `modeld` decodes the longitudinal ask at is the number the planner projects through,
-  plus the model's smoothing: one validator (`persisted_seed`) decides what a persisted value is worth
-  for both consumers, so a boot cannot compute the ask and the plan for different horizons."""
+  """Modeld and the planner accept the same persisted estimate."""
 
   def test_the_stock_constant_is_the_floor_and_the_fallback(self):
-    self.assertIsNone(persisted_seed(_StoredParams(0.0)))
-    self.assertAlmostEqual(applied_long_delay(CP, _StoredParams(0.0)), CP.longitudinalActuatorDelay, delta=1e-9)
-    self.assertAlmostEqual(applied_long_delay(CP, _StoredParams(0.0), 0.3), CP.longitudinalActuatorDelay + 0.3, delta=1e-9)
+    zero = params(on=False, overrides={MOONPILOT_LAG_KEY: 0.0, MOONPILOT_LAG_BLOCKS_KEY: 0, MOONPILOT_LAG_HISTORY_KEY: None})
+    self.assertIsNone(persisted_seed(zero))
+    self.assertAlmostEqual(applied_long_delay(CP, zero), CP.longitudinalActuatorDelay, delta=1e-9)
+    self.assertAlmostEqual(applied_long_delay(CP, zero, 0.3), CP.longitudinalActuatorDelay + 0.3, delta=1e-9)
 
   def test_a_trusted_value_is_applied_with_its_evidence(self):
-    trusted = _StoredParams(0.45, MOONPILOT_LAG_BLOCKS_NEEDED)
+    trusted = params(on=False, overrides={MOONPILOT_LAG_KEY: 0.45, MOONPILOT_LAG_BLOCKS_KEY: MOONPILOT_LAG_BLOCKS_NEEDED, MOONPILOT_LAG_HISTORY_KEY: None})
+    uncounted = params(on=False, overrides={MOONPILOT_LAG_KEY: 0.45, MOONPILOT_LAG_BLOCKS_KEY: 0, MOONPILOT_LAG_HISTORY_KEY: None})
+    partial = params(on=False, overrides={MOONPILOT_LAG_KEY: 0.45, MOONPILOT_LAG_BLOCKS_KEY: 1, MOONPILOT_LAG_HISTORY_KEY: None})
     self.assertAlmostEqual(applied_long_delay(CP, trusted), 0.45, delta=1e-9)
-    # a value written before the count existed was only ever written when trusted
-    self.assertAlmostEqual(applied_long_delay(CP, _StoredParams(0.45)), 0.45, delta=1e-9)
-    # below the requirement the value is carried, not applied
-    self.assertAlmostEqual(applied_long_delay(CP, _StoredParams(0.45, 1)), CP.longitudinalActuatorDelay, delta=1e-9)
+    self.assertAlmostEqual(applied_long_delay(CP, uncounted), 0.45, delta=1e-9)
+    self.assertAlmostEqual(applied_long_delay(CP, partial), CP.longitudinalActuatorDelay, delta=1e-9)
 
   def test_the_roi_bounds_the_value(self):
-    self.assertAlmostEqual(applied_long_delay(CP, _StoredParams(1.5, MOONPILOT_LAG_BLOCKS_NEEDED)), MOONPILOT_LAG_MAX, delta=1e-9)
-    self.assertAlmostEqual(applied_long_delay(CP, _StoredParams(0.02, MOONPILOT_LAG_BLOCKS_NEEDED)), CP.longitudinalActuatorDelay, delta=1e-9)
+    high = params(on=False, overrides={MOONPILOT_LAG_KEY: 1.5, MOONPILOT_LAG_BLOCKS_KEY: MOONPILOT_LAG_BLOCKS_NEEDED, MOONPILOT_LAG_HISTORY_KEY: None})
+    low = params(on=False, overrides={MOONPILOT_LAG_KEY: 0.02, MOONPILOT_LAG_BLOCKS_KEY: MOONPILOT_LAG_BLOCKS_NEEDED, MOONPILOT_LAG_HISTORY_KEY: None})
+    self.assertAlmostEqual(applied_long_delay(CP, high), MOONPILOT_LAG_MAX, delta=1e-9)
+    self.assertAlmostEqual(applied_long_delay(CP, low), CP.longitudinalActuatorDelay, delta=1e-9)
 
-  def test_modeld_decodes_at_it(self):
-    """Both the horizon it starts with and the one it re-reads: a boot with a learned value and a
-    boot that learns one mid-drive must decode the ask at the plan's own horizon."""
-    text = (Path(__file__).resolve().parents[2] / "openpilot/selfdrive/modeld/modeld.py").read_text()
-    self.assertEqual(text.count("applied_long_delay(CP, params, long_smooth)"), 2)
+  def test_wide_history_is_rejected_by_modeld_and_planner(self):
+    wide = params(on=False, overrides={MOONPILOT_LAG_KEY: 0.40, MOONPILOT_LAG_BLOCKS_KEY: MOONPILOT_LAG_BLOCKS_NEEDED,
+                                       MOONPILOT_LAG_HISTORY_KEY: [0.10, 0.20, 0.50, 0.55, 0.60]})
+    planner = LongLagEstimator(CP)
+    planner.restore(wide)
+    self.assertEqual(planner.status, "unestimated")
+    self.assertAlmostEqual(applied_long_delay(CP, wide), CP.longitudinalActuatorDelay, delta=1e-9)
+
+  def test_tight_history_is_applied_by_modeld_and_planner(self):
+    tight = params(on=False, overrides={MOONPILOT_LAG_KEY: 0.40, MOONPILOT_LAG_BLOCKS_KEY: MOONPILOT_LAG_BLOCKS_NEEDED,
+                                        MOONPILOT_LAG_HISTORY_KEY: [0.39, 0.40, 0.40, 0.41, 0.40]})
+    planner = LongLagEstimator(CP)
+    planner.restore(tight)
+    self.assertEqual(planner.status, "estimated")
+    self.assertAlmostEqual(planner.applied_delay(), 0.40, delta=1e-9)
+    self.assertAlmostEqual(applied_long_delay(CP, tight), 0.40, delta=1e-9)
 
 
 if __name__ == "__main__":

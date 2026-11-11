@@ -1,46 +1,40 @@
 """Moonpilot settings panel for mici with inline vertical feature/model pages."""
 
-from collections.abc import Callable
 
-from moonpilot import models, tailscale
-from moonpilot.engage import car_unavailable_reason
-from moonpilot.features import GROUPS, Group, Feature, available, choice, wanted
-from moonpilot.ui import models_mici, offroad_mode_mici
+from moonpilot import boot, deps, modelprotocols, modelview, tailscale
+from moonpilot.features import GROUPS, Group, Feature, car_reason, choice, missing_modules, wanted
+from moonpilot.ui import models_mici, offroad_mode_mici, panel_common, widgets_mici
 from moonpilot.ui.tailscale_qr_mici import TailscaleSignInDialogMici
 from openpilot.common.params import Params
 from openpilot.selfdrive.ui.mici.widgets.button import BigButton, BigMultiParamToggle, BigParamControl
 from openpilot.selfdrive.ui.mici.widgets.dialog import BigDialog
 from openpilot.selfdrive.ui.ui_state import ui_state
 from openpilot.system.ui.lib.application import gui_app
+from moonpilot.ui.panel_common import PageStack
 from openpilot.system.ui.widgets import Widget
 from openpilot.system.ui.widgets.scroller import Scroller
 
 
-def _feature_button(feature: Feature):
+def _feature_button(feature: Feature, parked_only: bool):
   if feature.choices:
-    button: BigParamControl | BigMultiParamToggle = BigMultiParamToggle(feature.title, feature.key, list(feature.choices), description=feature.description)
+    button: BigParamControl | BigMultiParamToggle = BigMultiParamToggle(feature.title, feature.key, list(feature.labels), description=feature.description)
   else:
     button = BigParamControl(feature.title, feature.key, description=feature.description)
-  button.set_enabled(lambda f=feature: available(f) and car_unavailable_reason(f, ui_state.CP) is None and (not f.offroad_only or ui_state.is_offroad()))
+  button.set_enabled(lambda: panel_common.feature_enabled(feature, parked_only))
   return button
 
 
 def _unavailable_value(feature: Feature) -> str:
-  if reason := car_unavailable_reason(feature, ui_state.CP):
-    return reason
-  return "" if available(feature) else "unavailable"
+  if missing_modules(feature):
+    return "unavailable"
+  return car_reason(feature, ui_state.CP) or ""
 
 
 def _dependencies_row(params: Params):
-  from moonpilot import deps
-
   row = BigButton("dependencies", deps.status_text(params)[0])
 
   def activate():
-    state = deps.read_status(params)[0]
-    if state == deps.WAITING_METERED:
-      deps.request_retry(params)
-    elif detail := deps.status_text(params)[1]:
+    if not deps.request_retry(params) and (detail := deps.status_text(params)[1]):
       gui_app.push_widget(BigDialog("dependencies", detail))
 
   row.set_click_callback(activate)
@@ -48,52 +42,18 @@ def _dependencies_row(params: Params):
 
 
 def _rollback_row(params: Params):
-  from moonpilot import boot
 
   row = BigButton("rollback", boot.rollback_text(params))
   row.set_visible(lambda: bool(boot.rollback_text(params)))
   return row
 
 
-class _PageStack(Widget):
-  def __init__(self):
-    super().__init__()
-    self._pages: list[Widget] = []
-
-  def set_root(self, page: Widget):
-    self._pages = [page]
-
-  def open(self, page: Widget):
-    if self._pages:
-      self._pages[-1].hide_event()
-    self._pages.append(page)
-    page.show_event()
-
-  def back(self):
-    if len(self._pages) <= 1:
-      return
-    self._pages.pop().hide_event()
-    self._pages[-1].show_event()
-
-  def show_event(self):
-    super().show_event()
-    if self._pages:
-      self._pages[-1].show_event()
-
-  def hide_event(self):
-    if self._pages:
-      self._pages[-1].hide_event()
-    super().hide_event()
-
-  def _render(self, rect):
-    if self._pages:
-      self._pages[-1].render(rect)
 
 
 class _FeatureRows:
-  def __init__(self, features: tuple[Feature, ...]):
+  def __init__(self, group: Group):
     self._params: Params = ui_state.params
-    self._rows = tuple((feature, _feature_button(feature)) for feature in features)
+    self._rows = tuple((feature, _feature_button(feature, group.parked_only)) for feature in group.features)
     self._cp = ui_state.CP
     self._update_rows()
 
@@ -111,49 +71,32 @@ class _FeatureRows:
 
   def _update_rows(self):
     for feature, button in self._rows:
+      # BigParamControl reads get_bool, which ignores the declared default: push the registry's answer.
+      reason = _unavailable_value(feature)
       if feature.choices:
-        # ponytail: a choice row's value line is its option, so it has no room for an unavailable
-        # reason; no choice feature has a dependency or car gate yet.
-        button.set_value(feature.choices[choice(feature, self._params)])
+        button.set_value(reason or feature.labels[choice(feature, self._params)])
         continue
-      button.set_value(_unavailable_value(feature))
+      button.set_value(reason)
       button.set_checked(wanted(feature, self._params))
 
 
-class GroupPageMici(Scroller):
-  """One feature group's inline page, with an explicit leading Back card."""
-
-  def __init__(self, group: Group, back: Callable):
-    self._rows = _FeatureRows(group.features)
-    back_card = BigButton(group.title, models.LABEL_BACK, description=group.description)
-    back_card.set_click_callback(back)
-    super().__init__(horizontal=False)
-    self._scroller.add_widgets([back_card, *self._rows.widgets])
-
-  def show_event(self):
-    super().show_event()
-    self._rows.show_event()
-
-  def _update_state(self):
-    super()._update_state()
-    self._rows.update_state()
 
 
 class MoonpilotLayoutMici(Widget):
   def __init__(self):
     super().__init__()
     self._params = ui_state.params
-    self._stack = self._child(_PageStack())
-    self._models_button = models_mici.submenu_button(
-      "models",
-      models.model_label(self._params, models.DRIVING),
-      description="Models from the openmodels catalog: what this car drives with and how it watches you.",
+    self._stack = self._child(PageStack())
+    self._models_button = widgets_mici.SubmenuButton(
+      modelview.TITLE_MODELS,
+      modelview.model_label(self._params, modelprotocols.DRIVING),
+      description=modelview.DESCRIPTION_MODELS,
     )
     self._models_button.set_click_callback(self._open_models)
 
     self._group_buttons: list[tuple[Group, BigButton]] = []
     for group in GROUPS:
-      button = models_mici.submenu_button(group.title, description=group.description)
+      button = widgets_mici.SubmenuButton(group.title, description=group.description)
       button.set_click_callback(lambda group=group: self._open_group(group))
       self._group_buttons.append((group, button))
 
@@ -168,11 +111,6 @@ class MoonpilotLayoutMici(Widget):
     )
     self._stack.set_root(self._root)
     self._update_rows()
-    ui_state.add_offroad_transition_callback(self._update_rows)
-
-  def show_event(self):
-    super().show_event()
-    self._update_rows()
 
   def _update_state(self):
     super()._update_state()
@@ -185,12 +123,13 @@ class MoonpilotLayoutMici(Widget):
     self._stack.open(models_mici.ModelsPage(self._params, self._stack.open, self._stack.back))
 
   def _open_group(self, group: Group):
-    self._stack.open(GroupPageMici(group, self._stack.back))
+    rows = _FeatureRows(group)
+    page = widgets_mici.Page(rows.widgets, group.title, group.description, self._stack.back, rows.update_state)
+    self._stack.open(page)
 
   def _update_rows(self):
-    self._models_button.set_value(models.model_label(self._params, models.DRIVING))
+    self._models_button.set_value(modelview.model_label(self._params, modelprotocols.DRIVING))
     self._tailscale.set_value(tailscale.status_text(self._params)[0])
-    from moonpilot import boot, deps
 
     self._dependencies.set_value(deps.status_text(self._params)[0])
     self._rollback.set_value(boot.rollback_text(self._params))

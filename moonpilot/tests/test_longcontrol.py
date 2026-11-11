@@ -23,7 +23,8 @@ from moonpilot.longcontrol import (
   MoonpilotLongControl,
   moonpilot_longcontrol,
 )
-from moonpilot.tests.fakes import _params
+from moonpilot.longitudinal import moonpilot_longitudinal_planner
+from moonpilot.tests.fakes import params
 
 LongCtrlState = car.CarControl.Actuators.LongControlState
 
@@ -288,13 +289,23 @@ class TestCrawlRelease(unittest.TestCase):
 class TestLongControlSeam(unittest.TestCase):
   def test_factory_returns_the_fork_controller_only_when_wanted(self):
     CP = CarInterface.get_non_essential_params(CAR.HONDA_CIVIC)
-    self.assertIsInstance(moonpilot_longcontrol(CP, _params(on=True)), MoonpilotLongControl)
-    self.assertIsNone(moonpilot_longcontrol(CP, _params(on=False)))
+    self.assertIsInstance(moonpilot_longcontrol(CP, params(on=True)), MoonpilotLongControl)
+    self.assertIsNone(moonpilot_longcontrol(CP, params(on=False)))
+
+  def test_stock_acc_cars_use_upstream_longcontrol(self):
+    CP = CarInterface.get_non_essential_params(CAR.HONDA_CIVIC)
+    CP.openpilotLongitudinalControl = False
+    self.assertIsNone(moonpilot_longcontrol(CP, params(on=True)))
+
+  def test_stock_acc_cars_use_upstream_planner(self):
+    CP = CarInterface.get_non_essential_params(CAR.HONDA_CIVIC)
+    CP.openpilotLongitudinalControl = False
+    self.assertIsNone(moonpilot_longitudinal_planner(CP, params(on=True)))
 
   def test_the_crawl_release_is_read_from_its_toggle_at_construction(self):
     CP = CarInterface.get_non_essential_params(CAR.HONDA_CIVIC)
     for on in (False, True):
-      controller = moonpilot_longcontrol(CP, _params(on=True, overrides={"MoonpilotCrawlRelease": on}))
+      controller = moonpilot_longcontrol(CP, params(on=True, overrides={"MoonpilotCrawlRelease": on}))
       assert controller is not None
       self.assertIs(controller.crawl_release, on)
 

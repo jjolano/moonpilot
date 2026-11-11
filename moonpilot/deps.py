@@ -5,11 +5,8 @@ AGNOS ships a read-only rootfs with a system `python3.12` and no venv, no `pip` 
 anything afterwards. So a fork feature that needs a package off that lock has to bring its own
 installer, and that is what `uv()` + `install()` are.
 
-The target directory is `<data_root>/deps/current`, a symlink to the hash-named release under
-`<data_root>/deps/releases/`, outside the checkout on purpose. The updater runs `git clean -xdff` +
-`git reset --hard` and then swaps the whole checkout directory, so a package installed under
-`/data/openpilot` is gone on the next update; `/data` is the only writable tree and survives (see
-moonpilot/paths.py). It is not on `sys.path`, hence the import-time append below.
+The active release is `<data_root>/deps/current`, a symlink to a hash-named release under
+`<data_root>/deps/releases/`. The path is appended to `sys.path` by `activate()`.
 
 This module is imported on init paths (the manager's process table, the UI, plannerd), so it
 imports only the standard library: everything heavier lives inside the function that needs it.
@@ -25,11 +22,10 @@ import tempfile
 import time
 from dataclasses import dataclass
 
-from moonpilot import paths
+from moonpilot import paths, status
 
-# The uv release we bootstrap on device. The asset is the glibc aarch64 build, which matches the
-# device's `comma_arm64` target (SConstruct:179-182 selects clang and /usr/lib/aarch64-linux-gnu
-# for that arch). UV_SHA256 is the sha256 of that exact asset, checked before it is ever executed.
+# The device uses uv's glibc aarch64 asset for the `comma_arm64` target. UV_SHA256
+# hashes that exact asset before it is ever executed.
 UV_VERSION = "0.12.13"
 UV_SHA256 = "2eaa5d94f5db7b3a1a092156b9420459e42ab0217d917fe74a876309cef9b5e9"
 UV_ASSET = "uv-aarch64-unknown-linux-gnu.tar.gz"
@@ -45,6 +41,7 @@ WAITING_NETWORK = "waiting-network"
 WAITING_METERED = "waiting-metered"
 INSTALLING = "installing"
 ERROR = "error"
+READY_DETAIL = "All required modules are installed."
 
 
 @dataclass(frozen=True)
@@ -84,11 +81,9 @@ def activate() -> None:
   feature would stay off until something restarted those processes.
   """
   target = site_dir()
-  try:
-    present = os.path.isdir(target)
-  except OSError:
-    present = False
+  present = os.path.isdir(target)
   if target not in sys.path and present:
+    # Append, never insert: only supply what the system is missing.
     sys.path.append(target)
 
 
@@ -117,16 +112,15 @@ def missing() -> list[Requirement]:
 
 
 def put_status(params, state: str, detail: str = "") -> None:
-  """Publish a status string, avoiding a param write when it did not change."""
-  payload = f"{state} {detail}".strip()
-  if params.get(STATUS_KEY) != payload:
-    params.put(STATUS_KEY, payload)
+  status.put(params, STATUS_KEY, state, detail)
 
 
 def read_status(params) -> tuple[str, str]:
-  """Return `(state, detail)` from the last published status."""
-  state, _, detail = (params.get(STATUS_KEY) or "").partition(" ")
-  return state, detail
+  return status.read(params, STATUS_KEY)
+
+
+def can_retry(params) -> bool:
+  return read_status(params)[0] == WAITING_METERED
 
 
 def status_text(params) -> tuple[str, str]:
@@ -136,7 +130,7 @@ def status_text(params) -> tuple[str, str]:
   # CLEAR_ON_MANAGER_START — so after boot an empty status with nothing missing is the
   # normal case, not "still starting". Answer from reality until depsd has written.
   if not state and not missing():
-    return "ready", "All required modules are installed."
+    return "ready", READY_DETAIL
   labels = {
     READY: "ready",
     WAITING_NETWORK: "waiting for network",
@@ -147,9 +141,12 @@ def status_text(params) -> tuple[str, str]:
   return labels.get(state, "starting"), detail
 
 
-def request_retry(params) -> None:
-  """Authorize one install attempt over a metered connection."""
+def request_retry(params) -> bool:
+  """Authorize one install attempt over a metered connection, or refuse when that state has passed."""
+  if not can_retry(params):
+    return False
   params.put(REQUEST_KEY, "1")
+  return True
 
 
 def take_retry(params) -> bool:
@@ -171,7 +168,7 @@ def uv() -> str:
   if os.path.isfile(uv_path):
     return uv_path
 
-  from moonpilot import fetch  # fetch's heavy stdlib stays behind this import; deps.py is on the init path
+  from moonpilot import fetch
 
   fetch.extract(fetch.download(UV_URL, UV_SHA256), ("uv",), _bin_dir())
   return uv_path
@@ -262,7 +259,4 @@ def install() -> None:
         pass
 
 
-# Populates sys.path for everything that imports this module before the tree exists; see
-# activate(). Append, never insert: we only supply what the system is missing, so an installed
-# package must never shadow one the OS or AGNOS already ships.
 activate()

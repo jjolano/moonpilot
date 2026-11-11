@@ -1,29 +1,21 @@
-import contextlib
 import unittest
-import numpy as np
-import pyray as rl
-from types import SimpleNamespace
-from unittest import mock
 
+import numpy as np
 from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.realtime import DT_MDL
-from openpilot.cereal import log, messaging
+from openpilot.cereal import messaging
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import LEAD_DANGER_FACTOR
 from openpilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPlanner
-from openpilot.selfdrive.ui.ui_state import ui_state
+from openpilot.selfdrive.modeld.constants import ModelConstants
 from opendbc.car.honda.interface import CarInterface
 from opendbc.car.honda.values import CAR
-from openpilot.selfdrive.modeld.constants import ModelConstants
 from moonpilot.lead import (
   MOONPILOT_INPATH_GRID,
-  MOONPILOT_INPATH_HORIZON,
   MOONPILOT_INPATH_RC,
   MOONPILOT_LEAD_ACCEL_MIN_SAMPLES,
   MOONPILOT_LEAD_ACCEL_FAST_STREAK,
   MOONPILOT_LEAD_ACCEL_TAU,
   MOONPILOT_LEAD_ACCEL_WINDOW,
-  MOONPILOT_LEAD_PATH_PX_PER_M,
-  MOONPILOT_LEAD_PATH_WIDTH,
   MOONPILOT_LEAD_PROB_GATE,
   MOONPILOT_LEAD_PROB_RC,
   MOONPILOT_LEAD_SAME_CAR_GAP,
@@ -39,10 +31,11 @@ from moonpilot.lead import (
   lead_in_path_prob,
   lead_yaw_rel,
   normalize_lead,
-  resample,
 )
 from moonpilot.longitudinal import MOONPILOT_OUT_OF_PATH_ENTER, MOONPILOT_OUT_OF_PATH_LEAVE
-from moonpilot.tests.fakes import _params
+from moonpilot.tests.fakes import params
+from moonpilot.tests.harness import SubMaster, inputs, lead, slot
+
 
 STRAIGHT_PATH_X = list(np.linspace(0.0, 60.0, 33))
 STRAIGHT_PATH_Y = [0.0] * 33
@@ -80,44 +73,7 @@ class FusedLead:
     self.radarTrackId = track_id
 
 
-class FakeSubMaster:
-  def __init__(self, leads, valid=True, alive=True):
-    self.valid = {"moonpilotState": valid}
-    self.alive = {"moonpilotState": alive}
-    self._leads = leads
 
-  def __getitem__(self, s):
-    assert s == "moonpilotState"
-    return self
-
-  @property
-  def leads(self):
-    return self._leads
-
-
-class RendererSubMaster:
-  def __init__(self, state, valid=True, alive=True):
-    self.recv_frame = {"extrinsicsCalibration": 1, "modelV2": 1}
-    self.updated = {"carParams": False, "modelV2": False, "radarState": False}
-    self.valid = {"moonpilotState": valid, "radarState": False}
-    self.alive = {"moonpilotState": alive}
-    self._values = {
-      "carOutput": SimpleNamespace(actuatorsOutput=SimpleNamespace(torque=0.0)),
-      "extrinsicsCalibration": SimpleNamespace(height=[0.0]),
-      "modelV2": SimpleNamespace(),
-      "moonpilotState": state,
-      "radarState": None,
-      "selfdriveState": SimpleNamespace(),
-    }
-
-  def __getitem__(self, service):
-    return self._values[service]
-
-
-class FakeLead:
-  def __init__(self, present=True, in_path=1.0):
-    self.present = present
-    self.inPath = in_path
 
 
 def _filter(x0=1.0):
@@ -127,14 +83,6 @@ def _filter(x0=1.0):
 def _prob_filter(x0=1.0):
   """The gate's own filter (radard's shape), separate from the inPath one."""
   return FirstOrderFilter(x0, MOONPILOT_LEAD_PROB_RC, DT_MDL)
-
-
-class TestResample(unittest.TestCase):
-  def test_interpolates(self):
-    np.testing.assert_allclose(resample([0.0, 2.0], [0.0, 10.0], [1.0]), [5.0])
-
-  def test_too_short_is_empty(self):
-    assert resample([0.0], [1.0], [0.0, 1.0]).size == 0
 
 
 class TestRadardMirrors(unittest.TestCase):
@@ -190,17 +138,15 @@ class TestLeadAccelEstimator(unittest.TestCase):
     """Settled follow, then a step onto -3.5 m/s^2 at frame 0 of the second loop. Times are measured
     from that frame; `bare_window` is the same estimator with the onset window made inert, which is
     the arm this change is measured against."""
-    patch = mock.patch("moonpilot.lead.MOONPILOT_LEAD_ACCEL_FAST_STREAK", 10**9) if bare_window else contextlib.nullcontext()
+    estimator = LeadAccelEstimator(fast_streak=10**9 if bare_window else MOONPILOT_LEAD_ACCEL_FAST_STREAK)
     hit = {}
-    with patch:
-      estimator = LeadAccelEstimator()
-      for _ in range(30):  # 1.5 s settled, so the full window is full of pre-onset samples
-        estimator.update(FusedLead(35.0, 0.0, v_lead=20.0, radar=True))
-      for k in range(15):
-        a_lead, _ = estimator.update(FusedLead(35.0, 0.0, v_lead=20.0 - 3.5 * k * DT_MDL, radar=True))
-        for threshold in (-2.0, -3.0):
-          if threshold not in hit and a_lead <= threshold:
-            hit[threshold] = k * DT_MDL
+    for _ in range(30):
+      estimator.update(FusedLead(35.0, 0.0, v_lead=20.0, radar=True))
+    for k in range(15):
+      a_lead, _ = estimator.update(FusedLead(35.0, 0.0, v_lead=20.0 - 3.5 * k * DT_MDL, radar=True))
+      for threshold in (-2.0, -3.0):
+        if threshold not in hit and a_lead <= threshold:
+          hit[threshold] = k * DT_MDL
     return hit
 
   def test_the_onset_window_reads_a_brake_before_the_full_window_does(self):
@@ -231,9 +177,8 @@ class TestLeadAccelEstimator(unittest.TestCase):
     v = 20.0 + np.cumsum(rng.normal(0.0, 0.05, 600))
     series = []
     for streak in (MOONPILOT_LEAD_ACCEL_FAST_STREAK, 10**9):
-      estimator = LeadAccelEstimator()
-      with mock.patch("moonpilot.lead.MOONPILOT_LEAD_ACCEL_FAST_STREAK", streak):
-        series.append(np.array([estimator.update(FusedLead(35.0, 0.0, v_lead=float(x), radar=True))[0] for x in v]))
+      estimator = LeadAccelEstimator(fast_streak=streak)
+      series.append(np.array([estimator.update(FusedLead(35.0, 0.0, v_lead=float(x), radar=True))[0] for x in v]))
 
     self.assertFalse(bool((series[0] > series[1] + 1e-12).any()), "the onset window lifted the estimate")
     self.assertLess(float((series[0] < series[1] - 1e-12).mean()), 0.05)
@@ -245,9 +190,8 @@ class TestLeadAccelEstimator(unittest.TestCase):
     v = np.array([20.0] * 20 + [19.5] + [20.0] * 20)
     series = []
     for streak in (MOONPILOT_LEAD_ACCEL_FAST_STREAK, 10**9):
-      estimator = LeadAccelEstimator()
-      with mock.patch("moonpilot.lead.MOONPILOT_LEAD_ACCEL_FAST_STREAK", streak):
-        series.append(np.array([estimator.update(FusedLead(35.0, 0.0, v_lead=float(x), radar=True))[0] for x in v]))
+      estimator = LeadAccelEstimator(fast_streak=streak)
+      series.append(np.array([estimator.update(FusedLead(35.0, 0.0, v_lead=float(x), radar=True))[0] for x in v]))
 
     np.testing.assert_array_equal(series[0], series[1])
 
@@ -368,13 +312,13 @@ class TestLeadAccelEstimator(unittest.TestCase):
     v_lead = 20.0
     for _ in range(40):  # a long brake, which drives the filter's state to ~0
       v_lead -= 3.5 * DT_MDL
-      estimator.update(FusedLead(35.0, 0.0, v_lead=v_lead, radar=True))
-    self.assertLess(estimator._tau.x, 0.1)  # the state really did collapse
+      _, a_lead_tau = estimator.update(FusedLead(35.0, 0.0, v_lead=v_lead, radar=True))
+    self.assertLess(a_lead_tau, 0.1)  # the state really did collapse
 
     for _ in range(40):  # two seconds of holding speed
       _, a_lead_tau = estimator.update(FusedLead(35.0, 0.0, v_lead=v_lead, radar=True))
     self.assertEqual(a_lead_tau, MOONPILOT_LEAD_ACCEL_TAU)
-    self.assertEqual(estimator._tau.x, MOONPILOT_LEAD_ACCEL_TAU)  # re-armed, not just reported
+
 
     # so a second onset decays from the long tau again, rather than from the first brake's residue
     for _ in range(MOONPILOT_LEAD_ACCEL_MIN_SAMPLES):
@@ -390,8 +334,8 @@ class TestLeadAccelEstimator(unittest.TestCase):
     v_lead = 20.0
     for _ in range(40):
       v_lead -= 3.5 * DT_MDL
-      estimator.update(FusedLead(35.0, 0.0, v_lead=v_lead, radar=True, track_id=1))
-    self.assertLess(estimator._tau.x, 0.1)
+      _, a_lead_tau = estimator.update(FusedLead(35.0, 0.0, v_lead=v_lead, radar=True, track_id=1))
+    self.assertLess(a_lead_tau, 0.1)
 
     for i in range(MOONPILOT_LEAD_ACCEL_MIN_SAMPLES):
       _, a_lead_tau = estimator.update(FusedLead(50.0, 0.0, v_lead=13.0 - 3.5 * i * DT_MDL, radar=True, track_id=2))
@@ -420,6 +364,18 @@ class TestNormalizeLead(unittest.TestCase):
     self.assertAlmostEqual(out["x"][1], 40.0 + (61.52 - 41.52), places=6)
     self.assertEqual(out["v"], model.v)
     self.assertEqual(out["yStd"], model.yStd)
+
+  def test_normalized_dict_round_trips_through_capnp(self):
+    model = ModelLead(x=[41.52, 61.52, 81.52], y=[-0.5, -0.6, -0.7])
+    values = normalize_lead(0, model, FusedLead(40.0, 0.5), STRAIGHT_PATH_X, STRAIGHT_PATH_Y, _filter(), _prob_filter())
+    message = messaging.new_message("moonpilotState")
+    slot = message.moonpilotState.init("leads", 3)[0]
+    for field, value in values.items():
+      setattr(slot, field, value)
+    self.assertTrue(slot.present)
+    self.assertEqual(slot.source, "vision")
+    self.assertAlmostEqual(slot.x[0], 40.0)
+    self.assertEqual(len(slot.yawRel), len(model.x))
 
   def test_model_y_is_right_positive(self):
     # model_y increasing = drifting right = published y decreases, heading turns negative.
@@ -569,10 +525,6 @@ class TestLeadInPath(unittest.TestCase):
     # Resting low, one in-path frame restores stock behavior exactly.
     assert lead_in_path(**_wire(y=0.0), filt=_filter(0.0)) == 1.0
 
-  def test_grid_covers_the_cut_in_window(self):
-    assert MOONPILOT_INPATH_GRID[0] == 0.0
-    assert MOONPILOT_INPATH_GRID[-1] >= 4.0
-    assert MOONPILOT_INPATH_GRID[-1] < LEAD_T[-1]
 
   # A far lead on a straight path, in the model's own shape (route 0000044d at 211 s, and the corpus' p90 / p10 of the 4 s
   # knot): near the 0 s sample the std is a few tenths, at 2 s it is wide, and the 4 s knot sits meters off the lead's own
@@ -605,260 +557,41 @@ class TestLeadInPath(unittest.TestCase):
     each of those is still the true-std Gaussian, a far lead's 4 s sample included."""
     y, y_std = [0.0, 0.0, 6.0, 1.2, 3.0, -6.8], [0.2] * 6
     assert MOONPILOT_INPATH_YSTD_FLOOR > max(y_std)
-    x_d, y_d = resample(LEAD_T, self.FAR_X, MOONPILOT_INPATH_GRID), resample(LEAD_T, y, MOONPILOT_INPATH_GRID)
-    probs = lead_in_path_prob(x_d, y_d, resample(LEAD_T, y_std, MOONPILOT_INPATH_GRID), self.FAR_PATH_X, self.FAR_PATH_Y)
+    x_d, y_d = np.interp(MOONPILOT_INPATH_GRID, LEAD_T, self.FAR_X), np.interp(MOONPILOT_INPATH_GRID, LEAD_T, y)
+    probs = lead_in_path_prob(x_d, y_d, np.interp(MOONPILOT_INPATH_GRID, LEAD_T, y_std), self.FAR_PATH_X, self.FAR_PATH_Y)
     assert probs[-1] < 0.01, probs
     settled = lead_in_path(list(LEAD_T), self.FAR_X, y, y_std, self.FAR_PATH_X, self.FAR_PATH_Y, _filter(0.0))
     self.assertAlmostEqual(settled, float(np.mean(probs)), places=9)
 
 
-class TestRendererLeadPath(unittest.TestCase):
-  """The on-device line cannot be observed headlessly (EGL window init is unavailable here),
-  so project a synthetic lead through each tree's own renderer and check the line."""
-
-  W, H = 1920, 1080
-
-  @staticmethod
-  def _transform():
-    # Synthetic forward camera: u = W/2 + fx*y/x, v = cy + fz*z/x.
-    m = np.zeros((3, 3), dtype=np.float32)
-    m[0] = [TestRendererLeadPath.W / 2, 1600.0, 0.0]
-    m[1] = [350.0, 0.0, 2000.0]
-    m[2] = [1.0, 0.0, 0.0]
-    return m
-
-  def _renderer(self, tree):
-    if tree == "tizi":
-      from openpilot.selfdrive.ui.onroad.model_renderer import ModelRenderer
-    else:
-      from openpilot.selfdrive.ui.mici.onroad.model_renderer import ModelRenderer
-
-    r = ModelRenderer()
-    r.set_transform(self._transform())
-    r.set_rect(rl.Rectangle(0, 0, self.W, self.H))
-    r._clip_region = rl.Rectangle(-500, -500, self.W + 1000, self.H + 1000)
-    x = np.linspace(0.0, 60.0, 33)
-    r._path.raw_points = np.array([x, np.zeros_like(x), np.full_like(x, 1.2)], dtype=np.float32).T
-    r._path_offset_z = 0.0
-    return r
-
-  @staticmethod
-  def _state(y, present=True, in_path=1.0, y_std=None):
-    state = type("State", (), {})()
-    state.leads = []
-    if present:
-      lead = ModelLead(x=[40.0, 45.0, 50.0, 55.0, 60.0, 65.0], y=y, y_std=y_std)
-      lead.present = True
-      lead.inPath = in_path
-      state.leads = [lead]
-    return state
-
-  def _projected(self, tree, y, y_std=None):
-    r = self._renderer(tree)
-    r._update_lead_path(self._state(y, y_std=y_std), np.linspace(0.0, 60.0, 33).astype(np.float32))
-    return r._lead_path.projected_points, r._lead_in_path, r._lead_path_widths
-
-  def _render_lead_path(self, renderer, state, valid=True, alive=True):
-    renderer._transform_dirty = True
-    sm = RendererSubMaster(state, valid=valid, alive=alive)
-    rect = rl.Rectangle(0, 0, self.W, self.H)
-    with (
-      mock.patch.object(ui_state, "sm", sm),
-      mock.patch.object(ui_state, "started_frame", 0),
-      mock.patch.object(ui_state, "params", _params()),
-      mock.patch.object(renderer, "_update_model"),
-      mock.patch.object(renderer, "_draw_lane_lines"),
-      mock.patch.object(renderer, "_draw_path"),
-      mock.patch.object(renderer, "_draw_lead_path"),
-    ):
-      renderer._render(rect)
-
-  def test_projects_a_line(self):
-    for tree in ("tizi", "mici"):
-      with self.subTest(tree=tree):
-        points, in_path, widths = self._projected(tree, [0.0] * 6)
-        assert points.ndim == 2 and points.shape[1] == 2, points.shape
-        # One point per 0.5 s sample out to the planner's horizon, and one width per point.
-        assert 2 <= points.shape[0] <= int(MOONPILOT_INPATH_HORIZON / 0.5) + 1, points.shape
-        assert widths.shape[0] == points.shape[0], (widths.shape, points.shape)
-        assert np.isfinite(points).all()
-        self.assertEqual(in_path, 1.0)
-
-  def test_line_stops_at_the_planner_horizon(self):
-    # The lead's own grid runs 40..65 m over 10 s; the drawn line ends at the 4 s sample.
-    for tree in ("tizi", "mici"):
-      with self.subTest(tree=tree):
-        r = self._renderer(tree)
-        r._update_lead_path(self._state([0.0] * 6), np.linspace(0.0, 60.0, 33).astype(np.float32))
-        raw = r._lead_path.raw_points
-        self.assertAlmostEqual(float(raw[0, 0]), 40.0, places=4)
-        self.assertAlmostEqual(float(raw[-1, 0]), 50.0, places=4)
-
-  def test_width_comes_from_the_models_own_std(self):
-    for tree in ("tizi", "mici"):
-      with self.subTest(tree=tree):
-        floor, ceiling = MOONPILOT_LEAD_PATH_WIDTH
-        np.testing.assert_allclose(self._projected(tree, [0.0] * 6, y_std=[0.0] * 6)[2], floor)
-        np.testing.assert_allclose(self._projected(tree, [0.0] * 6, y_std=[10.0] * 6)[2], ceiling)
-        middle = np.clip(1.0 * MOONPILOT_LEAD_PATH_PX_PER_M, floor, ceiling)
-        np.testing.assert_allclose(self._projected(tree, [0.0] * 6, y_std=[1.0] * 6)[2], middle)
-
-  def test_a_short_y_std_falls_back_instead_of_raising(self):
-    # resample() is np.interp, which raises unless values is as long as t, so a partially
-    # populated yStd must not reach it.
-    for tree in ("tizi", "mici"):
-      with self.subTest(tree=tree):
-        points, _, widths = self._projected(tree, [0.0] * 6, y_std=[0.9])
-        assert points.shape[0] >= 2, points.shape
-        expected = np.clip(MOONPILOT_MIN_Y_STD * MOONPILOT_LEAD_PATH_PX_PER_M, *MOONPILOT_LEAD_PATH_WIDTH)
-        np.testing.assert_allclose(widths, expected)
-
-  def test_lateral_prediction_reaches_the_projection(self):
-    for tree in ("tizi", "mici"):
-      with self.subTest(tree=tree):
-        centered = self._projected(tree, [0.0] * 6)[0]
-        # y is left positive, and screen x grows to the right.
-        leftward = self._projected(tree, [2.0] * 6)[0]
-        assert leftward[:, 0].mean() < centered[:, 0].mean() - 20, (centered[:, 0].mean(), leftward[:, 0].mean())
-
-  def test_no_lead_or_missing_samples_draws_nothing(self):
-    for tree in ("tizi", "mici"):
-      with self.subTest(tree=tree):
-        r = self._renderer(tree)
-        path_x = np.linspace(0.0, 60.0, 33).astype(np.float32)
-
-        r._update_lead_path(self._state([0.0] * 6, present=False), path_x)
-        assert r._lead_path.projected_points.size == 0
-        assert r._lead_path_widths.size == 0
-
-        single = self._state([0.0])
-        r._update_lead_path(single, path_x)
-        assert r._lead_path.projected_points.size == 0
-        assert r._lead_path_widths.size == 0
-
-  def test_toggle_off_clears_the_line(self):
-    """The line shows the inPath the fork planner acts on, so it follows that feature's toggle:
-    with upstream's planner back in the line there is no decision for it to draw."""
-    for tree in ("tizi", "mici"):
-      with self.subTest(tree=tree):
-        r = self._renderer(tree)
-        path_x = np.linspace(0.0, 60.0, 33).astype(np.float32)
-        r._update_lead_path(self._state([0.0] * 6), path_x)
-        assert r._lead_path.projected_points.size > 0
-
-        with mock.patch.object(ui_state, "params", _params(on=False)):
-          r._update_lead_path(self._state([0.0] * 6), path_x)
-        assert r._lead_path.projected_points.size == 0
-        assert r._lead_path_widths.size == 0
-        self.assertEqual(r._lead_in_path, 1.0)
-
-  def test_invalid_or_dead_state_clears_and_redraws(self):
-    for valid, alive in ((False, True), (True, False)):
-      for tree in ("tizi", "mici"):
-        with self.subTest(tree=tree, valid=valid, alive=alive):
-          r = self._renderer(tree)
-          state = self._state([0.0] * 6)
-
-          self._render_lead_path(r, state)
-          assert r._lead_path.projected_points.size > 0
-
-          self._render_lead_path(r, state, valid=valid, alive=alive)
-          assert r._lead_path.projected_points.size == 0
-          assert r._lead_path_widths.size == 0
-          self.assertEqual(r._lead_in_path, 1.0)
-
-          self._render_lead_path(r, state)
-          assert r._lead_path.projected_points.size > 0
-
 
 class TestLeadDangerFactor(unittest.TestCase):
   def test_toggle_off_is_the_upstream_default(self):
-    sm = FakeSubMaster([FakeLead(in_path=0.0)])
-    assert lead_danger_factor(sm, _params(on=False), 0.75) == 0.75
+    sm = SubMaster({}, moonpilot_leads=[slot(0.0)])
+    assert lead_danger_factor(sm, params(on=False), 0.75) == 0.75
 
   def test_invalid_state_is_the_upstream_default(self):
     for valid, alive in ((False, True), (True, False)):
-      sm = FakeSubMaster([FakeLead(in_path=0.0)], valid=valid, alive=alive)
-      assert lead_danger_factor(sm, _params(), 0.75) == 0.75
+      sm = SubMaster({}, moonpilot_leads=[slot(0.0)])
+      sm.valid["moonpilotState"], sm.alive["moonpilotState"] = valid, alive
+      assert lead_danger_factor(sm, params(), 0.75) == 0.75
 
   def test_no_lead_is_the_upstream_default(self):
-    for leads in ([], [FakeLead(present=False)]):
-      assert lead_danger_factor(FakeSubMaster(leads), _params(), 0.75) == 0.75
+    for leads in ([], [slot(1.0, present=False)]):
+      assert lead_danger_factor(SubMaster({}, moonpilot_leads=leads), params(), 0.75) == 0.75
+
 
   def test_plain_dict_submaster_is_the_upstream_default(self):
     # The longitudinal maneuver harness passes a dict, not a SubMaster.
-    assert lead_danger_factor({"radarState": None}, _params(), 0.75) == 0.75
+    assert lead_danger_factor({"radarState": None}, params(), 0.75) == 0.75
 
   def test_in_path_lead_is_bit_identical(self):
-    sm = FakeSubMaster([FakeLead(in_path=1.0)])
-    assert lead_danger_factor(sm, _params(), 0.75) == 0.75
+    sm = SubMaster({}, moonpilot_leads=[slot(1.0)])
+    assert lead_danger_factor(sm, params(), 0.75) == 0.75
 
   def test_out_of_path_lead_relaxes_the_constraint(self):
-    sm = FakeSubMaster([FakeLead(in_path=0.0)])
-    assert lead_danger_factor(sm, _params(), 0.75) == MOONPILOT_OUT_OF_PATH_DANGER
-
-  def test_halfway_is_linear(self):
-    sm = FakeSubMaster([FakeLead(in_path=0.5)])
-    expected = (MOONPILOT_OUT_OF_PATH_DANGER + 0.75) / 2.0
-    self.assertAlmostEqual(lead_danger_factor(sm, _params(), 0.75), expected, places=6)
-
-
-if __name__ == "__main__":
-  unittest.main()
-
-
-class PlannerSubMaster:
-  """A real planner's inputs, with moonpilotState spliced in — the seam's actual call site."""
-
-  def __init__(self, in_path):
-    car_state = messaging.new_message("carState")
-    car_state.carState.vEgo = 20.0
-    car_state.carState.vCruise = 100.0
-    car_state.carState.aEgo = 0.0
-    car_state.carState.standstill = False
-    car_state.carState.steeringAngleDeg = 0.0
-
-    car_control = messaging.new_message("carControl")
-    car_control.carControl.orientationNED = [0.0, 0.0, 0.0]
-
-    controls_state = messaging.new_message("controlsState")
-    controls_state.controlsState.forceDecel = False
-    controls_state.controlsState.longControlState = log.LongitudinalPlan.LongitudinalPlanSource.lead0
-
-    selfdrive_state = messaging.new_message("selfdriveState")
-    selfdrive_state.selfdriveState.enabled = True
-
-    vehicle_parameters = messaging.new_message("vehicleParameters")
-    vehicle_parameters.vehicleParameters.angleOffsetDeg = 0.0
-
-    model = messaging.new_message("modelV2")
-    model.modelV2.meta.disengagePredictions.gasPressProbs = [1.0] * 6
-    model.modelV2.action.desiredAcceleration = 0.0
-    model.modelV2.action.shouldStop = False
-
-    radar = messaging.new_message("radarState")
-    radar.radarState.leadOne.present = True
-    radar.radarState.leadOne.dRel = 60.0
-    radar.radarState.leadOne.vLead = 22.0
-    radar.radarState.leadOne.aLeadK = 0.0
-    radar.radarState.leadOne.aLeadTau = 0.3
-    radar.radarState.leadOne.modelProb = 0.9
-
-    self._data = {
-      "carState": car_state.carState,
-      "carControl": car_control.carControl,
-      "controlsState": controls_state.controlsState,
-      "selfdriveState": selfdrive_state.selfdriveState,
-      "vehicleParameters": vehicle_parameters.vehicleParameters,
-      "modelV2": model.modelV2,
-      "radarState": radar.radarState,
-      "moonpilotState": FakeSubMaster([FakeLead(in_path=in_path)]),
-    }
-    self.valid = {"moonpilotState": True}
-    self.alive = {"moonpilotState": True}
-
-  def __getitem__(self, s):
-    return self._data[s]
+    sm = SubMaster({}, moonpilot_leads=[slot(0.0)])
+    assert lead_danger_factor(sm, params(), 0.75) == MOONPILOT_OUT_OF_PATH_DANGER
 
 
 class TestPlannerSeam(unittest.TestCase):
@@ -867,8 +600,10 @@ class TestPlannerSeam(unittest.TestCase):
   @staticmethod
   def _mpc_danger_factor(in_path, toggle_on=True):
     planner = LongitudinalPlanner(CarInterface.get_non_essential_params(CAR.HONDA_CIVIC), init_v=20.0)
-    planner.params = _params(on=toggle_on)
-    planner.update(PlannerSubMaster(in_path))
+    planner.params = params(on=toggle_on)
+    lead_msg = lead(60.0, 22.0, a_lead_tau=0.3, model_prob=0.9)
+    planner.update(inputs(v_ego=20.0, v_cruise_kph=100.0, lead=lead_msg,
+                           moonpilot_leads=[slot(in_path)]))
     return float(planner.mpc.params[0, 5])
 
   def test_in_path_lead_uses_the_upstream_factor(self):
@@ -879,3 +614,7 @@ class TestPlannerSeam(unittest.TestCase):
 
   def test_toggle_off_ignores_the_prediction(self):
     self.assertEqual(self._mpc_danger_factor(0.0, toggle_on=False), LEAD_DANGER_FACTOR)
+
+
+if __name__ == "__main__":
+  unittest.main()

@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
 """Run tailscaled, drive its login, and publish MoonpilotTailscaleStatus for the UI.
 
-The manager starts this process when the `MoonpilotTailscale` toggle is on — offroad and onroad,
-since remote access is wanted while driving — and stops it when the toggle goes off. `main()`
-never returns: `ensure_running` does not restart a process that exited while `should_run` was
-still True (`openpilot/system/manager/process.py:142-147,166-171` — `start()` no-ops while
-`self.proc` is set), so exiting on success or failure would wedge the feature until the next boot.
-Same shape and same reason as moonpilot/depsd.py.
+The manager starts it when the `MoonpilotTailscale` toggle is on and stops it when the toggle goes
+off. See `moonpilot/procs.py` for the manager's restart semantics; this process keeps supervision
+and cleanup together.
 
 Installing, upgrading and supervising all live here rather than in a second process: the daemon is
 the thing that has to be restarted after an upgrade, and the status param is the thing the panels
 read. Device state stays under the data root; only PC startup migrates legacy state to persistence.
+
 """
 
 import os
@@ -19,6 +17,7 @@ import subprocess
 import tempfile
 import time
 
+from moonpilot.backoff import Backoff
 from openpilot.cereal import log, messaging
 from openpilot.common.params import Params
 from openpilot.common.swaglog import cloudlog
@@ -32,33 +31,6 @@ CHECK_INTERVAL = 6 * 3600  # stable-track version-check cadence
 LEGACY_STATE_ERROR = "persistent tailscale state unavailable; using legacy state"
 PERSIST_DIR_ERROR = "persistent tailscale directory unavailable; using legacy state"
 
-_MIGRATE_STATE = """\
-import os
-import shutil
-import sys
-import tempfile
-
-legacy, target = sys.argv[1:3]
-target_dir = os.path.dirname(target)
-if not os.path.isdir(os.path.dirname(target_dir)):
-  raise OSError("persistent root is unavailable")
-os.makedirs(target_dir, mode=0o700, exist_ok=True)
-fd, staged = tempfile.mkstemp(prefix=".tailscaled.state.", dir=target_dir)
-try:
-  with os.fdopen(fd, "wb") as destination:
-    with open(legacy, "rb") as source:
-      shutil.copyfileobj(source, destination)
-    os.fchmod(destination.fileno(), 0o600)
-    destination.flush()
-    os.fsync(destination.fileno())
-  os.replace(staged, target)
-  if not os.path.isfile(target):
-    raise OSError("tailscale state migration did not create its destination")
-  os.unlink(legacy)
-finally:
-  if os.path.exists(staged):
-    os.unlink(staged)
-"""
 
 
 def _copy_state(legacy: str, target: str) -> None:
@@ -72,8 +44,6 @@ def _copy_state(legacy: str, target: str) -> None:
       destination.flush()
       os.fsync(destination.fileno())
     os.replace(staged, target)
-    if not os.path.isfile(target):
-      raise OSError("tailscale state migration did not create its destination")
     os.unlink(legacy)
   finally:
     if os.path.exists(staged):
@@ -91,15 +61,6 @@ def _ensure_state_dir() -> bool:
           return False
       except OSError:
         return False
-
-  if tailscale.sudo():
-    if not os.path.isdir(persist_root):
-      return False
-    try:
-      subprocess.run([*tailscale.sudo(), "mkdir", "-p", "-m", "700", target_dir], check=True)
-    except (OSError, subprocess.CalledProcessError):
-      return False
-    return os.path.isdir(target_dir)
 
   try:
     os.makedirs(target_dir, mode=0o700, exist_ok=True)
@@ -129,14 +90,8 @@ def _migrate_state() -> str:
     return ""
 
   try:
-    if tailscale.sudo():
-      subprocess.run(
-        [*tailscale.sudo(), "python3", "-c", _MIGRATE_STATE, legacy, target],
-        check=True,
-      )
-    else:
-      _copy_state(legacy, target)
-  except (OSError, subprocess.CalledProcessError):
+    _copy_state(legacy, target)
+  except OSError:
     tailscale.use_legacy_state()
     cloudlog.exception("moonpilot tailscale state migration failed")
     return LEGACY_STATE_ERROR
@@ -151,9 +106,7 @@ def _put_status(params: Params, state: str, detail: str = "", state_error: str =
     tailscale.put_status(params, state, detail)
 
 
-BACKOFF_START = 30.0
-BACKOFF_MAX = 1800.0  # 30 min
-UP_RETRY = 30.0  # do not respawn `tailscale up` faster than this
+UP_RETRY = 30.0
 
 
 def _stop(proc: subprocess.Popen | None) -> None:
@@ -191,7 +144,7 @@ def main() -> None:
   login: subprocess.Popen | None = None
   last_up = 0.0
   last_check = -CHECK_INTERVAL  # first offroad+online tick checks immediately; gate is then "6 h between checks"
-  backoff = BACKOFF_START
+  backoff = Backoff()
   autoupdate_disabled = False
 
   try:
@@ -212,12 +165,11 @@ def main() -> None:
           latest = tailscale.latest_release()
           tailscale.install(*latest)
           cloudlog.event("moonpilot tailscale installed", version=latest[0])
-          backoff = BACKOFF_START
+          backoff.reset()
         except Exception:
           cloudlog.exception("moonpilot tailscale install failed")
           _put_status(params, tailscale.ERROR, "download failed", state_error)
-          time.sleep(backoff)
-          backoff = min(backoff * 2, BACKOFF_MAX)
+          time.sleep(backoff.next())
       elif online and params.get_bool("IsOffroad") and time.monotonic() - last_check >= CHECK_INTERVAL:
         # Offroad only: this is ~35 MB down and a daemon restart, neither of which belongs
         # mid-drive. The old binary keeps serving until the new one is on disk. The latest
@@ -227,8 +179,7 @@ def main() -> None:
           last_check = time.monotonic()
         except Exception:
           cloudlog.exception("moonpilot tailscale version check failed")
-          time.sleep(backoff)
-          backoff = min(backoff * 2, BACKOFF_MAX)
+          time.sleep(backoff.next())
           continue
         if tailscale.upgrade_available(latest[0]):
           was = tailscale.marker_version()
@@ -236,13 +187,12 @@ def main() -> None:
           try:
             tailscale.install(*latest)
             cloudlog.event("moonpilot tailscale upgraded", was=was, now=latest[0])
-            backoff = BACKOFF_START
+            backoff.reset()
             _stop(daemon)
             daemon = None  # os.replace leaves a running process on the old inode
           except Exception:
             cloudlog.exception("moonpilot tailscale upgrade failed")
-            time.sleep(backoff)
-            backoff = min(backoff * 2, BACKOFF_MAX)
+            time.sleep(backoff.next())
             # Deliberately no put_status(ERROR): a failed upgrade must not cost a working tunnel,
             # and the poll below overwrites the status with what the daemon is actually doing.
 
@@ -250,8 +200,7 @@ def main() -> None:
         if daemon is not None:
           cloudlog.event("moonpilot tailscaled exited", code=daemon.returncode)
           _put_status(params, tailscale.ERROR, "tailscaled exited", state_error)
-          time.sleep(backoff)
-          backoff = min(backoff * 2, BACKOFF_MAX)
+          time.sleep(backoff.next())
 
         # ponytail: tailscaled's own output goes to /dev/null — the exit code lands in cloudlog,
         # and a launch that never succeeds is debugged by running daemon_args() by hand over ssh.
@@ -274,7 +223,7 @@ def main() -> None:
 
       state, detail = tailscale.parse_status(output)
       if state == tailscale.RUNNING:
-        backoff = BACKOFF_START  # something works, so a later failure starts over
+        backoff.reset()
       elif (login is None or login.poll() is not None) and time.monotonic() - last_up > UP_RETRY:
         # `tailscale up` blocks until the node is authenticated, so the live child is what holds
         # the interactive login open; the URL is read from status --json, never from its stdout.
@@ -286,7 +235,7 @@ def main() -> None:
       _put_status(params, state, detail, state_error)
       time.sleep(POLL)
   finally:
-    # The manager sends SIGINT on stop (process.py:82), which lands here as KeyboardInterrupt.
+    # PythonProcess handles SIGINT by raising KeyboardInterrupt.
     _stop(login)
     _stop(daemon)
     tailscale.put_status(params, tailscale.STOPPED)

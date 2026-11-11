@@ -238,14 +238,8 @@ def main(demo=False):
     cloudlog.exception("moonpilot model runtime unavailable")
     runtime = None
 
-  try:  # moonpilot seam, see AGENTS.md: the learned horizon, with the stock formula when the module is absent
-    from moonpilot.latency import MOONPILOT_LAG_MODEL_REFRESH_FRAMES, applied_long_delay
-  except Exception:
-    cloudlog.exception("moonpilot long-lag horizon unavailable")
-    MOONPILOT_LAG_MODEL_REFRESH_FRAMES = 100
-
-    def applied_long_delay(CP, params, smoothing=0.0):
-      return CP.longitudinalActuatorDelay + smoothing
+  # moonpilot seam, see AGENTS.md: the learned horizon; a missing fork module is an error, not a fallback.
+  from moonpilot.latency import MOONPILOT_LAG_MODEL_REFRESH_FRAMES, applied_long_delay
 
   # a cable is a chestnut on its way, unless a USB host is on it
   CHESTNUT = chestnut_compiled() and (chestnut_present() or (cable_connected() and not usb_host_connected()))
@@ -480,7 +474,7 @@ def main(demo=False):
       lane_change_prob = l_lane_change_prob + r_lane_change_prob
       DH.update(sm['carState'], sm['carControl'].latActive, lane_change_prob)
       # moonpilot seam, see AGENTS.md: low-speed turn desire from the blinker
-      turn = turn_desire(sm, desire_state, params)
+      turn = turn_desire(sm['carState'], desire_state, params)
       if turn is not None:
         DH.desire = turn
       modelv2_send.modelV2.meta.laneChangeState = DH.lane_change_state

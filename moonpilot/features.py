@@ -1,4 +1,6 @@
+from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any
 
 from moonpilot import deps
 from openpilot.common.params import Params
@@ -10,23 +12,57 @@ class Feature:
   key: str  # param row in moonpilot/params_keys.h, which also carries its default
   title: str
   description: str
-  offroad_only: bool = False  # changes driving behavior, so only flip it while parked
   requires: tuple[str, ...] = ()  # modules that must be importable for this feature to run
-  choices: tuple[str, ...] = ()  # a choice row instead of a toggle: the param is an INT index here, 0 = off
+  # A choice row instead of a toggle: (label, value) pairs, the param an INT index into them, 0 = off.
+  choices: tuple[tuple[str, Any], ...] = ()
+  # Why a car cannot run this, value-line sized, or None when it can.
+  car: Callable[[Any], str | None] | None = None
+
+  @property
+  def labels(self) -> tuple[str, ...]:
+    return tuple(label for label, _ in self.choices)
+
+  @property
+  def values(self) -> tuple[Any, ...]:
+    return tuple(value for _, value in self.choices)
+
+  def at(self, index: Any) -> Any:
+    """The value a choice index selects; anything out of range is the off choice."""
+    return self.choices[index][1] if isinstance(index, int) and 0 <= index < len(self.choices) else self.choices[0][1]
+
+
+def _torque_steered(CP) -> str | None:
+  # controlsd's own dispatch: steerControlType is tested before the tuning, so an angle- or curvature-steered
+  # car never reaches the torque branch the fork controller sits in, however its tuning reads.
+  if CP.steerControlType in ("angle", "curvature") or CP.lateralTuning.which() != "torque":
+    return "torque-steered cars only"
+  return None
+
+
+def _openpilot_longitudinal(CP) -> str | None:
+  return None if CP.openpilotLongitudinalControl else "openpilot-longitudinal cars only"
+
+
+def _toyota_openpilot_longitudinal(CP) -> str | None:
+  return None if CP.brand == "toyota" and CP.openpilotLongitudinalControl else "Toyota openpilot-longitudinal only"
+
+
+def _lateral_engage(CP) -> str | None:
+  from moonpilot.engage import unsupported_reason  # the safety gate lives with the safety code, which imports this module
+  return unsupported_reason(CP)
 
 
 LEAD_LATERAL = Feature(
   key="MoonpilotLeadLateral",
   title="lead lateral prediction",
   description="Relax the lead following constraint for a lead predicted to leave your path. Applies immediately.",
-  offroad_only=True,
 )
 
 TORQUE_LATERAL = Feature(
   key="MoonpilotTorqueLateral",
   title="moonpilot steering",
   description="moonpilot's own torque steering controller instead of openpilot's. Torque-steered cars only; takes effect after a restart.",
-  offroad_only=True,
+  car=_torque_steered,
 )
 
 PATH_LOOKAHEAD = Feature(
@@ -37,8 +73,14 @@ PATH_LOOKAHEAD = Feature(
     + "never steers less than without it, so it does not run wide. Stronger starts earlier and cuts more toward the inside. "
     + "Restart to apply."
   ),
-  offroad_only=True,
-  choices=("off", "light", "medium", "strong"),
+  # (window s, gain, cap m/s^2). See `moonpilot/curvature.py` for behavior and replay measurements:
+  # replayed on the recorded turns of routes 3f8-410 (python -m moonpilot.lab lookahead) the request started
+  # 0.00/0.10/0.12 s (light), 0.00/0.20/0.20 s (medium) and 0.00/0.35/0.24 s (strong) earlier at 5-10/10-17/>17 m/s
+  # with every turn's apex at 100% of today's (p10 included) and no outward drift at the median; the 5-10 column is
+  # after the low-speed fade. Unrestricted, the same averages cut the apex to 82-96% and let turns out early --
+  # running wide. The cost is a turn-in that begins inside the lane: 0.4-0.6 / 0.8-1.2 / 1.1-1.5 m median open-loop,
+  # before the model's own re-planning. None makes highway builds lighter: the controller adds that abruptness.
+  choices=(("off", None), ("light", (1.0, 0.3, 0.8)), ("medium", (1.0, 0.6, 1.5)), ("strong", (1.5, 0.6, 1.5))),
 )
 
 PATH_SMOOTH = Feature(
@@ -49,8 +91,7 @@ PATH_SMOOTH = Feature(
     + "steps out, 0.10 s most of the rest, 0.15 s little more. Above about 18 km/h the planned path is read that much "
     + "further ahead, which removes half to three quarters of the filter's steering lag. Restart to apply."
   ),
-  offroad_only=True,
-  choices=("off", "0.05 s", "0.10 s", "0.15 s"),
+  choices=(("off", 0.0), ("0.05 s", 0.05), ("0.10 s", 0.10), ("0.15 s", 0.15)),  # first-order time constant, s
 )
 
 PATH_RECENTER = Feature(
@@ -62,7 +103,6 @@ PATH_RECENTER = Feature(
     + "on a curb that reappears past an intersection, drifts instead of lurching. Never adds steering, and does "
     + "nothing during lane changes or where the lane lines are not seen. Restart to apply."
   ),
-  offroad_only=True,
 )
 
 STEER_HYSTERESIS = Feature(
@@ -73,8 +113,9 @@ STEER_HYSTERESIS = Feature(
     + "(percent of maximum), so tiny back-and-forth corrections never reach the wheel. Wider is calmer and less precise. "
     + "Restart to apply."
   ),
-  offroad_only=True,
-  choices=("off", "0.3%", "0.7%", "1.3%"),
+  # Half-widths in normalized steer torque. On a RAV4 (STEER_MAX 1500) these are ~4.5 / 10.5 / 19.5 CAN units;
+  # `python -m moonpilot.lab torque` cuts torque reversals on 40d/40e from 14.2/15.9 per s to 4.3/5.6 at 0.7%.
+  choices=(("off", 0.0), ("0.3%", 0.003), ("0.7%", 0.007), ("1.3%", 0.013)),
 )
 
 STEER_DAMPING = Feature(
@@ -85,8 +126,12 @@ STEER_DAMPING = Feature(
     + "without slowing turns the path asks for. Stronger is steadier, but passes more sensor noise to the wheel. "
     + "Restart to apply."
   ),
-  offroad_only=True,
-  choices=("off", "light", "medium", "strong"),
+  # Derivative time, s: P + D = KP * (error + T * error_rate). In hands-off curves at 3-17 m/s (routes 3f8-410,
+  # matched by speed and turn size against the same driver's manual curves) 22-24% of the wheel's motion was above
+  # 1 Hz against the driver's 4-10%, and P carried it: P's 1-5 Hz content equalled its turn-scale correction and
+  # moved with the wheel at r = 0.9, 81% of it at 1-2 Hz. At 1.2 Hz these are 21 / 37 / 48 degrees of lead;
+  # `python -m moonpilot.lab damping` puts 42 / 83 / 125% of P's 1-2 Hz action into D.
+  choices=(("off", 0.0), ("light", 0.05), ("medium", 0.10), ("strong", 0.15)),
 )
 
 STEER_FRICTION_RAMP = Feature(
@@ -97,7 +142,6 @@ STEER_FRICTION_RAMP = Feature(
     + "instead of in one step, so the wheel does not snap past the path when it lets go. Releasing is always immediate. "
     + "Restart to apply."
   ),
-  offroad_only=True,
 )
 
 TURN_DESIRE = Feature(
@@ -107,14 +151,13 @@ TURN_DESIRE = Feature(
     "Below 32 km/h, a turn signal feeds a turn desire into the model so it steers into the corner. "
     + "The model's own turn prediction picks the direction. Restart to apply."
   ),
-  offroad_only=True,
 )
 
 LONGITUDINAL = Feature(
   key="MoonpilotLongitudinal",
   title="moonpilot longitudinal",
   description="moonpilot's own longitudinal planner and acceleration controller, not openpilot's MPC. openpilot-longitudinal cars only; restart to apply.",
-  offroad_only=True,
+  car=_openpilot_longitudinal,
 )
 
 EXPERIMENTAL_MODE = Feature(
@@ -124,35 +167,30 @@ EXPERIMENTAL_MODE = Feature(
     "moonpilot longitudinal passes the model's own acceleration straight through, as openpilot's experimental mode "
     + "did; no-flicker braking, the model-braking deadband and coast on grade stand aside. Applies immediately."
   ),
-  offroad_only=True,
 )
 
 MODEL_BRAKING = Feature(
   key="MoonpilotModelBraking",
   title="model braking",
   description="Outside experimental mode, let the model's own braking ask through to the command. Applies immediately.",
-  offroad_only=True,
 )
 
 CURVE_SPEED = Feature(
   key="MoonpilotCurveSpeed",
   title="curve speed control",
   description="Slow for a curve the model already sees, and hold the lateral acceleration it is pulling. Braking is bounded, and only added. Immediate.",
-  offroad_only=True,
 )
 
 SQUEEZE = Feature(
   key="MoonpilotSqueeze",
   title="narrow corridor braking",
   description="Slow when free space ahead pinches under about two car widths. Braking is bounded, and only added. Immediate.",
-  offroad_only=True,
 )
 
 PATH_OUTSIDE = Feature(
   key="MoonpilotPathOutside",
   title="path outside road warning",
   description="Warn when the planned path leaves the model's free corridor. Immediate.",
-  offroad_only=True,
 )
 
 COAST_GRADE = Feature(
@@ -163,7 +201,6 @@ COAST_GRADE = Feature(
     + "run up on a descent and to sag on a climb. Following, curve and model braking are unchanged. "
     + "Applies immediately."
   ),
-  offroad_only=True,
 )
 
 BRAKE_BAND = Feature(
@@ -174,7 +211,6 @@ BRAKE_BAND = Feature(
     + "a second, so the brake lights do not blink on and off. Firmer braking and anything below 18 km/h are "
     + "unchanged. Applies immediately."
   ),
-  offroad_only=True,
 )
 
 ENGINE_COAST = Feature(
@@ -185,7 +221,7 @@ ENGINE_COAST = Feature(
     + "lead lights the brake lights far less. Untested on the road: watch that the car still slows as asked. "
     + "Toyota openpilot-longitudinal only. Takes effect after a restart."
   ),
-  offroad_only=True,
+  car=_toyota_openpilot_longitudinal,
 )
 
 HANDBACK_EASE = Feature(
@@ -195,7 +231,6 @@ HANDBACK_EASE = Feature(
     "When you lift off the gas below the set speed, openpilot eases off and builds back up to the set speed over a couple "
     + "of seconds, instead of carrying on at the rate you were accelerating. Braking is unchanged. Applies immediately."
   ),
-  offroad_only=True,
 )
 
 CRAWL_RELEASE = Feature(
@@ -206,12 +241,9 @@ CRAWL_RELEASE = Feature(
     + "the car stops, to take out the final lurch. Firmer stops are unchanged. Untested on the road: watch the stopping "
     + "distance. Needs moonpilot longitudinal; openpilot-longitudinal cars only. Takes effect after a restart."
   ),
-  offroad_only=True,
+  car=_openpilot_longitudinal,
 )
 
-# No requires: `requires` gates on importable Python modules, and tailscale here is a binary.
-# There is nothing to gate either way — the supervisor installs what is missing and the settings
-# row says so while it does.
 TAILSCALE = Feature(
   key="MoonpilotTailscale",
   title="tailscale",
@@ -222,7 +254,6 @@ SLAM = Feature(
   key="MoonpilotSlam",
   title="rolling-window ego correction",
   description="Smooths recent ego motion over a 5 s rotating window and corrects the speed the fork planner plans from. Off = the raw wheel speed.",
-  offroad_only=True,
 )
 
 CATALOG_SIGNATURES = Feature(
@@ -240,51 +271,43 @@ LATERAL_ENGAGE = Feature(
   key="MoonpilotLateralEngage",
   title="lateral engagement",
   description="Steer from the main switch; brake, gas and cancel keep steering. Where panda cannot read the switch, the host's claim is trusted. Restart.",
-  offroad_only=True,
+  car=_lateral_engage,
 )
 
 
 @dataclass(frozen=True)
 class Group:
-  """A page of the panel: what its rows have in common, in the driver's terms.
-
-  The panel has one screen per group, because the flat list had grown past what a driver can read at
-  a glance -- and the grouping is by *what the row changes about the car*, not by which module owns
-  it, so the question a driver arrives with ("why does it steer like that") lands on one page."""
 
   title: str
   description: str
   features: tuple[Feature, ...]
+  parked_only: bool  # the rows change driving behavior, so they only flip while offroad
 
 
-# Behaviors the driver can swap back to upstream, grouped into the pages each panel renders. The
-# panels are built from this table, so a feature is one row here, one row in params_keys.h, and its
-# own code -- and a new page is one `Group` and no panel edit.
 STEERING = Group(
   title="steering",
   description="How openpilot moves the wheel: whose controller, when a curve is entered, and whether openpilot can steer at all.",
   features=(LATERAL_ENGAGE, TORQUE_LATERAL, PATH_LOOKAHEAD, PATH_SMOOTH, PATH_RECENTER, STEER_HYSTERESIS, STEER_DAMPING, STEER_FRICTION_RAMP,
             TURN_DESIRE),
+  parked_only=True,
 )
 
 SPEED = Group(
   title="speed & distance",
   description="What the car does with the pedals: whose planner sets the speed, and how it reads the road ahead.",
-  # The lead's lateral prediction sits here rather than with the steering because the fork reaches
-  # it through the planner's time gap, not through a steering request.
   features=(LONGITUDINAL, EXPERIMENTAL_MODE, MODEL_BRAKING, CURVE_SPEED, SQUEEZE, PATH_OUTSIDE, COAST_GRADE, BRAKE_BAND, ENGINE_COAST, CRAWL_RELEASE,
             HANDBACK_EASE, LEAD_LATERAL, SLAM),
+  parked_only=True,
 )
 
 DEVICE = Group(
   title="device",
   description="What the device does for itself, off the road.",
   features=(TAILSCALE, CATALOG_SIGNATURES),
+  parked_only=False,
 )
 
 GROUPS: tuple[Group, ...] = (STEERING, SPEED, DEVICE)
-
-# Depth-first over the groups: every feature, once, in the order the pages show them.
 FEATURES: tuple[Feature, ...] = tuple(feature for group in GROUPS for feature in group.features)
 
 
@@ -292,46 +315,42 @@ def missing_modules(feature: Feature) -> tuple[str, ...]:
   return tuple(module for module in feature.requires if not deps.available(module))
 
 
-def available(feature: Feature) -> bool:
-  return not missing_modules(feature)
+def car_reason(feature: Feature, CP) -> str | None:
+  """Why this car cannot run the feature, or None. A CarParams not loaded yet is no verdict on the car."""
+  return None if CP is None or feature.car is None else feature.car(CP)
 
 
 def wanted(feature: Feature, params: Params) -> bool:
-  # Not get_bool: that ignores the default declared in params_keys.h and reports off for
-  # an unset param. return_default=True is the value that holds inside and outside the
-  # manager, which seeds unset params from their default at boot.
   return bool(params.get(feature.key, return_default=True))
 
 
 def enabled(feature: Feature, params: Params) -> bool:
-  # The seam-facing "is this behavior on" predicate: a feature the driver asked for but
-  # whose dependencies are not installed yet is off, so seams never import what is missing.
-  return available(feature) and wanted(feature, params)
+  return not missing_modules(feature) and wanted(feature, params)
+
+
+def in_force(feature: Feature, params: Params, CP) -> bool:
+  return enabled(feature, params) and car_reason(feature, CP) is None
 
 
 def choice(feature: Feature, params: Params) -> int:
-  # A choice row's selected index; anything out of range reads as 0, its "off".
   index = params.get(feature.key, return_default=True)
   return index if isinstance(index, int) and 0 <= index < len(feature.choices) else 0
 
 
+def value(feature: Feature, params: Params) -> Any:
+  return feature.at(choice(feature, params) if not missing_modules(feature) else 0)
+
+
 def brand() -> str:
-  # Fork identity, like version(). Always on, so no param and no toggle to carry: nobody
-  # picks between "moonpilot" and "openpilot" as a name. The seams name upstream's own
-  # value as a fallback, so this is the only thing standing between them and stock.
   return "moonpilot"
 
 
 def version() -> str:
-  # Fork identity, like brand(): COMMA_VERSION verbatim, "<upstream>-moonpilot.<fork revision>".
-  # get_version() reads version.h directly, so this is right outside the manager too, where the
-  # Version param is unset. See AGENTS.md, Versioning.
   return get_version()
 
 
 def is_fork_build() -> bool:
-  # The one identity helper that gates behavior: comma tests comma's branches, so upstream's
-  # "WARNING: This branch is not tested" startup banner would sit on the road at the top of every
-  # drive in a build of this tree. Keyed on the COMMA_VERSION marker rather than on the git remote,
-  # because the marker is what every fork build carries however it was installed. See AGENTS.md.
+  # comma tests comma's branches, so upstream's "WARNING: This branch is not tested" startup banner would sit on the
+  # road at the top of every drive in a build of this tree. Keyed on the COMMA_VERSION marker rather than the git
+  # remote, because the marker is what every fork build carries however it was installed. See AGENTS.md.
   return "-moonpilot." in version()

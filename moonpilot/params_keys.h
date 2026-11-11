@@ -51,26 +51,15 @@
     // On by default: on a hand-back from the driver's gas the positive ask starts low and rebuilds; read every
     // frame, so it applies immediately.
     {"MoonpilotHandbackEase", {PERSISTENT, BOOL, "1"}},
-    // Off by default: an index into PATH_LOOKAHEAD.choices (0 off, then light / medium / strong):
-    // the turn-in lead-in from the planned curvature averaged over a window ahead; chosen at
-    // construction, so a restart.
     {"MoonpilotPathLookahead", {PERSISTENT, INT, "0"}},
-    // Off by default: an index into PATH_SMOOTH.choices (0 off, then 0.05 / 0.10 / 0.15 s),
-    // the time constant of a filter on the model's curvature request before the controller,
-    // led by the same time on the planned path above 5 m/s; chosen at construction, so the row
-    // takes a restart.
     {"MoonpilotPathSmooth", {PERSISTENT, INT, "0"}},
     // Off by default: the part of the curvature request beyond the ego lane's own bend is capped
     // at MOONPILOT_RECENTER_LAT_ACCEL above 12 m/s (faded in from 8) on seen lane lines; bound into
     // the curvature reference at construction, so the row takes a restart.
     {"MoonpilotPathRecenter", {PERSISTENT, BOOL, "0"}},
-    // Off by default: an index into STEER_HYSTERESIS.choices (0 off, then 0.3 / 0.7 / 1.3 % of
-    // max torque), the half-width of a backlash on the fork torque controller's output; chosen at
-    // construction, so the row takes a restart.
     {"MoonpilotSteerHysteresis", {PERSISTENT, INT, "0"}},
-    // Off by default: an index into STEER_DAMPING.choices (0 off, then 0.05 / 0.10 / 0.15 s of
-    // derivative time on the fork torque controller's feedback, 5-15 m/s); chosen at construction,
-    // so the row takes a restart.
+    // Off by default: an index into STEER_DAMPING's choices, the derivative time on the fork torque controller's
+    // feedback. Chosen at construction, so the row takes a restart.
     {"MoonpilotSteerDamping", {PERSISTENT, INT, "0"}},
     // Off by default, a test toggle: the fork torque controller's friction compensation may rise
     // no faster than MOONPILOT_FRICTION_RISE, so the torque that breaks the wheel loose is not
@@ -80,9 +69,6 @@
     // feeds a turn desire into the model so it steers into the corner. The
     // model's own turn prediction picks the direction.
     {"MoonpilotTurnDesire", {PERSISTENT, BOOL, "1"}},
-    // Tailscaled -> panels, one line: "<state>" or "<state> <detail>", decoded
-    // in moonpilot/tailscale.py. CLEAR_ON_MANAGER_START so a reboot cannot
-    // leave a stale "running 100.x" on screen.
     {"MoonpilotTailscaleStatus", {CLEAR_ON_MANAGER_START, STRING}},
     // Learned onroad by moonpilot/latency.py, written by the fork longitudinal
     // planner: the command -> delivered-accel lag in seconds. 0.0 means nothing
@@ -120,11 +106,6 @@
     // [0, 0.3]. The evidence count rides with it so partial drives accumulate.
     {"MoonpilotRadarLatency", {PERSISTENT, FLOAT, "0.0"}},
     {"MoonpilotRadarLatencySamples", {PERSISTENT, INT, "0"}},
-    // Offroad mode, entered from the moonpilot panel's row or a hold on the
-    // driving view: while it is set the device stays offroad with the ignition
-    // on. CLEAR_ON_IGNITION_ON so a new drive always comes up onroad,
-    // CLEAR_ON_MANAGER_START so a reboot does too; both are cleared by
-    // openpilot/system/manager/manager.py, not by fork code.
     {"MoonpilotOffroad",
      {CLEAR_ON_MANAGER_START | CLEAR_ON_IGNITION_ON, BOOL, "0"}},
     // Model marketplace, moonpilot/models.py. The two desired strings are the
@@ -162,8 +143,6 @@
     // The settings panel writes retry requests; depsd consumes and clears them
     // this boot.
     {"MoonpilotDepsRequest", {CLEAR_ON_MANAGER_START, STRING}},
-    // The settings panel writes this toggle; a user change or params reset
-    // clears it.
     {"MoonpilotCatalogSignatures", {PERSISTENT, BOOL, "0"}},
     // manager writes the boot rollback report; it clears it at manager start.
     {"MoonpilotRollback", {CLEAR_ON_MANAGER_START, STRING}},

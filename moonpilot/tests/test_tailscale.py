@@ -8,6 +8,7 @@ import tarfile
 import tempfile
 import time
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from typing import cast
 from unittest import mock
@@ -15,7 +16,8 @@ from unittest import mock
 from openpilot.common.params import Params
 
 from moonpilot import fetch, paths, procs, tailscale, tailscaled
-from moonpilot.features import FEATURES
+from moonpilot.features import TAILSCALE
+from moonpilot.tests.fakes import FakeParams, params
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -36,30 +38,8 @@ def _quick_install(payload: bytes | None = None) -> None:
     tailscale.install(_VERSION, _URL, _SHA)
 
 
-class FakeParams:
-  """Duck-typed stand-in for Params, so the tests never touch the real param store."""
-
-  def __init__(self, values=None):
-    self._values: dict[str, object] = values or {}
-
-  def get(self, key, block=False, return_default=False):
-    return self._values.get(key)
-
-  def put(self, key, value, block=False):
-    self._values[key] = value
-
-  def get_bool(self, key, block=False):
-    return bool(self._values.get(key))
-
-
-def _params(**values) -> Params:
-  # Same duck-typed cast as test_deps.py: the code under test only calls get()/put().
-  return cast(Params, FakeParams(values))
-
-
 def _status(state: str, detail: str = "") -> Params:
-  return _params(**{tailscale.STATUS_KEY: f"{state} {detail}".strip(), tailscale.ENABLE_KEY: True})
-
+  return params(overrides={tailscale.STATUS_KEY: f"{state} {detail}".strip(), TAILSCALE.key: True})
 
 def _tarball(names: tuple[str, ...]) -> bytes:
   """A tailscale-shaped tarball: both binaries under a versioned directory, plus a systemd unit."""
@@ -92,7 +72,6 @@ class TestInstall(unittest.TestCase):
       # The unit file inside the archive shares no basename with either binary, so it is skipped.
       self.assertFalse(os.path.exists(os.path.join(tailscale.bin_dir(), "tailscaled.service")))
       self.assertEqual(tailscale.marker_version(), _VERSION)
-      self.assertTrue(tailscale.installed())
 
   def test_install_replaces_a_binary_that_is_being_executed(self):
     # The upgrade case: the daemon is up, running the old inode, on the old path, while the new
@@ -159,7 +138,6 @@ class TestLatestRelease(unittest.TestCase):
       tailscale.install(*tailscale.latest_release())
       self.assertEqual(download.call_args[0], (_URL, _SHA))
       self.assertEqual(tailscale.marker_version(), _VERSION)
-      self.assertTrue(tailscale.installed())
 
 
 class TestFetch(unittest.TestCase):
@@ -243,6 +221,17 @@ class TestStateMigration(unittest.TestCase):
     persist_root = persist_parent / "moonpilot"
     return data_root, persist_parent, persist_root
 
+  @contextmanager
+  def _migration_environment(self, data_root, persist_root, pc, persist_probe=None):
+    tailscale.use_persistent_state()
+    with (
+      mock.patch.object(paths, "data_root", return_value=str(data_root)),
+      mock.patch.object(paths, "persist_root", return_value=str(persist_root)) if persist_probe is None
+      else mock.patch.object(paths, "persist_root", side_effect=persist_probe),
+      mock.patch.object(tailscale, "PC", pc),
+    ):
+      yield
+
   def test_legacy_state_is_copied_before_it_is_removed(self):
     with tempfile.TemporaryDirectory() as tmp:
       data_root, persist_parent, persist_root = self._roots(tmp)
@@ -250,12 +239,7 @@ class TestStateMigration(unittest.TestCase):
       payload = b"node identity and login session"
       legacy.write_bytes(payload)
       legacy.chmod(0o600)
-      with (
-        mock.patch.object(paths, "data_root", return_value=str(data_root)),
-        mock.patch.object(paths, "persist_root", return_value=str(persist_root)),
-        mock.patch.object(tailscale, "PC", True),
-        mock.patch.object(tailscale, "_state_fallback", None),
-      ):
+      with self._migration_environment(data_root, persist_root, True):
         self.assertEqual(tailscaled._migrate_state(), "")
         target = persist_root / "tailscaled.state"
         self.assertEqual(target.read_bytes(), payload)
@@ -265,12 +249,7 @@ class TestStateMigration(unittest.TestCase):
   def test_missing_persist_directory_is_created_for_new_state(self):
     with tempfile.TemporaryDirectory() as tmp:
       data_root, _, persist_root = self._roots(tmp)
-      with (
-        mock.patch.object(paths, "data_root", return_value=str(data_root)),
-        mock.patch.object(paths, "persist_root", return_value=str(persist_root)),
-        mock.patch.object(tailscale, "PC", True),
-        mock.patch.object(tailscale, "_state_fallback", None),
-      ):
+      with self._migration_environment(data_root, persist_root, True):
         self.assertEqual(tailscaled._migrate_state(), "")
         self.assertTrue(persist_root.is_dir())
 
@@ -283,12 +262,7 @@ class TestStateMigration(unittest.TestCase):
       legacy = data_root / "tailscale" / "tailscaled.state"
       legacy.write_bytes(b"legacy")
       legacy.chmod(0o600)
-      with (
-        mock.patch.object(paths, "data_root", return_value=str(data_root)),
-        mock.patch.object(paths, "persist_root", return_value=str(persist_root)),
-        mock.patch.object(tailscale, "PC", True),
-        mock.patch.object(tailscale, "_state_fallback", None),
-      ):
+      with self._migration_environment(data_root, persist_root, True):
         self.assertEqual(tailscaled._migrate_state(), tailscaled.PERSIST_DIR_ERROR)
         self.assertEqual(tailscale.state_path(), str(legacy))
         self.assertTrue(legacy.exists())
@@ -300,10 +274,7 @@ class TestStateMigration(unittest.TestCase):
       legacy.write_bytes(b"device state")
       legacy.chmod(0o600)
       with (
-        mock.patch.object(paths, "data_root", return_value=str(data_root)),
-        mock.patch.object(paths, "persist_root", side_effect=AssertionError("device must not probe /persist")),
-        mock.patch.object(tailscale, "PC", False),
-        mock.patch.object(tailscale, "_state_fallback", None),
+        self._migration_environment(data_root, Path(), False, AssertionError("device must not probe /persist")),
         mock.patch.object(tailscaled.subprocess, "run") as run,
       ):
         self.assertEqual(tailscaled._migrate_state(), "")
@@ -334,8 +305,8 @@ class TestParseStatus(unittest.TestCase):
 
 class TestStatusText(unittest.TestCase):
   def test_toggle_off_wins_over_a_stale_status(self):
-    params = _params(**{tailscale.STATUS_KEY: f"{tailscale.RUNNING} 100.64.0.7"})
-    self.assertEqual(tailscale.status_text(params), ("off", "Turn on to join this device to your tailnet."))
+    store = params(on=False, overrides={tailscale.STATUS_KEY: f"{tailscale.RUNNING} 100.64.0.7"})
+    self.assertEqual(tailscale.status_text(store), ("off", "Turn on to join this device to your tailnet."))
 
   def test_each_state_has_a_row(self):
     self.assertEqual(tailscale.status_text(_status(tailscale.OFFLINE)), ("offline", "Waiting for a network."))
@@ -343,16 +314,16 @@ class TestStatusText(unittest.TestCase):
     self.assertEqual(tailscale.status_text(_status(tailscale.LOGIN, LOGIN_URL)), ("sign in", LOGIN_URL))
     self.assertEqual(tailscale.status_text(_status(tailscale.RUNNING, "100.64.0.7")), ("100.64.0.7", "Connected as 100.64.0.7."))
     self.assertEqual(tailscale.status_text(_status(tailscale.ERROR, "download failed")), ("error", "download failed"))
-    self.assertEqual(tailscale.status_text(_status(tailscale.STOPPED))[0], "starting")
-    self.assertEqual(tailscale.status_text(_params(**{tailscale.ENABLE_KEY: True}))[0], "starting")
+    self.assertEqual(tailscale.status_text(_status(tailscale.STOPPED)), ("stopped", ""))
+    self.assertEqual(tailscale.status_text(params(on=False, overrides={TAILSCALE.key: True}))[0], "starting")
 
   def test_round_trip_through_the_param(self):
-    params = FakeParams()
-    tailscale.put_status(cast(Params, params), tailscale.LOGIN, LOGIN_URL)
-    self.assertEqual(tailscale.read_status(cast(Params, params)), (tailscale.LOGIN, LOGIN_URL))
+    store = FakeParams(on=False)
+    tailscale.put_status(cast(Params, store), tailscale.LOGIN, LOGIN_URL)
+    self.assertEqual(tailscale.read_status(cast(Params, store)), (tailscale.LOGIN, LOGIN_URL))
 
-    tailscale.put_status(cast(Params, params), tailscale.STARTING)
-    self.assertEqual(tailscale.read_status(cast(Params, params)), (tailscale.STARTING, ""))
+    tailscale.put_status(cast(Params, store), tailscale.STARTING)
+    self.assertEqual(tailscale.read_status(cast(Params, store)), (tailscale.STARTING, ""))
 
 
 class TestAuthUrl(unittest.TestCase):
@@ -365,11 +336,11 @@ class TestAuthUrl(unittest.TestCase):
       "error": _status(tailscale.ERROR, "download failed"),
       "login holding a non-url": _status(tailscale.LOGIN, "not a url"),
       "login with no detail": _status(tailscale.LOGIN),
-      "toggle off": _params(**{tailscale.STATUS_KEY: f"{tailscale.LOGIN} {LOGIN_URL}"}),
+      "toggle off": params(on=False, overrides={tailscale.STATUS_KEY: f"{tailscale.LOGIN} {LOGIN_URL}"}),
     }
-    for name, params in closed.items():
+    for name, store in closed.items():
       with self.subTest(case=name):
-        self.assertEqual(tailscale.auth_url(params), "")
+        self.assertEqual(tailscale.auth_url(store), "")
 
     self.assertEqual(tailscale.auth_url(_status(tailscale.LOGIN, LOGIN_URL)), LOGIN_URL)
 
@@ -399,7 +370,6 @@ class TestBinaries(unittest.TestCase):
       with open(tailscale.marker_path(), "w") as f:
         f.write("0.0.0")
       self.assertTrue(tailscale.upgrade_available(_VERSION))
-      self.assertTrue(tailscale.installed())
       pair = tailscale.binaries()
       self.assertIsNotNone(pair)
       self.assertEqual(cast(tuple[str, str], pair)[0], os.path.join(tailscale.bin_dir(), "tailscale"))
@@ -411,7 +381,6 @@ class TestBinaries(unittest.TestCase):
       mock.patch.object(tailscale.shutil, "which", return_value=None),
     ):
       self.assertIsNone(tailscale.binaries())
-      self.assertFalse(tailscale.installed())
       self.assertFalse(tailscale.upgrade_available(_VERSION))
 
 
@@ -462,15 +431,9 @@ class TestSupervisorKill(unittest.TestCase):
 
 
 class TestWiring(unittest.TestCase):
-  def test_the_param_rows_exist(self):
-    # A missing row is a device-only UnknownKeyName, raised the first time the supervisor writes
-    # status or the panel reads the toggle.
-    text = (ROOT / "moonpilot" / "params_keys.h").read_text()
-    self.assertTrue('"MoonpilotTailscale"' in text)
-    self.assertTrue('"MoonpilotTailscaleStatus"' in text)
 
   def test_the_feature_and_its_process_are_registered(self):
-    self.assertTrue(tailscale.ENABLE_KEY in [f.key for f in FEATURES])
+    # The feature is covered by the registry table; the process registration is unique to this module.
     matches = [p for p in procs.MOONPILOT_PROCS if p.name == "tailscaled"]
     self.assertEqual(len(matches), 1)
     self.assertIsInstance(matches[0], procs.PythonProcess)

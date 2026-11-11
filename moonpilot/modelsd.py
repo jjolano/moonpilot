@@ -3,18 +3,13 @@
 
 The device has no installer and the panels have no business doing I/O, so both halves of the model
 marketplace meet at two params: `MoonpilotModelsRequest` goes in, `MoonpilotModelsStatus` comes out
-(moonpilot/models.py). This process is the only writer of either, and it never interprets a request
--- it decodes one op, does it, and publishes.
+(`moonpilot/modelstatus.py`). The panels write requests; this process reads them and is the only
+status writer. It decodes one op, does it, and publishes.
 
 Four things about it are not obvious.
 
-**It never returns on its own.** The manager's `should_run` predicate is
-`request present or status missing`, and its stop is the only exit that leads anywhere:
-`ensure_running` does not restart a child that exited while the predicate was still True
-(`openpilot/system/manager/process.py:142-147,166-171` -- `start()` no-ops while `self.proc` is
-set), so a process that returned after finishing a job would be gone until the next boot. So the
-loop idles instead, and finishing a job means publishing the status and *then* clearing the
-request, which is what makes the predicate false and lets the manager reap it.
+**The worker waits for a request.** Finishing a job publishes status, clears the request, and returns
+to its idle loop.
 
 **A rebuild is not automatic.** Nothing here watches for a version bump or a tinygrad change: the
 build directory is keyed on (selection, protocol, camera resolutions) only, so a build stays valid
@@ -44,7 +39,7 @@ import openpilot.cereal.messaging as messaging
 from openpilot.common.params import Params
 from openpilot.common.swaglog import cloudlog
 
-from moonpilot import models
+from moonpilot import modelprotocols, modelstatus, models
 
 IDLE_INTERVAL = 1.0  # nothing to do: re-check the store and the request once a second
 NETWORK_INTERVAL = 5.0  # the network is unusable right now
@@ -66,7 +61,7 @@ class Worker:
     self.sm = messaging.SubMaster(["deviceState"])
     self.catalog = None  # the vendored Catalog, when the store has a validated snapshot
     self.catalog_error: str | None = None
-    self.job: models.Job | None = None
+    self.job: modelstatus.Job | None = None
     self._published = ""
     self._completed = 0
     self._progress_artifact: str | None = None
@@ -101,21 +96,21 @@ class Worker:
     """Write the status, skipping the write when nothing changed: the idle loop runs at 1 Hz and a
     param write per second is a write no reader can see."""
     installed = models.installed_entries()
-    storage = models.storage_status()
+    storage = modelstatus.storage_status()
     catalog = self._catalog_status()
     snapshot = {"catalog": catalog, "job": self.job.to_dict() if self.job is not None else None, "installed": installed, "storage": storage}
     signature = json.dumps(snapshot, sort_keys=True)
     if signature == self._published and not force:
       return
     self._published = signature
-    models.publish_status(self.params, catalog=catalog, job=self.job, installed=installed, storage=storage)
+    modelstatus.publish_status(self.params, catalog=catalog, job=self.job, installed=installed, storage=storage)
 
   # --- requests ----------------------------------------------------------------------------------
   def run(self) -> None:
     self.publish(force=True)
     while True:
       self.sm.update(0)
-      request = models.read_request(self.params)
+      request = modelstatus.read_request(self.params)
       if request is None:
         self.publish()
         time.sleep(IDLE_INTERVAL)
@@ -124,45 +119,41 @@ class Worker:
 
   def serve(self, request: dict) -> None:
     """Serve one request to completion, then hand the process back to the manager by clearing it."""
-    job = models.Job(id=request["id"], op=request["op"], selection=request["recipe"], phase="waiting-network")
-    job.started_at = time.monotonic()  # published as `elapsed`, so the panels can show a clock
+    job = modelstatus.Job(id=request["id"], op=request["op"], selection=request["recipe"], phase=modelstatus.PHASE_WAITING_NETWORK)
+
     self.job = job
     self._completed = 0
     self._progress_artifact = None
     self._progress_finished = False
     self.publish(force=True)
     try:
-      if request["op"] == "refresh":
+      if request["op"] == modelstatus.OP_REFRESH:
         self._refresh(job)
-      elif request["op"] == "install":
+      elif request["op"] == modelstatus.OP_INSTALL:
         self._install(job)
-      elif request["op"] == "remove":
+      elif request["op"] == modelstatus.OP_REMOVE:
         self._remove(job)
       # "cancel" with nothing running is already done: the request it would cancel is gone.
     except _Canceled:
-      job.phase = "canceled"
+      job.phase = modelstatus.PHASE_CANCELED
       cloudlog.info("moonpilot models: canceled")
     except _Refused as exc:
-      job.phase = "error"
+      job.phase = modelstatus.PHASE_ERROR
       job.error = str(exc)
       cloudlog.warning(f"moonpilot models: refused: {exc}")
     except Exception:
-      job.phase = "error"
+      job.phase = modelstatus.PHASE_ERROR
       job.error = "unexpected failure, see the log"
       cloudlog.exception("moonpilot models: job failed")
     self.publish(force=True)
-    models.clear_request(self.params, request["id"])
+    modelstatus.clear_request(self.params, request["id"])
     self.job = None
     self.publish(force=True)
 
-  def _canceled(self, job: models.Job) -> bool:
-    """Has the driver moved on? True when the request is gone, is a different one, or is a cancel.
-
-    The SDK's only abort path is its `DownloadCanceled` exception raised from here, which makes a partial
-    package impossible: the staging directory is removed on the way out.
-    """
-    request = models.read_request(self.params)
-    return request is None or request["id"] != job.id or request["op"] == "cancel"
+  def _canceled(self, job: modelstatus.Job) -> bool:
+    """Has the driver moved on? True when the request is gone, changed, or canceled."""
+    request = modelstatus.read_request(self.params)
+    return request is None or request["id"] != job.id or request["op"] == modelstatus.OP_CANCEL
 
   def _network_usable(self) -> bool:
     state = self.sm["deviceState"]
@@ -171,27 +162,32 @@ class Worker:
   def _network_available(self) -> bool:
     return self.sm["deviceState"].networkType != log.DeviceState.NetworkType.none
 
+  def _wait(self, job: modelstatus.Job, phase: str, condition, interval: float, *, metered=None, force=True) -> None:
+    while condition():
+      job.phase = phase
+      if metered is not None:
+        job.metered = metered() if callable(metered) else metered
+      self.publish(force=force)
+      time.sleep(interval)
+      self.sm.update(0)
+      if self._canceled(job):
+        raise _Canceled
+
   # --- ops ---------------------------------------------------------------------------------------
-  def _refresh(self, job: models.Job) -> None:
-    from moonpilot import deps, features, modelcatalog
+  def _refresh(self, job: modelstatus.Job) -> None:
+    from moonpilot import features, modelcatalog
 
     require_signature = features.wanted(features.CATALOG_SIGNATURES, self.params)
-    if require_signature and not deps.available("cryptography"):
+    if require_signature and features.missing_modules(features.CATALOG_SIGNATURES):
       raise _Refused("catalog signature requirement cannot be met: cryptography package is not installed")
 
     # A catalog is 7 MB and not worth a metered connection, so an unusable network holds the
     # request rather than dropping it: the driver asked for this refresh, and it runs the moment
     # there is a connection worth using. The process stays alive while a request exists
     # (`moonpilot/procs.py::_models_wanted`), which is what makes waiting here possible.
-    while not self._network_usable():
-      job.phase = "waiting-network"
-      job.metered = bool(self.sm["deviceState"].networkMetered)
-      self.publish(force=True)
-      time.sleep(NETWORK_INTERVAL)
-      self.sm.update(0)
-      if self._canceled(job):
-        raise _Canceled
-    job.phase = "downloading"
+    self._wait(job, modelstatus.PHASE_WAITING_NETWORK, lambda: not self._network_usable(), NETWORK_INTERVAL,
+               metered=lambda: bool(self.sm["deviceState"].networkMetered))
+    job.phase = modelstatus.PHASE_DOWNLOADING
     self.publish(force=True)
     try:
       _revision, catalog = modelcatalog.refresh(require_signature=require_signature)
@@ -201,11 +197,11 @@ class Worker:
     self.catalog = catalog
     self.catalog_error = None
     modelcatalog.write_browse(catalog)
-    job.phase = "done"
-    cloudlog.info(f"moonpilot models: catalog {catalog.revision[:12]} refreshed")
+    job.phase = modelstatus.PHASE_DONE
+    cloudlog.info(f"moonpilot models: catalog {models.short(catalog.revision)} refreshed")
 
-  def _install(self, job: models.Job) -> None:
-    from moonpilot import modelbuild, modelcatalog
+  def _install(self, job: modelstatus.Job) -> None:
+    from moonpilot import modelcatalog
 
     selection = job.selection
     if self.catalog is None:
@@ -221,10 +217,10 @@ class Worker:
       if not verdict["admitted"]:
         raise _Refused(str(verdict["reason"]) or "this model cannot run here")
       declared = modelcatalog.artifact_bytes(self.catalog, selection)
-      if (reason := models.capacity_reason(declared)) is not None:
+      if (reason := modelstatus.capacity_reason(declared)) is not None:
         raise _Refused(reason)
       self._fetch(job, self.catalog, selection, declared)
-      if (reason := modelcatalog.verify_downloaded(self.catalog, selection)) is not None:
+      if (reason := modelcatalog.verify_downloaded(selection)) is not None:
         self._discard(selection)
         raise _Refused(reason)
       resolved = models.selection_record(selection)
@@ -235,29 +231,18 @@ class Worker:
         self._discard(selection)
         raise _Refused(reason)
 
-    if resolved is None:
-      raise _Refused("this model is not installed and could not be resolved")
-    proto = resolved["protocol"]
-    # A build is a package again: the same copies in flight, and it is larger than its members, so
-    # the estimate is their sum (the panel shows the store's own numbers, this only decides).
-    build_bytes = sum(member["size"] for member in resolved["members"].values())
-    if (reason := models.capacity_reason(build_bytes)) is not None:
-      raise _Refused(reason)
-    self._build(job, modelbuild, selection, resolved, proto)
-    job.phase = "done"
 
-  def _fetch(self, job: models.Job, catalog, selection: str, declared: int) -> None:
+    build_bytes = sum(member["size"] for member in resolved["members"].values())
+    if (reason := modelstatus.capacity_reason(build_bytes)) is not None:
+      raise _Refused(reason)
+    self._build(job, selection, resolved)
+    job.phase = modelstatus.PHASE_DONE
+
+  def _fetch(self, job: modelstatus.Job, catalog, selection: str, declared: int) -> None:
     from moonpilot.vendor.openmodels.client import DownloadCancelled, ModelStore  # codespell:ignore cancelled
 
-    while not self._network_available():
-      job.phase = "waiting-network"
-      job.metered = False
-      self.publish(force=True)
-      time.sleep(NETWORK_INTERVAL)
-      self.sm.update(0)
-      if self._canceled(job):
-        raise _Canceled
-    job.phase = "downloading"
+    self._wait(job, modelstatus.PHASE_WAITING_NETWORK, lambda: not self._network_available(), NETWORK_INTERVAL, metered=False)
+    job.phase = modelstatus.PHASE_DOWNLOADING
     job.total = declared
     job.metered = bool(self.sm["deviceState"].networkMetered)
     self.publish(force=True)
@@ -283,7 +268,7 @@ class Worker:
     except DownloadCancelled as exc:  # codespell:ignore cancelled
       raise _Canceled from exc
     job.received = job.total
-    job.phase = "verifying"
+    job.phase = modelstatus.PHASE_VERIFYING
     self.publish(force=True)
 
   def _discard(self, selection: str) -> None:
@@ -314,17 +299,12 @@ class Worker:
         except OSError:
           pass
 
-  def _build(self, job: models.Job, modelbuild, selection: str, resolved: dict, proto) -> None:
-    directory = models.build_dir(selection, proto.id)
-    while self.sm["deviceState"].started:
-      # The compiler is a whole CPU and the car may want it: a build waits for offroad.
-      job.phase = "waiting-offroad"
-      self.publish()
-      time.sleep(IDLE_INTERVAL)
-      self.sm.update(0)
-      if self._canceled(job):
-        raise _Canceled
-    job.phase = "building"
+  def _build(self, job: modelstatus.Job, selection: str, resolved: dict) -> None:
+    from moonpilot import modelbuild
+    proto = resolved["protocol"]
+    directory = models.build_dir(selection, proto.id, models.CAMERA_RESOLUTIONS)
+    self._wait(job, modelstatus.PHASE_WAITING_OFFROAD, lambda: self.sm["deviceState"].started, IDLE_INTERVAL, force=False)
+    job.phase = modelstatus.PHASE_BUILDING
     self.publish(force=True)
     started = time.monotonic()
     try:
@@ -334,39 +314,35 @@ class Worker:
         resolved["configuration"],
         models.CAMERA_RESOLUTIONS,
         directory,
-        selection=selection,
       )
     except Exception as exc:
-      self._failed_build(modelbuild, directory, str(exc))
+      self._failed_build(directory, str(exc))
       raise _Refused(f"{models.BUILD_FAILED_PREFIX}{exc}") from exc
-    cloudlog.info(f"moonpilot models: built {os.path.basename(directory)[:12]} in {time.monotonic() - started:.0f}s")
+    cloudlog.info(f"moonpilot models: built {models.short(os.path.basename(directory))} in {time.monotonic() - started:.0f}s")
 
-  def _failed_build(self, modelbuild, directory: str, error: str) -> None:
-    """Record the compiler's own message where `models.build_state` and the panel read it, and leave
-    no `model.pkl` behind: a build that parses as built while holding garbage is the one thing the
-    boot commit must never accept."""
+  def _failed_build(self, directory: str, error: str) -> None:
     os.makedirs(directory, exist_ok=True)
     try:
       os.remove(os.path.join(directory, "model.pkl"))
     except OSError:
       pass
-    models.write_json(models.build_record(os.path.basename(directory)), modelbuild.failure_record(error))
+    models.write_failed_build(os.path.basename(directory), error)
 
-  def _remove(self, job: models.Job) -> None:
+  def _remove(self, job: modelstatus.Job) -> None:
     selection = job.selection
-    if not models.valid_selection(selection):
+    if not models.is_recipe(selection):
       raise _Refused(models.UNKNOWN_SELECTION)
     # Anything in effect this boot, or wanted for the next one, is off limits: the driver switches
     # first, and the panel says so (models.SELECTED_HINT).
-    live = {models.boot(self.params)[kind]["id"] for kind in models.KINDS}
-    live |= {models.desired(self.params, kind) for kind in models.KINDS}
+    live = {models.boot(self.params)[kind]["id"] for kind in modelprotocols.KINDS}
+    live |= {models.desired(self.params, kind) for kind in modelprotocols.KINDS}
     if selection in live:
       raise _Refused(models.SELECTED_HINT)
     resolved = models.selection_record(selection)
     if resolved is not None:
-      shutil.rmtree(models.build_dir(selection, resolved["protocol"].id), ignore_errors=True)
+      shutil.rmtree(models.build_dir(selection, resolved["protocol"].id, models.CAMERA_RESOLUTIONS), ignore_errors=True)
     self._discard(selection)
-    job.phase = "done"
+    job.phase = modelstatus.PHASE_DONE
 
 
 def main() -> None:

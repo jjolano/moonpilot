@@ -6,20 +6,11 @@ from pathlib import Path
 from unittest import mock
 
 from moonpilot import boot
+from moonpilot.tests.fakes import FakeParams
 
 ROOT = Path(__file__).resolve().parents[2]
 BOOT_SH = ROOT / "moonpilot" / "boot.sh"
 
-
-class FakeParams:
-  def __init__(self, values=None):
-    self.values = values or {}
-
-  def get(self, key):
-    return self.values.get(key)
-
-  def put(self, key, value, block=False):
-    self.values[key] = value
 
 
 class TestBootRecovery(unittest.TestCase):
@@ -50,12 +41,12 @@ class TestBootRecovery(unittest.TestCase):
       checkout = root / "openpilot"
       old = staging / "old_openpilot"
       old.mkdir()
-      (staging / boot.SWAP_MARKER).write_text("boot-a\n", encoding="utf-8")
+      (staging / "moonpilot_swap").write_text("boot-a\n", encoding="utf-8")
 
       self.assertEqual(self.recover(staging, checkout, "boot-b"), "restart")
       self.assertTrue(checkout.is_dir())
       self.assertFalse(old.exists())
-      self.assertFalse((staging / boot.SWAP_MARKER).exists())
+      self.assertFalse((staging / "moonpilot_swap").exists())
 
   def test_same_boot_swap_waits_for_manager(self):
     with tempfile.TemporaryDirectory() as tmp:
@@ -66,12 +57,12 @@ class TestBootRecovery(unittest.TestCase):
       checkout.mkdir()
       old = staging / "old_openpilot"
       old.mkdir()
-      (staging / boot.SWAP_MARKER).write_text("boot-a\n", encoding="utf-8")
+      (staging / "moonpilot_swap").write_text("boot-a\n", encoding="utf-8")
 
       self.assertEqual(self.recover(staging, checkout, "boot-a"), "none")
       self.assertTrue(checkout.is_dir())
       self.assertTrue(old.is_dir())
-      self.assertTrue((staging / boot.SWAP_MARKER).exists())
+      self.assertTrue((staging / "moonpilot_swap").exists())
 
   def test_matching_health_token_cleans_later_boot(self):
     with tempfile.TemporaryDirectory() as tmp:
@@ -82,13 +73,13 @@ class TestBootRecovery(unittest.TestCase):
       checkout.mkdir()
       old = staging / "old_openpilot"
       old.mkdir()
-      (staging / boot.SWAP_MARKER).write_text("boot-a\n", encoding="utf-8")
+      (staging / "moonpilot_swap").write_text("boot-a\n", encoding="utf-8")
       (staging / boot.BOOT_OK_MARKER).write_text("boot-a\n", encoding="utf-8")
 
       self.assertEqual(self.recover(staging, checkout, "boot-b"), "cleaned")
       self.assertTrue(old.is_dir())
       self.assertTrue(checkout.is_dir())
-      self.assertFalse((staging / boot.SWAP_MARKER).exists())
+      self.assertFalse((staging / "moonpilot_swap").exists())
 
   def test_missing_health_token_rolls_back(self):
     self._assert_rolls_back("boot-b", None)
@@ -107,17 +98,17 @@ class TestBootRecovery(unittest.TestCase):
       old = staging / "old_openpilot"
       old.mkdir()
       (old / "old").write_text("old", encoding="utf-8")
-      failed = staging / boot.FAILED_OPENPILOT
+      failed = staging / "failed_openpilot"
       failed.mkdir()
       (failed / "stale").touch()
-      (staging / boot.SWAP_MARKER).write_text("boot-a\n", encoding="utf-8")
+      (staging / "moonpilot_swap").write_text("boot-a\n", encoding="utf-8")
       if health_token is not None:
         (staging / boot.BOOT_OK_MARKER).write_text(health_token + "\n", encoding="utf-8")
 
       self.assertEqual(self.recover(staging, checkout, current_token), "restart")
       self.assertEqual((checkout / "old").read_text(encoding="utf-8"), "old")
       self.assertEqual((failed / "new").read_text(encoding="utf-8"), "new")
-      self.assertFalse((staging / boot.SWAP_MARKER).exists())
+      self.assertFalse((staging / "moonpilot_swap").exists())
       record = (staging / boot.ROLLBACK_MARKER).read_text(encoding="utf-8")
       self.assertRegex(record, r"^update rolled back at .+: the new tree never reached a healthy manager\n$")
 
@@ -130,7 +121,7 @@ class TestBootRecovery(unittest.TestCase):
       checkout.mkdir()
       old = staging / "old_openpilot"
       old.mkdir()
-      swap = staging / boot.SWAP_MARKER
+      swap = staging / "moonpilot_swap"
       swap.write_text("boot-a\n", encoding="utf-8")
       boot_id_file = staging / "boot_id"
       boot_id_file.write_text("boot-a\n", encoding="utf-8")
@@ -155,7 +146,7 @@ class TestBootRecovery(unittest.TestCase):
       checkout.mkdir()
       old = staging / "old_openpilot"
       old.mkdir()
-      swap = staging / boot.SWAP_MARKER
+      swap = staging / "moonpilot_swap"
       swap.touch()
 
       self.assertEqual(self.recover(staging, checkout, "boot-a"), "none")
@@ -172,7 +163,7 @@ class TestBootRecovery(unittest.TestCase):
       checkout.mkdir()
       old = staging / "old_openpilot"
       old.mkdir()
-      swap = staging / boot.SWAP_MARKER
+      swap = staging / "moonpilot_swap"
       swap.write_text("boot-a\n", encoding="utf-8")
 
       self.assertEqual(self.recover(staging, checkout, ""), "none")
@@ -189,7 +180,7 @@ class TestBootRecovery(unittest.TestCase):
       checkout.mkdir()
       old = staging / "old_openpilot"
       old.mkdir()
-      swap = staging / boot.SWAP_MARKER
+      swap = staging / "moonpilot_swap"
       swap.write_text("boot-a\n", encoding="utf-8")
 
       self.assertEqual(self.recover(staging, checkout, None), "none")
@@ -225,7 +216,7 @@ class TestBootRecovery(unittest.TestCase):
   def test_rollback_text_reads_the_current_boot_param(self):
     self.assertEqual(boot.rollback_text(FakeParams()), "")
     sentence = "update rolled back at now: the new tree never reached a healthy manager"
-    self.assertEqual(boot.rollback_text(FakeParams({boot.ROLLBACK_KEY: sentence})), sentence)
+    self.assertEqual(boot.rollback_text(FakeParams(overrides={boot.ROLLBACK_KEY: sentence})), sentence)
 
 
 if __name__ == "__main__":

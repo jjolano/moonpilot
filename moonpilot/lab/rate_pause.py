@@ -1,11 +1,13 @@
 """Replay Toyota steering-rate gating over recorded control frames."""
+from opendbc.car.toyota.carcontroller import MAX_STEER_RATE, MAX_STEER_RATE_FRAMES
 import numpy as np
 
 from openpilot.tools.lib.logreader import LogReader
 from moonpilot.engage import ActuatorGate
+from moonpilot.features import LATERAL_ENGAGE
 from moonpilot.lab import DEFAULT_ROOT, cached, drive_config, expand
+from moonpilot.lab.routes import add_routes_arg
 
-ROUTE_SETS = {"rate-pause": ("00000408", "0000040d", "0000040e")}
 EXTRACT_VERSION = 3
 
 
@@ -14,7 +16,7 @@ class _Params:
     self.value = value
 
   def get(self, key, return_default=False):
-    return self.value if key == "MoonpilotLateralEngage" else None
+    return self.value if key == LATERAL_ENGAGE.key else None
 
 
 def _build(segs):
@@ -69,12 +71,12 @@ def replay(d, enabled=True):
     cs.steeringRateDeg = float(rate)
     panda[0].controlsAllowedLateral = bool(d["lateral_allowed"][i])
     released[i] = gate.lateral(panda, cs)
-    if d["active"][i] and abs(rate) >= 100:
+    if d["active"][i] and abs(rate) >= MAX_STEER_RATE:
       hot += 1
     else:
       hot = 0
-    stock[i] = not (d["active"][i] and hot > 17)
-    if hot >= 18:
+    stock[i] = not (d["active"][i] and hot > MAX_STEER_RATE_FRAMES)
+    if hot > MAX_STEER_RATE_FRAMES:
       hot = 0
   return released, stock
 
@@ -84,13 +86,13 @@ def _episodes(mask):
 
 
 def _rate_pause(args):
-  for route in expand(args.routes, ROUTE_SETS):
+  for route in expand(args.routes, args.root):
     d = extract(route, args.root)
     _, params = drive_config(route, args.root)
-    as_driven, stock = replay(d, params.get("MoonpilotLateralEngage") == "1")
+    as_driven, stock = replay(d, params.get(LATERAL_ENGAGE.key) == "1")
     current, _ = replay(d)
     active = d["active"]
-    hot = np.abs(d["rate"]) >= 100
+    hot = np.abs(d["rate"]) >= MAX_STEER_RATE
     # The logs for the pre-current-pause routes already contain the old first-hot pause, so the
     # request upstream would have made without that pause is reconstructed on hot, granted frames.
     request = active | (hot & d["lateral_allowed"])
@@ -99,7 +101,7 @@ def _rate_pause(args):
     stock_active = request & stock
     err = int(np.count_nonzero((active & as_driven) != active))
     lockouts = _episodes(d["temporary"] | d["permanent"])
-    print(f"{route}: as-driven lateral-engage={params.get('MoonpilotLateralEngage', 'unset')}, "
+    print(f"{route}: as-driven lateral-engage={params.get(LATERAL_ENGAGE.key, 'unset')}, "
           + f"gate-vs-logged latActive mismatches {err}/{len(active)} frames; "
           + f"lockouts {lockouts} (temporary {_episodes(d['temporary'])}, permanent {_episodes(d['permanent'])}); "
           + f"gate releases {int(current_active.sum())}/{int(request.sum())} reconstructed requests, "
@@ -110,6 +112,6 @@ def _rate_pause(args):
 
 def register(sub):
   p = sub.add_parser("rate-pause", help="replay Toyota rapid-wheel pause")
-  p.add_argument("--routes", nargs="+", default=["rate-pause"], help=f"route names or sets: {', '.join(ROUTE_SETS)}")
+  add_routes_arg(p, ["rate-pause"])
   p.set_defaults(fn=_rate_pause)
 

@@ -14,28 +14,20 @@ not certain of, and `None` means "run upstream's model", which is the whole cont
   digests -- is the commit's job, run a moment earlier in the same boot.
 - **Fail at load, fall back, never mid-drive.** Nothing here hot-swaps or caches a prediction: a
   model that cannot load gives `None`, the process runs the bundled model, and
-  MoonpilotModelsActive* records which of the two happened. A failure *after* the model is running
-  propagates exactly as upstream's does -- the process exits; while `should_run` remains true,
-  `ensure_running` leaves it down; the next manager/boot cycle re-runs the same check.
+  `ensure_running` behavior is described in `moonpilot/procs.py`.
 - **The build drives the buffers.** Every queue shape and every packed view is recorded by
   `moonpilot/modelbuild.py` in `model.pkl`'s metadata and rebuilt here from that record, so the JIT
   sees the buffers it was compiled against by construction rather than by two files agreeing about
   arithmetic. The one thing this file derives is the NV12 frame copy size, which is a function of
   the camera resolution and nothing else (upstream's `ModelState` does the same).
-- **The action decode is the protocol's, and `curvature-100` is the one that is not upstream's.**
-  `plan` and `lateral-accel` both hand the action to upstream `get_action_from_model`, which already
-  branches on the presence of an `action` slice; `curvature-100` is the pre-2026-06 convention
-  (`action[0, 0] / 100`, the head's first column a curvature times a hundred) that
-  `openpilot@9757bf10` used for the split families it carried. Applying the wrong one of the two
-  scales is a wrong steering request that no shape in a model can reveal, which is why the protocol
-  pins it at admission and the build record carries it forward.
+- **Action decoding follows the build record's protocol contract.** See
+  `moonpilot/modelprotocols.py` for the action-era distinction.
 """
 
-import io
 import os
 import pickle
-import struct
 import time
+from moonpilot.modelpickle import load_oob
 
 import numpy as np
 from tinygrad.tensor import Tensor
@@ -45,18 +37,16 @@ from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.controls.lib.drive_helpers import smooth_value
 from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.selfdrive.modeld.helpers import MODELS_DIR
+from openpilot.selfdrive.modeld.modeld import LAT_SMOOTH_SECONDS, LONG_SMOOTH_SECONDS, MIN_LAT_CONTROL_SPEED
 from openpilot.selfdrive.modeld.parse_model_outputs import Parser, safe_exp, sigmoid
 from openpilot.system.camerad.cameras.nv12_info import get_nv12_info
 
-from moonpilot import models
+from moonpilot import modelprotocols, models
 from typing import Any
 
 SEND_RAW_PRED = os.getenv("SEND_RAW_PRED")
-MIN_LAT_CONTROL_SPEED = 0.3
 
-# The DM warp is model-independent -- it maps the camera's NV12 frame to the model's input size,
-# which the build refuses to change (`models.DM_INPUT_SIZE`) -- so it is read from the checkout
-# rather than copied into every build.
+# The DM warp is model-independent and uses upstream's fixed `DM_INPUT_SIZE`.
 DM_WARP = "dm_warp_{w}x{h}_tinygrad.pkl"
 
 
@@ -70,36 +60,19 @@ def _active(kind: str, text: str, params: Any) -> None:
 
 def _fallback(kind: str, reason: str, params: Any) -> None:
   cloudlog.warning(f"moonpilot models: running the bundled model, {reason}")
-  _active(kind, f"stock: {reason}", params)
+  _active(kind, models.active_failure(reason), params)
 
 
-def _load_fork_oob(handle):
-  """The fork `model.pkl` loader: pre-#38933 upstream `helpers.load_oob`, verbatim."""
-  opcodes = handle.read(struct.unpack("<q", handle.read(8))[0])
-
-  def buffers():
-    while chunk := handle.read(8):
-      buf = pickle.PickleBuffer(bytearray(struct.unpack("<q", chunk)[0]))
-      if handle.readinto(buf) != buf.raw().nbytes:
-        raise EOFError("incomplete model buffer")
-      yield buf
-
-  return pickle.load(io.BytesIO(opcodes), buffers=buffers())
 
 
-def _field_key(names: set[str], role: str, field: str) -> str:
-  """The packed-view name for one role's field. A single-role family uses upstream's own names
-  (`desire`, `prev_feat`); a split namespaces them per role (`desire_on_policy`). Recorded by the
-  compiler as `npy_shapes`; this resolves which convention it used, and a miss is a build this
-  runtime cannot drive rather than a wrong buffer."""
-  if field in names:
-    return field
-  if f"{field}_{role}" in names:
-    return f"{field}_{role}"
-  raise KeyError(f"no packed field for {role}.{field}: {sorted(names)}")
+def _field_key(proto: modelprotocols.Protocol, names: set[str], role: str, field: str) -> str:
+  key = proto.field(role, field)
+  if key not in names:
+    raise KeyError(f"no packed field for {role}.{field}: {sorted(names)}")
+  return key
 
 
-def _make_queues(metadata: dict, device: str, frame_copy_size: int):
+def make_queues(metadata: dict, device: str, frame_copy_size: int):
   """Rebuild the JIT's input queues and the views into the packed buffer.
 
   Mirrors upstream `compile_modeld.make_input_queues`, but from the recorded shapes: the compiler
@@ -137,25 +110,27 @@ class DriverModel:
 
   def __init__(self, entry: dict, cam_w: int, cam_h: int):
     with open(os.path.join(entry["build"], "model.pkl"), "rb") as handle:
-      payload = _load_fork_oob(handle)
+      payload = load_oob(handle)
 
     self.metadata = payload["metadata"]
+    proto = modelprotocols.protocol(str(self.metadata["family"]))
+    if proto is None:
+      raise ValueError("unknown model family")
     self.model_device = payload["input_devices"]["model"]
     self.role_order = [str(role) for role in self.metadata["role_order"]]
     self.role_slices = {role: {name: slice(*bounds) for name, bounds in self.metadata["roles"][role]["slices"].items()} for role in self.role_order}
     self.features_role = str(self.metadata["features_role"])
     self.vision_input_names = [str(name) for name in self.metadata["vision_input_names"]]
-    self.frame_skip = int(self.metadata["frame_skip"])
     self.output_slices = {name: bounds for role in self.role_order for name, bounds in self.role_slices[role].items()}
     self.policy_roles = [role for role in self.role_order if "desire_pulse" in self.metadata["roles"][role]["input_shapes"]]
 
     npy_names = {str(name) for name, _shape in self.metadata["npy_shapes"]}
     self.npy_keys = {
       role: {
-        "desire": _field_key(npy_names, role, "desire"),
-        "traffic_convention": _field_key(npy_names, role, "traffic_convention"),
-        "action_t": _field_key(npy_names, role, "action_t") if "action_t" in self.metadata["roles"][role]["input_shapes"] else None,
-        "prev_feat": _field_key(npy_names, role, "prev_feat"),
+        "desire": _field_key(proto, npy_names, role, "desire"),
+        "traffic_convention": _field_key(proto, npy_names, role, "traffic_convention"),
+        "action_t": _field_key(proto, npy_names, role, "action_t") if "action_t" in self.metadata["roles"][role]["input_shapes"] else None,
+        "prev_feat": _field_key(proto, npy_names, role, "prev_feat"),
       }
       for role in self.policy_roles
     }
@@ -163,7 +138,7 @@ class DriverModel:
     stride, y_height, uv_height, _ = get_nv12_info(cam_w, cam_h)
     self.frame_copy_size = models.nv12_copy_size(stride, y_height, uv_height)
     self.run_model = payload["run_model"][(cam_w, cam_h)]
-    self.input_queues, self.npy, self.frame_views = _make_queues(self.metadata, self.model_device, self.frame_copy_size)
+    self.input_queues, self.npy, self.frame_views = make_queues(self.metadata, self.model_device, self.frame_copy_size)
     self.parser = Parser()
     self.chestnut = False  # a custom selection never loads as chestnut; modeld gates its big-model path on this
     self.prev_desire = np.zeros(ModelConstants.DESIRE_LEN, dtype=np.float32)
@@ -215,37 +190,32 @@ class DriverRuntime:
 
   def __init__(self, entry: dict, record: dict, params: Any):
     self.entry = entry
-    self.record = record
     self.selection = str(entry.get("id", ""))
     self.protocol = str(entry.get("protocol", ""))
-    self.name = models.entry_name(self.selection) or self.selection[:12]
-    self.action_contract = str(record.get("action_contract") or "plan")
+    self.name = models.short(self.selection)
+    self.action_contract = str(record.get("action_contract") or modelprotocols.ACTION_PLAN)
     self.configuration = entry.get("configuration") or {}
     self._params: Any = params
 
   @property
   def smoothness(self) -> tuple[float, float]:
-    return (float(self.configuration.get("LAT_SMOOTH_SECONDS", 0.0)), float(self.configuration.get("LONG_SMOOTH_SECONDS", 0.3)))
+    return (float(self.configuration.get("LAT_SMOOTH_SECONDS", LAT_SMOOTH_SECONDS)),
+            float(self.configuration.get("LONG_SMOOTH_SECONDS", LONG_SMOOTH_SECONDS)))
 
   def create_model(self, cam_w: int, cam_h: int) -> DriverModel | None:
     try:
       model = DriverModel(self.entry, cam_w, cam_h)
     except Exception as exc:
       cloudlog.exception("moonpilot models: custom model failed to load")
-      _active(models.DRIVING, f"stock: {type(exc).__name__}: {exc}", self._params)
+      _active(modelprotocols.DRIVING, models.active_failure(f"{type(exc).__name__}: {exc}"), self._params)
       return None
-    _active(models.DRIVING, f"{self.name} ({self.protocol})", self._params)
+    _active(modelprotocols.DRIVING, f"{self.name} ({self.protocol})", self._params)
     cloudlog.warning(f"moonpilot models: driving model {self.name} ({self.protocol}) loaded")
     return model
 
   def get_action(self, model_output: dict[str, np.ndarray], prev_action, lat_action_t: float, long_action_t: float, v_ego: float):
-    if self.action_contract == "curvature-100" and "action" in model_output:
+    if self.action_contract == modelprotocols.ACTION_CURVATURE_100 and "action" in model_output:
       return self._action_from_curvature_100(model_output, prev_action, v_ego)
-    if self.action_contract == "curvature-100":
-      # A record that says `curvature-100` while the model publishes no `action` is a build whose
-      # selection changed under it, and the plan decode is the one that cannot be wrong about a head
-      # that is not there. The compiler writes the contract from the members, so this is a guard.
-      cloudlog.warning("moonpilot models: no action head for a curvature-100 build, decoding the plan")
     # `plan` and `lateral-accel` are both upstream's own function: it branches on the presence of an
     # `action` slice and decodes `plan` otherwise.
     from openpilot.selfdrive.modeld.modeld import get_action_from_model
@@ -312,12 +282,11 @@ class MonitoringModel:
 
 
 class MonitoringRuntime:
-  def __init__(self, entry: dict, record: dict, params: Any):
+  def __init__(self, entry: dict, params: Any):
     self.entry = entry
-    self.record = record
     self.selection = str(entry.get("id", ""))
     self.protocol = str(entry.get("protocol", ""))
-    self.name = models.entry_name(self.selection) or self.selection[:12]
+    self.name = models.short(self.selection)
     self._params: Any = params
 
   def create_model(self, cam_w: int, cam_h: int) -> MonitoringModel | None:
@@ -325,9 +294,9 @@ class MonitoringRuntime:
       model = MonitoringModel(self.entry, cam_w, cam_h)
     except Exception as exc:
       cloudlog.exception("moonpilot models: monitoring model failed to load")
-      _active(models.MONITORING, f"stock: {type(exc).__name__}: {exc}", self._params)
+      _active(modelprotocols.MONITORING, models.active_failure(f"{type(exc).__name__}: {exc}"), self._params)
       return None
-    _active(models.MONITORING, f"{self.name} ({self.protocol})", self._params)
+    _active(modelprotocols.MONITORING, f"{self.name} ({self.protocol})", self._params)
     cloudlog.warning(f"moonpilot models: monitoring model {self.name} ({self.protocol}) loaded")
     return model
 
@@ -360,16 +329,10 @@ class MonitoringRuntime:
 
 
 def runtime_from_entry(kind: str, entry: Any, params: Any = None):
-  """A runtime for a committed custom entry, or `None` to run the bundled model.
-
-  Every reason for `None` is logged, and the ones that mean the driver's selection did not load are
-  written to `MoonpilotModelsActive*` so the panel can say so. The checks are the cheap half of the
-  boot commit's -- presence and size, not digest -- because the commit hashed these files moments
-  earlier in the same boot; a store edited since then fails to load rather than running wrong bytes.
-  """
-  if not isinstance(entry, dict) or entry.get("kind") != "custom":
+  """A runtime for a committed custom entry, or `None` to run the bundled model."""
+  if not isinstance(entry, dict) or entry.get("kind") != modelprotocols.CUSTOM:
     return None
-  proto = models.protocol(str(entry.get("protocol", "")))
+  proto = modelprotocols.protocol(str(entry.get("protocol", "")))
   if proto is None or proto.kind != kind:
     _fallback(kind, "the committed protocol is not one this fork runs", params)
     return None
@@ -377,7 +340,7 @@ def runtime_from_entry(kind: str, entry: Any, params: Any = None):
   build = str(entry.get("build", ""))
   key = os.path.basename(build)
   state, error = models.build_state(key)
-  if state != "built" or not build:
+  if state != models.BUILT or not build:
     _fallback(kind, error or models.NOT_BUILT, params)
     return None
   record = models.load_build(key) or {}
@@ -386,7 +349,7 @@ def runtime_from_entry(kind: str, entry: Any, params: Any = None):
     return None
   resolved = models.selection_record(selection)
   if resolved is None or resolved["protocol"].id != proto.id:
-    _fallback(kind, models.NOT_INSTALLED, params)
+    _fallback(kind, modelprotocols.NOT_INSTALLED, params)
     return None
   for role, member in resolved["members"].items():
     try:
@@ -394,11 +357,11 @@ def runtime_from_entry(kind: str, entry: Any, params: Any = None):
         _fallback(kind, f"{role}: {models.ARTIFACT_CHANGED}", params)
         return None
     except OSError:
-      _fallback(kind, f"{role}: {models.NOT_INSTALLED}", params)
+      _fallback(kind, f"{role}: {modelprotocols.NOT_INSTALLED}", params)
       return None
-  if kind == models.DRIVING:
+  if kind == modelprotocols.DRIVING:
     return DriverRuntime(entry, record, params)
-  return MonitoringRuntime(entry, record, params)
+  return MonitoringRuntime(entry, params)
 
 
 def moonpilot_model_runtime() -> DriverRuntime | None:
@@ -407,7 +370,7 @@ def moonpilot_model_runtime() -> DriverRuntime | None:
     from openpilot.common.params import Params
 
     params = Params()
-    return runtime_from_entry(models.DRIVING, models.boot(params)[models.DRIVING], params)
+    return runtime_from_entry(modelprotocols.DRIVING, models.boot(params)[modelprotocols.DRIVING], params)
   except Exception:
     cloudlog.exception("moonpilot models: driving runtime unavailable")
     return None
@@ -419,7 +382,7 @@ def moonpilot_dm_runtime() -> MonitoringRuntime | None:
     from openpilot.common.params import Params
 
     params = Params()
-    return runtime_from_entry(models.MONITORING, models.boot(params)[models.MONITORING], params)
+    return runtime_from_entry(modelprotocols.MONITORING, models.boot(params)[modelprotocols.MONITORING], params)
   except Exception:
     cloudlog.exception("moonpilot models: monitoring runtime unavailable")
     return None

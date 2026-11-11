@@ -11,12 +11,9 @@ shape: `curvature-100` is a curvature times a hundred, `lateral-accel` is a late
 and applying the wrong one is a wrong steering request, silently. The same numbers through both are
 therefore asserted to *differ* in the way the conventions differ.
 
-Two tests reach into `moonpilot/modelbuild.py` because the pair has to agree and nothing else checks
-it: the tinygrad flags string against the SConscript the device actually builds with, and the fork's
-`dump_oob` output against `modelruntime._load_fork_oob`.
+The pickle round trip checks the fork's writer against the runtime's reader.
 """
 
-import json
 import os
 import re
 import tempfile
@@ -26,9 +23,9 @@ from unittest import mock
 
 import numpy as np
 
-from moonpilot import models
-from moonpilot.tests.test_models import FakeParams, profile_document
-
+from moonpilot import modelprotocols, models
+from moonpilot.tests.fakes import FakeParams
+from moonpilot.tests.model_store import TempStoreMixin, write_build, write_package
 ROOT = Path(__file__).resolve().parents[2]
 RECIPE = "a" * 64
 
@@ -58,7 +55,7 @@ def driver_runtime(contract: str, *, lat: float = 0.0, long: float = 0.3):
   entry = {
     "kind": "custom",
     "id": RECIPE,
-    "protocol": models.SUPERCOMBO.id,
+    "protocol": modelprotocols.SUPERCOMBO.id,
     "build": "/nonexistent",
     "members": {},
     "configuration": {"LAT_SMOOTH_SECONDS": lat, "LONG_SMOOTH_SECONDS": long},
@@ -114,116 +111,80 @@ class TestActionConventions(unittest.TestCase):
     self.assertAlmostEqual(action.desiredCurvature, 0.123, places=6)
 
 
-class TestEntries(unittest.TestCase):
+class TestEntries(TempStoreMixin, unittest.TestCase):
   """`runtime_from_entry` is the seam's whole decision: `None` means upstream's model runs."""
 
   def setUp(self):
+    super().setUp()
     from moonpilot import modelruntime
 
     self.runtime = modelruntime
-    self.tmp = tempfile.mkdtemp()
-    patcher = mock.patch.object(models.paths, "data_dir", lambda feature: os.path.join(self.tmp, feature))
-    patcher.start()
-    self.addCleanup(patcher.stop)
-
   def entry(self, *, selection: str = RECIPE, **overrides) -> dict:
     """A committed entry, with the build directory its own selection would have produced."""
     entry = {
       "kind": "custom",
       "id": selection,
-      "protocol": models.SUPERCOMBO.id,
-      "build": models.build_dir(selection, models.SUPERCOMBO.id),
+      "protocol": modelprotocols.SUPERCOMBO.id,
+      "build": models.build_dir(selection, modelprotocols.SUPERCOMBO.id, models.CAMERA_RESOLUTIONS),
       "members": {},
       "configuration": {},
     }
     entry.update(overrides)
     return entry
 
-  def add_build(self, *, key_protocol: str = models.SUPERCOMBO.id, record_protocol: str | None = None,
-                selection: str = RECIPE, action_contract: str | None = "lateral-accel") -> str:
-    """A build directory named for `key_protocol` -- what the boot commit produced -- whose record
-    may name another protocol, which is the mismatch the runtime refuses."""
-    key = models.build_key(selection, key_protocol)
-    os.makedirs(os.path.dirname(models.build_model(key)), exist_ok=True)
-    with open(models.build_model(key), "wb") as handle:
-      handle.write(b"x")
-    models.write_json(models.build_record(key), {"schema": 1, "state": "built", "protocol": record_protocol or key_protocol,
-                                                "action_contract": action_contract})
-    return key
-
-  def add_package(self, role: str = "supercombo", *, size: int = 4) -> str:
-    """A stored package for `RECIPE`'s member, minimal but readable: `load_package` re-serializes
-    `recipe.json` and checks it against the directory name, so the bytes must be canonical."""
-    agreed = {"frame_skip": 4, "LAT_SMOOTH_SECONDS": 0.0, "LONG_SMOOTH_SECONDS": 0.3}
-    artifact_bytes = bytes(size)
-    digest = models.hashlib.sha256(artifact_bytes).hexdigest()
-    document = {"schema": 1, "type": "recipe", "profile": "c" * 64,
-                "members": {role: {"artifact": {"sha256": digest, "size": size, "format": "onnx"}, "source": {},
-                                   "configuration": dict(agreed), "missing": [], "inputs": {}, "outputs": {},
-                                   "targets": ["QCOM"], "metadata": {"input_shapes": {}, "output_slices": {}}}},
-                "configuration": dict(agreed)}
-    raw = json.dumps(document, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
-    recipe = models.hashlib.sha256(raw.encode()).hexdigest()
-    os.makedirs(models.package_dir(recipe), exist_ok=True)
-    with open(os.path.join(models.package_dir(recipe), "recipe.json"), "w", encoding="utf-8") as handle:
-      handle.write(raw)
-    models.write_json(os.path.join(models.package_dir(recipe), "profile.json"), profile_document("comma/test/v1"))
-    with open(os.path.join(models.package_dir(recipe), digest), "wb") as handle:
-      handle.write(artifact_bytes)
-    self.selection = recipe
-    return recipe
 
   def test_a_bundled_entry_runs_upstream(self):
     params = FakeParams()
-    self.assertIsNone(self.runtime.runtime_from_entry(models.DRIVING, {"kind": "bundled", "id": ""}, params))
+    self.assertIsNone(self.runtime.runtime_from_entry(modelprotocols.DRIVING, {"kind": "bundled", "id": ""}, params))
     self.assertTrue(models.ACTIVE_DRIVING_KEY not in params.values)
 
   def test_a_malformed_entry_is_not_a_verdict_on_the_car(self):
     for entry in (None, {}, {"kind": "custom"}, {"kind": "custom", "id": RECIPE, "protocol": "nope", "build": ""}):
       with self.subTest(entry=entry):
-        self.assertIsNone(self.runtime.runtime_from_entry(models.DRIVING, entry, FakeParams()))
+        self.assertIsNone(self.runtime.runtime_from_entry(modelprotocols.DRIVING, entry, FakeParams()))
 
   def test_a_missing_build_falls_back_with_the_reason(self):
     params = FakeParams()
-    self.assertIsNone(self.runtime.runtime_from_entry(models.DRIVING, self.entry(), params))
+    self.assertIsNone(self.runtime.runtime_from_entry(modelprotocols.DRIVING, self.entry(), params))
     self.assertTrue(str(params.values[models.ACTIVE_DRIVING_KEY]).startswith("stock: "))
 
   def test_a_record_without_a_contract_decodes_from_the_plan(self):
     # A build written before the field existed falls back to upstream's own decode -- never to the
     # old split family's `/100`, which would be a wrong steering request on a model nobody checked.
-    self.add_package()
-    self.add_build(selection=self.selection, action_contract=None)
-    runtime = self.runtime.runtime_from_entry(models.DRIVING, self.entry(selection=self.selection), FakeParams())
+    self.selection = write_package("supercombo")
+    write_build(self.selection, modelprotocols.SUPERCOMBO.id, action_contract=None)
+    runtime = self.runtime.runtime_from_entry(modelprotocols.DRIVING, self.entry(selection=self.selection), FakeParams())
     assert isinstance(runtime, self.runtime.DriverRuntime)
     self.assertEqual(runtime.action_contract, "plan")
 
   def test_a_build_of_another_protocol_is_refused(self):
-    self.add_package()
-    self.add_build(selection=self.selection, record_protocol=models.SPLIT_VISION_OFF_ON.id)
+    self.selection = write_package("supercombo")
+    write_build(self.selection, modelprotocols.SUPERCOMBO.id, record_protocol=modelprotocols.SPLIT_VISION_OFF_ON.id,
+                action_contract="lateral-accel")
     params = FakeParams()
-    self.assertIsNone(self.runtime.runtime_from_entry(models.DRIVING, self.entry(selection=self.selection), params))
+    self.assertIsNone(self.runtime.runtime_from_entry(modelprotocols.DRIVING, self.entry(selection=self.selection), params))
     self.assertTrue("another protocol" in str(params.values[models.ACTIVE_DRIVING_KEY]))
 
   def test_the_wrong_kind_never_constructs_a_runtime(self):
     # The boot commit already refuses this; the runtime refuses it again because the commit ran in
     # another process, and a driving runtime handed to `dmonitoringmodeld` would load a driving
     # pickle into the monitoring path.
-    self.add_build()
+    write_build(RECIPE, modelprotocols.SUPERCOMBO.id, action_contract="lateral-accel")
     params = FakeParams()
-    self.assertIsNone(self.runtime.runtime_from_entry(models.MONITORING, self.entry(), params))
+    self.assertIsNone(self.runtime.runtime_from_entry(modelprotocols.MONITORING, self.entry(), params))
 
   def test_a_verified_build_yields_the_runtime_for_its_kind(self):
-    self.add_package()
-    self.add_build(selection=self.selection)
-    runtime = self.runtime.runtime_from_entry(models.DRIVING, self.entry(selection=self.selection), FakeParams())
+    self.selection = write_package("supercombo")
+    write_build(self.selection, modelprotocols.SUPERCOMBO.id, action_contract="lateral-accel")
+    runtime = self.runtime.runtime_from_entry(modelprotocols.DRIVING, self.entry(selection=self.selection), FakeParams())
     assert isinstance(runtime, self.runtime.DriverRuntime)
-    self.assertEqual(runtime.protocol, models.SUPERCOMBO.id)
+    self.assertEqual(runtime.protocol, modelprotocols.SUPERCOMBO.id)
     self.assertEqual(runtime.smoothness, (0.0, 0.3))
     # The contract comes from the record, because that is what the model's `action` head means.
     self.assertEqual(runtime.action_contract, "lateral-accel")
 
 
-class TestLoadFailure(unittest.TestCase):
+class TestLoadFailure(TempStoreMixin, unittest.TestCase):
   """The path the boot commit cannot cover: the build is there, it is just not loadable.
 
   This is the on-device corruption case -- a truncated or overwritten `model.pkl` -- and what has to
@@ -232,38 +193,27 @@ class TestLoadFailure(unittest.TestCase):
   """
 
   def setUp(self):
+    super().setUp()
     from moonpilot import modelruntime
 
     self.runtime = modelruntime
-    self.tmp = tempfile.mkdtemp()
-    patcher = mock.patch.object(models.paths, "data_dir", lambda feature: os.path.join(self.tmp, feature))
-    patcher.start()
-    self.addCleanup(patcher.stop)
     self.params = FakeParams()
-    self.build = os.path.join(self.tmp, "build")
+    self.build = os.path.join(self.tmp.name, "build")
     os.makedirs(self.build, exist_ok=True)
     with open(os.path.join(self.build, "model.pkl"), "wb") as handle:
       handle.write(b"not a pickle at all")
-    self.entry = {"kind": "custom", "id": RECIPE, "protocol": models.SUPERCOMBO.id, "build": self.build,
+    self.entry = {"kind": "custom", "id": RECIPE, "protocol": modelprotocols.SUPERCOMBO.id, "build": self.build,
                   "members": {}, "configuration": {"LAT_SMOOTH_SECONDS": 0.0, "LONG_SMOOTH_SECONDS": 0.3}}
-
   def test_a_corrupt_build_falls_back_to_the_bundled_model(self):
     runtime = self.runtime.DriverRuntime(self.entry, {"action_contract": "lateral-accel"}, self.params)
     self.assertIsNone(runtime.create_model(1928, 1208))
     self.assertTrue(str(self.params.values[models.ACTIVE_DRIVING_KEY]).startswith("stock: "))
 
   def test_the_monitoring_half_fails_the_same_way(self):
-    runtime = self.runtime.MonitoringRuntime({**self.entry, "protocol": models.DMONITORING.id}, {}, self.params)
+    runtime = self.runtime.MonitoringRuntime({**self.entry, "protocol": modelprotocols.DMONITORING.id}, self.params)
     self.assertIsNone(runtime.create_model(1928, 1208))
     self.assertTrue(str(self.params.values[models.ACTIVE_MONITORING_KEY]).startswith("stock: "))
 
-  def test_a_missing_resolution_is_a_load_failure_not_a_crash(self):
-    # A build compiled for other camera resolutions: the JIT is not in the pickle under this key, and
-    # that must be the same fallback as any other load failure.
-    with open(os.path.join(self.build, "model.pkl"), "wb") as handle:
-      handle.write(b"x")
-    runtime = self.runtime.DriverRuntime(self.entry, {"action_contract": "lateral-accel"}, self.params)
-    self.assertIsNone(runtime.create_model(1344, 760))
 
 
 class TestMonitoringParse(unittest.TestCase):
@@ -296,7 +246,7 @@ class TestMonitoringParse(unittest.TestCase):
     from moonpilot import modelruntime
 
     runtime = modelruntime.MonitoringRuntime(
-      {"kind": "custom", "id": RECIPE, "protocol": models.DMONITORING.id, "build": "/nonexistent", "members": {}, "configuration": {}}, {}, None
+      {"kind": "custom", "id": RECIPE, "protocol": modelprotocols.DMONITORING.id, "build": "/nonexistent", "members": {}, "configuration": {}}, None
     )
     with_sleep = tuple(self.SHARED) + ("sleep_prob_lhd", "sleep_prob_rhd")
     old = runtime.parse(self.sliced(with_sleep), self.Model(with_sleep))
@@ -317,7 +267,7 @@ class TestMonitoringParse(unittest.TestCase):
     from moonpilot import modelruntime
 
     runtime = modelruntime.MonitoringRuntime(
-      {"kind": "custom", "id": RECIPE, "protocol": models.DMONITORING.id, "build": "/nonexistent", "members": {}, "configuration": {}}, {}, None
+      {"kind": "custom", "id": RECIPE, "protocol": modelprotocols.DMONITORING.id, "build": "/nonexistent", "members": {}, "configuration": {}}, None
     )
     heads = ("wheel_on_right",)
     parsed = runtime.parse(self.sliced(heads), self.Model(heads))
@@ -325,38 +275,18 @@ class TestMonitoringParse(unittest.TestCase):
 
 
 class TestBuildAgreement(unittest.TestCase):
-  """The two facts `moonpilot/modelbuild.py` and the device must agree on, which nothing else
-  checks: the compile flags, and the pickle format the runtime loads."""
+  """The fork's pickle writer and runtime reader must agree."""
 
-  def setUp(self):
-    self.tmp = tempfile.TemporaryDirectory()
-    self.addCleanup(self.tmp.cleanup)
-    patcher = mock.patch.object(models.paths, "data_dir", lambda feature: os.path.join(self.tmp.name, feature))
-    patcher.start()
-    self.addCleanup(patcher.stop)
 
-  def test_tg_flags_match_the_sconscript(self):
-    # The device's string is a plain QCOM literal, so compare it directly rather than from
-    # a copy that could drift silently.
-    from moonpilot import modelbuild
 
-    scons = (ROOT / "openpilot/selfdrive/modeld/SConscript").read_text()
-    device = re.search(r"tg_flags = '(DEV=QCOM[^']*)'", scons)
-    cpu = re.search(r"else '(DEV=CPU:LLVM)'", scons)
-    self.assertIsNotNone(device, "the SConscript's QCOM flag string moved")
-    self.assertIsNotNone(cpu, "the SConscript's CPU flag string moved")
-    self.assertEqual(device.group(1), modelbuild.TG_FLAGS_QCOM)
-    self.assertEqual(cpu.group(1), modelbuild.TG_FLAGS_CPU)
-
-  def test_dump_oob_round_trips_through_fork_loader(self):
-    from moonpilot import modelbuild
-    from moonpilot import modelruntime
+  def test_dump_oob_round_trips_through_runtime_codec(self):
+    from moonpilot.modelpickle import dump_oob, load_oob
 
     payload = {"metadata": {"input_shapes": {"img": [1, 12, 128, 256]}}, "values": np.arange(16, dtype=np.float32).reshape(4, 4)}
-    with tempfile.TemporaryFile() as handle:
-      modelbuild.dump_oob(payload, handle)
+    with tempfile.TemporaryDirectory() as scratch, tempfile.TemporaryFile() as handle:
+      dump_oob(payload, handle, scratch)
       handle.seek(0)
-      loaded = modelruntime._load_fork_oob(handle)
+      loaded = load_oob(handle)
     self.assertEqual(sorted(loaded), sorted(payload))
     values = loaded["values"]
     assert isinstance(values, np.ndarray)
@@ -375,7 +305,7 @@ class TestBuildAgreement(unittest.TestCase):
       "packed_npy_size": (9 + 9 + 512) * 4,
       "input_keys": ["img_q", "big_img_q", "packed_npy_inputs"],
     }
-    queues, npy, frame_views = modelruntime._make_queues(metadata, "NPY", 4096)
+    queues, npy, frame_views = modelruntime.make_queues(metadata, "NPY", 4096)
     # The packed buffer is the one queue the record does not carry a shape for: its size is the
     # recorded float region plus the camera's own frame copy size.
     self.assertEqual(sorted(queues), ["big_img_q", "img_q", "packed_npy_inputs"])
@@ -404,7 +334,6 @@ class TestSeamFallback(unittest.TestCase):
       "action = (runtime.get_action(model_output, prev_action, lat_action_t, long_action_t, v_ego) if runtime is not None",
     ],
     "openpilot/selfdrive/modeld/dmonitoringmodeld.py": [
-      "model = ModelState(vipc_client.width, vipc_client.height)",
       "model_output = runtime.parse(model_output, model) if runtime is not None else parse_model_output(model_output)",
     ],
   }

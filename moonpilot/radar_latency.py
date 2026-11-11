@@ -35,6 +35,7 @@ driver flips, so there is no row in the registry.
 import math
 from typing import Any
 
+
 MOONPILOT_RADAR_LATENCY_KEY = "MoonpilotRadarLatency"  # the param the learned value persists in, as FLOAT
 MOONPILOT_RADAR_LATENCY_SAMPLES_KEY = "MoonpilotRadarLatencySamples"  # its evidence, as INT
 MOONPILOT_RADAR_LATENCY_MAX = 0.3  # s; one-sided ceiling — past this the projection is longer than
@@ -45,25 +46,15 @@ MOONPILOT_RADAR_LATENCY_MIN_SAMPLES = 50  # gated frames before the mean is appl
 # alone carried 429, so one drive of stop-and-go clears it
 MOONPILOT_RADAR_LATENCY_MIN_AEGO = 0.6  # m/s^2; excitation floor, the same one the 429-sample
 # measurement used
-MOONPILOT_RADAR_LATENCY_PERSIST_EVERY = 1200  # frames, 60 s at DT_MDL, as the other learned values
-
 
 def persisted_seed(params: Any) -> tuple[float, int] | None:
-  """The persisted estimate as a seed: `(latency, evidence samples)` when usable, else None.
-
-  One place decides what a usable persisted value is. `isinstance` is load-bearing — the tests'
-  FakeParams answers every key with a bool, and the real param is a FLOAT whose "0.0" default
-  means nothing measured yet — and the evidence count rides with the value, so a drive that
-  earns samples adds them to what earlier drives left.
-  """
+  """The persisted estimate as a seed: `(latency, evidence samples)` when usable, else None."""
   seeded = params.get(MOONPILOT_RADAR_LATENCY_KEY, return_default=True)
-  if not (isinstance(seeded, float) and math.isfinite(seeded) and seeded > 0.0):
+  if not isinstance(seeded, (int, float)) or not math.isfinite(seeded) or seeded <= 0.0:
     return None
   seeded_samples = params.get(MOONPILOT_RADAR_LATENCY_SAMPLES_KEY, return_default=True)
-  samples = seeded_samples if isinstance(seeded_samples, int) and not isinstance(seeded_samples, bool) else 0
-  if samples <= 0:
-    samples = MOONPILOT_RADAR_LATENCY_MIN_SAMPLES
-  return min(seeded, MOONPILOT_RADAR_LATENCY_MAX), samples
+  samples = seeded_samples if isinstance(seeded_samples, int) else 0
+  return min(seeded, MOONPILOT_RADAR_LATENCY_MAX), max(samples, MOONPILOT_RADAR_LATENCY_MIN_SAMPLES)
 
 
 class RadarLatencyEstimator:
@@ -77,6 +68,18 @@ class RadarLatencyEstimator:
     """Resume a persisted estimate, clamped, so the next boot plans with it from the first frame."""
     self.estimate = min(max(float(latency), 0.0), MOONPILOT_RADAR_LATENCY_MAX)
     self.samples = max(int(samples), 0)
+
+  def restore(self, params: Any) -> None:
+    seed = persisted_seed(params)
+    if seed is not None:
+      self.seed(*seed)
+
+  def persist(self, params: Any) -> None:
+    """The value *and its evidence*: a drive that only earned a few samples hands them on, and it is the count that
+    decides whether the next boot applies them (`persisted_seed`), so a partial drive is not thrown away."""
+    if self.samples > 0:
+      params.put(MOONPILOT_RADAR_LATENCY_KEY, round(self.estimate, 4))
+      params.put(MOONPILOT_RADAR_LATENCY_SAMPLES_KEY, self.samples)
 
   @property
   def status(self) -> str:

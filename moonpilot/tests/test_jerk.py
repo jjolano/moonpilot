@@ -3,12 +3,9 @@ import unittest
 
 from openpilot.common.realtime import DT_MDL
 
+from moonpilot.longitudinal import LeadState, LongitudinalPlanSource
+
 from moonpilot.jerk import (
-  MOONPILOT_LONG_JERK_MIN_SAMPLES,
-  MOONPILOT_LONG_JERK_SCALE_MIN,
-  LongitudinalComfortJerkEstimator,
-)
-from moonpilot.longitudinal import (
   MOONPILOT_JERK_DOWN,
   MOONPILOT_JERK_LAUNCH_SPEED,
   MOONPILOT_JERK_ONSET,
@@ -18,6 +15,9 @@ from moonpilot.longitudinal import (
   MOONPILOT_JERK_LAUNCH_V,
   MOONPILOT_JERK_RAMP_V,
   MOONPILOT_JERK_UP,
+  MOONPILOT_LONG_JERK_MIN_SAMPLES,
+  MOONPILOT_LONG_JERK_SCALE_MIN,
+  LongitudinalComfortJerkEstimator,
   positive_ramp,
   jerk_limit,
   ramp_jerk,
@@ -121,7 +121,7 @@ class TestPositiveRamp(unittest.TestCase):
     `MOONPILOT_JERK_RAMP_GAP` or `MOONPILOT_JERK_RAMP_HEADWAY` of the ego's speed, whichever is farther, so a lead being
     followed at speed still sets it while one past 3 s of headway is not the lead being followed."""
     def state(gap, a_lead):
-      return (0, gap, 0.0, a_lead, 2.0, a_lead)
+      return LeadState(LongitudinalPlanSource.lead0, gap, 0.0, a_lead, 2.0, a_lead)
 
     floor, lead_free = MOONPILOT_JERK_RAMP_V[0], MOONPILOT_JERK_RAMP_V[-1]
     gentle, brisker = ramp_jerk([state(5.0, 0.5)], 0.0), ramp_jerk([state(5.0, 1.0)], 0.0)

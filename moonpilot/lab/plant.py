@@ -3,8 +3,10 @@ import math
 
 import numpy as np
 
+from moonpilot.features import ENGINE_COAST
 from moonpilot.lab import drive_config, expand, lag_s, param_index
-from moonpilot.lab.planner import ROUTE_SETS, SCORECARD_HOLDOUT, _split_routes, control_rate_dt, extract_control
+from moonpilot.lab.planner import SCORECARD_HOLDOUT, _split_routes, control_rate_dt, extract_control
+from moonpilot.lab.routes import add_routes_arg
 
 PLANT_BANDS = ((0.0, 3.0), (3.0, 6.0), (6.0, 10.0), (10.0, 15.0), (15.0, 40.0))
 PLANT_CENTERS = tuple((lo + hi) / 2 for lo, hi in PLANT_BANDS)
@@ -31,7 +33,7 @@ def _plant_route(job):
   cmd, a, v = c["a_target"][:-k], c["a_ego"][k:], c["v_ego"][:-k]
   mask = ok[:-k] & ok[k:]
   try:
-    ec = param_index(drive_config(route, root)[1], "MoonpilotEngineCoast")
+    ec = param_index(drive_config(route, root)[1], ENGINE_COAST.key)
   except (ValueError, FileNotFoundError, OSError):
     ec = 0
   environment = {"lag": lag, "cmd": cmd[mask], "a": a[mask], "v": v[mask], "steady": (change[:-k] < 0.3)[mask], "ec": ec}
@@ -78,14 +80,11 @@ class _PlantGain:
     return np.where(np.asarray(cmd) > 0.2, accel_gain, np.where(np.asarray(cmd) < -0.2, brake_gain, 1.0))
 
 
-def _plant_gain(table):
-  """A delayed command's gain as a function of its sign and speed: the identified table interpolated between band centers."""
-  return _PlantGain(table)
 
 
 def _plant_validation(results, table):
   """Median |aEgo - aTarget| of the open-loop gain prediction against gain=1, on non-engine-coast drives."""
-  gain, base, fitted = _plant_gain(table), [], []
+  gain, base, fitted = _PlantGain(table), [], []
   for _, d in results:
     if d["ec"]:
       continue
@@ -108,7 +107,7 @@ def _plant_fit(args):
   """The longitudinal plant from engaged drives: the chain's lag, the steady aEgo/aTarget gain by sign and speed band,
   and the gain's held-out prediction error. The gain table seeds `scorecard --plant fitted`; it is identification, not a
   replacement for the car's PCM/brake arbitration."""
-  routes = [r.split("--")[0] for r in expand(args.routes, ROUTE_SETS)]
+  routes = [r.split("--")[0] for r in expand(args.routes, args.root)]
   train, holdout = _split_routes(routes, args.holdout, args.seed)
   train_results, holdout_results = _plant_results(args.root, train), _plant_results(args.root, holdout)
   if not train_results:
@@ -128,7 +127,7 @@ def _plant_fit(args):
 
 def register(sub):
   parser = sub.add_parser("plant-fit", help="identify the longitudinal plant from engaged drives: lag, gain by sign and speed, held-out error")
-  parser.add_argument("--routes", nargs="+", default=["engaged"], help=f"route names or sets: {', '.join(ROUTE_SETS)}")
+  add_routes_arg(parser, ["longitudinal-engaged"])
   parser.add_argument("--holdout", type=float, default=SCORECARD_HOLDOUT, help="fraction of routes held out")
   parser.add_argument("--seed", type=int, default=0, help="split seed")
   parser.set_defaults(fn=_plant_fit)

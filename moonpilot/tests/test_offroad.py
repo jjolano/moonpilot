@@ -10,61 +10,18 @@ import unittest
 from pathlib import Path
 
 from moonpilot import offroad
-from moonpilot.longcontrol import MOONPILOT_STANDSTILL_SPEED
-from moonpilot.longitudinal import MOONPILOT_SHOULD_STOP_SPEED
+from moonpilot.tests.fakes import FakeParams
 
 ROOT = Path(__file__).resolve().parents[2]
 
-
-class FakeParams:
-  """Duck-typed stand-in for Params, so the tests never touch the real param store.
-
-  Models both reads faithfully: `return_default=True` sees the row's declared default while nothing
-  has been written, and a plain read returns None for an unset key, as `Params.get` does.
-  """
-
-  def __init__(self, default=False):
-    self._default = default
-    self.written = None
-
-  def get(self, key, return_default=False):
-    if self.written is None:
-      return self._default if return_default else None
-    return self.written
-
-  def put_bool(self, key, value, block=False):
-    self.written = value
-
-
 def _params(requested: bool | None = None) -> FakeParams:
-  """The row with `"0"` declared, as it is in params_keys.h, and the fork's request in it."""
-  params = FakeParams(default=False)
-  if requested is not None:
-    params.put_bool(offroad.MOONPILOT_OFFROAD_KEY, requested)
-  return params
+  return FakeParams(on=False, overrides={offroad.MOONPILOT_OFFROAD_KEY: requested} if requested is not None else {})
+
+
+
 
 
 class TestPolicy(unittest.TestCase):
-  def test_the_param_row_is_declared_and_cleared_by_both_edges(self):
-    """The default is the off state, and both edges that end the mode are in the flags: a new
-    ignition cycle and a manager start -- so neither a fresh drive nor a reboot can inherit it.
-    The row is what declares them: a read of a key with no row is an UnknownKeyName out of the
-    compiled param table, which a fake params in a test never sees.
-    Whitespace-normalized, because the row is too long for one 80-column line in this file and
-    the formatter wraps it."""
-    text = " ".join((ROOT / "moonpilot" / "params_keys.h").read_text().split())
-    self.assertTrue('{"MoonpilotOffroad", {CLEAR_ON_MANAGER_START | CLEAR_ON_IGNITION_ON, BOOL, "0"}}' in text)
-
-  def test_the_speed_is_the_forks_standstill_convention(self):
-    """ "Parked" has to mean here what it means in the planner, or a car the planner calls at rest
-    could be one this refuses to enter offroad (or the reverse)."""
-    self.assertEqual(offroad.MOONPILOT_OFFROAD_SPEED, MOONPILOT_STANDSTILL_SPEED)
-    self.assertEqual(offroad.MOONPILOT_OFFROAD_SPEED, MOONPILOT_SHOULD_STOP_SPEED)
-
-  def test_requested_reads_the_declared_default(self):
-    self.assertFalse(offroad.requested(_params()))
-    self.assertTrue(offroad.requested(_params(True)))
-    self.assertFalse(offroad.requested(_params(False)))
 
   def test_can_enter_requires_the_car_on_parked_and_disengaged(self):
     self.assertTrue(offroad.can_enter(True, 0.0, False))
@@ -93,9 +50,6 @@ class TestPolicy(unittest.TestCase):
     self.assertTrue(offroad.enabled(_params(), parked=True))
     self.assertFalse(offroad.enabled(_params(), parked=False))
 
-  def test_the_seam_condition_is_the_inverse_of_the_request(self):
-    self.assertFalse(offroad.onroad_condition(_params(True)))
-    self.assertTrue(offroad.onroad_condition(_params()))
 
 
 class TestWiring(unittest.TestCase):

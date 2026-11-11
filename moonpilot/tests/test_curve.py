@@ -416,11 +416,11 @@ class TestLatAccelBiasTrackingGate(unittest.TestCase):
 
   @staticmethod
   def _inputs():
-    from moonpilot.tests.test_longitudinal import _inputs, _path
+    from moonpilot.tests.harness import inputs, path
 
-    return _inputs(
+    return inputs(
       v_ego=20.0,
-      path=_path(20.0, 0.006),
+      path=path(20.0, 0.006),
       steer_angle_deg=10.0,
       vp_valid=True,
       steer_ratio=15.0,
@@ -429,12 +429,12 @@ class TestLatAccelBiasTrackingGate(unittest.TestCase):
 
   @classmethod
   def _samples(cls, torque=None):
-    from moonpilot.tests.test_longitudinal import _planner
+    from moonpilot.tests.harness import planner as make_planner
 
     sm = cls._inputs()
     if torque is not None:
       sm['controlsState'].lateralControlState.torqueState = torque
-    planner = _planner()
+    planner = make_planner()
     for _ in range(planner.lat_bias.delay_frames + MOONPILOT_CURVE_BIAS_MIN_SAMPLES):
       planner.update(sm)
     return planner.lat_bias.samples

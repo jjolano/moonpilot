@@ -15,13 +15,17 @@ import unittest
 from openpilot.common.realtime import DT_MDL
 
 from moonpilot.longitudinal import MOONPILOT_COAST_FLAT_ACCEL, coast_accel
+from moonpilot.learned import PERSIST_EVERY
 from moonpilot.pitch import (
   MOONPILOT_PITCH_MIN_SAMPLES,
+  MOONPILOT_PITCH_OFFSET_KEY,
   MOONPILOT_PITCH_OFFSET_MAX,
   MOONPILOT_PITCH_RC,
   MOONPILOT_PITCH_SANITY,
   PitchOffsetEstimator,
 )
+from moonpilot.tests.fakes import FakeParams
+from moonpilot.tests.harness import inputs, planner as make_planner
 
 ROUTE_BIAS = math.radians(2.16)  # the measured offset on the route this feature was written for
 
@@ -97,6 +101,24 @@ class TestPitchOffsetEstimator(unittest.TestCase):
 
     estimator.seed(math.radians(45.0), MOONPILOT_PITCH_MIN_SAMPLES)
     self.assertAlmostEqual(estimator.applied(), MOONPILOT_PITCH_OFFSET_MAX, delta=1e-9)
+
+  def test_seeded_offset_persists_only_on_shared_frame_ticks(self):
+    class RecordingParams(FakeParams):
+      def __init__(self):
+        super().__init__(overrides={MOONPILOT_PITCH_OFFSET_KEY: ROUTE_BIAS})
+        self.pitch_writes = 0
+
+      def put(self, key, value, block=False):
+        if key == MOONPILOT_PITCH_OFFSET_KEY:
+          self.pitch_writes += 1
+        super().put(key, value, block)
+
+    params = RecordingParams()
+    planner = make_planner(params=params)
+    self.assertEqual(planner.pitch_offset.samples, MOONPILOT_PITCH_MIN_SAMPLES)
+    for _ in range(2 * PERSIST_EVERY):
+      planner.update(inputs(vp_valid=False))
+    self.assertEqual(params.pitch_writes, 2)
 
   def test_a_route_that_comes_back_down_is_not_an_offset(self):
     """The assumption stated as a test: equal time up and down averages to zero, so real terrain

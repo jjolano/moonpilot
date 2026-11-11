@@ -21,16 +21,13 @@ from itertools import islice
 import numpy as np
 
 from opendbc.car.structs import car
-from openpilot.cereal import messaging
+from moonpilot.features import MODEL_BRAKING
 from openpilot.tools.lib.logreader import LogReader
-from moonpilot.lab import DEFAULT_ROOT, cached, expand, runs
+from moonpilot.lab import DEFAULT_ROOT, cached, expand, manual_authority, runs
+from moonpilot.lab.routes import ROUTE_SETS
 from moonpilot.lab import planner
-from moonpilot.lab.planner import MESSAGES, extract, replay
+from moonpilot.lab.planner import ExtractReader, extract, replay
 
-ROUTE_SETS = {
-  "engaged": (*planner.ROUTE_SETS["longitudinal"], "0000044d"),
-  "manual": planner.ROUTE_SETS["manual-approach"],
-}
 VERSION = 1
 WARMUP_S = 15.0  # replay lead-in before each engaged episode
 MERGE_S = 1.0  # runs of qualifying frames closer than this are one episode
@@ -66,19 +63,14 @@ def episodes(mask: np.ndarray, t: np.ndarray, group: np.ndarray, merge_s: float 
 def _build(route, root, segs):
   t0 = min(m.logMonoTime for m in islice(LogReader(segs[0]), 200))
   data = extract(route, root)
-  blob, offsets = data["blob"], data["offsets"]
-  index = {k: 1 + i * 3 for i, k in enumerate(MESSAGES)}
   rows = []
-  for row in offsets:
-    def read(kind, row=row):
-      start, size = row[index[kind]], row[index[kind] + 1]
-      return getattr(messaging.log_from_bytes(blob[start:start + size].tobytes()), kind)
-    cs, cc, lead, mv = read("carState"), read("carControl"), read("radarState").leadOne, read("modelV2")
-    plan_start, plan_size = row[1 + len(MESSAGES) * 3:3 + len(MESSAGES) * 3]
-    plan = messaging.log_from_bytes(blob[plan_start:plan_start + plan_size].tobytes()).longitudinalPlan if plan_size else None
+  for mono, messages, _, plan_msg in ExtractReader(data).rows():
+    cs, cc = messages["carState"].carState, messages["carControl"].carControl
+    lead, mv = messages["radarState"].radarState.leadOne, messages["modelV2"].modelV2
+    plan = plan_msg
     one = mv.leadsV3[0] if len(mv.leadsV3) else None
     rows.append((
-      (row[0] - t0) * 1e-9, cs.vEgo, cs.aEgo, cs.gasPressed, cs.brakePressed, cs.cruiseState.enabled, cc.longActive,
+      (mono - t0) * 1e-9, cs.vEgo, cs.aEgo, cs.gasPressed, cs.brakePressed, cs.cruiseState.enabled, cc.longActive,
       cs.gearShifter == car.CarState.GearShifter.drive, lead.present and lead.radar, lead.dRel, lead.vLead, lead.aLeadK,
       mv.action.desiredAcceleration, mv.action.shouldStop, min(mv.velocity.x) if len(mv.velocity.x) else np.nan,
       one.a[0] if one is not None and len(one.a) else np.nan, one.prob if one is not None else np.nan,
@@ -112,7 +104,7 @@ def _route(job):
     for w in merged:
       part = {"cp": data["cp"], "blob": data["blob"], "offsets": data["offsets"][w]}
       d["replayed"][w] = replay(route, part, root)[0]
-      d["lead_only"][w] = replay(route, part, root, overrides={"MoonpilotModelBraking": 0})[0]
+      d["lead_only"][w] = replay(route, part, root, overrides={MODEL_BRAKING.key: 0})[0]
   return d
 
 
@@ -248,7 +240,7 @@ def _responses(resp):
 def _manual(args, routes):
   d = _pool(routes, args.root, with_replay=False)
   dt = _dt(d)
-  manual = (d["active"] == 0) & (d["cruise"] == 0) & (d["drive"] > 0)
+  manual = manual_authority(d["active"] > 0, d["cruise"] > 0, d["drive"] > 0)
   near = (d["lead"] > 0) & (d["gap"] < LEAD_NEAR_M) & (d["v_lead"] < d["v"])
   contexts = {"slower lead < 50 m": near, "farther / none": ~near}
   fast_h = dt[manual & (d["v"] > V_MIN)].sum() / 3600
@@ -278,12 +270,12 @@ def _manual(args, routes):
 
 
 def _run(args):
-  _engaged(args, expand(args.engaged, ROUTE_SETS))
-  _manual(args, expand(args.manual, ROUTE_SETS))
+  _engaged(args, expand(args.engaged, args.root))
+  _manual(args, expand(args.manual, args.root))
 
 
 def register(sub):
   parser = sub.add_parser("model-braking", help="how often the model's own braking asks for more than the lead and geometry justify")
-  parser.add_argument("--engaged", nargs="+", default=["engaged"], help=f"route names or sets: {', '.join(ROUTE_SETS)}")
+  parser.add_argument("--engaged", nargs="+", default=["model-braking-engaged"], help=f"route names or sets: {', '.join(ROUTE_SETS)}")
   parser.add_argument("--manual", nargs="+", default=["manual"], help=f"route names or sets: {', '.join(ROUTE_SETS)}")
   parser.set_defaults(fn=_run)

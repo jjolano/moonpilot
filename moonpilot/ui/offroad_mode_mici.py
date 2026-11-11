@@ -6,16 +6,12 @@ method is a failure no merge can see, and each tree's widgets are its own.
 """
 
 from moonpilot import offroad
+from moonpilot.ui.panel_common import enter, parked, toggle
 from openpilot.common.params import Params
 from openpilot.selfdrive.ui.mici.widgets.button import BigButton
 from openpilot.selfdrive.ui.mici.widgets.dialog import BigConfirmationDialog
 from openpilot.selfdrive.ui.ui_state import ui_state
 from openpilot.system.ui.lib.application import gui_app
-
-
-def parked() -> bool:
-  """Whether the mode may be entered now, read off the UI state the panel and the road view share."""
-  return offroad.can_enter(ui_state.started, ui_state.sm["carState"].vEgo, ui_state.engaged)
 
 
 def row(params: Params) -> BigButton:
@@ -26,16 +22,13 @@ def row(params: Params) -> BigButton:
   return button
 
 
+
+
 def refresh(button: BigButton, params: Params) -> None:
   """Push the value line: `set_value` is not callable-resolved, unlike `set_enabled`, so the panel
   calls this every frame next to the tailscale row."""
   button.set_value(offroad.button_label(params, ui_state.started, parked()))
 
-
-def toggle(params: Params) -> None:
-  offroad.set_requested(
-    params, not offroad.requested(params), ui_state.started, ui_state.sm["carState"].vEgo, ui_state.engaged
-  )
 
 
 def long_press() -> None:
@@ -46,5 +39,3 @@ def long_press() -> None:
   gui_app.push_widget(BigConfirmationDialog(offroad.SLIDE_LABEL, gui_app.texture("icons_mici/settings/device/power.png", 54, 64), enter))
 
 
-def enter() -> None:
-  offroad.set_requested(ui_state.params, True, ui_state.started, ui_state.sm["carState"].vEgo, ui_state.engaged)

@@ -7,8 +7,7 @@ the manager runs it whenever `deps.missing()` is non-empty, it waits for a conne
 and it installs moonpilot/deps.lock into a hash-named release, then atomically promotes
 `<data_root>/deps/current`.
 
-Observation only with respect to driving: it writes Python packages under /data and touches
-nothing in the control path. Features only pick up what it installs on the next process start.
+See `moonpilot/procs.py` for the manager's restart semantics.
 """
 
 import time
@@ -17,12 +16,11 @@ from openpilot.cereal import log, messaging
 from openpilot.common.params import Params
 from openpilot.common.swaglog import cloudlog
 
+from moonpilot.backoff import Backoff
 from moonpilot import deps
 
 IDLE_INTERVAL = 300.0  # nothing to do: re-check missing() every 5 min
 WAIT_INTERVAL = 30.0   # no usable network yet
-BACKOFF_START = 30.0
-BACKOFF_MAX = 1800.0   # 30 min
 
 
 def _missing_names(missing: list[deps.Requirement]) -> str:
@@ -32,18 +30,14 @@ def _missing_names(missing: list[deps.Requirement]) -> str:
 def main() -> None:
   sm = messaging.SubMaster(['deviceState'])
   params = Params()
-  backoff = BACKOFF_START
+  backoff = Backoff()
 
-  # Never returns: `ensure_running` does not restart a process that exited while `should_run` is
-  # still True (openpilot/system/manager/process.py:142-147,166-171 — `start()` no-ops while
-  # `self.proc` is set), so exiting on success or failure would wedge installs until the next
-  # boot. The manager stops this process when nothing is missing.
   while True:
     sm.update(0)
     missing = deps.missing()
 
     if not missing:
-      deps.put_status(params, deps.READY, "All required modules are installed.")
+      deps.put_status(params, deps.READY, deps.READY_DETAIL)
       time.sleep(IDLE_INTERVAL)
       continue
 
@@ -64,15 +58,14 @@ def main() -> None:
       deps.install()
       cloudlog.event("moonpilot deps installed", target=deps.site_dir())
       deps.put_status(params, deps.READY, f"Installed modules: {names}.")
-      backoff = BACKOFF_START
+      backoff.reset()
       time.sleep(WAIT_INTERVAL)
     except Exception as exc:
       detail = str(exc).strip().replace("\n", " ")
       suffix = f": {detail}" if detail else ""
       deps.put_status(params, deps.ERROR, f"Failed to install modules: {names}{suffix}.")
       cloudlog.exception("moonpilot deps install failed")
-      time.sleep(backoff)
-      backoff = min(backoff * 2, BACKOFF_MAX)
+      time.sleep(backoff.next())
 
 
 if __name__ == "__main__":

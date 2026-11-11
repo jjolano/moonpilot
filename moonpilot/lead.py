@@ -1,7 +1,7 @@
 """Normalization for the vision model's lead trajectories.
 
-Pure functions only: the publisher (`moonpilot/leadd.py`), the longitudinal planner and the
-onroad renderers all consume this module, so it must stay importable without a messaging loop.
+The module owns per-slot filters and acceleration-estimator state, plus normalization used by the
+publisher, planner and onroad renderers.
 
 Frame and sign: published `x` is meters forward of the front bumper (radarState.dRel convention)
 and published `y` is LEFT POSITIVE (radarState.yRel convention). modelV2's device frame is
@@ -20,10 +20,9 @@ from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.modeld.constants import ModelConstants
 
 from moonpilot.features import LEAD_LATERAL, enabled
+from moonpilot.state import moonpilot_state
 
-# Mirrors RADAR_TO_CAMERA in openpilot/selfdrive/controls/radard.py, and pinned to it by
-# test_lead.test_matches_radard. Defined here rather than imported so this module stays free of
-# radard's messaging/opendbc imports — the planner seam and the renderers import it.
+# Mirrors RADAR_TO_CAMERA in radard without importing its messaging/opendbc dependencies.
 MOONPILOT_RADAR_TO_CAMERA = 1.52  # m; radar is ~1.5m ahead of the camera mesh frame
 
 # Starting points, all fork-owned. Tune against logs: see the lead path line in the UI and
@@ -54,33 +53,15 @@ MOONPILOT_INPATH_GRID = np.arange(0.0, MOONPILOT_INPATH_HORIZON + 1e-9, 0.25)
 MOONPILOT_LEAD_PATH_PX_PER_M = 8.0  # px of line width per meter of yStd
 MOONPILOT_LEAD_PATH_WIDTH = (2.0, 18.0)  # px clamp
 # The model's own confidence in a slot, below which normalize_lead publishes it as empty rather
-# than as a lead. radard refuses a vision lead at this same threshold (radard.py:156-165) — and, as
-# there, only behind an asymmetric filter (MOONPILOT_LEAD_PROB_RC), because slot 0 crosses it in
-# runs whose median is 4 frames and 29 % of which are a single frame (corpus, 47k frames), so a raw
-# gate would blink at 20 Hz. The fail direction is upstream's own — no lead, inPath 1.0, base
-# t_follow — which is why nothing downstream has to know the slot was ever there.
+# than as a lead. radard uses the same threshold after its asymmetric lead-probability filter;
+# slot 0 crosses it in a median 4 frames, 29 % of which are single-frame runs (47k-frame corpus).
 MOONPILOT_LEAD_PROB_GATE = 0.5
-MOONPILOT_LEAD_PROB_RC = 0.2  # s; radard's own gate-filter decay (radard.py:234-241)
-# The lead accel estimator's window. radard's aLeadK is a KF1D with fixed gains (radard.py:29-48),
-# tau = 0.49 s at DT_MDL, so 90 % of a -3 m/s^2 step takes 1.20 s. A least-squares slope over this
-# window reaches the same step in the window's own length and averages noise instead of lagging it.
-# 15 samples rather than 7, because the estimate is what the policy's continuous lead terms read and
-# its noise was the command's. Replayed open-loop over 340 local rlog segments (22.6 min of closing
-# approaches), the planner's jerk-limited command jitter (RMS about a 1 s mean) went 0.090 -> 0.082
-# m/s^2; smoothing the estimate after the fact instead delayed real brakes into contact (a 0.6 s
-# filter hit a lead braking -5 m/s^2 to rest). No closed-loop brake flown (-0.75 to -5 m/s^2, settled
-# and mid-approach, and a -5 tap) reaches a braking threshold more than 0.05 s later than on the
-# 7-sample window, and minimum gaps agree within 0.02 m. What caps the gain is radar track churn:
-# `radarTrackId` changes 3.1 times a second in those approaches, 98 % of them the same vehicle, and
-# each resets the window: it holds more than 7 samples on 42 % of those frames, and the whole cut is
-# there (0.096 -> 0.077 m/s^2; unchanged on the rest). Keeping it across those same-vehicle
-# changes lowers the estimate's error (0.307 -> 0.236 m/s^2 sd) but not the command's jitter while
-# following. Near a stop it does: route 00000400 seg 4 swapped tracks 517/541 on one stopped car
-# every 0.1-0.3 s, each swap refitted from three samples or fell back to the new track's `aLeadK`
-# (+-0.6 m/s^2 on a car at rest), and the decel pulsed -0.88 -> -1.26 -> -0.75 m/s^2 at 1.9 m/s.
-# So a new track at the same range and speed (`same_car`) keeps the window; replayed, together with
-# the planner's one-candidate-per-car, the last 4.5 s of that stop's command jitter went 0.090 ->
-# 0.056 m/s^2 and all engaged frames on hand (5.5k) 0.0430 -> 0.0410.
+MOONPILOT_LEAD_PROB_RC = 0.2  # s; matches radard's lead_prob_filters decay
+# A 15-sample window rather than 7 reduced command jitter from 0.090 to 0.082 m/s^2 RMS over 340
+# closing-approach segments; closed-loop braking thresholds moved by at most 0.05 s and gaps by
+# 0.02 m. Track IDs changed 3.1/s, 98 % for the same vehicle; the window held >7 samples on 42 %
+# of those frames, lowering jitter 0.096 -> 0.077 m/s^2. Keeping same-car history reduced stop
+# jitter 0.090 -> 0.056 m/s^2 on the stopped-track route and 0.0430 -> 0.0410 over 5.5k frames.
 MOONPILOT_LEAD_ACCEL_WINDOW = 15  # samples, 0.75 s at DT_MDL
 MOONPILOT_LEAD_ACCEL_MIN_SAMPLES = 3  # below this the slope is noise, so radard's value stands
 MOONPILOT_LEAD_SPEED_JUMP = 2.5  # m/s in one frame: re-association, not motion (50 m/s^3)
@@ -119,36 +100,26 @@ MOONPILOT_LEAD_ACCEL_FAST_STREAK = 4  # consecutive frames the margin must hold 
 # engaged steady follow) streak 2 gave 69 frames past -0.8 m/s^2 and the command's high-frequency sd
 # 0.141; streak 4 gives 35 and 0.114, within 0.002 of having no onset window at all, for 0.10 s more
 # onset latency on the plan tail and FCW.
-# radard's accel-decay model, mirrored rather than imported: `radard.py` pulls messaging and opendbc,
-# and this module is on plannerd's and both renderers' import path. `MOONPILOT_LEAD_ACCEL_TAU` is
-# pinned to radard's own constant by test_lead; the two below copy inline literals there
-# (`radard.py:55,76`), so they have nothing to assert against and this comment is their only record.
+# Radard's accel-decay model is mirrored to keep this module lightweight.
 MOONPILOT_LEAD_ACCEL_TAU = 1.5  # s; the decay a lead believed to be holding its accel gets
 MOONPILOT_LEAD_ACCEL_TAU_RC = 0.45  # s; time constant of the filter that gives that belief up
 MOONPILOT_LEAD_ACCEL_TAU_RESET = 0.5  # m/s^2; |a| above this is braking, not a transient
-# The lead's accel for comfort answers only (`moonpilot/longitudinal.py`'s MOONPILOT_MIRROR_*), never a safety term's:
-# the estimate low-passed. On 10 min of leads steady over +-3 s (`python -m moonpilot.lab decel-peaks`) the estimate read
-# below -0.2 m/s^2 on 6.30 % of frames and below -0.3 on 1.43 % (min -1.63); low-passed, 0.07 % and none (min -0.24),
-# while a -0.3..-0.8 slowing reads 0.76 of itself. Zero on a new lead, so its answer builds with the window.
+# Low-passed acceleration is used only by the planner's comfort response.
 MOONPILOT_LEAD_ACCEL_SLOW_RC = 1.0  # s
 
 LEAD_T_IDXS = ModelConstants.LEAD_T_IDXS
 LEAD_T_OFFSETS = ModelConstants.LEAD_T_OFFSETS
 
-_LIST_FIELDS = ("t", "x", "y", "v", "a", "xStd", "yStd", "vStd", "aStd", "yawRel", "inPathProb")
+class LeadSlot:
+  def __init__(self, slot: int):
+    self.slot = slot
+    self.in_path_filter = FirstOrderFilter(1.0, MOONPILOT_INPATH_RC, DT_MDL)
+    self.prob_filter = FirstOrderFilter(0.0, MOONPILOT_LEAD_PROB_RC, DT_MDL)
 
+  def normalize(self, model_lead, fused_lead, ego_path_x, ego_path_y) -> dict:
+    return normalize_lead(self.slot, model_lead, fused_lead, ego_path_x, ego_path_y, self.in_path_filter, self.prob_filter)
 
-def resample(t_src, values, t_dst) -> np.ndarray:
-  """Linear resample onto t_dst. The one interpolation entry point, so consumers agree.
-
-  Linear on purpose: the model's grid is 2 s apart, and a cubic through two points manufactures
-  sub-2 s structure the network never predicted.
-  """
-  t_src = np.asarray(t_src, dtype=float)
-  values = np.asarray(values, dtype=float)
-  if t_src.size < 2 or values.size < 2:
-    return np.empty((0,), dtype=float)
-  return np.interp(np.asarray(t_dst, dtype=float), t_src, values)
+RADAR_ONLY_MODEL_PROB = 0.0
 
 
 def same_car(a, b) -> bool:
@@ -164,8 +135,8 @@ def same_car(a, b) -> bool:
 class LeadAccelEstimator:
   """A lead's acceleration from the slope of `vLead` over a short window.
 
-  radard reports `aLeadK` from a Kalman filter with hardcoded gains (`radard.py:29-48`): tau is
-  0.49 s at DT_MDL, so 90 % of a -3 m/s^2 step arrives 1.20 s late, which is most of the margin a
+  radard reports `aLeadK` from `KalmanParams`' KF1D gains: tau is 0.49 s at DT_MDL, so
+  90 % of a -3 m/s^2 step arrives 1.20 s late, which is most of the margin a
   braking lead gives us. The least-squares slope over MOONPILOT_LEAD_ACCEL_WINDOW samples has no lag
   of its own — a clean ramp reads exactly as soon as MOONPILOT_LEAD_ACCEL_MIN_SAMPLES are on it,
   0.10 s — so the only latency it carries is the ramp onto a window that already holds samples from
@@ -201,17 +172,18 @@ class LeadAccelEstimator:
   frame (`radard.py:263-272`), and plannerd is polled on the same message.
   """
 
-  def __init__(self, dt: float = DT_MDL, window: int = MOONPILOT_LEAD_ACCEL_WINDOW):
-    self._samples: deque[float] = deque(maxlen=window)
+  def __init__(self, dt: float = DT_MDL, fast_streak: int = MOONPILOT_LEAD_ACCEL_FAST_STREAK):
+    self._samples: deque[float] = deque(maxlen=MOONPILOT_LEAD_ACCEL_WINDOW)
     self._track: tuple[bool, bool, int] | None = None
-    self._last = None  # the previous frame's lead, snapshotted, for `same_car` across a track change
+    self._last = None
     self._fast_streak = 0
+    self._fast_streak_required = fast_streak
     self._tau = FirstOrderFilter(MOONPILOT_LEAD_ACCEL_TAU, MOONPILOT_LEAD_ACCEL_TAU_RC, dt)
     self._slow = FirstOrderFilter(0.0, MOONPILOT_LEAD_ACCEL_SLOW_RC, dt)
     self.a_lead_tau = MOONPILOT_LEAD_ACCEL_TAU
-    self.a_slow = 0.0  # MOONPILOT_LEAD_ACCEL_SLOW_RC's estimate, zero while the slot is empty
-    # slope = sum(w_i * v_i) for a uniform grid: w_i = 12 (i - (n-1)/2) / (dt n (n^2 - 1)).
-    self._weights = {n: (np.arange(n) - (n - 1) / 2.0) * (12.0 / (dt * n * (n * n - 1))) for n in range(MOONPILOT_LEAD_ACCEL_MIN_SAMPLES, window + 1)}
+    self.a_slow = 0.0
+    self._weights = {n: (np.arange(n) - (n - 1) / 2.0) * (12.0 / (dt * n * (n * n - 1)))
+                     for n in range(MOONPILOT_LEAD_ACCEL_MIN_SAMPLES, MOONPILOT_LEAD_ACCEL_WINDOW + 1)}
 
   def update(self, lead) -> tuple[float, float]:
     a_lead, a_lead_tau = self._estimate(lead)
@@ -247,13 +219,11 @@ class LeadAccelEstimator:
     n = len(self._samples)
     samples = np.fromiter(self._samples, float, n)
     a_lead = float(self._weights[n] @ samples)
-    # The onset window, one-sided: it may only deepen the estimate, never lift it, because deeper is
-    # the direction the policy's preview and floor already treat as more braking. The streak is the
-    # noise gate — a real onset holds it for many frames, a noisy one cannot hold it at all.
+
     if n >= MOONPILOT_LEAD_ACCEL_FAST:
       a_fast = float(self._weights[MOONPILOT_LEAD_ACCEL_FAST] @ samples[-MOONPILOT_LEAD_ACCEL_FAST:])
       self._fast_streak = self._fast_streak + 1 if a_fast < a_lead - MOONPILOT_LEAD_ACCEL_FAST_MARGIN else 0
-      if self._fast_streak >= MOONPILOT_LEAD_ACCEL_FAST_STREAK:
+      if self._fast_streak >= self._fast_streak_required:
         a_lead = min(a_lead, a_fast)
     if abs(a_lead) < MOONPILOT_LEAD_ACCEL_TAU_RESET:
       # `radard.py:77` re-arms the filter's own state here, not just the value it reports, and that
@@ -303,7 +273,6 @@ def lead_in_path_prob(x, y, y_std, ego_path_x, ego_path_y) -> list[float]:
 
   probs = []
   for i, (xi, yi) in enumerate(zip(x, y, strict=True)):
-    # Ego path negated into the left-positive convention the lead's y lives in.
     dy = yi - (-float(np.interp(xi, ego_path_x, ego_path_y)))
     s = max(float(y_std[i]), MOONPILOT_MIN_Y_STD) if i < y_std.size else MOONPILOT_MIN_Y_STD
     w = MOONPILOT_PATH_HALF_WIDTH
@@ -324,18 +293,17 @@ def lead_in_path(t, x, y, y_std, ego_path_x, ego_path_y, filt) -> float:
     filt.x = 1.0
     return 1.0
 
-  x_d = resample(t, x, MOONPILOT_INPATH_GRID)
-  y_d = resample(t, y, MOONPILOT_INPATH_GRID)
-  s_d = resample(t, y_std, MOONPILOT_INPATH_GRID) if len(y_std) >= 2 else np.full(MOONPILOT_INPATH_GRID.shape, MOONPILOT_MIN_Y_STD)
-  if x_d.size == 0 or y_d.size == 0:
-    filt.x = 1.0
-    return 1.0
+  # Linear on purpose: the model's grid is 2 s apart, and a cubic through two points manufactures sub-2 s structure
+  # the network never predicted.
+  x_d = np.interp(MOONPILOT_INPATH_GRID, t, x)
+  y_d = np.interp(MOONPILOT_INPATH_GRID, t, y)
+  s_d = np.interp(MOONPILOT_INPATH_GRID, t, y_std) if len(y_std) >= 2 else np.full(MOONPILOT_INPATH_GRID.shape, MOONPILOT_MIN_Y_STD)
 
   probs = np.array(lead_in_path_prob(x_d, y_d, s_d, ego_path_x, ego_path_y), dtype=float)
   s_weighted = np.maximum(s_d[: probs.size], MOONPILOT_INPATH_YSTD_FLOOR)
   weights = 1.0 / s_weighted**2
   raw = float(np.sum(probs * weights) / np.sum(weights))
-  return _rise_hold(raw, filt)
+  return rise_hold(raw, filt)
 
 
 def _empty(slot: int, filt) -> dict:
@@ -343,15 +311,13 @@ def _empty(slot: int, filt) -> dict:
   return {
     "present": False,
     "prob": 0.0,
-    "probTime": float(LEAD_T_OFFSETS[slot]) if slot < len(LEAD_T_OFFSETS) else 0.0,
+    "probTime": float(LEAD_T_OFFSETS[slot]),
     "source": "none",
-    **{field: [] for field in _LIST_FIELDS},
+    "t": [], "x": [], "y": [], "v": [], "a": [], "xStd": [], "yStd": [], "vStd": [], "aStd": [], "yawRel": [], "inPathProb": [],
     "inPath": 1.0,
   }
 
-
-def _rise_hold(raw: float, filt) -> float:
-  """radard's gate shape: a rise is instant, a fall decays, so one low frame cannot drop the value."""
+def rise_hold(raw: float, filt) -> float:
   if raw > filt.x:
     filt.x = raw
   else:
@@ -359,18 +325,11 @@ def _rise_hold(raw: float, filt) -> float:
   return float(filt.x)
 
 
-def _filtered_prob(prob: float, filt) -> float:
-  """The lead-prob gate through `_rise_hold`: one low-prob frame cannot drop a lead."""
-  return _rise_hold(prob, filt)
-
 
 def normalize_lead(slot, model_lead, fused_lead, ego_path_x, ego_path_y, in_path_filter, prob_filter) -> dict:
-  """One leadsV3 slot as a LeadTrajectory dict, on the model's native 6-point t grid.
+  """One leadsV3 slot as a LeadTrajectory dict on the model's native 6-point t grid.
 
-  `fused_lead` is radarState.leadOne/leadTwo, or None for slot 2 / when radard published none.
-  A vision-only slot whose filtered prob is below MOONPILOT_LEAD_PROB_GATE comes back as the empty
-  trajectory. A fused one is never gated here: its prob is radard's own filtered number, and radard
-  only publishes a lead it already believes.
+  A vision slot below `MOONPILOT_LEAD_PROB_GATE` is published as empty, the upstream fail direction.
   """
   if model_lead is None or len(model_lead.x) == 0 or len(ego_path_x) == 0:
     return _empty(slot, in_path_filter)
@@ -380,25 +339,14 @@ def normalize_lead(slot, model_lead, fused_lead, ego_path_x, ego_path_y, in_path
 
   # The low-speed override substitutes a bare radar track that does not correspond to this slot,
   # so it has no predicted trajectory at all: one point, straight from the fused state.
-  if fused_lead is not None and fused_lead.present and fused_lead.radar and fused_lead.modelProb == 0.0:
-    return {
-      "present": True,
-      "prob": float(fused_lead.modelProb),
-      "probTime": float(LEAD_T_OFFSETS[slot]) if slot < len(LEAD_T_OFFSETS) else 0.0,
-      "source": "radar",
-      "t": [0.0],
-      "x": [float(fused_lead.dRel)],
-      "y": [float(fused_lead.yRel)],
-      "v": [float(fused_lead.vLead)],
-      "a": [float(fused_lead.aLeadK)],
-      "xStd": [],
-      "yStd": [],
-      "vStd": [],
-      "aStd": [],
-      "yawRel": [],
-      "inPath": 1.0,
-      "inPathProb": [],
-    }
+  if fused_lead is not None and fused_lead.present and fused_lead.radar and fused_lead.modelProb == RADAR_ONLY_MODEL_PROB:
+    lead = _empty(slot, in_path_filter)
+    lead.update({
+      "present": True, "prob": float(fused_lead.modelProb), "source": "radar",
+      "t": [0.0], "x": [float(fused_lead.dRel)], "y": [float(fused_lead.yRel)],
+      "v": [float(fused_lead.vLead)], "a": [float(fused_lead.aLeadK)],
+    })
+    return lead
 
   if fused_lead is not None and fused_lead.present:
     # Anchor the predicted shape to the fused t=0 state, so index 0 equals radarState exactly.
@@ -406,22 +354,17 @@ def normalize_lead(slot, model_lead, fused_lead, ego_path_x, ego_path_y, in_path
     y = float(fused_lead.yRel) + (-model_y + model_y[0])
     prob = float(fused_lead.modelProb)
   else:
-    # Vision-only: no fused state to anchor to, so publish in the raw radarState conventions, and
-    # this is the one branch that can be published as empty -- the model's own prob is the only
-    # confidence anyone here has, and the UI drew it and the planner scaled its time gap by its
-    # inPath. `present=False` is the upstream default everywhere downstream, so the gate only
-    # removes the fork's own state. The low-speed override above is exempt for the mirror reason:
-    # it is a track radard saw, not a slot the model rates.
-    prob = _filtered_prob(float(model_lead.prob), prob_filter)
+    prob = rise_hold(float(model_lead.prob), prob_filter)
     if prob < MOONPILOT_LEAD_PROB_GATE:
       return _empty(slot, in_path_filter)
     x = model_x - MOONPILOT_RADAR_TO_CAMERA
     y = -model_y
 
-  t = np.asarray(model_lead.t, dtype=float) if len(model_lead.t) else np.asarray(LEAD_T_IDXS[: model_x.size], dtype=float)
+  t = np.asarray(model_lead.t, dtype=float)
   y_std = np.asarray(model_lead.yStd, dtype=float)
 
-  return {
+  lead = _empty(slot, in_path_filter)
+  lead.update({
     "present": True,
     "prob": prob,
     "probTime": float(model_lead.probTime),
@@ -438,18 +381,13 @@ def normalize_lead(slot, model_lead, fused_lead, ego_path_x, ego_path_y, in_path
     "yawRel": lead_yaw_rel(t, y, model_lead.v),
     "inPath": lead_in_path(t, x, y, y_std, ego_path_x, ego_path_y, in_path_filter),
     "inPathProb": lead_in_path_prob(x, y, y_std, ego_path_x, ego_path_y),
-  }
+  })
+  return lead
 
 
 def _moonpilot_leads(sm):
-  """The published leads, or None when there is no valid, alive moonpilotState.
-
-  getattr, not sm.valid: the longitudinal maneuver harness
-  (test/longitudinal_maneuvers/plant.py) passes a plain dict as `sm`.
-  """
-  if not (getattr(sm, "valid", {}).get("moonpilotState", False) and getattr(sm, "alive", {}).get("moonpilotState", False)):
-    return None
-  return sm["moonpilotState"].leads
+  state = moonpilot_state(sm)
+  return None if state is None else state.leads
 
 
 def lead_danger_factor(sm, params: Params, default: float) -> float:
@@ -482,55 +420,3 @@ def nearest_lead_in_path(sm) -> float:
   return float(leads[0].inPath)
 
 
-_NO_LEAD_LINE = (np.empty((0, 3), dtype=np.float32), np.empty((0, 2), dtype=np.float32), np.empty((0,), dtype=np.float32), 1.0)
-
-
-def lead_path_line(renderer, moonpilot_state, path_x, params):
-  """The nearest lead's predicted path projected into a line, out to the planner's horizon.
-
-  `renderer` is either tree's ModelRenderer, duck-typed so this module imports no UI: its ego path
-  gives the line its z and its own transform and clip region project it. `moonpilot_state` is None when
-  message is invalid or its publisher dead. Returns (raw_points, projected_points, widths, in_path),
-  with every array empty and in_path 1.0 when there is no line to draw.
-  """
-  # Off with the feature: the line shows the inPath the fork planner acts on, so with upstream's
-  # MPC back in the line there is no decision on screen to visualize. Cleared rather than skipped,
-  # so a line drawn before the toggle went off does not linger.
-  lead = moonpilot_state.leads[0] if moonpilot_state is not None and len(moonpilot_state.leads) else None
-  if lead is None or not lead.present or len(lead.x) < 2 or not enabled(LEAD_LATERAL, params):
-    return _NO_LEAD_LINE
-
-  # Densify with the same helper the planner path uses, so both agree on the shape, and stop at
-  # the horizon the planner reads: the 6-10 s tail is drawn from samples the model itself rates
-  # +-1 m on, and it landed past the end of the white path. y is negated back into the model's
-  # right-positive convention the projection works in.
-  t_dense = np.arange(0.0, MOONPILOT_INPATH_HORIZON + 1e-9, 0.5)
-  x_d = resample(lead.t, lead.x, t_dense)
-  y_d = -resample(lead.t, lead.y, t_dense)
-  if x_d.size < 2 or y_d.size < 2:  # resample()'s answer to a lead with a single sample
-    return _NO_LEAD_LINE
-  s_d = resample(lead.t, lead.yStd, t_dense) if len(lead.yStd) == len(lead.t) else np.full(t_dense.shape, MOONPILOT_MIN_Y_STD)
-  # z follows the ego path at the lead's distance.
-  z = np.array([renderer._path.raw_points[renderer._get_path_length_idx(path_x, x), 2] for x in x_d], dtype=np.float32)
-
-  # Projected point by point rather than as a ribbon: the width is per sample, and the ribbon
-  # helper returns the two chains interleaved with anything off screen silently dropped. Stop at
-  # the first point that is not visible -- a polyline must not bridge a hole.
-  #
-  # The projection is this file's rather than the renderer's `_map_to_screen`: upstream deleted that
-  # method from the mici tree (lead bar, #39033) while tizi kept it, so calling it worked in exactly
-  # one of the two trees. Both still carry the transform and the clip region it was built from, and
-  # that is all this needs.
-  clip = renderer._clip_region
-  points = []
-  for x, y, zi in zip(x_d, y_d, z, strict=True):
-    pt = renderer._car_space_transform @ np.array([x, y, zi + renderer._path_offset_z], dtype=np.float32)
-    if abs(pt[2]) < 1e-6:
-      break
-    sx, sy = float(pt[0] / pt[2]), float(pt[1] / pt[2])
-    if not (clip.x <= sx <= clip.x + clip.width and clip.y <= sy <= clip.y + clip.height):
-      break
-    points.append((sx, sy))
-
-  widths = np.clip(s_d[: len(points)] * MOONPILOT_LEAD_PATH_PX_PER_M, *MOONPILOT_LEAD_PATH_WIDTH).astype(np.float32)
-  return np.array([x_d, y_d, z], dtype=np.float32).T, np.array(points, dtype=np.float32).reshape(-1, 2), widths, float(lead.inPath)

@@ -4,10 +4,8 @@ import os
 
 STAGING_ROOT = os.environ.get("STAGING_ROOT", "/data/safe_staging")
 BOOT_ID_PATH = os.environ.get("MOONPILOT_BOOT_ID_PATH", "/proc/sys/kernel/random/boot_id")
-SWAP_MARKER = "moonpilot_swap"
 BOOT_OK_MARKER = "moonpilot_boot_ok"
 ROLLBACK_MARKER = "moonpilot_rollback"
-FAILED_OPENPILOT = "failed_openpilot"
 ROLLBACK_KEY = "MoonpilotRollback"
 
 
@@ -24,7 +22,6 @@ def _path(name: str) -> str:
 
 
 def mark_boot_healthy() -> None:
-  """Write the current boot token, ignoring unavailable staging storage."""
   token = boot_id()
   if not token or not os.path.isdir(STAGING_ROOT):
     return
@@ -45,11 +42,17 @@ def read_rollback() -> str:
 
 
 def rollback_text(params) -> str:
-  """Return the rollback sentence currently published for this manager boot."""
+  return params.get(ROLLBACK_KEY) or ""
+
+
+def on_manager_ready(params) -> None:
+  from openpilot.common.swaglog import cloudlog
+
   try:
-    value = params.get(ROLLBACK_KEY)
+    mark_boot_healthy()
+    rollback = read_rollback()
+    if rollback:
+      params.put(ROLLBACK_KEY, rollback, block=True)
+      cloudlog.warning(f"moonpilot rollback: {rollback}")
   except Exception:
-    return ""
-  if not value:
-    return ""
-  return value.decode() if isinstance(value, bytes) else str(value)
+    cloudlog.exception("failed to record moonpilot boot health")

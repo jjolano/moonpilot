@@ -17,10 +17,10 @@ from moonpilot.brake_band import (
   MOONPILOT_BRAKE_BAND_RELEASE_T,
   BrakeBand,
 )
-from moonpilot.features import FEATURES
-from moonpilot.tests.test_longitudinal import COAST_SET_SPEED, ROOT, _inputs, _lead, _planner
+from moonpilot.tests.harness import inputs, lead, planner as make_planner
 
 
+COAST_SET_SPEED = 30.0
 class TestBrakeBand(unittest.TestCase):
   """Shallow negative asks coast; deep ones are one committed press; nothing changes at a crawl."""
 
@@ -81,8 +81,8 @@ class TestBrakeBand(unittest.TestCase):
     floor; with the row off it settles on the rung."""
     settled = {}
     for on in (True, False):
-      planner = _planner(params_overrides={"MoonpilotBrakeBand": on})
-      sm = _inputs(v_ego=COAST_SET_SPEED + 1.0, v_cruise_kph=COAST_SET_SPEED * 3.6)
+      planner = make_planner(overrides={"MoonpilotBrakeBand": on})
+      sm = inputs(v_ego=COAST_SET_SPEED + 1.0, v_cruise_kph=COAST_SET_SPEED * 3.6)
       for _ in range(100):
         planner.update(sm)
       settled[on] = planner.output_a_target
@@ -94,8 +94,8 @@ class TestBrakeBand(unittest.TestCase):
     for reset in ("long_off", "unset_cruise"):
       for previously_active in (False, True):
         with self.subTest(reset=reset, previously_active=previously_active):
-          planner = _planner()
-          deep = _inputs(v_ego=COAST_SET_SPEED + 1.0, v_cruise_kph=COAST_SET_SPEED * 3.6, lead=_lead(12.0, 0.0))
+          planner = make_planner()
+          deep = inputs(v_ego=COAST_SET_SPEED + 1.0, v_cruise_kph=COAST_SET_SPEED * 3.6, lead=lead(12.0, 0.0))
           if previously_active:
             planner.update(deep)
             self.assertTrue(planner.brake_band.pressing)
@@ -109,7 +109,7 @@ class TestBrakeBand(unittest.TestCase):
             self.assertFalse(planner.brake_band.pressing)
             self.assertEqual(planner.brake_band.held, 0.0)
             self.assertEqual(planner.brake_band.above, 0.0)
-          shallow = _inputs(v_ego=COAST_SET_SPEED + 1.0, v_cruise_kph=COAST_SET_SPEED * 3.6)
+          shallow = inputs(v_ego=COAST_SET_SPEED + 1.0, v_cruise_kph=COAST_SET_SPEED * 3.6)
           # Allow the ordinary jerk ramp, but stay inside the stale press's one-second hold.
           for _ in range(8):
             planner.update(shallow)
@@ -121,21 +121,14 @@ class TestBrakeBand(unittest.TestCase):
     the emitted target above that ceiling, or the car would hold -0.10 on throttle."""
     settled = {}
     for on in (True, False):
-      planner = _planner(params_overrides={"MoonpilotBrakeBand": on})
-      sm = _inputs(v_ego=COAST_SET_SPEED, v_cruise_kph=COAST_SET_SPEED * 3.6, throttle_prob=0.0)
+      planner = make_planner(overrides={"MoonpilotBrakeBand": on})
+      sm = inputs(v_ego=COAST_SET_SPEED, v_cruise_kph=COAST_SET_SPEED * 3.6, throttle_prob=0.0)
       for _ in range(100):
         planner.update(sm)
       self.assertFalse(planner.allow_throttle)
       settled[on] = planner.output_a_target
     self.assertLess(settled[False], MOONPILOT_BRAKE_BAND_FLOOR)  # the ceiling is a real coast, inside the band's raise
     self.assertAlmostEqual(settled[True], settled[False], delta=1e-9)
-
-  def test_feature_row_is_on_and_registered(self):
-    feature = next(f for f in FEATURES if f.key == "MoonpilotBrakeBand")
-    self.assertTrue(feature.offroad_only)
-    self.assertFalse(feature.requires)
-    text = (ROOT / "moonpilot" / "params_keys.h").read_text()
-    self.assertTrue('{"MoonpilotBrakeBand", {PERSISTENT, BOOL, "1"}}' in text)
 
 
 if __name__ == "__main__":

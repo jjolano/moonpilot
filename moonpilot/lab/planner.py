@@ -7,24 +7,33 @@ rather than hidden: window overrides the drive did not carry (a marketplace mode
 and the car's own brake arbitration, which no replay models — `brake-lamps` reports the drive's real BRKON, not what
 the band would have produced.
 """
+import contextlib
 import math
 from collections import deque
 from contextlib import contextmanager
-from functools import cache, partial
-from types import MethodType, SimpleNamespace
+from unittest import mock
+from functools import partial
+from types import SimpleNamespace
+from typing import NamedTuple
 
 import numpy as np
 from openpilot.cereal import messaging
 from openpilot.cereal.services import SERVICE_LIST
 from opendbc.car.car_helpers import interfaces
+from openpilot.common.params import Params
+from opendbc.car.toyota.values import CAR as ToyotaCar
 from opendbc.car.structs import car
 from openpilot.common.constants import CV
 from openpilot.common.realtime import DT_CTRL, DT_MDL
 from openpilot.tools.lib.logreader import LogReader
-from moonpilot.latency import MOONPILOT_LAG_MAX
-from moonpilot.longitudinal import MoonpilotLongitudinalPlanner
+from moonpilot.latency import MOONPILOT_LAG_BLOCKS_KEY, MOONPILOT_LAG_HISTORY_KEY, MOONPILOT_LAG_KEY
+from moonpilot.radar_latency import MOONPILOT_RADAR_LATENCY_KEY, MOONPILOT_RADAR_LATENCY_SAMPLES_KEY
+from moonpilot.features import BRAKE_BAND, ENGINE_COAST
 from moonpilot.longcontrol import MoonpilotLongControl
-from moonpilot.lab import DEFAULT_ROOT, cached, drive_config, expand, lag_s, param_index, runs
+from moonpilot.longitudinal import MoonpilotLongitudinalPlanner, lead_band
+from moonpilot.tests.harness import fly, inputs, lead, planner as make_planner, plant_planner
+from moonpilot.lab import DEFAULT_ROOT, cached, drive_config, expand, lag_s, manual_authority, moving_mean, param_index, p95_abs_err, route_moving_mean, runs
+from moonpilot.lab.routes import STOP_SHAPE_ROUTE, add_calibration_arg, add_routes_arg
 
 EXTRACT_VERSION = 2
 LAMP_VERSION = 1
@@ -32,21 +41,8 @@ LAMP_ADDRESS = 0x320  # VSC1S07: the skid-control ECU's own frame, where BRKON i
 CONTROL_VERSION = 1  # one row per carControl frame: the rate the acceleration controller is written for
 MANUAL_VERSION = 2
 CUES_VERSION = 1
-ROUTE_SETS = {
-  # Engaged local drives. 0000042c/42d/42e have zero longActive frames and are skipped by the commands.
-  "longitudinal": ("000003f8", "000003fe", "00000400", "00000401", "00000408", "0000040d", "0000040e", "00000410", "00000414", "0000043e", "0000043f"),
-  "lead-approach": ("000003f8", "00000400", "00000401", "00000408", "0000040d", "0000040e", "00000410", "00000414", "0000043e", "0000043f"),
-  # The driver's own longitudinal behind radar leads; routes without such frames are counted as empty.
-  "manual-approach": ("000003f8", "000003fe", "00000400", "00000401", "00000408", "0000040d", "0000040e", "00000410", "00000414",
-                      "0000042b", "0000042c", "0000043e", "0000043f", "0000044d"),
-  # Every cached drive with engaged longitudinal frames.
-  "engaged": ("000003f8", "000003fe", "00000400", "00000401", "00000408", "0000040d", "0000040e", "0000040f", "00000410", "00000414",
-              "00000417", "0000041d", "00000424", "00000429", "0000042a", "0000042b", "00000439", "0000043a", "0000043e", "0000043f",
-              "0000044d", "00000450", "00000451", "0000045a", "0000045d", "0000045e"),
-}
 MESSAGES = ("carState", "controlsState", "carControl", "vehicleParameters", "radarState", "selfdriveState", "moonpilotState", "modelV2")
-ON_BY_DEFAULT = {"MoonpilotLongitudinal", "MoonpilotModelBraking", "MoonpilotBrakeBand", "MoonpilotCurveSpeed", "MoonpilotLeadLateral", "MoonpilotCoastGrade",
-                 "MoonpilotHandbackEase"}
+_DEFAULT_PARAMS = Params()
 
 
 class ReplayParams:
@@ -56,15 +52,11 @@ class ReplayParams:
   def get(self, key, block=False, return_default=False):
     value = self.values.get(key)
     if value is None:
-      return key in ON_BY_DEFAULT if return_default else None
-    text = value.decode() if isinstance(value, bytes) else value
-    try:
-      return int(text)
-    except (TypeError, ValueError):
-      try:
-        return float(text)
-      except (TypeError, ValueError):
-        return text
+      return _DEFAULT_PARAMS.get_default_value(key) if return_default else None
+    if isinstance(value, (bool, int, float, list, dict)):
+      return value
+    value = value.encode() if isinstance(value, str) else value
+    return _DEFAULT_PARAMS.cpp2python(key, value)
 
   def put(self, key, value):
     self.values[key] = value
@@ -142,73 +134,85 @@ def extract(route, root=DEFAULT_ROOT):
   return cached(route, "planner", EXTRACT_VERSION, root, _build)
 
 
-def replay(route, data, root=DEFAULT_ROOT, overrides=None, details_out=None):
-  cp = messaging.log_from_bytes(data["cp"].tobytes(), car.CarParams)
-  params = ReplayParams({k: v.encode() for k, v in drive_config(route, root)[1].items()})
-  if overrides:
-    params.values.update({k: str(v).encode() for k, v in overrides.items()})
-  import moonpilot.longitudinal as longitudinal
-  original_params, original_time = longitudinal.Params, longitudinal.time
-  clock = ReplayClock()
-  longitudinal.Params = lambda: params  # ty: ignore[invalid-assignment]  # the replay's params, for the planner's own constructor
-  longitudinal.time = clock  # ty: ignore[invalid-assignment]  # wall clock == the row's logMonoTime
-  try:
-    planner = MoonpilotLongitudinalPlanner(cp)
-    blob, offsets = data["blob"], data["offsets"]
-    replayed, logged, active, lead_age = [], [], [], []
-    for row in offsets:
-      mono, messages, stamps = int(row[0]), {}, {}
+class ExtractReader:
+  def __init__(self, data):
+    self.blob, self.offsets = data["blob"], data["offsets"]
+
+  def stamp(self, row, kind):
+    return int(row[2 + MESSAGES.index(kind) * 3])
+
+  def rows(self):
+    for row in self.offsets:
+      messages, stamps = {}, {}
       for i, kind in enumerate(MESSAGES):
         start, size, stamp = row[1 + i * 3:4 + i * 3]
         if size:
-          messages[kind] = messaging.log_from_bytes(blob[start:start + size].tobytes())
+          messages[kind] = messaging.log_from_bytes(self.blob[start:start + size].tobytes())
           stamps[kind] = int(stamp)
-      clock.now_ns = mono
-      sm = ReplaySubMaster(messages, stamps, mono)
-      planner.update(sm)
-      replayed.append(planner.output_a_target)
-      plan_start, plan_size = row[1 + len(MESSAGES) * 3:3 + len(MESSAGES) * 3]
-      plan = messaging.log_from_bytes(blob[plan_start:plan_start + plan_size].tobytes()) if plan_size else None
-      logged.append(float(plan.longitudinalPlan.aTarget) if plan is not None else np.nan)
-      active.append(bool(messages["carControl"].carControl.longActive))
-      radar_stamp = stamps.get("radarState", 0)
-      lead_age.append((mono - radar_stamp) * 1e-9 if messages.get("radarState") and messages["radarState"].radarState.leadOne.present else np.nan)
-      if details_out is not None:
-        cs = messages["carState"].carState
-        cc = messages["carControl"].carControl
-        lead = messages["radarState"].radarState.leadOne
-        mv = messages["modelV2"].modelV2
-        plan_reader = plan.longitudinalPlan if plan is not None else None
-        details_out.append({
-          "t": mono * 1e-9,
-          "manual_authority": not cc.longActive and not cs.cruiseState.enabled and cs.gearShifter == car.CarState.GearShifter.drive,
-          "radar_present": bool(lead.radar),
-          "v_ego": float(cs.vEgo),
-          "a_ego": float(cs.aEgo),
-          "v_cruise": float(cs.vCruise),
-          "brake_pressed": bool(cs.brakePressed),
-          "gas_pressed": bool(cs.gasPressed),
-          "standstill": bool(cs.standstill),
-          "cruise_standstill": bool(cs.cruiseState.standstill),
-          "long_active": bool(cc.longActive),
-          "curvature": float(mv.action.desiredCurvature),
-          "model_accel": float(mv.action.desiredAcceleration),
-          "lead_present": bool(lead.present),
-          "d_rel": float(lead.dRel),
-          "v_lead": float(lead.vLead),
-          "plan_allow_throttle": bool(planner.allow_throttle),
-          "replay_should_stop": bool(planner.output_should_stop),
-          "logged_a_target": float(plan_reader.aTarget) if plan_reader is not None else np.nan,
-          "logged_should_stop": bool(plan_reader.shouldStop) if plan_reader is not None else False,
-          "logged_allow_throttle": bool(plan_reader.allowThrottle) if plan_reader is not None else False,
-          "logged_accel": float(cc.actuators.accel),
-          "band_pressing": bool(planner.brake_band.pressing),
-          "model_slot": bool(planner.model_braking),
-          "source": int(planner.source),
-        })
-  finally:
-    longitudinal.Params, longitudinal.time = original_params, original_time
-  return np.asarray(replayed), np.asarray(logged), np.asarray(active), np.asarray(lead_age)
+      start, size = row[1 + len(MESSAGES) * 3:3 + len(MESSAGES) * 3]
+      plan = messaging.log_from_bytes(self.blob[start:start + size].tobytes()) if size else None
+      yield int(row[0]), messages, stamps, plan
+
+
+def replay_params(route, root, overrides=None):
+  values = {k: v.encode() for k, v in drive_config(route, root)[1].items()}
+  if overrides:
+    values.update({k: str(v).encode() for k, v in overrides.items()})
+  return ReplayParams(values)
+
+
+
+def replay(route, data, root=DEFAULT_ROOT, overrides=None, details=False):
+  cp = messaging.log_from_bytes(data["cp"].tobytes(), car.CarParams)
+  params = replay_params(route, root, overrides)
+  clock = ReplayClock()
+  planner = MoonpilotLongitudinalPlanner(cp, params=params, clock=clock)
+  replayed, logged, active = [], [], []
+  detail_rows = [] if details else None
+  for mono, messages, stamps, plan in ExtractReader(data).rows():
+    clock.now_ns = mono
+    sm = ReplaySubMaster(messages, stamps, mono)
+    planner.update(sm)
+    replayed.append(planner.output_a_target)
+    plan_reader = plan.longitudinalPlan if plan is not None else None
+    logged.append(float(plan_reader.aTarget) if plan_reader is not None else np.nan)
+    active.append(bool(messages["carControl"].carControl.longActive))
+    if detail_rows is None:
+      continue
+    lead = messages["radarState"].radarState.leadOne
+    cs = messages["carState"].carState
+    cc = messages["carControl"].carControl
+    mv = messages["modelV2"].modelV2
+    detail_rows.append({
+      "t": mono * 1e-9,
+      "lead_age": (mono - stamps.get("radarState", 0)) * 1e-9 if lead.present else np.nan,
+      "manual_authority": manual_authority(cc.longActive, cs.cruiseState.enabled, cs.gearShifter == car.CarState.GearShifter.drive),
+      "radar_present": bool(lead.radar),
+      "v_ego": float(cs.vEgo),
+      "a_ego": float(cs.aEgo),
+      "v_cruise": float(cs.vCruise),
+      "brake_pressed": bool(cs.brakePressed),
+      "gas_pressed": bool(cs.gasPressed),
+      "standstill": bool(cs.standstill),
+      "cruise_standstill": bool(cs.cruiseState.standstill),
+      "long_active": bool(cc.longActive),
+      "curvature": float(mv.action.desiredCurvature),
+      "model_accel": float(mv.action.desiredAcceleration),
+      "lead_present": bool(lead.present),
+      "d_rel": float(lead.dRel),
+      "v_lead": float(lead.vLead),
+      "plan_allow_throttle": bool(planner.allow_throttle),
+      "replay_should_stop": bool(planner.output_should_stop),
+      "logged_a_target": float(plan_reader.aTarget) if plan_reader is not None else np.nan,
+      "logged_should_stop": bool(plan_reader.shouldStop) if plan_reader is not None else False,
+      "logged_allow_throttle": bool(plan_reader.allowThrottle) if plan_reader is not None else False,
+      "logged_accel": float(cc.actuators.accel),
+      "band_pressing": bool(planner.brake_band.pressing),
+      "model_slot": bool(planner.model_braking),
+      "source": int(planner.source),
+    })
+  details_array = _details_arrays(detail_rows) if detail_rows else {}
+  return np.asarray(replayed), np.asarray(logged), np.asarray(active), details_array
 
 
 def _details_arrays(details):
@@ -221,8 +225,7 @@ def _curve_mask(d):
 
 
 def _rms_about_mean(x, mask):
-  kernel = np.ones(20) / 20
-  mean = np.convolve(x, kernel, mode="same")
+  mean = moving_mean(x, round(1.0 / DT_MDL))
   return float(np.sqrt(np.mean((x - mean)[mask] ** 2))) if mask.any() else float("nan")
 
 
@@ -232,72 +235,76 @@ def _skip_no_engaged(route, active):
     return True
   return False
 
+class RouteReplay(NamedTuple):
+  route: str
+  replayed: np.ndarray
+  logged: np.ndarray
+  active: np.ndarray
+  mask: np.ndarray
+  err: float
+  commit: str
+  details: dict
+
+
+def replay_route(route, root=DEFAULT_ROOT, data=None, overrides=None, details=False):
+  commit, _ = drive_config(route, root)
+  data = extract(route, root) if data is None else data
+  replayed, logged, active, detail_arrays = replay(route, data, root, overrides, details)
+  if _skip_no_engaged(route, active):
+    return None
+  mask = active & np.isfinite(logged)
+  return RouteReplay(route, replayed, logged, active, mask, p95_abs_err(replayed, logged, mask), commit, detail_arrays)
+
+
+def engaged_replays(args, details=False, routes=None):
+  for route in expand(args.routes if routes is None else routes, args.root):
+    result = replay_route(route, args.root, details=details)
+    if result is not None:
+      yield result
+
 
 def _fidelity(args):
-  for route in expand(args.routes, ROUTE_SETS):
-    commit, _ = drive_config(route, args.root)
-    replayed, logged, active, _ = replay(route, extract(route, args.root), args.root)
-    if _skip_no_engaged(route, active):
-      continue
-    mask = active & np.isfinite(logged)
-    err = float(np.percentile(np.abs(replayed[mask] - logged[mask]), 95)) if mask.any() else float("nan")
-    print(f"{route}: commit {commit}, frames {mask.sum()}, p95 |aTarget error| {err:.4f} m/s^2")
+  for result in engaged_replays(args):
+    print(f"{result.route}: commit {result.commit}, frames {result.mask.sum()}, p95 |aTarget error| {result.err:.4f} m/s^2")
 
 
 def _band(args):
-  for route in expand(args.routes, ROUTE_SETS):
-    commit, cfg = drive_config(route, args.root)
-    d = extract(route, args.root)
-    driven, logged, active, _ = replay(route, d, args.root)
-    if _skip_no_engaged(route, active):
-      continue
-    off, _, _, _ = replay(route, d, args.root, {"MoonpilotBrakeBand": 0})
-    mask = active & np.isfinite(logged)
-    err = float(np.percentile(np.abs(driven[mask] - logged[mask]), 95)) if mask.any() else float("nan")
-    off_err = float(np.percentile(np.abs(off[mask] - logged[mask]), 95)) if mask.any() else float("nan")
-    print(f"{route}: commit {commit}, as-driven MoonpilotBrakeBand={cfg.get('MoonpilotBrakeBand', '0')};")
-    print(f"  p95 logged as-driven {err:.4f}, band-off {off_err:.4f};")
-    print(f"  engaged command sd band on/off {np.std(driven[mask]):.4f}/{np.std(off[mask]):.4f}; see `brake-lamps` for the car's own BRKON")
+  for result in engaged_replays(args):
+    _, cfg = drive_config(result.route, args.root)
+    off, _, _, _ = replay(result.route, extract(result.route, args.root), args.root, {BRAKE_BAND.key: 0})
+    off_err = p95_abs_err(off, result.logged, result.mask)
+    print(f"{result.route}: commit {result.commit}, as-driven MoonpilotBrakeBand={cfg.get(BRAKE_BAND.key, '0')};")
+    print(f"  p95 logged as-driven {result.err:.4f}, band-off {off_err:.4f};")
+    print(f"  engaged command sd band on/off {np.std(result.replayed[result.mask]):.4f}/"
+          + f"{np.std(off[result.mask]):.4f}; see `brake-lamps` for the car's own BRKON")
 
 
 def _hf_sd(x, mask):
   """Standard deviation of the command residual after a centered one-second mean."""
-  kernel = np.ones(20) / 20
-  mean = np.convolve(x, kernel, mode="same")
+  mean = moving_mean(x, round(1.0 / DT_MDL))
   return float(np.std((x - mean)[mask]))
 
 
 def _smooth(args):
-  for route in expand(args.routes, ROUTE_SETS):
-    commit, _ = drive_config(route, args.root)
-    d = extract(route, args.root)
-    driven, logged, active, _ = replay(route, d, args.root)
-    if _skip_no_engaged(route, active):
-      continue
-    off, _, _, _ = replay(route, d, args.root, {"MoonpilotBrakeBand": 0})
-    mask = active & np.isfinite(logged)
-    err = float(np.percentile(np.abs(driven[mask] - logged[mask]), 95)) if mask.any() else float("nan")
-    print(f"{route}: commit {commit}, engaged aTarget sd band on/off {np.std(driven[mask]):.4f}/{np.std(off[mask]):.4f} m/s^2,",
-          f"HF sd band on/off {_hf_sd(driven, mask):.4f}/{_hf_sd(off, mask):.4f}, logged p95 {err:.4f}")
+  for result in engaged_replays(args):
+    off, _, _, _ = replay(result.route, extract(result.route, args.root), args.root, {BRAKE_BAND.key: 0})
+    print(f"{result.route}: commit {result.commit}, engaged aTarget sd band on/off "
+          + f"{np.std(result.replayed[result.mask]):.4f}/{np.std(off[result.mask]):.4f} m/s^2,")
+    print(f"  HF sd band on/off {_hf_sd(result.replayed, result.mask):.4f}/{_hf_sd(off, result.mask):.4f}, "
+          + f"logged p95 {result.err:.4f}")
 
 
 def _events(args):
-  for route in expand(args.routes, ROUTE_SETS):
-    commit, _ = drive_config(route, args.root)
-    d = extract(route, args.root)
-    driven, logged, active, _ = replay(route, d, args.root)
-    if _skip_no_engaged(route, active):
-      continue
-    mask = active & np.isfinite(logged)
-    duration = mask.sum() / 20.0
-    press_episodes = runs(mask & (driven < -0.4))
-    represses = sum(start.start - previous.stop <= 2 * 20 for previous, start in zip(press_episodes, press_episodes[1:], strict=False))
+  for result in engaged_replays(args):
+    duration = result.mask.sum() * DT_MDL
+    press_episodes = runs(result.mask & (result.replayed < -0.4))
+    represses = sum(start.start - previous.stop <= 2 * round(1 / DT_MDL) for previous, start in zip(press_episodes, press_episodes[1:], strict=False))
     per_minute = len(press_episodes) / max(duration, 1) * 60
     print(
-      f"{route}: commit {commit}, engaged {duration:.1f} s; presses {len(press_episodes)} ({per_minute:.2f}/min),",
+      f"{result.route}: commit {result.commit}, engaged {duration:.1f} s; presses {len(press_episodes)} ({per_minute:.2f}/min),",
       f"re-presses within 2 s {represses} ({represses / max(duration, 1) * 60:.2f}/min);",
     )
-    print(f"  peak min/max {np.nanmin(driven[mask]):.3f}/{np.nanmax(driven[mask]):.3f} m/s^2")
+    print(f"  peak min/max {np.nanmin(result.replayed[result.mask]):.3f}/{np.nanmax(result.replayed[result.mask]):.3f} m/s^2")
 
 
 def _lamps_build(segs):
@@ -325,90 +332,65 @@ def extract_lamps(route, root=DEFAULT_ROOT):
 
 def _lamps(args):
   """The car's own brake lamp, beside the planner's press episodes, over engaged speed-control frames above 5 m/s."""
-  for route in expand(args.routes, ROUTE_SETS):
-    commit, _ = drive_config(route, args.root)
-    details = []
-    driven, logged, active, _ = replay(route, extract(route, args.root), args.root, details_out=details)
-    if _skip_no_engaged(route, active):
-      continue
-    d = _details_arrays(details)
-    lamp = extract_lamps(route, args.root)
+  for result in engaged_replays(args, details=True):
+    d = result.details
+    lamp = extract_lamps(result.route, args.root)
     if not len(lamp["lamp"]):
-      print(f"{route}: commit {commit}, no VSC1S07 frames in the logs")
+      print(f"{result.route}: commit {result.commit}, no VSC1S07 frames in the logs")
       continue
-    # Sample-and-hold the lamp at each planner tick, then keep the engaged speed-control frames above 5 m/s.
     held = lamp["lamp"][np.clip(np.searchsorted(lamp["lamp_t"], (d["t"] * 1e9).astype(np.int64), side="right") - 1, 0, len(lamp["lamp"]) - 1)]
-    mask = active & (d["v_ego"] > 5.0)
-    duration = mask.sum() / 20.0
-    press = runs(mask & (driven < -0.4))
-    reps = sum(a.start - b.stop <= 2 * 20 for b, a in zip(press, press[1:], strict=False))
+    mask = result.active & (d["v_ego"] > 5.0)
+    duration = mask.sum() * DT_MDL
+    press = runs(mask & (result.replayed < -0.4))
+    reps = sum(a.start - b.stop <= round(2 / DT_MDL) for b, a in zip(press, press[1:], strict=False))
     lit = runs(mask & held)
-    relights = sum(a.start - b.stop <= 2 * 20 for b, a in zip(lit, lit[1:], strict=False))
-    print(f"{route}: commit {commit}, engaged>5 {duration:.1f} s; brake-lamp episodes {len(lit)} ({len(lit) / max(duration, 1) * 60:.2f}/min),"
+    relights = sum(a.start - b.stop <= round(2 / DT_MDL) for b, a in zip(lit, lit[1:], strict=False))
+    print(f"{result.route}: commit {result.commit}, engaged>5 {duration:.1f} s; brake-lamp episodes {len(lit)} ({len(lit) / max(duration, 1) * 60:.2f}/min),"
           + f" re-lights within 2 s {relights} ({relights / max(duration, 1) * 60:.2f}/min), lit {100 * held[mask].mean():.0f}% of frames")
     print(f"  planner presses {len(press)} ({len(press) / max(duration, 1) * 60:.2f}/min), re-presses within 2 s {reps}"
           + " — the lamp is the drive's own; its counterfactual under the band still needs the switching-rate model")
 
 
 def _lead_ages(args):
-  for route in expand(args.routes, ROUTE_SETS):
-    commit, _ = drive_config(route, args.root)
-    _, _, active, lead_age = replay(route, extract(route, args.root), args.root)
-    if _skip_no_engaged(route, active):
-      continue
-    ages = lead_age[active & np.isfinite(lead_age)]
+  for result in engaged_replays(args, details=True):
+    ages = result.details["lead_age"][result.active & np.isfinite(result.details["lead_age"])]
     if not len(ages):
-      print(f"{route}: commit {commit}, no engaged lead-present frames")
+      print(f"{result.route}: commit {result.commit}, no engaged lead-present frames")
       continue
-    print(f"{route}: commit {commit}, frames {len(ages)}, lead age median {np.median(ages) * 1e3:.1f} ms, max {np.max(ages) * 1e3:.1f} ms")
+    print(f"{result.route}: commit {result.commit}, frames {len(ages)}, lead age median {np.median(ages) * 1e3:.1f} ms, max {np.max(ages) * 1e3:.1f} ms")
 
 
 def _curve_metrics(args):
-  for route in expand(args.routes, ROUTE_SETS):
-    commit, _ = drive_config(route, args.root)
-    details = []
-    driven, logged, active, _ = replay(route, extract(route, args.root), args.root, details_out=details)
-    if _skip_no_engaged(route, active):
-      continue
-    d = _details_arrays(details)
-    mask = active & np.isfinite(logged)
-    curve = _curve_mask(d)
-    curve &= np.isfinite(logged)
-    err = float(np.percentile(np.abs(driven[mask] - logged[mask]), 95)) if mask.any() else float("nan")
-    flips = int(np.sum(d["plan_allow_throttle"][mask][1:] != d["plan_allow_throttle"][mask][:-1]))
-    duration = mask.sum() / 20.0
-    curve_hf = _hf_sd(driven, curve) if curve.any() else float("nan")
-    print(f"{route}: commit {commit}, p95 logged {err:.4f}; curve mask |a_y|>=1 m/s^2, frames {curve.sum()}")
-    print(f"  curve HF sd current {curve_hf:.4f}, pre-brake frames driven<-1 {int(np.sum(curve & (driven < -1.0)))};",
+  for result in engaged_replays(args, details=True):
+    d = result.details
+    curve = _curve_mask(d) & np.isfinite(result.logged)
+    flips = int(np.sum(d["plan_allow_throttle"][result.mask][1:] != d["plan_allow_throttle"][result.mask][:-1]))
+    duration = result.mask.sum() * DT_MDL
+    curve_hf = _hf_sd(result.replayed, curve) if curve.any() else float("nan")
+    print(f"{result.route}: commit {result.commit}, p95 logged {result.err:.4f}; curve mask |a_y|>=1 m/s^2, frames {curve.sum()}")
+    print(f"  curve HF sd current {curve_hf:.4f}, pre-brake frames driven<-1 {int(np.sum(curve & (result.replayed < -1.0)))};",
           f"allowThrottle flips {flips} ({flips / max(duration, 1):.3f}/s)")
-    closing = mask & d["lead_present"] & (d["v_ego"] > d["v_lead"])
-    print(f"  closing-approach RMS about 1s mean current/logged {_rms_about_mean(driven, closing):.4f}/{_rms_about_mean(logged, closing):.4f}")
+    closing = result.mask & d["lead_present"] & (d["v_ego"] > d["v_lead"])
+    print(f"  closing-approach RMS about 1s mean current/logged {_rms_about_mean(result.replayed, closing):.4f}/{_rms_about_mean(result.logged, closing):.4f}")
 
 
 def _window_metrics(args, start, end, label):
-  for route in expand(args.routes, ROUTE_SETS):
-    commit, _ = drive_config(route, args.root)
-    details = []
-    driven, logged, active, _ = replay(route, extract(route, args.root), args.root, details_out=details)
-    if _skip_no_engaged(route, active):
-      continue
-    d = _details_arrays(details)
+  for result in engaged_replays(args, details=True):
+    d = result.details
     elapsed = d["t"] - d["t"][0]
-    window = (elapsed >= start) & (elapsed <= end) & active & np.isfinite(logged)
+    window = (elapsed >= start) & (elapsed <= end) & result.active & np.isfinite(result.logged)
     if not window.any():
-      print(f"{route}: commit {commit}, no {label} frames in {start}-{end} s")
+      print(f"{result.route}: commit {result.commit}, no {label} frames in {start}-{end} s")
       continue
-    err = float(np.percentile(np.abs(driven[window] - logged[window]), 95))
+    err = p95_abs_err(result.replayed, result.logged, window)
     idx = np.flatnonzero(window)
-    near = idx[np.argmin(np.abs(d["v_ego"][idx] - 0.30))] if len(idx) else None
-    peak_i = idx[np.argmin(driven[idx])] if len(idx) else None
-    print(f"{route}: commit {commit}, {label} {start}-{end} s, frames {len(idx)}, p95 logged {err:.4f}")
-    if near is not None:
-      print(f"  at v=0.30 nearest {d['v_ego'][near]:.3f} m/s: ask {driven[near]:.3f}, logged {logged[near]:.3f}")
-    if peak_i is not None:
-      print(f"  window peak ask {driven[peak_i]:.3f}, logged {logged[peak_i]:.3f} at v={d['v_ego'][peak_i]:.3f}")
-    for i in idx[::20]:
-      print(f"  t={elapsed[i]:.1f}s v={d['v_ego'][i]:.2f} ask={driven[i]:.3f} logged={logged[i]:.3f} gap={d['d_rel'][i]:.1f}")
+    near = idx[np.argmin(np.abs(d["v_ego"][idx] - 0.30))]
+    peak_i = idx[np.argmin(result.replayed[idx])]
+    print(f"{result.route}: commit {result.commit}, {label} {start}-{end} s, frames {len(idx)}, p95 logged {err:.4f}")
+    print(f"  at v=0.30 nearest {d['v_ego'][near]:.3f} m/s: ask {result.replayed[near]:.3f}, logged {result.logged[near]:.3f}")
+    print(f"  window peak ask {result.replayed[peak_i]:.3f}, logged {result.logged[peak_i]:.3f} at v={d['v_ego'][peak_i]:.3f}")
+    for i in idx[::round(1 / DT_MDL)]:
+      print(f"  t={elapsed[i]:.1f}s v={d['v_ego'][i]:.2f} ask={result.replayed[i]:.3f} logged={result.logged[i]:.3f} gap={d['d_rel'][i]:.1f}")
 
 
 def _queue_stop(args):
@@ -420,20 +402,18 @@ def _crawl_stop(args):
 
 
 def _rolling_exits(args):
-  for route in expand(args.routes, ROUTE_SETS):
+  for route in expand(args.routes, args.root):
     commit, _ = drive_config(route, args.root)
-    details = []
-    driven, logged, active, _ = replay(route, extract(route, args.root), args.root, details_out=details)
+    driven, logged, active, d = replay(route, extract(route, args.root), args.root, details=True)
     if _skip_no_engaged(route, active):
       continue
-    d = _details_arrays(details)
     mask = active & np.isfinite(logged)
     engaged = np.flatnonzero(mask)
     releases = engaged[1:][(driven[engaged[1:]] > 0.0) & (driven[engaged[:-1]] <= 0.0)]
     if not len(releases):
       print(f"{route}: commit {commit}, no release events")
       continue
-    err = float(np.percentile(np.abs(driven[mask] - logged[mask]), 95))
+    err = p95_abs_err(driven, logged, mask)
     best = []
     for i in releases:
       j = min(i + 100, len(driven))
@@ -504,17 +484,14 @@ def control_rate_dt(t_ns: np.ndarray) -> float:
 def _longcontrol(args):
   """The acceleration controller on the drive's own control ticks: the same `CI.get_pid_accel_limits` call controlsd
   makes (nothing in cereal logs the limits), the logged plan and `carState`, and the logged accel as the reference."""
-  for route in expand(args.routes, ROUTE_SETS):
+  for route in expand(args.routes, args.root):
     commit, _ = drive_config(route, args.root)
     c = extract_control(route, args.root)
     dt = control_rate_dt(c["t"])
     d = extract(route, args.root)
-    details = []
-    replayed, _, active, _ = replay(route, d, args.root, details_out=details)
+    replayed, _, active, plan = replay(route, d, args.root, details=True)
     if not active.any():
-      print(f"{route}: no longActive frames, skipping")
       continue
-    plan = _details_arrays(details)
     # The replayed plan, held at the value the planner last published, on the control ticks.
     held = np.clip(np.searchsorted(plan["t"], c["t"] * 1e-9, side="right") - 1, 0, len(replayed) - 1)
     cp = messaging.log_from_bytes(d["cp"].tobytes(), car.CarParams)
@@ -531,9 +508,9 @@ def _longcontrol(args):
           loc.reset()  # controlsd's own line, so the integrator does not carry across a disengagement
         out[i] = loc.update(bool(c["long_active"][i]), cs, float(target[i]), bool(c["should_stop"][i]), limits)
     mask = c["long_active"] & np.isfinite(c["accel"])
-    err_logged = float(np.percentile(np.abs(out_logged[mask] - c["accel"][mask]), 95))
-    err_replayed = float(np.percentile(np.abs(out_replayed[mask] - c["accel"][mask]), 95))
-    plan_err = float(np.percentile(np.abs(replayed[active] - plan["logged_a_target"][active]), 95))
+    err_logged = p95_abs_err(out_logged, c["accel"], mask)
+    err_replayed = p95_abs_err(out_replayed, c["accel"], mask)
+    plan_err = p95_abs_err(replayed, plan["logged_a_target"], active)
     print(f"{route}: commit {commit}, control frames {mask.sum()} at {1e3 * dt:.1f} ms;")
     print(f"  controller p95 vs logged accel: on the logged plan {err_logged:.4f} (isolates the controller),"
           + f" on the replayed plan {err_replayed:.4f} m/s^2 (that plus the planner's own {plan_err:.4f})")
@@ -556,10 +533,9 @@ def _brake_gain_route(job):
   k, half = max(int(round(lag / dt)), 1), int(round(0.5 / dt))
   change = np.full(len(c["t"]), np.inf)  # the target's change over the surrounding second
   change[half:-half] = np.abs(c["a_target"][2 * half:] - c["a_target"][:-2 * half])
-  mean = np.ones(half) / half  # the 0.5 s mean every lab peak is read on, applied to the ask and the response alike
-  felt, asked = np.convolve(c["a_ego"], mean, mode="same"), np.convolve(c["a_target"], mean, mode="same")
+  felt, asked = moving_mean(c["a_ego"], half), moving_mean(c["a_target"], half)
   return route, {"lag": lag, "dt": dt, "cmd": c["a_target"][:-k], "asked": asked[:-k], "a": c["a_ego"][k:], "felt": felt[k:], "v": c["v_ego"][:-k],
-                 "ok": ok[:-k] & ok[k:], "steady": change[:-k] < 0.3, "ec": param_index(drive_config(route, root)[1], "MoonpilotEngineCoast")}
+                 "ok": ok[:-k] & ok[k:], "steady": change[:-k] < 0.3, "ec": param_index(drive_config(route, root)[1], ENGINE_COAST.key)}
 
 
 def _brake_gain(args):
@@ -570,7 +546,7 @@ def _brake_gain(args):
   Engine-coast drives and drives whose lag sits on the search bound are listed but not pooled."""
   from concurrent.futures import ProcessPoolExecutor
   with ProcessPoolExecutor(4) as pool:
-    results = list(pool.map(_brake_gain_route, [(r, args.root) for r in expand(args.routes, ROUTE_SETS)]))
+    results = list(pool.map(_brake_gain_route, [(r, args.root) for r in expand(args.routes, args.root)]))
   steady, episodes = [], []
   print("drive: braking s (target < -0.3), lag, steady aEgo / target median, episodes, peak aEgo / peak target median")
   for route, r in results:
@@ -641,7 +617,6 @@ def _window_summary(label, windows):
 
 
 def _approach_scenarios():
-  from moonpilot.tests.test_longitudinal import _fly
 
   scenarios = (
     ("steady lead", 12.0, 43.2, 80.0, 3.0, lambda t: 0.0),
@@ -661,20 +636,17 @@ def _approach_scenarios():
 
   print("Current full planner, existing _fly point-mass harness (no actuator delay):")
   for label, v0, setpoint, gap, v_lead, accel in scenarios:
-    report(label, _fly(v0, setpoint, gap, v_lead, accel, 55.0))
+    report(label, fly(v0, setpoint, gap, v_lead, accel, 55.0))
 
 
 def _lead_approach(args):
   if not args.smoke_only:
     pooled = {"moving": [], "stationary": []}
-    for route in expand(args.routes, ROUTE_SETS):
-      commit, config = drive_config(route, args.root)
-      details = []
-      replayed, logged, active, _ = replay(route, extract(route, args.root), args.root, details_out=details)
-      d = _details_arrays(details)
-      mask = active & np.isfinite(logged)
-      p95 = float(np.percentile(np.abs(replayed[mask] - logged[mask]), 95)) if mask.any() else float("nan")
-      print(f"{route}: commit {commit}, config {config}")
+    for result in engaged_replays(args, details=True):
+      d = result.details
+      mask = result.mask
+      p95 = p95_abs_err(result.replayed, result.logged, mask)
+      print(f"{result.route}: commit {result.commit}, config {drive_config(result.route, args.root)[1]}")
       print(f"  replay-vs-logged p95 |aTarget error| {p95:.4f} m/s^2 on {mask.sum()} engaged frames "
             + "(current-code mismatch is expected on pre-change logs)")
       times, gaps = d["t"], d["d_rel"]
@@ -697,7 +669,7 @@ def _lead_approach(args):
 
 def _register_lead_approach(sub):
   parser = sub.add_parser("lead-approach", help="manual lead windows and full-planner approach diagnostic")
-  parser.add_argument("--routes", nargs="+", default=["lead-approach"], help=f"route names or IDs: {', '.join(ROUTE_SETS)}")
+  add_routes_arg(parser, ["lead-approach"])
   parser.add_argument("--smoke-only", action="store_true", help="skip route replay and run only planner scenarios")
   parser.set_defaults(fn=_lead_approach)
 
@@ -709,17 +681,12 @@ def _manual_frames(route, root=DEFAULT_ROOT):
 
   def build(_segs):
     data = extract(route, root)
-    blob, offsets = data["blob"], data["offsets"]
-    index = {k: 1 + i * 3 for i, k in enumerate(MESSAGES)}
     estimator, rows = LeadAccelEstimator(), []
-    for row in offsets:
-      def read(kind, row=row):
-        start, size = row[index[kind]], row[index[kind] + 1]
-        return messaging.log_from_bytes(blob[start:start + size].tobytes())
-      cs, cc, lead = read("carState").carState, read("carControl").carControl, read("radarState").radarState.leadOne
+    for mono, messages, _, _ in ExtractReader(data).rows():
+      cs, cc, lead = messages["carState"].carState, messages["carControl"].carControl, messages["radarState"].radarState.leadOne
       a_lead, _ = estimator.update(lead)
-      manual = not cc.longActive and not cs.cruiseState.enabled and cs.gearShifter == car.CarState.GearShifter.drive
-      rows.append((row[0] * 1e-9, manual, cs.vEgo, cs.aEgo, cs.gasPressed, cs.brakePressed, lead.present and lead.radar, lead.dRel, lead.vLead,
+      manual = manual_authority(cc.longActive, cs.cruiseState.enabled, cs.gearShifter == car.CarState.GearShifter.drive)
+      rows.append((mono * 1e-9, manual, cs.vEgo, cs.aEgo, cs.gasPressed, cs.brakePressed, lead.present and lead.radar, lead.dRel, lead.vLead,
                    a_lead, estimator.a_slow))
     keys = ("t", "manual", "v", "a", "gas", "brake", "lead", "gap", "v_lead", "a_lead", "a_slow")
     return {k: np.asarray(col, dtype=float) for k, col in zip(keys, zip(*rows, strict=True), strict=True)}
@@ -770,18 +737,16 @@ def _fly_lagged(v0, v_set_kph, gap0, v_lead0, a_lead_fn, T, seed=None, engine_co
   """The RAV4 planner against a scripted lead through a lagged point-mass plant; with a seed, white radar
   noise on `dRel` (0.3 m + 0.4 %) and `vLead` (0.05 m/s). `gain` scales the delayed command, and `visible_fn(t)`
   drops the lead when it returns False."""
-  from moonpilot.tests.test_engine_coast import _planner
-  from moonpilot.tests.test_longitudinal import _inputs, _lead
   rng = np.random.default_rng(seed) if seed is not None else None
-  planner, plant, v, gap, v_lead = _planner(engine_coast), _LaggedPlant(gain=gain), v0, gap0, v_lead0
+  planner, plant, v, gap, v_lead = make_planner(engine_coast, car=ToyotaCar.TOYOTA_RAV4_TSS2), _LaggedPlant(gain=gain), v0, gap0, v_lead0
   out = {k: [] for k in ("v", "gap", "v_lead", "cmd")}
   for i in range(round(T / DT_MDL)):
     d_seen, v_seen = gap, v_lead
     if rng is not None:
       d_seen, v_seen = gap + rng.normal(0.0, 0.3 + 0.004 * gap), v_lead + rng.normal(0.0, 0.05)
     present = visible_fn(i * DT_MDL) if visible_fn is not None else True
-    planner.update(_inputs(v_ego=max(v, 0.0), v_cruise_kph=v_set_kph, a_ego=plant.a,
-                           lead=_lead(max(d_seen, 0.0), max(v_seen, 0.0), present=present), personality=1))
+    planner.update(inputs(v_ego=max(v, 0.0), v_cruise_kph=v_set_kph, a_ego=plant.a,
+                           lead=lead(max(d_seen, 0.0), max(v_seen, 0.0), present=present), personality=1))
     for k, x in zip(out, (v, gap, v_lead, float(planner.output_a_target)), strict=True):
       out[k].append(x)
     a = plant.step(float(planner.output_a_target), v)
@@ -821,10 +786,10 @@ def _manual_decel(args):
   manual frames behind a radar lead; then where the driver actually ends up — rest gaps and settled headways."""
   from moonpilot.longitudinal import MOONPILOT_STOP_REST, lead_accel_estimate, stopping_decel
   t_follow = args.t_follow
-  routes = expand(args.routes, ROUTE_SETS)
+  routes = expand(args.routes, args.root)
   d = _pooled_manual(routes, args.root)
   v, v_lead, gap = d["v"], d["v_lead"], d["gap"]
-  target = _arrival_target(v_lead, t_follow)
+  target = lead_band(v_lead, t_follow)[0]
   lead = (d["manual"] > 0) & (d["lead"] > 0)
   a_lead = np.array([lead_accel_estimate(x) for x in d["a_lead"]])
   need = np.array([stopping_decel(*x) if m else 0.0 for m, x in zip(lead, zip(v, v_lead, a_lead, np.maximum(gap - target, 0.1), strict=True), strict=True)])
@@ -863,12 +828,6 @@ def _manual_decel(args):
           + f"{np.median(headway):.2f} s, p10 {np.percentile(headway, 10):.2f}, p90 {np.percentile(headway, 90):.2f}; the law's is {t_follow} s")
 
 
-def _arrival_target(v_lead, t_follow):
-  """The lead law's near gap behind a lead at constant speed: max(the moving rest, t_follow * v_lead)."""
-  from moonpilot.longitudinal import MOONPILOT_CREEP_SPEED, MOONPILOT_MOVING_STOP_RESERVE, MOONPILOT_STOP_DISTANCE, MOONPILOT_STOP_REST
-  reserve = MOONPILOT_STOP_DISTANCE - MOONPILOT_STOP_REST + MOONPILOT_MOVING_STOP_RESERVE
-  return np.maximum(MOONPILOT_STOP_REST + reserve * np.clip(v_lead / MOONPILOT_CREEP_SPEED, 0.0, 1.0), t_follow * v_lead)
-
 
 def _lead_ask(t_follow):
   """(v, gap, v_lead, a_lead, a_slow) -> the lead law's ask as `policy` gives it for the engine-coast RAV4 with cruise at the
@@ -882,7 +841,7 @@ def _lead_ask(t_follow):
   src = longitudinal.LongitudinalPlanSource.lead0
 
   def ask(v, gap, v_lead, a_lead, a_slow):
-    lead = (src, gap, v_lead, a_lead, longitudinal.brake_sustain(a_lead), a_slow)
+    lead = longitudinal.LeadState(src, gap, v_lead, a_lead, longitudinal.brake_sustain(a_lead), a_slow)
     return longitudinal.policy(v, [lead], v, t_follow, False, None, 0.0, CP, -0.3, True)[0]
   return ask
 
@@ -946,9 +905,9 @@ def _approach_onsets(args):
   'after' do not predict closed-loop onset. Windows that open already slowing are left-censored, not counted. Engaged
   drives (`--engaged`): the logged command against today's planner replayed on them."""
   t_follow = args.t_follow
-  d = _pooled_manual(expand(args.routes, ROUTE_SETS), args.root)
+  d = _pooled_manual(expand(args.routes, args.root), args.root)
   t, v, gap, v_lead = d["t"], d["v"], d["gap"], d["v_lead"]
-  target, closing = _arrival_target(v_lead, t_follow), v - v_lead
+  target, closing = lead_band(v_lead, t_follow)[0], v - v_lead
   ok = (d["manual"] > 0) & (d["lead"] > 0) & (v > 5.0) & (closing > 1.0) & (gap > target)
   runs = _approach_runs(t, d["route"], ok, gap, target)
   idx = np.unique(np.concatenate([np.arange(s, e) for s, e in runs])) if runs else np.array([], dtype=int)
@@ -964,20 +923,19 @@ def _approach_onsets(args):
   ]
   _onset_report("Manual approaches: law asks on the driver's states; 'first' = the law's onset precedes the driver's", runs, t, v, gap, closing, rows)
 
-  for route in expand(args.engaged, ROUTE_SETS):
-    commit, _ = drive_config(route, args.root)
-    details = []
-    replayed, logged, active, _ = replay(route, extract(route, args.root), args.root, details_out=details)
-    e = _details_arrays(details)
-    target_e, closing_e = _arrival_target(e["v_lead"], t_follow), e["v_ego"] - e["v_lead"]
-    ok_e = active & e["lead_present"] & e["radar_present"] & (e["v_ego"] > 5.0) & (closing_e > 1.0) & (e["d_rel"] > target_e)
+  for result in engaged_replays(args, details=True, routes=args.engaged):
+    e = result.details
+    target_e, closing_e = lead_band(e["v_lead"], t_follow)[0], e["v_ego"] - e["v_lead"]
+    ok_e = result.active & e["lead_present"] & e["radar_present"] & (e["v_ego"] > 5.0) & (closing_e > 1.0) & (e["d_rel"] > target_e)
     runs_e = _approach_runs(e["t"], np.zeros(len(ok_e)), ok_e, e["d_rel"], target_e)
-    m = active & np.isfinite(logged)
-    p95 = float(np.percentile(np.abs(replayed - logged)[m], 95)) if m.any() else math.nan
+    logged = result.logged
+    logged_mask = result.active & np.isfinite(logged)
+    p95 = p95_abs_err(result.replayed, logged, logged_mask)
     logged = np.nan_to_num(logged)
-    rows_e = [(f"now vs logged at {thr}", lambda s, e, x=logged <= thr: _onset(x, s, e), lambda s, e, x=replayed <= thr: _onset(x, s, e), 0.0)
+    rows_e = [(f"now vs logged at {thr}", lambda s, e, x=logged <= thr: _onset(x, s, e), lambda s, e, x=result.replayed <= thr: _onset(x, s, e), 0.0)
               for thr in (-0.05, -0.3)]
-    _onset_report(f"Engaged {route} (ran {commit[:9]}; replay vs logged p95 {p95:.3f})", runs_e, e["t"], e["v_ego"], e["d_rel"], closing_e, rows_e)
+    _onset_report(f"Engaged {result.route} (ran {result.commit[:9]}; replay vs logged p95 {p95:.3f})",
+                  runs_e, e["t"], e["v_ego"], e["d_rel"], closing_e, rows_e)
 
 
 def _plant_inputs(v, a, gap, v_lead, a_lead, v_cruise):
@@ -996,7 +954,7 @@ def _plant_inputs(v, a, gap, v_lead, a_lead, v_cruise):
   model.modelV2.acceleration = log.XYZTData.new_message(x=[0.0] * len(ModelConstants.T_IDXS))
   control.controlsState.longControlState = LongCtrlState.pid
   ss.selfdriveState.personality = log.LongitudinalPersonality.standard
-  cs.carState.vEgo, cs.carState.aEgo, cs.carState.vCruise = float(v), float(a), float(v_cruise * 3.6)
+  cs.carState.vEgo, cs.carState.aEgo, cs.carState.vCruise = float(v), float(a), float(v_cruise * CV.MS_TO_KPH)
   return {"radarState": radar.radarState, "carState": cs.carState, "controlsState": control.controlsState,
           "selfdriveState": ss.selfdriveState, "modelV2": model.modelV2}
 
@@ -1006,8 +964,6 @@ def _hard_brake_run(kind, v0, a_brake, lag, onset=5.0, T=30.0, gain=None):
   from openpilot.selfdrive.controls.lib.longitudinal_planner import ACCEL_MIN, LongitudinalPlanner
   from opendbc.car.toyota.interface import CarInterface
   from opendbc.car.toyota.values import CAR
-  from moonpilot.tests.test_engine_coast import _planner
-  from moonpilot.tests.test_longitudinal import _plant_sm
   if kind == "upstream":
     CP = CarInterface.get_non_essential_params(CAR.TOYOTA_RAV4_TSS2)
     CP.openpilotLongitudinalControl = True
@@ -1016,8 +972,9 @@ def _hard_brake_run(kind, v0, a_brake, lag, onset=5.0, T=30.0, gain=None):
   elif kind == "ideal":
     planner, update = None, None
   else:
-    planner = _planner(kind == "fork+engine")
-    update = lambda sm: planner.update(_plant_sm(sm))  # noqa: E731
+    planner = make_planner(kind == "fork+engine", car=ToyotaCar.TOYOTA_RAV4_TSS2)
+    planner = plant_planner(params=planner.params)(planner.CP)
+    update = planner.update
   plant = _LaggedPlant(gain=gain) if lag else None
   v, v_lead, gap, a, v_prev = v0, v0, 1.45 * v0, 0.0, v0
   gaps, cmds, fcw = [], [], []
@@ -1092,7 +1049,6 @@ def _sustain_rule(rule):
 
 
 def _sustain_flights(names):
-  from moonpilot.tests.test_longitudinal import _fly
   print("hard brake to rest from a 1.45 s follow (fork, RAV4): min gap m, contact < 0.4")
   print(f"{'plant':5s} {'v0':>4s} {'lead a':>6s}  " + "  ".join(f"{n:>14s}" for n in names))
   for lag in (False, True):
@@ -1115,14 +1071,14 @@ def _sustain_flights(names):
     cells = []
     for n in names:
       with _sustain_rule(SUSTAIN_RULES[n]):
-        s = _fly(v0, v0 * 3.6 + 10.0, gap0, v0, lambda t, b=brake, n_=length: b if 1.0 < t < 1.0 + n_ else 0.0, 20.0)
+        s = fly(v0, v0 * CV.MS_TO_KPH + 10.0, gap0, v0, lambda t, b=brake, n_=length: b if 1.0 < t < 1.0 + n_ else 0.0, 20.0)
       cells.append(f"{s['peak']:6.2f} ({s['end_gap']:5.1f})")
     print(f"{label:28s}  " + "  ".join(f"{c:>14s}" for c in cells))
 
 
 def _sustain_drives(args, names):
   print("engaged drives replayed: replay vs logged p95 (current code), then frames deeper than 2.0 s by > 0.05 m/s^2, deepest delta")
-  for route in expand(args.routes, ROUTE_SETS):
+  for route in expand(args.routes, args.root):
     data = extract(route, args.root)
     shipped, logged, active, _ = replay(route, data, args.root)
     if _skip_no_engaged(route, active):
@@ -1136,7 +1092,7 @@ def _sustain_drives(args, names):
         cmd = replay(route, data, args.root)[0]
       delta = (cmd - base)[active]
       cells.append(f"{n} {int((delta < -0.05).sum()):4d} {delta.min():6.2f}")
-    err = float(np.percentile(np.abs(shipped - logged)[m], 95)) if m.any() else math.nan
+    err = p95_abs_err(shipped, logged, m)
     print(f"{route} ({int(active.sum())} engaged, p95 {err:.4f}): " + "  ".join(cells), flush=True)
 
 
@@ -1161,67 +1117,31 @@ def _advance(s, v, v_new):
 
 def _calibration(route, root):
   """The learned horizons a drive's initData recorded — longitudinal lag and radar latency — as planner params."""
-  import json
-  cfg, out = drive_config(route, root)[1], {}
-  for key, kind in (("MoonpilotLongLag", float), ("MoonpilotLongLagBlocks", int), ("MoonpilotLongLagHistory", json.loads),
-                    ("MoonpilotRadarLatency", float), ("MoonpilotRadarLatencySamples", int)):
-    if cfg.get(key):
-      out[key] = kind(cfg[key])
-  return out
+  params = replay_params(route, root)
+  keys = (MOONPILOT_LAG_KEY, MOONPILOT_LAG_BLOCKS_KEY, MOONPILOT_LAG_HISTORY_KEY,
+          MOONPILOT_RADAR_LATENCY_KEY, MOONPILOT_RADAR_LATENCY_SAMPLES_KEY)
+  return {key: params.get(key) for key in keys if params.values.get(key)}
 
 
-def _in_flight_speed(planner, v_ego, a_prev, standstill):
-  """The speed the car reaches over `action_t` on the commands still in flight — the last `action_t - dt` issued, oldest
-  first, one tick each — then `a_prev` for what is left: exact on a pure dead-time plant with the planner's delay."""
-  if not hasattr(planner, "issued"):
-    planner.issued = deque(maxlen=round(MOONPILOT_LAG_MAX / planner.dt) + 1)  # the first frame: nothing issued yet
-  else:
-    planner.issued.append(planner.output_a_target)
-  issued = [max(a, 0.0) for a in planner.issued] if standstill else list(planner.issued)
-  n = min(int(round((planner.action_t - planner.dt) / planner.dt, 6)), len(issued))
-  return max(0.0, v_ego + planner.dt * sum(issued[len(issued) - n:]) + (planner.action_t - n * planner.dt) * a_prev)
 
 
-@cache
-def _in_flight_update():
-  """`MoonpilotLongitudinalPlanner.update` with its ego projection — the latest ask spent over the whole delay — replaced
-  by `_in_flight_speed`. The variant `delay-cost` measures and rejects, kept here so the claim stays reproducible."""
-  import inspect
-  import textwrap
-  import moonpilot.longitudinal as longitudinal
-  line = "v_pred = max(0.0, v_ego + a_prev * self.action_t)"
-  source = textwrap.dedent(inspect.getsource(longitudinal.MoonpilotLongitudinalPlanner.update))
-  if source.count(line) != 1:
-    raise ValueError(f"the planner no longer projects with `{line}`: rebuild the in-flight variant against what it does now")
-  scope = dict(vars(longitudinal), _in_flight_speed=_in_flight_speed)
-  exec(compile(source.replace(line, "v_pred = _in_flight_speed(self, v_ego, a_prev, CS.standstill)"), longitudinal.__file__, "exec"), scope)
-  return scope["update"]
-
-
-def _fly_logged_lead(job, plant=(HOLD_FLY_DEAD_S, HOLD_FLY_TAU_S), engine_coast=True, delay=None, in_flight=False, gain=None):
+def _fly_logged_lead(job, plant=(HOLD_FLY_DEAD_S, HOLD_FLY_TAU_S), engine_coast=True, gain=None):
   """The RAV4 planner (engine coast on unless `engine_coast` is False), seeded with `calibration`, on the lagged plant
   (`plant`: dead time, first-order lag) from a logged start behind the logged lead's own path. The set speed is the
   start's unless a sixth element gives one, so by default only the lead terms brake; a seventh is the drive's model ask,
-  frame by frame. `delay` replaces the delay the planner projects through, `in_flight` its projection (`delay-cost`), and
-  `gain` scales the delayed command (a scalar or `(cmd, v) -> factor`)."""
-  from moonpilot.tests.test_engine_coast import _planner
-  from moonpilot.tests.test_longitudinal import _inputs, _lead
+  frame by frame. `gain` scales the delayed command (a scalar or `(cmd, v) -> factor)."""
   v_log, gap_log, v_lead, a0, calibration, *extra = job
-  v_cruise_kph = extra[0] if extra else v_log[0] * 3.6
+  v_cruise_kph = extra[0] if extra else v_log[0] * CV.MS_TO_KPH
   model = extra[1] if len(extra) > 1 else np.zeros(len(v_log))
   s_ego = [0.0]
   for v0, v1 in zip(v_log[:-1], v_log[1:], strict=True):
     s_ego.append(_advance(s_ego[-1], v0, v1))
   s_lead = np.asarray(s_ego) + gap_log
-  planner, plant = _planner(engine_coast, calibration), _LaggedPlant(*plant, gain=gain)
-  if delay is not None:
-    planner.long_lag.applied_delay = lambda: delay  # ty: ignore[invalid-assignment]  # this flight's delay, same signature
-  if in_flight:
-    planner.update = MethodType(_in_flight_update(), planner)  # ty: ignore[invalid-assignment]  # the rejected variant, same signature
+  planner, plant = make_planner(engine_coast, calibration, car=ToyotaCar.TOYOTA_RAV4_TSS2), _LaggedPlant(*plant, gain=gain)
   plant.a, plant.queue = a0, deque([a0] * len(plant.queue))
   v, s, out = v_log[0], 0.0, {"v": [], "a": [], "gap": [], "pressing": [], "cmd": []}
   for i in range(len(v_log)):
-    planner.update(_inputs(v_ego=v, v_cruise_kph=v_cruise_kph, a_ego=plant.a, lead=_lead(max(s_lead[i] - s, 0.0), max(v_lead[i], 0.0)),
+    planner.update(inputs(v_ego=v, v_cruise_kph=v_cruise_kph, a_ego=plant.a, lead=lead(max(s_lead[i] - s, 0.0), max(v_lead[i], 0.0)),
                            standstill=v < 0.05, personality=1, model_accel=float(model[i])))
     for k, x in zip(out, (v, plant.a, s_lead[i] - s, planner.brake_band.pressing, float(planner.output_a_target)), strict=True):
       out[k].append(x)
@@ -1268,10 +1188,9 @@ def _decel_peaks(args):
   over 0.5 s, above 2 m/s) and the minimum gap against the driver's; the hard brakes (`hard-brake`'s default
   calibration); engaged drives' press time."""
   from concurrent.futures import ProcessPoolExecutor
-  from moonpilot.tests.test_engine_coast import _planner
-  d = _pooled_manual(expand(args.routes, ROUTE_SETS), args.root)
+  d = _pooled_manual(expand(args.routes, args.root), args.root)
   v, gap, v_lead = d["v"], d["gap"], d["v_lead"]
-  a_s = np.concatenate([np.convolve(d["a"][d["route"] == r], np.ones(10) / 10, mode="same") for r in np.unique(d["route"])])
+  a_s = route_moving_mean(d, 10)
   near = (d["manual"] > 0) & (d["lead"] > 0) & (v > 5.0) & (np.abs(v - v_lead) < 1.5)
   print("Driver, lead slowing, |closing| < 1.5 m/s, above 5 m/s: median aEgo / aLead by headway (n)")
   for lo_a, hi_a in ((-0.6, -0.2), (-1.0, -0.6), (-1.6, -1.0)):
@@ -1299,14 +1218,15 @@ def _decel_peaks(args):
 
   jobs, drv = _decel_jobs(d, a_s)
   calibration = _calibration(args.calibration, args.root) if args.calibration != "none" else {}
-  seeded = _planner(True, calibration)
+  seeded = make_planner(True, calibration, car=ToyotaCar.TOYOTA_RAV4_TSS2)
   jobs = [(*job, calibration) for job in jobs]
   print(f"\n{len(jobs)} manual decels a radar lead caused, flown (engine-coast RAV4, {HOLD_FLY_DEAD_S} s dead time + {HOLD_FLY_TAU_S} s lag; "
         + f"calibration {args.calibration}: action_t {seeded.action_t:.3f} s, radar latency {seeded.radar_latency.applied():.3f} s). "
         + "Median peak decel and minimum gap; 'deeper' = planner peak past the driver's by more than 0.5:")
   with ProcessPoolExecutor(4) as pool:
     flown = list(pool.map(_fly_logged_lead, jobs))
-  peak = np.asarray([np.convolve(f["a"], np.ones(10) / 10, mode="same")[f["v"] > 2.0].min() for f in flown])
+  from moonpilot.lab.probes import flight_peak
+  peak = np.asarray([flight_peak(f) for f in flown])
   min_gap = np.asarray([f["gap"].min() for f in flown])
   print(f"  closest {min_gap.min():.1f} m")
   for lo, hi in ((4, 10), (10, 16), (16, 40)):
@@ -1331,21 +1251,20 @@ def _decel_peaks(args):
   quiet = sum(int(steady[w][e].sum()) for w, e in zip(follows, edges, strict=True))
   print(f"  {sum(len(e) for e in edges)} presses, {quiet} of them while the lead was steady")
 
-  for route in expand(args.engaged, ROUTE_SETS):
-    now_d = []
-    now, logged, active, _ = replay(route, extract(route, args.root), args.root, details_out=now_d)
-    m = active & np.isfinite(logged)
-    presses = int(np.sum(m[1:] & (np.diff(np.asarray([r["band_pressing"] for r in now_d], dtype=int)) > 0)))
-    print(f"{route}: {m.sum()} engaged frames; ask < -0.4 for {np.sum(m & (now < -0.4)) * DT_MDL:.1f} s; band presses {presses}; peak {now[m].min():.2f}")
+  for result in engaged_replays(args, details=True, routes=args.engaged):
+    m = result.details
+    mask = result.active & np.isfinite(result.logged)
+    presses = int(np.sum(mask[1:] & (np.diff(m["band_pressing"].astype(int)) > 0)))
+    braking = np.sum(mask & (result.replayed < -0.4)) * DT_MDL
+    print(f"{result.route}: {mask.sum()} engaged frames; ask < -0.4 for {braking:.1f} s; "
+          + f"band presses {presses}; peak {result.replayed[mask].min():.2f}")
 
 
 def _engaged_fly(args):
   """An engaged window flown closed-loop: today's planner on the lagged plant from the car's state at `--start`, behind
   the logged lead's own path, fed the drive's model ask and set speed — against what the car did there. The model's ask
   is open-loop (what it asked from where the car really was), so a flight that strays far from the car reads it less."""
-  details = []
-  _, logged, _, _ = replay(args.route, extract(args.route, args.root), args.root, details_out=details)
-  m = _details_arrays(details)
+  _, logged, _, m = replay(args.route, extract(args.route, args.root), args.root, details=True)
   t = m["t"] - m["t"][0]
   w = (t >= args.start) & (t < args.end)
   v_cruise = float(np.nanmedian(m["v_cruise"][w]))
@@ -1355,7 +1274,7 @@ def _engaged_fly(args):
   def line(name, a, cmd, gap, v):
     s = np.sign(np.where(np.abs(cmd) < 0.05, 0.0, cmd))
     s = s[s != 0]
-    return (f"  {name:8s} peak aEgo {np.convolve(a, np.ones(10) / 10, mode='same').min():+.2f}  command {cmd.min():+.2f}  "
+    return (f"  {name:8s} peak aEgo {moving_mean(a, 10).min():+.2f}  command {cmd.min():+.2f}  "
             + f"sign flips {int(np.sum(s[1:] != s[:-1])):2d}  closest {gap.min():5.2f} m  ends {v[-1]:.2f} m/s at {gap[-1]:5.2f} m")
 
   print(f"{args.route} {args.start:.1f}-{args.end:.1f} s, set speed {v_cruise:.0f} kph:")
@@ -1363,60 +1282,6 @@ def _engaged_fly(args):
   print(line("planner", flown["a"], flown["cmd"], flown["gap"], flown["v"]))
 
 
-# (name, plant dead time s, plant first-order lag s, the delay the planner projects or None for its learned one, in flight)
-DELAY_ARMS = (
-  ("instant car", DT_MDL, 1e-6, 0.0, False),
-  ("car model (today)", HOLD_FLY_DEAD_S, HOLD_FLY_TAU_S, None, False),
-  ("car model, not projected", HOLD_FLY_DEAD_S, HOLD_FLY_TAU_S, 0.0, False),
-  ("car model, asks in flight", HOLD_FLY_DEAD_S, HOLD_FLY_TAU_S, None, True),
-  ("slower car, 0.3 s dead", 0.3, HOLD_FLY_TAU_S, None, False),
-  ("dead time 0.35 s", 0.35, 1e-6, None, False),
-  ("dead time 0.35 s, in flight", 0.35, 1e-6, None, True),
-)
-
-
-def _delay_fly(job):
-  """One `DELAY_ARMS` flight, engine coast off as the device runs: the peak ask, the peak aEgo (0.5 s mean, above 2 m/s),
-  brake pumps and the closest gap."""
-  from moonpilot.lab.driver import _pumps
-  arm, flight = job
-  _, dead, tau, delay, in_flight = DELAY_ARMS[arm]
-  f = _fly_logged_lead(flight, plant=(dead, tau), engine_coast=False, delay=delay, in_flight=in_flight)
-  felt = np.convolve(f["a"], np.ones(10) / 10, mode="same")
-  return float(f["cmd"].min()), float(felt[f["v"] > 2.0].min()), _pumps(f["cmd"]), float(f["gap"].min())
-
-
-def _delay_cost(args):
-  """What the car's actuation delay costs at a stop's peak, and that projecting the ego better does not recover it: the
-  57 lead-caused manual decels (`intent` (b)) and one engaged stop flown on an instant car, on the lab's car model with
-  and without the planner's projection through its delay, with the commands still in flight projected instead of the
-  latest one (`_in_flight_update`), on a car slower than the delay it projects, and on a pure dead time, where that
-  in-flight projection is exact. The extra ask is each flight's peak against the same flight on the instant car."""
-  from concurrent.futures import ProcessPoolExecutor
-  d = _pooled_manual(expand(["manual-approach", "0000044e", "0000044f", "00000450", "00000451"], ROUTE_SETS), args.root)
-  a_s = np.concatenate([np.convolve(d["a"][d["route"] == r], np.ones(10) / 10, mode="same") for r in np.unique(d["route"])])
-  jobs, _ = _decel_jobs(d, a_s)
-  calibration = _calibration(args.calibration, args.root)
-  details = []
-  replay(args.route, extract(args.route, args.root), args.root, details_out=details)
-  m = _details_arrays(details)
-  t = m["t"] - m["t"][0]
-  w = (t >= args.start) & (t < args.end)
-  stop = (m["v_ego"][w], m["d_rel"][w], m["v_lead"][w], float(m["a_ego"][w][0]), _calibration(args.route, args.root),
-          float(np.nanmedian(m["v_cruise"][w])), m["model_accel"][w])
-  arms = range(len(DELAY_ARMS))
-  with ProcessPoolExecutor(4) as pool:
-    flown = [list(pool.map(_delay_fly, [(arm, (*job, calibration)) for job in jobs])) for arm in arms]
-    stops = list(pool.map(_delay_fly, [(arm, stop) for arm in arms]))
-  print(f"{len(jobs)} manual lead-caused decels, calibration {args.calibration}: peak ask median / p10, peak aEgo median / p10, "
-        + f"brake pumps, closest gap, extra peak ask over the instant car median / p90; then {args.route} {args.start:g}-{args.end:g} s")
-  instant = np.asarray([row[0] for row in flown[0]])
-  for (name, *_), rows, (s_ask, s_felt, _, s_gap) in zip(DELAY_ARMS, flown, stops, strict=True):
-    ask, felt, pumps, gap = (np.asarray([row[i] for row in rows]) for i in range(4))
-    extra = instant - ask
-    print(f"  {name:27s} ask {np.median(ask):+.2f} / {np.percentile(ask, 10):+.2f}  aEgo {np.median(felt):+.2f} / {np.percentile(felt, 10):+.2f}  "
-          + f"pumps {int(pumps.sum()):3d}  closest {gap.min():4.1f} m  extra {np.median(extra):.3f} / {np.percentile(extra, 90):.3f}  "
-          + f"| stop: ask {s_ask:+.2f} aEgo {s_felt:+.2f} closest {s_gap:.2f} m")
 
 
 # stop-shape's arms: (braking-match shares, the ease rate while a lead brakes); None keeps today's value, and an infinite ease
@@ -1432,17 +1297,15 @@ SHAPE_ARMS: dict[str, tuple[list[float] | None, float | None]] = {
 @contextmanager
 def _shape_arm(arm):
   """The planner's constants under one `SHAPE_ARMS` arm, restored on exit."""
+  import moonpilot.jerk as jerk
   import moonpilot.longitudinal as longitudinal
   shares, ease = SHAPE_ARMS[arm]
-  saved = longitudinal.MOONPILOT_TRACK_BRAKE_V, longitudinal.MOONPILOT_JERK_EASE_LEAD_BRAKING
-  if shares is not None:
-    longitudinal.MOONPILOT_TRACK_BRAKE_V = shares
-  if ease is not None:
-    longitudinal.MOONPILOT_JERK_EASE_LEAD_BRAKING = ease  # ty: ignore[invalid-assignment]  # the arm's rate, a float like the constant
-  try:
+  with contextlib.ExitStack() as stack:
+    if shares is not None:
+      stack.enter_context(mock.patch.object(longitudinal, "MOONPILOT_TRACK_BRAKE_V", shares))
+    if ease is not None:
+      stack.enter_context(mock.patch.object(jerk, "MOONPILOT_JERK_EASE_LEAD_BRAKING", ease))
     yield
-  finally:
-    longitudinal.MOONPILOT_TRACK_BRAKE_V, longitudinal.MOONPILOT_JERK_EASE_LEAD_BRAKING = saved
 
 
 def _shape_fly(job):
@@ -1456,7 +1319,7 @@ def _shape(v, a, gap, cmd=None):
   """A decel's shape over its braking (aEgo over 0.5 s past -0.3): peak, where in the braking it lands, the first and last
   thirds' mean, closest gap, brake pumps."""
   from moonpilot.lab.driver import _pumps
-  felt = np.convolve(a, np.ones(10) / 10, mode="same")
+  felt = moving_mean(a, 10)
   braking = np.flatnonzero(felt < -0.3)
   if not len(braking):
     return (math.nan, math.nan, math.nan, math.nan, gap.min(), _pumps(cmd) if cmd is not None else 0)
@@ -1471,8 +1334,8 @@ def _stop_shape(args):
   today's schedule with its ease limit while a lead brakes, and a slower ease; then one engaged stop flown with its own
   model ask (`engaged-fly`'s window)."""
   from concurrent.futures import ProcessPoolExecutor
-  d = _pooled_manual(expand(args.routes, ROUTE_SETS), args.root)
-  a_s = np.concatenate([np.convolve(d["a"][d["route"] == r], np.ones(10) / 10, mode="same") for r in np.unique(d["route"])])
+  d = _pooled_manual(expand(args.routes, args.root), args.root)
+  a_s = route_moving_mean(d, 10)
   jobs, _ = _decel_jobs(d, a_s)
   calibration = _calibration(args.calibration, args.root)
   jobs = [(*job, calibration) for job in jobs]
@@ -1492,17 +1355,15 @@ def _stop_shape(args):
 
   # The gate before the counterfactual: the drive replayed under the arm it drove (`--route-match`), against the aTarget
   # it logged. Everything below is flown on the lab's plant; this is the only line about the car's own code.
-  details = []
   with _shape_arm(args.route_match):
-    replayed, logged, active, _ = replay(args.route, extract(args.route, args.root), args.root, details_out=details)
-  m = _details_arrays(details)
+    replayed, logged, active, m = replay(args.route, extract(args.route, args.root), args.root, details=True)
   t = m["t"] - m["t"][0]
   w = (t >= args.start) & (t < args.end)
   commit, _ = drive_config(args.route, args.root)
   for name, mask in (("drive", active & np.isfinite(logged)), ("window", active & np.isfinite(logged) & w)):
     err = np.abs(replayed[mask] - logged[mask])
     print(f"{args.route} (commit {commit}, replayed as '{args.route_match}') replay-vs-logged |aTarget error| over the {name}, "
-          + f"{mask.sum()} engaged frames: median {np.median(err):.4f} p95 {np.percentile(err, 95):.4f} max {err.max():.4f} m/s^2")
+          + f"{mask.sum()} engaged frames: median {np.median(err):.4f} p95 {p95_abs_err(replayed, logged, mask):.4f} max {err.max():.4f} m/s^2")
   flight = (m["v_ego"][w], m["d_rel"][w], m["v_lead"][w], float(m["a_ego"][w][0]), _calibration(args.route, args.root),
             float(np.nanmedian(m["v_cruise"][w])), m["model_accel"][w])
   print(f"{args.route} {args.start:g}-{args.end:g} s: peak, where, thirds, s to rest, rest gap, pumps — the car as recorded, "
@@ -1522,19 +1383,15 @@ def _cue_frames(route, root=DEFAULT_ROOT):
 
   def build(_segs):
     data = extract(route, root)
-    blob, offsets = data["blob"], data["offsets"]
-    index = {k: 1 + i * 3 for i, k in enumerate(MESSAGES)}
     estimator, rows = LeadAccelEstimator(), []
-    for row in offsets:
-      def read(kind, row=row):
-        start, size = row[index[kind]], row[index[kind] + 1]
-        return messaging.log_from_bytes(blob[start:start + size].tobytes()) if size else None
-      radar, model = read("radarState").radarState, read("modelV2")
+    for mono, messages, _, _ in ExtractReader(data).rows():
+      radar = messages["radarState"].radarState
+      model = messages.get("modelV2")
       one, two = radar.leadOne, radar.leadTwo
       estimator.update(one)
       m = model.modelV2 if model is not None else None
       vel = m.velocity if m is not None and len(m.velocity.x) else None
-      rows.append((row[0] * 1e-9, one.radarTrackId if one.present and one.radar else -1, one.dRel, one.vLead, estimator.a_slow,
+      rows.append((mono * 1e-9, one.radarTrackId if one.present and one.radar else -1, one.dRel, one.vLead, estimator.a_slow,
                    two.present, two.dRel, two.vLead, bool(m.action.shouldStop) if m is not None else False,
                    float(m.action.desiredAcceleration) if m is not None else np.nan,
                    float(np.interp(6.0, list(vel.t), list(vel.x))) if vel is not None else np.nan, float(vel.x[-1]) if vel is not None else np.nan))
@@ -1557,7 +1414,7 @@ def _stop_cues(args):
   counted and kept out of every share."""
   hold, settle = round(STOP_CUE_HOLD_S / DT_MDL), round(1.0 / DT_MDL)
   rows, censored = [], 0
-  for route in dict.fromkeys(expand(args.routes, ROUTE_SETS)):  # the default sets overlap
+  for route in expand(args.routes, args.root):
     c = _cue_frames(route, args.root)
     track, v1, a_slow = c["track"], c["v_lead"], c["a_slow"]
     if args.identity == "track":
@@ -1673,7 +1530,7 @@ def _launch_episodes(d, windows_out=None):
 def _launch_frames(args):
   """The driver extract pooled over `--routes` (every drive with rlogs by default), with `route` numbering the drives."""
   from moonpilot.lab import driver
-  routes = expand(args.routes, ROUTE_SETS) if args.routes else driver._routes(args.root)
+  routes = expand(args.routes, args.root) if args.routes else driver._routes(args.root)
   frames = [driver.extract(r, args.root) for r in routes]
   keys = ("t", "manual", "v", "a", "brake", "gas", "lead", "lead_radar", "gap", "v_lead", "track_id", "desired_a")
   d = {k: np.concatenate([f[k] for f in frames]) for k in keys}
@@ -1854,7 +1711,7 @@ def _score_following(d, calibration, engine_coast, gain=None):
 def _score_decels(d, calibration, engine_coast, gain=None):
   from concurrent.futures import ProcessPoolExecutor
   from moonpilot.lab.driver import _decel_line, _fly_stages
-  a_s = np.concatenate([np.convolve(d["a"][d["route"] == r], np.ones(10) / 10, mode="same") for r in np.unique(d["route"])])
+  a_s = route_moving_mean(d, 10)
   jobs, drv = _decel_jobs(d, a_s)
   if not jobs:
     print("  lead-caused decels: none")
@@ -1939,12 +1796,11 @@ def _scorecard(args):
   lead-caused decels with their stop shape, and launches. Synthetic hard brakes are reported without a split; crawl is
   not scored because the plant has no standstill resume or low-speed brake arbitration."""
   from moonpilot.lab import driver
-  from moonpilot.lab.plant import _plant_gain, _plant_results, _plant_table, _plant_table_text
+  from moonpilot.lab.plant import _PlantGain, _plant_results, _plant_table, _plant_table_text
   from moonpilot.lab.probes import _scorecard_checks
   available = driver._routes(args.root)
   short_available = {r.split("--")[0] for r in available}
-  routes = [r.split("--")[0] for r in expand(args.routes, ROUTE_SETS)] if args.routes else sorted(short_available)
-  routes = [r for r in dict.fromkeys(routes) if r in short_available]
+  routes = [r.split("--")[0] for r in expand(args.routes, args.root)] if args.routes else sorted(short_available)
   if not routes:
     raise ValueError("no routes with rlogs")
   train, holdout = _split_routes(routes, args.holdout, args.seed)
@@ -1961,7 +1817,7 @@ def _scorecard(args):
     if not plant_results:
       raise ValueError("no engaged train drives to fit the plant")
     plant_table, plant_counts = _plant_table(plant_results)
-    plant_gain = _plant_gain(plant_table)
+    plant_gain = _PlantGain(plant_table)
     print("  plant fitted on train: " + _plant_table_text(plant_table, plant_counts))
   results = {}
   for name, group, full in (("train", train, train_full), ("holdout", holdout, holdout_full)):
@@ -1988,70 +1844,61 @@ def _scorecard(args):
 
 def _register_manual(sub):
   parser = sub.add_parser("manual-decel", help="the lead law's approach requirement against the driver's own longitudinal")
-  parser.add_argument("--routes", nargs="+", default=["manual-approach"], help=f"route names or sets: {', '.join(ROUTE_SETS)}")
+  add_routes_arg(parser, ["manual-approach"])
   parser.add_argument("--t-follow", type=float, default=1.45, help="the target's time gap, s (standard personality's 1.45)")
   parser.set_defaults(fn=_manual_decel)
   parser = sub.add_parser("approach-onsets", help="where approaches to a slower lead start slowing: driver vs the lead law, logged vs now")
-  parser.add_argument("--routes", nargs="+", default=["manual-approach"], help=f"manual route names or sets: {', '.join(ROUTE_SETS)}")
+  add_routes_arg(parser, ["manual-approach"])
   parser.add_argument("--engaged", nargs="+", default=[], help="engaged drives to replay: logged command against today's planner")
   parser.add_argument("--t-follow", type=float, default=1.45, help="the target's time gap, s")
   parser.add_argument("--lag", type=float, default=0.36, help="command to aEgo lag, s (MoonpilotLongLag on this device)")
   parser.set_defaults(fn=_approach_onsets)
   sub.add_parser("hard-brake", help="lead braking hard from a follow: upstream vs fork vs ideal, with and without lag").set_defaults(fn=_hard_brake)
   parser = sub.add_parser("sustain", help="the lead-brake sustain horizon: fixed vs scaled, hard brakes, taps, drives")
-  parser.add_argument("--routes", nargs="+", default=["longitudinal"], help=f"route names or sets: {', '.join(ROUTE_SETS)}")
+  add_routes_arg(parser, ["longitudinal"])
   parser.add_argument("--part", choices=("all", "flights", "drives"), default="all", help="flown scenarios, replayed drives or both")
   parser.add_argument("--rules", nargs="+", choices=tuple(SUSTAIN_RULES), default=list(SUSTAIN_RULES), help="horizons beside the fixed 2.0 s")
   parser.set_defaults(fn=_sustain)
   parser = sub.add_parser("decel-peaks", help="manual lead-caused decels flown: peaks, gaps, hard brakes")
-  parser.add_argument("--routes", nargs="+", default=["manual-approach", "0000044e", "0000044f", "00000450", "00000451"],
-                      help=f"manual route names or sets: {', '.join(ROUTE_SETS)}")
+  add_routes_arg(parser, ["decel"])
   parser.add_argument("--engaged", nargs="+", default=[], help="engaged drives to replay")
-  parser.add_argument("--calibration", default="00000451", help="drive whose recorded lag and radar latency seed the flights, or none")
+  add_calibration_arg(parser)
   parser.set_defaults(fn=_decel_peaks)
   parser = sub.add_parser("brake-gain", help="how hard the car brakes for what the planner asks, over every engaged drive")
-  parser.add_argument("--routes", nargs="+", default=["engaged"], help=f"route names or sets: {', '.join(ROUTE_SETS)}")
+  add_routes_arg(parser, ["longitudinal-engaged"])
   parser.set_defaults(fn=_brake_gain)
   parser = sub.add_parser("engaged-fly", help="an engaged window flown closed-loop through today's planner, with the drive's model ask")
   parser.add_argument("route", help="full route name, e.g. 0000045a--8c1d34e64d")
   parser.add_argument("--start", type=float, required=True, help="s from the drive's first plan")
   parser.add_argument("--end", type=float, required=True, help="s from the drive's first plan")
   parser.set_defaults(fn=_engaged_fly)
-  parser = sub.add_parser("delay-cost", help="what the actuation delay costs at a stop's peak, and the in-flight projection that did not recover it")
-  parser.add_argument("--calibration", default="00000451", help="drive whose recorded lag and radar latency seed the decel flights")
-  parser.add_argument("--route", default="0000045a--8c1d34e64d", help="engaged drive whose stop is flown with its own model ask")
-  parser.add_argument("--start", type=float, default=183.0, help="s from the drive's first plan")
-  parser.add_argument("--end", type=float, default=216.0, help="s from the drive's first plan")
-  parser.set_defaults(fn=_delay_cost)
   parser = sub.add_parser("stop-shape", help="where a lead-caused decel's braking peaks: driver vs the braking match, flat and headway-scheduled")
-  parser.add_argument("--routes", nargs="+", default=["manual-approach", "0000044e", "0000044f", "00000450", "00000451"],
-                      help=f"manual route names or sets: {', '.join(ROUTE_SETS)}")
-  parser.add_argument("--calibration", default="00000451", help="drive whose recorded lag and radar latency seed the flights")
-  parser.add_argument("--route", default="00000468--34a8e259a0", help="engaged drive whose stop is flown with its own model ask")
+  add_routes_arg(parser, ["decel"])
+  add_calibration_arg(parser)
+  parser.add_argument("--route", default=STOP_SHAPE_ROUTE, help="engaged drive whose stop is flown with its own model ask")
   parser.add_argument("--start", type=float, default=597.0, help="s from the drive's first plan")
   parser.add_argument("--end", type=float, default=623.0, help="s from the drive's first plan")
   parser.add_argument("--route-match", choices=tuple(SHAPE_ARMS), default="flat 0.85",
                       help="the arm the route drove: 'flat 0.85' before a48c66e63, 'scheduled' to the ease limit, 'today' after")
   parser.set_defaults(fn=_stop_shape)
   parser = sub.add_parser("stop-cues", help="whether a braking lead ends at rest: braking time, time to rest, model stop intent, leadTwo")
-  parser.add_argument("--routes", nargs="+", default=["manual-approach", "0000044e", "0000044f", "00000450", "00000451", "engaged", "00000468"],
-                      help=f"route names or sets: {', '.join(ROUTE_SETS)}")
+  add_routes_arg(parser, ["stop-cues"])
   parser.add_argument("--threshold", type=float, default=-0.3, help="slow accel that reads as braking, m/s^2")
   parser.add_argument("--identity", choices=("track", "kinematic"), default="kinematic",
                       help="one lead = one radarTrackId, or a gap and speed that move continuously under any id")
   parser.set_defaults(fn=_stop_cues)
   parser = sub.add_parser("launch-reaction", help="the driver's brake release, gas and move times behind a launching lead, by its launch accel")
-  parser.add_argument("--routes", nargs="*", default=[], help=f"route names or sets: {', '.join(ROUTE_SETS)}; default every drive with rlogs")
+  add_routes_arg(parser, [])
   parser.set_defaults(fn=_launch_reaction)
   parser = sub.add_parser("launch-fly", help="today's planner flown from rest behind launch-reaction's launching leads, against the driver")
-  parser.add_argument("--routes", nargs="*", default=[], help=f"route names or sets: {', '.join(ROUTE_SETS)}; default every drive with rlogs")
-  parser.add_argument("--calibration", default="00000451", help="drive whose recorded lag and radar latency seed the flights")
+  add_routes_arg(parser, [])
+  add_calibration_arg(parser)
   parser.set_defaults(fn=_launch_fly)
   parser = sub.add_parser("scorecard", help="driver vs planner over following, lead-caused decels/stops and launches, train vs held-out")
-  parser.add_argument("--routes", nargs="*", default=[], help=f"route names or sets: {', '.join(ROUTE_SETS)}; default every drive with rlogs")
+  add_routes_arg(parser, [])
   parser.add_argument("--holdout", type=float, default=SCORECARD_HOLDOUT, help="fraction of routes held out")
   parser.add_argument("--seed", type=int, default=0, help="split seed")
-  parser.add_argument("--calibration", default="00000451", help="drive whose recorded lag and radar latency seed the flights")
+  add_calibration_arg(parser)
   parser.add_argument("--engine-coast", action="store_true", help="fly with the engine-coast planner (default off, the device's setting)")
   parser.add_argument("--plant", choices=("default", "fitted"), default="default", help="plant gain: the 1.0 point mass or the train-fitted table")
   parser.add_argument("--check", action="store_true", help="enforce the scorecard's regression thresholds and exit nonzero on a failure")
@@ -2076,5 +1923,5 @@ def register(sub):
   )
   for name, fn in commands:
     parser = sub.add_parser(name, help=fn.__name__)
-    parser.add_argument("--routes", nargs="+", default=["longitudinal"], help=f"route names or sets: {', '.join(ROUTE_SETS)}")
+    add_routes_arg(parser, ["longitudinal"])
     parser.set_defaults(fn=fn)

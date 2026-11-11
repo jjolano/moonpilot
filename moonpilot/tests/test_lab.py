@@ -1,10 +1,13 @@
+import tempfile
 import unittest
+from pathlib import Path
 
 import numpy as np
 
 from openpilot.common.realtime import DT_CTRL
 
 from moonpilot.lab import lag_s, reversals_per_s
+from moonpilot.lab.routes import expand
 
 
 class TestLabMetrics(unittest.TestCase):
@@ -25,6 +28,13 @@ class TestLabMetrics(unittest.TestCase):
     delay = 0.037
     x = np.interp(t - delay, t, ref)
     self.assertAlmostEqual(lag_s(ref, x, np.ones(len(t), dtype=bool)), delay, delta=0.002)
+
+  def test_filesystem_route_sets_use_the_requested_root(self):
+    with tempfile.TemporaryDirectory() as root:
+      (Path(root) / "000003f8--0").mkdir()
+      (Path(root) / "000003f8--0" / "rlog.zst").touch()
+      self.assertEqual(expand(["all"], root=root), ["000003f8"])
+      self.assertEqual(expand(["claims"], root=root), ["000003f8"])
 
 
 if __name__ == "__main__":

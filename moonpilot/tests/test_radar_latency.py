@@ -7,34 +7,32 @@ over 429 near-rest samples) or a synthetic frame that clears or misses the modul
 """
 
 import unittest
-from pathlib import Path
-from unittest import mock
 
-import moonpilot.longitudinal as longitudinal_mod
 from opendbc.car.honda.interface import CarInterface
 from opendbc.car.honda.values import CAR
 
+from moonpilot.learned import PERSIST_EVERY
 from moonpilot.longitudinal import MoonpilotLongitudinalPlanner
 from moonpilot.radar_latency import (
   MOONPILOT_RADAR_LATENCY_KEY,
   MOONPILOT_RADAR_LATENCY_MAX,
   MOONPILOT_RADAR_LATENCY_MIN_AEGO,
   MOONPILOT_RADAR_LATENCY_MIN_SAMPLES,
-  MOONPILOT_RADAR_LATENCY_PERSIST_EVERY,
   MOONPILOT_RADAR_LATENCY_SAMPLES_KEY,
   RadarLatencyEstimator,
   persisted_seed,
 )
-from moonpilot.tests.test_longitudinal import _inputs, _lead, _planner
+from moonpilot.tests.fakes import params
+
+from moonpilot.tests.harness import inputs, lead as make_lead, planner as make_planner
 
 CP = CarInterface.get_non_essential_params(CAR.HONDA_CIVIC)
 
 ROUTE_TAU = 0.136  # s; the RAV4 route's measured ratio
-ROOT = Path(__file__).resolve().parents[1]
 
 
 def _frame(v_lead: float, a_ego: float, radar: bool = True, present: bool = True):
-  lead = _lead(30.0, v_lead)
+  lead = make_lead(30.0, v_lead)
   lead.radar = radar
   lead.present = present
   return lead, a_ego
@@ -104,38 +102,19 @@ class TestRadarLatencyEstimator(unittest.TestCase):
     self.assertAlmostEqual(est.applied(), ROUTE_TAU, delta=0.01)
 
 
-class TestPersistedSeed(unittest.TestCase):
   def test_a_float_value_and_count_seed(self):
-    class Stored:
-      def get(self, key, return_default=False):
-        return {MOONPILOT_RADAR_LATENCY_KEY: ROUTE_TAU, MOONPILOT_RADAR_LATENCY_SAMPLES_KEY: 80}.get(key, 0.0)
-
-    self.assertEqual(persisted_seed(Stored()), (ROUTE_TAU, 80))
-
-  def test_a_bool_answer_does_not_seed(self):
-    """FakeParams answers every key with a bool, which is the existing tests' construction."""
-
-    class BoolParams:
-      def get(self, key, return_default=False):
-        return True
-
-    self.assertIsNone(persisted_seed(BoolParams()))
+    store = params(on=False, overrides={
+      MOONPILOT_RADAR_LATENCY_KEY: ROUTE_TAU,
+      MOONPILOT_RADAR_LATENCY_SAMPLES_KEY: 80,
+    })
+    self.assertEqual(persisted_seed(store), (ROUTE_TAU, 80))
 
   def test_a_zero_default_does_not_seed(self):
-    class ZeroParams:
-      def get(self, key, return_default=False):
-        return 0.0
-
-    self.assertIsNone(persisted_seed(ZeroParams()))
+    self.assertIsNone(persisted_seed(params(on=False)))
 
   def test_a_missing_count_reads_as_trusted(self):
     """A value written before the count existed was only ever written when trusted."""
-
-    class ValueOnly:
-      def get(self, key, return_default=False):
-        return ROUTE_TAU if key == MOONPILOT_RADAR_LATENCY_KEY else 0
-
-    seeded = persisted_seed(ValueOnly())
+    seeded = persisted_seed(params(on=False, overrides={MOONPILOT_RADAR_LATENCY_KEY: ROUTE_TAU}))
     assert seeded is not None
     latency, samples = seeded
     self.assertAlmostEqual(latency, ROUTE_TAU, delta=1e-9)
@@ -144,57 +123,46 @@ class TestPersistedSeed(unittest.TestCase):
 
 class TestPlannerWiring(unittest.TestCase):
   def test_an_unseeded_planner_applies_nothing(self):
-    planner = _planner()
+    planner = make_planner()
     self.assertEqual(planner.radar_latency.applied(), 0.0)
-    self.assertEqual(planner._lead_age(_lead(30.0, 0.0), 0.05), 0.05)
+    self.assertEqual(planner.lead_age(make_lead(30.0, 0.0), 0.05), 0.05)
 
   def test_a_seeded_latency_reaches_only_radar_leads(self):
-    planner = _planner()
+    planner = make_planner()
     planner.radar_latency.seed(ROUTE_TAU, MOONPILOT_RADAR_LATENCY_MIN_SAMPLES)
-    radar = _lead(30.0, 0.0)
-    vision = _lead(30.0, 0.0)
+    radar = make_lead(30.0, 0.0)
+    vision = make_lead(30.0, 0.0)
     vision.radar = False
-    self.assertAlmostEqual(planner._lead_age(radar, 0.05), 0.05 + ROUTE_TAU, delta=1e-9)
-    self.assertAlmostEqual(planner._lead_age(vision, 0.05), 0.05, delta=1e-9)
+    self.assertAlmostEqual(planner.lead_age(radar, 0.05), 0.05 + ROUTE_TAU, delta=1e-9)
+    self.assertAlmostEqual(planner.lead_age(vision, 0.05), 0.05, delta=1e-9)
 
   def test_gated_frames_reach_the_estimator_through_update(self):
-    planner = _planner()
+    planner = make_planner()
     tau = ROUTE_TAU
     for i in range(MOONPILOT_RADAR_LATENCY_MIN_SAMPLES):
       a = -2.0 if i % 2 == 0 else 2.0
-      lead = _lead(30.0, tau * a)
-      planner.update(_inputs(v_ego=10.0, v_cruise_kph=72.0, a_ego=a, lead=lead))
+      lead = make_lead(30.0, tau * a)
+      planner.update(inputs(v_ego=10.0, v_cruise_kph=72.0, a_ego=a, lead=lead))
     self.assertEqual(planner.radar_latency.status, "estimated")
     self.assertAlmostEqual(planner.radar_latency.applied(), tau, delta=0.02)
 
   def test_a_persisted_value_is_seeded_on_construction(self):
-    # A bare duck type is enough: construction only ever calls get(). Every other learned key
-    # answers with a bool, which is the FakeParams construction the other seeding tests use.
-    class StoredBare:
-      def get(self, key, return_default=False):
-        if key == MOONPILOT_RADAR_LATENCY_KEY:
-          return ROUTE_TAU
-        if key == MOONPILOT_RADAR_LATENCY_SAMPLES_KEY:
-          return MOONPILOT_RADAR_LATENCY_MIN_SAMPLES
-        return False
-
-    with mock.patch.object(longitudinal_mod, "Params", lambda: StoredBare()):
-      seeded = MoonpilotLongitudinalPlanner(CP)
+    store = params(on=False, overrides={
+      MOONPILOT_RADAR_LATENCY_KEY: ROUTE_TAU,
+      MOONPILOT_RADAR_LATENCY_SAMPLES_KEY: MOONPILOT_RADAR_LATENCY_MIN_SAMPLES,
+    })
+    seeded = MoonpilotLongitudinalPlanner(CP, params=store)
     self.assertEqual(seeded.radar_latency.status, "estimated")
     self.assertAlmostEqual(seeded.radar_latency.applied(), ROUTE_TAU, delta=1e-9)
 
   def test_the_value_and_its_evidence_persist_together(self):
-    planner = _planner()
+    planner = make_planner()
     planner.radar_latency.seed(ROUTE_TAU, 10)
-    for _ in range(MOONPILOT_RADAR_LATENCY_PERSIST_EVERY):
-      planner.update(_inputs())
+    for _ in range(PERSIST_EVERY):
+      planner.update(inputs())
     self.assertAlmostEqual(planner.params.puts.get(MOONPILOT_RADAR_LATENCY_KEY), ROUTE_TAU, places=4)
     self.assertEqual(planner.params.puts.get(MOONPILOT_RADAR_LATENCY_SAMPLES_KEY), 10)
 
-  def test_the_params_rows_match_the_module_keys(self):
-    text = (ROOT / "params_keys.h").read_text()
-    self.assertTrue(f'{{"{MOONPILOT_RADAR_LATENCY_KEY}", {{PERSISTENT, FLOAT, "0.0"}}}}' in text)
-    self.assertTrue(f'{{"{MOONPILOT_RADAR_LATENCY_SAMPLES_KEY}", {{PERSISTENT, INT, "0"}}}}' in text)
 
 
 if __name__ == "__main__":

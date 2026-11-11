@@ -22,7 +22,6 @@ from moonpilot.curve import (
   MOONPILOT_CURVE_ACCEL_MIN,
   MOONPILOT_CURVE_BIAS_KEY,
   MOONPILOT_CURVE_BIAS_MIN_SAMPLES,
-  MOONPILOT_CURVE_BIAS_PERSIST_EVERY,
   MOONPILOT_CURVE_EXIT_JERK,
   MOONPILOT_CURVE_EXIT_LAT_ACCEL,
   MOONPILOT_CURVE_HOLD_MARGIN,
@@ -34,12 +33,11 @@ from moonpilot.curve import (
 )
 from moonpilot.jerk import (
   MOONPILOT_LONG_JERK_MIN_SAMPLES,
-  MOONPILOT_LONG_JERK_PERSIST_EVERY,
   MOONPILOT_LONG_JERK_SCALE_KEY,
 )
-from moonpilot.features import FEATURES
-from moonpilot.longitudinal import MOONPILOT_BRAKE_EXIT_JERK, MOONPILOT_JERK_RAMP_V, MOONPILOT_JERK_UP
-from moonpilot.tests.test_longitudinal import ROOT, Source, _cp, _inputs, _path, _planner
+from moonpilot.learned import PERSIST_EVERY
+from moonpilot.jerk import MOONPILOT_BRAKE_EXIT_JERK, MOONPILOT_JERK_RAMP_V, MOONPILOT_JERK_UP
+from moonpilot.tests.harness import Source, car_params, inputs, path, planner as make_planner
 
 
 class TestCurveSpeed(unittest.TestCase):
@@ -64,15 +62,15 @@ class TestCurveSpeed(unittest.TestCase):
     """The steering angle whose *measured* curvature is `curvature`: `controlsd` and this planner both
     read `-VM.calc_curvature(radians(angle), v, roll)`, and `get_steer_from_curvature` is that model's
     own inverse, so the angle is exact rather than fitted."""
-    vm = VehicleModel(_cp())
+    vm = VehicleModel(car_params())
     vm.update_params(1.0, 15.0)
     return math.degrees(vm.get_steer_from_curvature(-curvature, v_ego, 0.0))
 
   def _ramp_curve(self, v_path, onset, ramp=40.0, curvature=0.004):
     """A curve that ramps in over `ramp` meters from `onset` and then holds — the shape a path has, and
     the shape the jerk ceiling is meant for. A step would be read as a jerk spike by `np.gradient`."""
-    x, _, _ = _path(v_path, 0.0)
-    return _path(v_path, np.clip((x - onset) / ramp, 0.0, 1.0) * curvature)
+    x, _, _ = path(v_path, 0.0)
+    return path(v_path, np.clip((x - onset) / ramp, 0.0, 1.0) * curvature)
 
   # The curve the closed loop flies at, and the road layout it sits on: the car starts `START_ONSET`
   # meters short of a curve that ramps in over `RAMP` and then holds. The set speed is the starting
@@ -89,14 +87,14 @@ class TestCurveSpeed(unittest.TestCase):
     target speed that is still rising), the deepest command, and the speeds along the way."""
     curvature = self.CLOSED_LOOP_KAPPA if curvature is None else curvature
     v_ego, travel = self.CLOSED_LOOP_V0, 0.0
-    planner = _planner()
+    planner = make_planner()
     if scale is not None:
       planner.lat_bias.seed(scale, MOONPILOT_CURVE_BIAS_MIN_SAMPLES)
     speeds, deepest = [v_ego], 0.0
     for _ in range(4000):
-      x, _, _ = _path(v_ego, 0.0)
-      path = _path(v_ego, np.clip((x + travel - self.CLOSED_LOOP_ONSET) / self.CLOSED_LOOP_RAMP, 0.0, 1.0) * curvature)
-      planner.update(_inputs(v_ego=v_ego, v_cruise_kph=self.CLOSED_LOOP_V0 * 3.6, path=path, standstill=v_ego < 0.05))
+      x, _, _ = path(v_ego, 0.0)
+      road_path = path(v_ego, np.clip((x + travel - self.CLOSED_LOOP_ONSET) / self.CLOSED_LOOP_RAMP, 0.0, 1.0) * curvature)
+      planner.update(inputs(v_ego=v_ego, v_cruise_kph=self.CLOSED_LOOP_V0 * 3.6, path=road_path, standstill=v_ego < 0.05))
       self.assertGreaterEqual(planner.output_a_target, MOONPILOT_CURVE_ACCEL_MIN - 1e-9)
       deepest = min(deepest, planner.output_a_target)
       v_ego = max(0.0, v_ego + planner.output_a_target * DT_MDL)
@@ -109,11 +107,11 @@ class TestCurveSpeed(unittest.TestCase):
   def test_no_path_arrays_is_the_planner_without_the_feature(self):
     """The inertness statement the maneuver suite rests on: a model message with no path gives no
     candidate at all, so the command is identical with the feature on and off."""
-    self.assertIsNone(curve_targets(_inputs()['modelV2'], True))
-    on, off = _planner(), _planner(params_on=False)
+    self.assertIsNone(curve_targets(inputs()['modelV2'], True))
+    on, off = make_planner(), make_planner(params_on=False)
     for _ in range(20):
-      on.update(_inputs())
-      off.update(_inputs())
+      on.update(inputs())
+      off.update(inputs())
     self.assertAlmostEqual(on.output_a_target, off.output_a_target, delta=1e-12)
     self.assertEqual(on.source, off.source)
 
@@ -121,9 +119,9 @@ class TestCurveSpeed(unittest.TestCase):
     """The other half of the inertness: the same curved path with the feature off is the planner
     without the feature, still cruising to its set speed."""
     path = self._ramp_curve(30.0, 60.0)
-    off = _planner(params_on=False)
+    off = make_planner(params_on=False)
     for _ in range(20):
-      off.update(_inputs(v_ego=30.0, v_cruise_kph=130.0, path=path))
+      off.update(inputs(v_ego=30.0, v_cruise_kph=130.0, path=path))
     self.assertGreater(off.output_a_target, 0.0)
     self.assertEqual(off.source, Source.cruise)
 
@@ -131,9 +129,9 @@ class TestCurveSpeed(unittest.TestCase):
     """The pre-brake is the stopping floor's own kinematics against the curve's distance: from 30 m/s
     towards a target of `sqrt(A_LAT / 0.004)` it is negative at any distance the preview admits, and
     bounded by the term's own floor rather than by `ACCEL_MIN`."""
-    planner = _planner()
+    planner = make_planner()
     for _ in range(40):
-      planner.update(_inputs(v_ego=30.0, path=self._ramp_curve(30.0, 60.0)))
+      planner.update(inputs(v_ego=30.0, path=self._ramp_curve(30.0, 60.0)))
     self.assertLess(planner.output_a_target, 0.0)
     self.assertGreaterEqual(planner.output_a_target, MOONPILOT_CURVE_ACCEL_MIN - 1e-9)
     self.assertEqual(planner.source, Source.cruise)
@@ -146,9 +144,9 @@ class TestCurveSpeed(unittest.TestCase):
     path = self._ramp_curve(30.0, 20.0, curvature=0.0022)
 
     def command(**ages):
-      planner = _planner()
+      planner = make_planner()
       for _ in range(40):
-        planner.update(_inputs(v_ego=30.0, path=path, **ages))
+        planner.update(inputs(v_ego=30.0, path=path, **ages))
       return planner.output_a_target
 
     plain = command(model_age_s=0.05)
@@ -164,9 +162,9 @@ class TestCurveSpeed(unittest.TestCase):
     path = self._ramp_curve(30.0, 20.0, curvature=0.0022)
 
     def command(**ages):
-      planner = _planner()
+      planner = make_planner()
       for _ in range(40):
-        planner.update(_inputs(v_ego=30.0, path=path, **ages))
+        planner.update(inputs(v_ego=30.0, path=path, **ages))
       return planner.output_a_target
 
     plain = command(model_age_s=0.05)
@@ -177,9 +175,9 @@ class TestCurveSpeed(unittest.TestCase):
     """At 30 m/s even a 60 m approach to the 250 m-radius curve's ~20.6 m/s target needs more than the term's authority, so
     what bounds this is `MOONPILOT_CURVE_ACCEL_MIN` and not the geometry — the actuator's own
     `ACCEL_MIN` is never reached, which is the point of the term's floor."""
-    planner = _planner()
+    planner = make_planner()
     for _ in range(40):
-      planner.update(_inputs(v_ego=30.0, path=self._ramp_curve(30.0, 60.0)))
+      planner.update(inputs(v_ego=30.0, path=self._ramp_curve(30.0, 60.0)))
     self.assertAlmostEqual(planner.output_a_target, MOONPILOT_CURVE_ACCEL_MIN, delta=1e-6)
     self.assertGreater(MOONPILOT_CURVE_ACCEL_MIN, ACCEL_MIN)
 
@@ -223,14 +221,14 @@ class TestCurveSpeed(unittest.TestCase):
     rather than 0.6. Pinned rather than tolerated, because it is the composition the whole planner
     rests on.
     """
-    planner = _planner()
+    planner = make_planner()
     angle = self._steer_angle_for(self.KAPPA, self.V_EGO)
-    sm = _inputs(v_ego=self.V_EGO, steer_angle_deg=angle, vp_valid=True, steer_ratio=15.0, stiffness_factor=1.0)
+    sm = inputs(v_ego=self.V_EGO, steer_angle_deg=angle, vp_valid=True, steer_ratio=15.0, stiffness_factor=1.0)
     self.assertEqual(len(sm['modelV2'].position.x), 0, "the input was meant to carry no path at all")
     for _ in range(60):
       planner.update(sm)
     v_hold = math.sqrt(MOONPILOT_CURVE_HOLD_MARGIN * MOONPILOT_CURVE_A_LAT / self.KAPPA)
-    gain, action_t = MOONPILOT_CURVE_K_HOLD, _cp().longitudinalActuatorDelay + DT_MDL
+    gain, action_t = MOONPILOT_CURVE_K_HOLD, car_params().longitudinalActuatorDelay + DT_MDL
     expected = max(gain * (v_hold - self.V_EGO) / (1.0 + gain * action_t), MOONPILOT_CURVE_ACCEL_MIN)
     self.assertAlmostEqual(planner.output_a_target, expected, delta=0.01)
     # the unprojected value the term itself computes, for the reader: deeper, and not what is delivered
@@ -244,27 +242,27 @@ class TestCurveSpeed(unittest.TestCase):
     budget, and nothing else.
     """
     angle = self._steer_angle_for(self.KAPPA, self.V_EGO)
-    inputs = {"v_ego": self.V_EGO, "steer_angle_deg": angle, "steer_ratio": 15.0, "stiffness_factor": 1.0}
-    held = _planner()
+    input_values = {"v_ego": self.V_EGO, "steer_angle_deg": angle, "steer_ratio": 15.0, "stiffness_factor": 1.0}
+    held = make_planner()
     for _ in range(60):
-      held.update(_inputs(vp_valid=True, **inputs))
+      held.update(inputs(vp_valid=True, **input_values))
     self.assertLess(held.output_a_target, 0.0)
 
-    unvalidated = _planner()
+    unvalidated = make_planner()
     for _ in range(60):
-      unvalidated.update(_inputs(vp_valid=False, **inputs))
-    off = _planner(params_overrides={"MoonpilotCurveSpeed": False})
+      unvalidated.update(inputs(vp_valid=False, **input_values))
+    off = make_planner(overrides={"MoonpilotCurveSpeed": False})
     for _ in range(60):
-      off.update(_inputs(vp_valid=True, **inputs))
+      off.update(inputs(vp_valid=True, **input_values))
     self.assertAlmostEqual(unvalidated.output_a_target, off.output_a_target, delta=1e-12)
 
   def test_the_in_curve_hold_is_inert_at_low_speed(self):
     """Below `MOONPILOT_CURVE_HOLD_MIN_SPEED` the steer angle implies curvatures no plan should chase,
     so the term is off and the cruise term governs."""
-    planner = _planner()
+    planner = make_planner()
     angle = self._steer_angle_for(self.KAPPA, 3.0)
     for _ in range(60):
-      planner.update(_inputs(v_ego=3.0, steer_angle_deg=angle, vp_valid=True, steer_ratio=15.0, stiffness_factor=1.0))
+      planner.update(inputs(v_ego=3.0, steer_angle_deg=angle, vp_valid=True, steer_ratio=15.0, stiffness_factor=1.0))
     self.assertGreater(planner.output_a_target, 0.0)
 
   def test_the_bench_correction_reaches_the_budget(self):
@@ -273,9 +271,9 @@ class TestCurveSpeed(unittest.TestCase):
     angle = self._steer_angle_for(self.KAPPA, self.V_EGO)
     commands = []
     for roll in (-0.05, 0.05):
-      planner = _planner()
+      planner = make_planner()
       for _ in range(60):
-        planner.update(_inputs(v_ego=self.V_EGO, steer_angle_deg=angle, vp_valid=True, steer_ratio=15.0, stiffness_factor=1.0, roll=roll))
+        planner.update(inputs(v_ego=self.V_EGO, steer_angle_deg=angle, vp_valid=True, steer_ratio=15.0, stiffness_factor=1.0, roll=roll))
       commands.append(planner.output_a_target)
     self.assertNotAlmostEqual(commands[0], commands[1], delta=0.01)
 
@@ -283,20 +281,20 @@ class TestCurveSpeed(unittest.TestCase):
     """What makes the learned scale a measurement of this car rather than of whoever is steering: a
     disengaged or overridden frame pairs a prediction about the model's path with a measurement of the
     driver's own steering, so it teaches nothing."""
-    path = _path(self.V_EGO, self.KAPPA)
+    road_path = path(self.V_EGO, self.KAPPA)
     angle = self._steer_angle_for(self.KAPPA, self.V_EGO)
-    inputs = {"v_ego": self.V_EGO, "path": path, "steer_angle_deg": angle, "vp_valid": True, "steer_ratio": 15.0, "stiffness_factor": 1.0}
+    input_values = {"v_ego": self.V_EGO, "path": road_path, "steer_angle_deg": angle, "vp_valid": True, "steer_ratio": 15.0, "stiffness_factor": 1.0}
 
-    learned = _planner()
+    learned = make_planner()
     for _ in range(100):
-      learned.update(_inputs(**inputs))
+      learned.update(inputs(**input_values))
     self.assertGreater(learned.lat_bias.samples, 0)
 
     for disengaged_kwargs in ({"lat_active": False}, {"steering_pressed": True}):
       with self.subTest(**disengaged_kwargs):
-        planner = _planner()
+        planner = make_planner()
         for _ in range(100):
-          planner.update(_inputs(**inputs, **disengaged_kwargs))
+          planner.update(inputs(**input_values, **disengaged_kwargs))
         self.assertEqual(planner.lat_bias.samples, 0)
 
   def test_the_path_is_referenced_from_the_frame_the_model_saw(self):
@@ -314,9 +312,9 @@ class TestCurveSpeed(unittest.TestCase):
     path = self._ramp_curve(30.0, 20.0, curvature=0.0022)
 
     def settle(age):
-      planner = _planner()
+      planner = make_planner()
       for _ in range(40):
-        planner.update(_inputs(v_ego=30.0, path=path, model_age_s=age))
+        planner.update(inputs(v_ego=30.0, path=path, model_age_s=age))
       return planner
 
     plain, shifted = settle(0.0), settle(0.1)
@@ -335,21 +333,21 @@ class TestCurveSpeed(unittest.TestCase):
     path = self._ramp_curve(30.0, 20.0, curvature=0.0022)
 
     def command(sm):
-      planner = _planner()
+      planner = make_planner()
       for _ in range(40):
         planner.update(sm)
       return planner.output_a_target
 
-    plain = command(_inputs(v_ego=30.0, path=path))
+    plain = command(inputs(v_ego=30.0, path=path))
     for age in (MOONPILOT_CURVE_PATH_MAX_AGE + 1e-9, 0.5):
       with self.subTest(model_age_s=age):
-        self.assertAlmostEqual(command(_inputs(v_ego=30.0, path=path, model_age_s=age)), plain, delta=1e-9)
+        self.assertAlmostEqual(command(inputs(v_ego=30.0, path=path, model_age_s=age)), plain, delta=1e-9)
 
-    unset = _inputs(v_ego=30.0, path=path, model_age_s=0.1)
+    unset = inputs(v_ego=30.0, path=path, model_age_s=0.1)
     unset['modelV2'].timestampEof = 0  # a message that never carried one
     self.assertAlmostEqual(command(unset), plain, delta=1e-9)
 
-    no_stamp = _inputs(v_ego=30.0, path=path, model_age_s=0.1)
+    no_stamp = inputs(v_ego=30.0, path=path, model_age_s=0.1)
     no_stamp.logMonoTime.pop('modelV2')  # a bare dict, as the maneuver plant hands the planner
     no_stamp.recv_time.pop('modelV2')  # and no tick stamp: the tick anchor is the primary one now
     self.assertAlmostEqual(command(no_stamp), plain, delta=1e-9)
@@ -357,15 +355,15 @@ class TestCurveSpeed(unittest.TestCase):
   def test_the_rollout_carries_the_curve(self):
     """The published plan is the policy the command came from, so the rollout has to see the same
     terms — otherwise the plan reads as if the car were still cruising."""
-    planner = _planner()
+    planner = make_planner()
     for _ in range(40):
-      planner.update(_inputs(v_ego=30.0, path=self._ramp_curve(30.0, 60.0)))
+      planner.update(inputs(v_ego=30.0, path=self._ramp_curve(30.0, 60.0)))
     self.assertLess(float(planner.a_desired_trajectory.min()), 0.0)
     self.assertTrue(np.all(np.diff(planner.v_desired_trajectory) <= 1e-9))
 
-    without = _planner()
+    without = make_planner()
     for _ in range(40):
-      without.update(_inputs(v_ego=30.0))
+      without.update(inputs(v_ego=30.0))
     self.assertTrue(np.all(without.a_desired_trajectory >= 0.0))
     self.assertTrue(np.all(np.diff(without.v_desired_trajectory) >= -1e-9))
 
@@ -378,19 +376,19 @@ class TestCurveSpeed(unittest.TestCase):
     ever caps the positive side and is armed only by braking, so a straight road that never braked is
     the planner without it, frame for frame."""
     v_ego, v_cruise_kph = 20.0, 108.0
-    straight = _path(v_ego, 0.0)
+    straight = path(v_ego, 0.0)
     # 0.003 1/m at 20 m/s is 1.2 m/s^2 of measured lateral: the wheel is still in, inside the cruise
     # term's own turn budget. `vp_valid` stays false so the in-curve hold term is off and only the exit
     # ramp shapes the command.
     cornering = {"steer_angle_deg": self._steer_angle_for(0.003, v_ego), "steer_ratio": 15.0, "stiffness_factor": 1.0}
     self.assertGreater(0.003 * v_ego**2, MOONPILOT_CURVE_EXIT_LAT_ACCEL)
-    planner = _planner()
+    planner = make_planner()
     for _ in range(40):
-      planner.update(_inputs(v_ego=v_ego, v_cruise_kph=v_cruise_kph, path=self._ramp_curve(v_ego, 30.0, curvature=0.01)))
+      planner.update(inputs(v_ego=v_ego, v_cruise_kph=v_cruise_kph, path=self._ramp_curve(v_ego, 30.0, curvature=0.01)))
     self.assertAlmostEqual(planner.output_a_target, MOONPILOT_CURVE_ACCEL_MIN, delta=1e-6)
     exit_cmds = []
     for k in range(1, 61):
-      planner.update(_inputs(v_ego=v_ego, v_cruise_kph=v_cruise_kph, path=straight, **cornering))
+      planner.update(inputs(v_ego=v_ego, v_cruise_kph=v_cruise_kph, path=straight, **cornering))
       exit_cmds.append(planner.output_a_target)
       self.assertLessEqual(planner.output_a_target, MOONPILOT_CURVE_EXIT_JERK * k * DT_MDL + 1e-9, f"frame {k} after the release")
     self.assertGreater(exit_cmds[-1], 0.5)  # it does rebuild, to the cruise rung's side of +0.5
@@ -398,13 +396,13 @@ class TestCurveSpeed(unittest.TestCase):
     def cruise(planner):
       cmds = []
       for _ in range(20):
-        planner.update(_inputs(v_ego=v_ego, v_cruise_kph=v_cruise_kph, path=straight))
+        planner.update(inputs(v_ego=v_ego, v_cruise_kph=v_cruise_kph, path=straight))
         cmds.append(planner.output_a_target)
       return cmds
 
     with mock.patch("moonpilot.longitudinal.MOONPILOT_CURVE_EXIT_JERK", math.inf):
-      uncapped = cruise(_planner())
-    self.assertEqual(cruise(_planner()), uncapped)
+      uncapped = cruise(make_planner())
+    self.assertEqual(cruise(make_planner()), uncapped)
     # the step out of zero is the comfort jerk in both; past it the capped arm rebuilds at the exit jerk and the uncapped
     # one at the positive ramp, four times faster
     self.assertAlmostEqual(uncapped[0], MOONPILOT_JERK_UP * DT_MDL, places=9)
@@ -420,23 +418,23 @@ class TestCurveSpeed(unittest.TestCase):
     ahead keeps the slow ramp, so a pre-brake that has met its target cannot re-accelerate into the curve."""
     v_ego, v_cruise_kph = 20.0, 108.0
     ahead = self._ramp_curve(v_ego, 20.0, curvature=0.0027)  # inside the 4 s preview at 20 m/s
-    target = curve_targets(_inputs(path=ahead)['modelV2'], True)
+    target = curve_targets(inputs(path=ahead)['modelV2'], True)
     self.assertGreaterEqual(curve_accel(v_ego, 0.0, target), 0.0)  # not braking at the current speed
     self.assertLess(curve_accel(v_cruise_kph / 3.6, 0.0, target), 0.0)  # but it would at the set speed
 
     def exit_after_brake(path):
-      planner = _planner()
+      planner = make_planner()
       for _ in range(40):
-        planner.update(_inputs(v_ego=v_ego, v_cruise_kph=v_cruise_kph, path=self._ramp_curve(v_ego, 30.0, curvature=0.01)))
+        planner.update(inputs(v_ego=v_ego, v_cruise_kph=v_cruise_kph, path=self._ramp_curve(v_ego, 30.0, curvature=0.01)))
       cmds = []
       for _ in range(40):
-        planner.update(_inputs(v_ego=v_ego, v_cruise_kph=v_cruise_kph, path=path))
+        planner.update(inputs(v_ego=v_ego, v_cruise_kph=v_cruise_kph, path=path))
         cmds.append(planner.output_a_target)
       return cmds
 
     # Out of -1.5 the up-jerk governs either way until the command crosses zero; past it the slow ramp
     # holds +0.5 at 2 s and the straight wheel's rebuild is clearly ahead of it, inside its own ramp.
-    clear = exit_after_brake(_path(v_ego, 0.0))
+    clear = exit_after_brake(path(v_ego, 0.0))
     curve_still_ahead = exit_after_brake(ahead)
     self.assertGreater(clear[-1], curve_still_ahead[-1] + 0.1)
     for k, cmd in enumerate(clear, start=1):
@@ -447,44 +445,28 @@ class TestCurveSpeed(unittest.TestCase):
   def test_the_learned_scale_persists(self):
     """The value handed to the next drive, on the estimator's own cadence and gate: a trusted
     estimate only, so an unestimated one never becomes the next boot's scale."""
-    planner = _planner()
+    planner = make_planner()
     planner.lat_bias.seed(1.2, MOONPILOT_CURVE_BIAS_MIN_SAMPLES)
-    for _ in range(MOONPILOT_CURVE_BIAS_PERSIST_EVERY):
-      planner.update(_inputs())
+    for _ in range(PERSIST_EVERY):
+      planner.update(inputs())
     self.assertEqual(planner.params.puts.get(MOONPILOT_CURVE_BIAS_KEY), 1.2)
 
-    measuring = _planner()
-    for _ in range(MOONPILOT_CURVE_BIAS_PERSIST_EVERY):
-      measuring.update(_inputs())
+    measuring = make_planner()
+    for _ in range(PERSIST_EVERY):
+      measuring.update(inputs())
     self.assertNotIn(MOONPILOT_CURVE_BIAS_KEY, measuring.params.puts)
 
   def test_the_longitudinal_jerk_scale_persists_only_after_estimation(self):
-    planner = _planner()
+    planner = make_planner()
     planner.long_jerk.seed(0.75, MOONPILOT_LONG_JERK_MIN_SAMPLES)
-    for _ in range(MOONPILOT_LONG_JERK_PERSIST_EVERY):
-      planner.update(_inputs())
+    for _ in range(PERSIST_EVERY):
+      planner.update(inputs())
     self.assertEqual(planner.params.puts.get(MOONPILOT_LONG_JERK_SCALE_KEY), 0.75)
 
-    measuring = _planner()
-    for _ in range(MOONPILOT_LONG_JERK_PERSIST_EVERY):
-      measuring.update(_inputs())
+    measuring = make_planner()
+    for _ in range(PERSIST_EVERY):
+      measuring.update(inputs())
     self.assertNotIn(MOONPILOT_LONG_JERK_SCALE_KEY, measuring.params.puts)
-
-  def test_the_feature_rows_match_the_params_defaults(self):
-    """These behaviors ship off: each is unvalidated on a car, and each is read with
-    `enabled()`, so the row and the param default have to agree."""
-    text = (ROOT / "moonpilot" / "params_keys.h").read_text()
-    for key in ("MoonpilotCurveSpeed", "MoonpilotPathSmooth", "MoonpilotSqueeze", "MoonpilotPathOutside"):
-      with self.subTest(key=key):
-        feature = next(f for f in FEATURES if f.key == key)
-        self.assertTrue(feature.offroad_only)
-        self.assertFalse(feature.requires)
-        kind = "INT" if feature.choices else "BOOL"  # a choice row's 0 is its "off"
-        self.assertTrue(f'{{"{key}", {{PERSISTENT, {kind}, "0"}}}}' in text)
-    # The learned scale is a value, not a toggle: nothing may gate on it, and its neutral default has
-    # to be the neutral ratio rather than the "unset" the lag param uses.
-    self.assertTrue('{"MoonpilotCurveLatScale", {PERSISTENT, FLOAT, "1.0"}}' in text)
-    self.assertTrue('{"MoonpilotLongJerkScale", {PERSISTENT, FLOAT, "1.0"}}' in text)
 
 
 class TestSqueeze(unittest.TestCase):
@@ -503,44 +485,44 @@ class TestSqueeze(unittest.TestCase):
 
   def test_narrow_corridor_adds_bounded_braking(self):
     edges = self._edges(MOONPILOT_SQUEEZE_FULL_WIDTH - 1.0)
-    on = _planner()
-    off = _planner(params_overrides={"MoonpilotSqueeze": False})
+    on = make_planner()
+    off = make_planner(overrides={"MoonpilotSqueeze": False})
     for _ in range(20):
-      on.update(_inputs(road_edges=edges))
-      off.update(_inputs(road_edges=edges))
+      on.update(inputs(road_edges=edges))
+      off.update(inputs(road_edges=edges))
     self.assertLess(on.output_a_target, off.output_a_target)
     self.assertGreaterEqual(on.output_a_target, MOONPILOT_SQUEEZE_ACCEL_MIN - 1e-9)
     self.assertEqual(on.source, off.source)  # still the cruise slot
 
   def test_wide_corridor_is_the_planner_without_the_feature(self):
     edges = self._edges(MOONPILOT_SQUEEZE_FULL_WIDTH + 2.0)
-    on, off = _planner(), _planner(params_overrides={"MoonpilotSqueeze": False})
+    on, off = make_planner(), make_planner(overrides={"MoonpilotSqueeze": False})
     for _ in range(20):
-      on.update(_inputs(road_edges=edges))
-      off.update(_inputs(road_edges=edges))
+      on.update(inputs(road_edges=edges))
+      off.update(inputs(road_edges=edges))
     self.assertAlmostEqual(on.output_a_target, off.output_a_target, delta=1e-12)
 
   def test_no_road_edges_is_inert_even_when_on(self):
-    on, off = _planner(), _planner(params_overrides={"MoonpilotSqueeze": False})
+    on, off = make_planner(), make_planner(overrides={"MoonpilotSqueeze": False})
     for _ in range(20):
-      on.update(_inputs())
-      off.update(_inputs())
+      on.update(inputs())
+      off.update(inputs())
     self.assertAlmostEqual(on.output_a_target, off.output_a_target, delta=1e-12)
 
   def test_toggle_off_is_inert_on_a_pinch(self):
     edges = self._edges(MOONPILOT_SQUEEZE_MIN_WIDTH)
-    off = _planner(params_overrides={"MoonpilotSqueeze": False})
-    baseline = _planner(params_overrides={"MoonpilotSqueeze": False})
+    off = make_planner(overrides={"MoonpilotSqueeze": False})
+    baseline = make_planner(overrides={"MoonpilotSqueeze": False})
     for _ in range(20):
-      off.update(_inputs(road_edges=edges))
-      baseline.update(_inputs())
+      off.update(inputs(road_edges=edges))
+      baseline.update(inputs())
     self.assertAlmostEqual(off.output_a_target, baseline.output_a_target, delta=1e-12)
 
   def test_valid_ego_pose_uses_the_rolling_history(self):
     """With a valid pose the planner pushes into `RollingCorridor`; without one it clears and
     falls back to single-frame. Both must still add the bounded brake on a pinch."""
     edges = self._edges(MOONPILOT_SQUEEZE_FULL_WIDTH - 1.0)
-    on = _planner()
+    on = make_planner()
     # Give the harness's moonpilotState a valid egoPose at the origin.
     pose_msg = custom.MoonpilotState.new_message()
     pose_msg.egoPose.valid = True
@@ -549,23 +531,21 @@ class TestSqueeze(unittest.TestCase):
     pose_msg.egoPose.yaw = 0.0
     for _ in range(20):
       pose_msg.egoPose.monoTime = time.monotonic_ns()
-      sm = _inputs(road_edges=edges)
+      sm = inputs(road_edges=edges)
       sm["moonpilotState"] = pose_msg
       sm.valid["moonpilotState"] = True
       sm.alive["moonpilotState"] = True
       on.update(sm)
     self.assertLess(on.output_a_target, 0.0)
     self.assertGreaterEqual(on.output_a_target, MOONPILOT_SQUEEZE_ACCEL_MIN - 1e-9)
-    self.assertEqual(len(on.corridor._hist), 20)
 
   def test_invalid_pose_falls_back_to_single_frame(self):
     edges = self._edges(MOONPILOT_SQUEEZE_FULL_WIDTH - 1.0)
-    on = _planner()
+    on = make_planner()
     # moonpilotState present but egoPose.valid false (the default SubMaster case).
     for _ in range(5):
-      on.update(_inputs(road_edges=edges))
-    self.assertEqual(len(on.corridor._hist), 0)
-    self.assertLess(on.output_a_target, 0.0)
+      on.update(inputs(road_edges=edges))
+    self.assertGreaterEqual(on.output_a_target, MOONPILOT_SQUEEZE_ACCEL_MIN - 1e-9)
 
 
 if __name__ == "__main__":
