@@ -25,7 +25,6 @@ from moonpilot.features import MODEL_BRAKING
 from openpilot.tools.lib.logreader import LogReader
 from moonpilot.lab import DEFAULT_ROOT, cached, expand, manual_authority, runs
 from moonpilot.lab.routes import ROUTE_SETS
-from moonpilot.lab import planner
 from moonpilot.lab.planner import ExtractReader, extract, replay
 
 VERSION = 1
