@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
-import pyray as rl
+import raylib_nb as rl
 
 from openpilot.selfdrive.ui.ui_state import UIStatus
 from moonpilot.tests.fakes import params

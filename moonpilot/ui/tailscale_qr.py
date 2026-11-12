@@ -1,7 +1,7 @@
 """Tizi sign-in dialog: a QR code of the tailscale login URL, plus the URL as text."""
 
 
-import pyray as rl
+import raylib_nb as rl
 
 from openpilot.common.params import Params
 from openpilot.system.ui.lib.application import FontWeight, gui_app
@@ -75,7 +75,7 @@ class TailscaleSignInDialog(QrTexture, Widget):
       rl.draw_circle(int(circle_x), int(circle_y), radius, rl.Color(70, 70, 70, 255))
       number = str(i + 1)
       number_size = measure_text_cached(font, number, 30)
-      rl.draw_text_ex(font, number, (int(circle_x - number_size.x // 2), int(circle_y - number_size.y // 2)), 30, 0, rl.WHITE)
+      rl.draw_text_ex(font, number, rl.Vector2(int(circle_x - number_size.x // 2), int(circle_y - number_size.y // 2)), 30, 0, rl.WHITE)
       rl.draw_text_ex(font, "\n".join(wrapped), rl.Vector2(text_x, y), 47, 0.0, rl.BLACK)
       y += text_height + 50
 

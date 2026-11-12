@@ -26,7 +26,7 @@ New fork behavior: write it under `moonpilot/`, hook it at the seam that already
 | `openpilot/selfdrive/modeld/modeld.py` | `moonpilot_model_runtime()`, and the runtime's model, smoothing constants and action decode; the learned long-lag horizon (`applied_long_delay`, re-read in the loop); low-speed turn-desire hook after `DesireHelper.update()` |
 | `openpilot/selfdrive/modeld/dmonitoringmodeld.py` | `moonpilot_dm_runtime()`, and the runtime's model and output parse |
 | `openpilot/cereal/custom.capnp` | `MoonpilotState` (upstream's reserved struct; never change the `@0x…` id) |
-| `openpilot/cereal/log.capnp` | `moonpilotState @107` event field; `PandaState.controlsAllowedLateral @38` and `controlsAllowedLongitudinal @39` — upstream's two slots reserved for forks, the first carrying this fork's lateral grant and the second named for the longitudinal half of the split, which this fork never populates; the fork's own `OnroadEvent.EventName` rows — `lateralEngageOff @105`, `turnLeft @106`, `turnRight @107` and `pathOutside @108`, above upstream's highest @104, so the next fork event is @109 |
+| `openpilot/cereal/log.capnp` | `moonpilotState @107` event field; `PandaState.controlsAllowedLateral @38` and `controlsAllowedLongitudinal @39` — upstream's two slots reserved for forks, the first carrying this fork's lateral grant and the second named for the longitudinal half of the split, which this fork never populates; the fork's own `OnroadEvent.EventName` rows — `turnLeft @106`, `turnRight @107`, `pathOutside @108` and `lateralEngageOff @109`. Upstream claimed @105 for `startupCruiseCanceled`, so only the colliding fork row moved; the next fork event is @110 |
 | `openpilot/cereal/services.py` | `moonpilotState` service row |
 | `openpilot/common/version.h` | `COMMA_VERSION "<upstream>-moonpilot.<fork revision>"` |
 | `openpilot/selfdrive/controls/plannerd.py` | `moonpilotState` subscription, kept out of `all_checks` (`ignore_alive`/`ignore_valid`) because `moonpilot_state()` gates every read on it and a dead `leadd` would otherwise mark every `longitudinalPlan` and `driverAssistance` invalid — `selfdrived`'s `commIssue` — until a reboot; and `vehicleParameters`, which upstream's planner stopped reading and the fork planner's in-curve term still does (`angleOffsetDeg`); `moonpilot_longitudinal_planner()` picks the longitudinal planner |
@@ -41,9 +41,9 @@ New fork behavior: write it under `moonpilot/`, hook it at the seam that already
 | `openpilot/selfdrive/ui/ui_state.py` | `moonpilotState` subscription |
 | `openpilot/selfdrive/ui/soundd.py` | `moonpilot_alert_volume()` holds warning volume at its cabin-derived opening level; the upstream critical-sound escalation remains |
 | `openpilot/selfdrive/ui/onroad/augmented_road_view.py` | half-engaged border color from `moonpilot/ui/onroad.py`; the disengaged border color moves off blue; the offroad-mode hold gesture |
-| `openpilot/selfdrive/ui/onroad/model_renderer.py` | lead path draw (tizi) |
+| `openpilot/selfdrive/ui/onroad/model_renderer.py` | shared lead path draw (tizi and mici) |
 | `openpilot/selfdrive/ui/mici/onroad/augmented_road_view.py` | the offroad-mode hold gesture (mici) |
-| `openpilot/selfdrive/ui/mici/onroad/model_renderer.py` | lead path draw (mici); half-engaged lane-line color |
+| `openpilot/selfdrive/ui/mici/onroad/model_renderer.py` | half-engaged lane-line color |
 | `openpilot/selfdrive/ui/mici/onroad/alert_renderer.py` | turn-desire banner icon and height (mici) |
 | `openpilot/selfdrive/ui/layouts/home.py` | brand string (tizi) |
 | `openpilot/selfdrive/ui/mici/layouts/home.py` | brand label (mici) |
@@ -343,16 +343,18 @@ Fork work lives on `master`. Merge, never rebase; no force-push.
 
     git fetch upstream
     git merge upstream/master    # conflicts land on seam lines; `grep -n moonpilot <file>` shows the fork's side
-    python3 -c "import moonpilot.engage, moonpilot.procs, moonpilot.ui.settings, moonpilot.ui.settings_mici"
-    tools/op.sh lint
-    tools/op.sh test moonpilot
     tools/op.sh build
+    SCALE=1 .venv/bin/python3 -c "import moonpilot.engage, moonpilot.procs, moonpilot.ui.settings, moonpilot.ui.settings_mici"
+    tools/op.sh lint
+    SCALE=1 tools/op.sh test moonpilot
 
-Push with LFS upload skipped: `.lfsconfig` points `url` and `pushurl` at comma's Hugging Face store (`https://huggingface.co/commaai/openpilot-lfs.git/info/lfs`), which this machine cannot authenticate to, and the pre-push hook `tools/op.sh` reinstalls on every setup will try it. The fork adds no LFS objects of its own — new files arrive from upstream merges and their contents already live on that store — so the skip is always correct here, and it is the same `GIT_LFS_SKIP_PUSH=1` upstream's own release scripts use:
+Push with LFS upload skipped: upstream's `lfs.py` installs the Git filter and pre-push hook and stores objects in the `commaai/openpilot-lfs` Hugging Face bucket, which this fork cannot write to. The fork adds no LFS objects of its own — new files arrive from upstream merges and their contents already live in that bucket — so the skip is always correct here. The custom client still honors `GIT_LFS_SKIP_PUSH=1`:
 
     GIT_LFS_SKIP_PUSH=1 git push origin master
 
 Then bump `COMMA_VERSION`'s upstream part to the new upstream version, leaving the `-moonpilot.<n>` suffix alone. See **Versioning** below. The two forked submodules sync on their own schedule — see **Forked opendbc and panda** — and `git submodule update --init --recursive` after a merge is what puts their recorded commits in place. Push each submodule to its `origin` first (they have no LFS, a plain `git push origin master` is fine), then the superproject with the skip above: a pin whose commit is not on the submodule's default branch is a device that cannot check its tree out.
+
+Build before the import smoke: upstream can add params or replace native bindings without a Python merge conflict, and the old binaries then fail imports. `SCALE=1` skips the PC UI's monitor probe, which otherwise creates a window at import and crashes without a display; actual rendering still needs a display.
 
 ### Versioning
 
@@ -403,7 +405,7 @@ Last 2000 upstream commits, per seam file: `pyproject.toml` (391) moves almost w
 - `tools/op.sh build | lint | test [target]` — build, lint, test. `tools/op.sh --help` lists the rest.
 - Offline replay claims go through `moonpilot/lab/` — `python -m moonpilot.lab <subcommand>`, `-h` lists them; each submodule registers its own subcommands, and the route sets and CLI argument helpers they share live in `moonpilot/lab/routes.py`. It extracts rlogs from `.cache/moonpilot-logs` into a derived cache, replays them through the fork code as it is now, and prints the metric beside a replay-vs-logged error. Every route is first replayed in the configuration its own `initData` recorded — its `Moonpilot*` params and commit — because a drive that ran older code does not replay as itself under today's settings: before `d8b15bd1b` controlsd counted `MoonpilotPathSmooth`'s τ into the controller delay, so 40d matches only at a delay offset of 0.10 s and 40e at 0.05. Read that error before the metric; a large one is the drive, not the replay. Add a claim as a subcommand in the matching submodule, plus its route set in `moonpilot/lab/routes.py`. The flight harness the replays fly — the planner builder, the fake `SubMaster`, the lead and `CarParams` builders, the maneuver plant's defaults and the point-mass flight — is `moonpilot/tests/harness.py`, shared with the planner tests so neither grows its own. The extracts hold only what the replays read, so keep the rlogs.
 - A dev PC without AVX2 (e.g. Celeron N5105) dies with `SIGILL` in the longitudinal MPC: comma's x86 `comma-deps-acados` wheel ships a Haswell-only `libblasfeo.so`. `moonpilot/blasfeo_portable.sh` rebuilds it as portable C from the blasfeo revision the wheel pins and swaps it into the venv and `c_generated_code/`; rerun after any reinstall of that wheel. Device builds (aarch64) are unaffected.
-- UI is Python + raylib; tizi (`openpilot/selfdrive/ui/layouts/`) and mici (`openpilot/selfdrive/ui/mici/layouts/`) are separate trees — a fork panel is registered in both.
+- UI is Python + raylib's `raylib_nb` bindings; tizi (`openpilot/selfdrive/ui/layouts/`) and mici (`openpilot/selfdrive/ui/mici/layouts/`) are separate trees — a fork panel is registered in both. Their model renderer shares the tizi base, so fork lead-path hooks live there once. Native calls require `rl.Vector2`, not tuples or `MousePos`; stars use `draw_triangle_fan` with perimeter points wound for the renderer.
 - Tests run through a unittest loader (`tools/test_runner.py`), so fork tests subclass `unittest.TestCase`.
 - Style is enforced by `scripts/lint/lint.sh` and `pyproject.toml` (ruff, ty, codespell); fork code mirrors the conventions of the upstream file it hooks into.
 - `scripts/lint/lint.sh` builds its `${ALL_FILES[@]}` checks — codespell, `check_added_large_files`, the shebang checks — from `git ls-files -z openpilot moonpilot`, so **an untracked file escapes them until it is `git add`ed**. `ruff` and `ty` are handed those two directories instead and do see untracked files. A green run therefore means less than it looks like: stage first, then trust it.

@@ -147,7 +147,7 @@ msgstr "Alterar esta configuração reiniciará o openpilot se o carro estiver l
 
 #: openpilot/selfdrive/ui/widgets/pairing_dialog.py
 msgid "Click \"add new device\" and scan the QR code on the right"
-msgstr "Toque em \"adicionar novo dispositivo\" e escaneie o QR code à direita"
+msgstr "Toque em \"add new device\" e escaneie o QR code à direita"
 
 #: openpilot/selfdrive/ui/widgets/offroad_alerts.py
 msgid "Close"
@@ -204,6 +204,10 @@ msgstr "ID do Dongle"
 #: openpilot/selfdrive/ui/layouts/settings/software.py
 msgid "Download"
 msgstr "Baixar"
+
+#: openpilot/selfdrive/ui/layouts/settings/toggles.py
+msgid "Driving Personality"
+msgstr "Personalidade"
 
 #: openpilot/system/ui/widgets/network.py
 msgid "EDIT"
@@ -289,10 +293,6 @@ msgstr "Fluxo contínuo"
 #: openpilot/selfdrive/ui/widgets/setup.py
 msgid "Firehose Mode"
 msgstr "Modo Firehose"
-
-#: openpilot/selfdrive/ui/layouts/settings/toggles.py
-msgid "Following Distance"
-msgstr ""
 
 #: openpilot/system/ui/widgets/network.py
 msgid "Forget"

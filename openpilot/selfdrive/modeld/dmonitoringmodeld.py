@@ -123,12 +123,14 @@ def main():
   while not vipc_client.connect(False):
     time.sleep(0.1)
   assert vipc_client.is_connected()
+  cam_w, cam_h = vipc_client.width, vipc_client.height
+  assert cam_w is not None and cam_h is not None
   cloudlog.warning(f"connected with buffer size: {vipc_client.buffer_len}")
 
-  model = runtime.create_model(vipc_client.width, vipc_client.height) if runtime is not None else None  # moonpilot seam, see AGENTS.md
+  model = runtime.create_model(cam_w, cam_h) if runtime is not None else None  # moonpilot seam, see AGENTS.md
   if model is None:  # moonpilot seam, see AGENTS.md: a build that fails to load takes the whole runtime with it, so the parse below is upstream's too
     runtime = None
-    model = ModelState(vipc_client.width, vipc_client.height)
+    model = ModelState(cam_w, cam_h)
   cloudlog.warning("models loaded, dmonitoringmodeld starting")
 
   sm = SubMaster(["extrinsicsCalibration"])

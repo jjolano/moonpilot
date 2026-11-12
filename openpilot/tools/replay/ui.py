@@ -4,7 +4,7 @@ import os
 import sys
 
 import numpy as np
-import pyray as rl
+import raylib_nb as rl
 
 import openpilot.cereal.messaging as messaging
 from openpilot.common.basedir import BASEDIR
@@ -31,7 +31,6 @@ ANGLE_SCALE = 5.0
 
 def ui_thread():
   # Get monitor info before creating window
-  rl.set_config_flags(rl.ConfigFlags.FLAG_MSAA_4X_HINT)
   rl.init_window(1, 1, "")
   max_height = rl.get_monitor_height(0)
   rl.close_window()
@@ -49,7 +48,6 @@ def ui_thread():
     write_y = 970
 
   rl.set_trace_log_level(rl.TraceLogLevel.LOG_ERROR)
-  rl.set_config_flags(rl.ConfigFlags.FLAG_MSAA_4X_HINT)
   rl.init_window(size[0], size[1], "openpilot debug UI")
   rl.set_target_fps(60)
 
@@ -139,7 +137,7 @@ def ui_thread():
     rl.begin_drawing()
     rl.clear_background(rl.Color(64, 64, 64, 255))
 
-    # Render camera (NV12->RGB on GPU via shader)
+    # Render camera
     if camera_view.frame:
       cam_h = 640.0 * camera_view.frame.height / camera_view.frame.width
     else:
@@ -204,7 +202,7 @@ def ui_thread():
     mask = np.any(img > 0, axis=2)
     overlay_img[:, :, :3] = img
     overlay_img[:, :, 3] = mask * 255
-    rl.update_texture(overlay_texture, rl.ffi.cast("void *", overlay_img.ctypes.data))
+    rl.update_texture(overlay_texture, overlay_img)
     rl.draw_texture(overlay_texture, 0, 0, rl.WHITE)  # noqa: TID251
 
     # display alerts
@@ -221,7 +219,7 @@ def ui_thread():
     # Convert lid_overlay to RGBA and update top_down texture
     # lid_overlay is (384, 960), need to transpose to (960, 384) for row-major RGBA buffer
     lid_rgba = palette[lid_overlay.T]
-    rl.update_texture(top_down_texture, rl.ffi.cast("void *", np.ascontiguousarray(lid_rgba).ctypes.data))
+    rl.update_texture(top_down_texture, np.ascontiguousarray(lid_rgba))
     rl.draw_texture(top_down_texture, 640, 0, rl.WHITE)  # noqa: TID251
 
     SPACING = 25

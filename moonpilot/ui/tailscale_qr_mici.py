@@ -6,7 +6,7 @@ dialog inverts the code for its dark background.
     OPENPILOT_PREFIX=tssmoke python3 moonpilot/ui/tailscale_qr_mici.py
 """
 
-import pyray as rl
+import raylib_nb as rl
 
 from openpilot.selfdrive.ui.ui_state import ui_state
 from openpilot.system.ui.lib.application import FontWeight

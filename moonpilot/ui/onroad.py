@@ -51,7 +51,7 @@ steering" when it is not.
 
 from typing import Any, Optional
 
-import pyray as rl
+import raylib_nb as rl
 
 from openpilot.selfdrive.ui.ui_state import UIStatus
 

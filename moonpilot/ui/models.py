@@ -8,7 +8,7 @@ now, and a driver picks from the whole list rather than from a paged copy of it.
 
 from collections.abc import Callable
 
-import pyray as rl
+import raylib_nb as rl
 
 from moonpilot import modelprotocols, modelstatus, models, modelview
 from moonpilot.ui import panel_common, widgets

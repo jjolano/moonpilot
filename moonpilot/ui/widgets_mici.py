@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 
-import pyray as rl
+import raylib_nb as rl
 
 from openpilot.selfdrive.ui.mici.widgets.button import BigButton
 from openpilot.selfdrive.ui.mici.widgets.dialog import BigConfirmationDialog, SettingDescriptionDialog
@@ -37,8 +37,8 @@ class SubmenuButton(BigButton):
   def _draw_content(self, btn_y: float):
     super()._draw_content(btn_y)
     rl.draw_texture_ex(self._chevron,
-                       (self._rect.x + self._rect.width - self.LABEL_HORIZONTAL_PADDING - self._chevron.width,
-                        btn_y + (self._rect.height - self._chevron.height) / 2),
+                       rl.Vector2(self._rect.x + self._rect.width - self.LABEL_HORIZONTAL_PADDING - self._chevron.width,
+                                  btn_y + (self._rect.height - self._chevron.height) / 2),
                        0.0, 1.0, rl.Color(255, 255, 255, int(255 * 0.9)) if self.enabled else rl.Color(255, 255, 255, 100))
 
 

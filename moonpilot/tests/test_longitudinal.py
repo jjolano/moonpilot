@@ -1572,7 +1572,10 @@ class TestPlanner(unittest.TestCase):
       def send(self, service, msg):
         sent[service] = msg
 
-    planner.publish(sm, PubMaster())
+    packet = messaging.new_message("longitudinalPlan")
+    packet.logMonoTime = 1_125_000_000
+    with mock.patch("moonpilot.longitudinal.messaging.new_message", return_value=packet):
+      planner.publish(sm, PubMaster())
     plan = sent["longitudinalPlan"].longitudinalPlan
     self.assertEqual(len(plan.speeds), CONTROL_N)
     self.assertEqual(len(plan.accels), CONTROL_N)
@@ -1583,6 +1586,7 @@ class TestPlanner(unittest.TestCase):
     self.assertTrue(plan.hasLead)
     self.assertTrue(plan.longitudinalPlanSource in (Source.cruise, Source.lead0, Source.lead1, Source.e2e))
     self.assertGreaterEqual(plan.solverExecutionTime, 0.0)
+    self.assertAlmostEqual(plan.processingDelay, 0.125)
 
   def test_trajectory_is_the_same_policy_rolled_forward(self):
     """The published plan has to agree with the command, or controlsd's plan and its accel disagree."""

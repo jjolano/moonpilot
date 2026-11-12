@@ -1,4 +1,4 @@
-import pyray as rl
+import raylib_nb as rl
 
 from moonpilot import offroad
 from moonpilot.features import Feature, car_reason, missing_modules

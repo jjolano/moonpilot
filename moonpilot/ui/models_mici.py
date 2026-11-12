@@ -8,7 +8,7 @@ for a star glyph beside a card's value.
 
 from collections.abc import Callable
 
-import pyray as rl
+import raylib_nb as rl
 
 from moonpilot import modelprotocols, modelstatus, models, modelview
 from openpilot.common.params import Params

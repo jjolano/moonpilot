@@ -6,6 +6,8 @@ import platform
 import shlex
 import importlib
 import numpy as np
+import nanobind
+import eigen
 
 import SCons.Errors
 from SCons.Defaults import _stripixes
@@ -59,20 +61,7 @@ pkg_names = ['acados', 'capnproto', 'ffmpeg', 'json11', 'ncurses', 'zstd']
 pkgs = [importlib.import_module(name) for name in pkg_names]
 acados = pkgs[pkg_names.index('acados')]
 ffmpeg = pkgs[pkg_names.index('ffmpeg')]
-# Shared package ships .so/.dylib; older device venvs still have static .a only.
-# Keep static link deps (x264/z/va/drm) when the installed package is static so
-# COMMA_HARDWARE CI works without upgrading the device venv yet.
-# TODO: drop the static fallback once device venvs have comma-deps-ffmpeg>=7.1.0.post94
-_ffmpeg_lib_names = os.listdir(ffmpeg.LIB_DIR) if os.path.isdir(ffmpeg.LIB_DIR) else []
-ffmpeg_shared = any(
-  n.startswith('libavcodec.so') or (n.startswith('libavcodec') and n.endswith('.dylib'))
-  for n in _ffmpeg_lib_names
-)
 ffmpeg_libs = ['avformat', 'avcodec', 'swresample', 'avutil']
-if not ffmpeg_shared:
-  ffmpeg_libs += ['x264', 'z']
-  if arch != "Darwin":
-    ffmpeg_libs += ['va', 'va-drm', 'drm']
 acados_include_dirs = [
   acados.INCLUDE_DIR,
   os.path.join(acados.INCLUDE_DIR, "blasfeo", "include"),
@@ -159,12 +148,11 @@ env = Environment(
     "#rednose_repo/rednose/helpers",
     [x.LIB_DIR for x in pkgs],
   ],
-  RPATH=[ffmpeg.LIB_DIR] if ffmpeg_shared else [],
-  CYTHONCFILESUFFIX=".cpp",
+  RPATH=[ffmpeg.LIB_DIR],
   COMPILATIONDB_USE_ABSPATH=True,
   REDNOSE_ROOT="#rednose_repo",
-  tools=["default", "cython", "compilation_db", "rednose_filter"],
-  toolpath=["#msgq_repo/site_scons/site_tools", "#rednose_repo/site_scons/site_tools"],
+  tools=["default", "compilation_db", "rednose_filter"],
+  toolpath=["#rednose_repo/site_scons/site_tools"],
 )
 # SCons' Darwin linker tool doesn't define the variables used to expand RPATH.
 if arch == "Darwin":
@@ -229,6 +217,20 @@ else:
 
 np_version = SCons.Script.Value(np.__version__)
 Export('envCython', 'np_version')
+
+# ********** nanobind build environment **********
+envNanobind = env.Clone(LIBS=[])
+nanobind_dir = os.path.dirname(nanobind.__file__)
+envNanobind.Append(CPPPATH=[sysconfig.get_paths()['include'], nanobind.include_dir(), os.path.join(nanobind_dir, "ext", "robin_map", "include"),
+                            os.path.join(eigen.INCLUDE_DIR, "eigen3")],
+                   CCFLAGS=["-fvisibility=hidden"])
+envNanobind["CCFLAGS"] = [f for f in envNanobind["CCFLAGS"] if not f.startswith("-Wshadow")]
+envNanobind["NANOBIND_SOURCE"] = os.path.join(nanobind_dir, "src", "nb_combined.cpp")
+if arch == "Darwin":
+  envNanobind["LINKFLAGS"] = env["LINKFLAGS"] + ["-bundle", "-undefined", "dynamic_lookup"]
+else:
+  envNanobind["LINKFLAGS"] = ["-pthread", "-shared"]
+Export('envNanobind')
 
 Export('env', 'arch', 'acados', 'ffmpeg_libs')
 

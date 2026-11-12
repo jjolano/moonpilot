@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-import pyray as rl
+import raylib_nb as rl
 
 from openpilot.system.ui.lib.application import FontWeight, TextAlignment, TextAlignmentVertical, gui_app
 from openpilot.system.ui.widgets import DialogResult, MousePos
@@ -59,7 +59,7 @@ class _SubmenuItem(ListItem):
   def _handle_mouse_release(self, mouse_pos: MousePos):
     if not self.is_visible:
       return
-    if self.action_item and rl.check_collision_point_rec(mouse_pos, self.get_right_item_rect(self._rect)):
+    if self.action_item and rl.check_collision_point_rec(rl.Vector2(mouse_pos.x, mouse_pos.y), self.get_right_item_rect(self._rect)):
       return
     if self.callback:
       self.callback()

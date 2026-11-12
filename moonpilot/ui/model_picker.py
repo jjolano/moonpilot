@@ -14,7 +14,7 @@ protocol the recipe needs.
 import math
 from collections.abc import Callable, Sequence
 
-import pyray as rl
+import raylib_nb as rl
 
 from moonpilot import modelstatus, modelview, models
 from openpilot.common.params import Params
@@ -48,18 +48,14 @@ DARK = rl.Color(30, 30, 30, 255)
 
 
 def draw_star(center_x: float, center_y: float, color: rl.Color) -> None:
-  """A five-pointed star: the five points plus the inner pentagon, as eight triangles. `rl.draw_poly`
-  wants a ctypes array of vertices, and the triangles are the same shape without one."""
-  points = []
+  """Draw a five-pointed star as a triangle fan."""
+  points = [rl.Vector2(center_x, center_y)]
   for index in range(10):
-    angle = -math.pi / 2 + index * math.pi / 5
+    angle = -math.pi / 2 - index * math.pi / 5
     radius = STAR_RADIUS if index % 2 == 0 else STAR_RADIUS * 0.42
     points.append(rl.Vector2(center_x + radius * math.cos(angle), center_y + radius * math.sin(angle)))
-  for index in range(0, 10, 2):
-    rl.draw_triangle(points[index - 1], points[index], points[(index + 1) % 10], color)
-  rl.draw_triangle(points[1], points[3], points[5], color)
-  rl.draw_triangle(points[1], points[5], points[7], color)
-  rl.draw_triangle(points[1], points[7], points[9], color)
+  points.append(points[1])
+  rl.draw_triangle_fan(points, len(points), color)
 
 
 class Row(Button):
@@ -88,7 +84,7 @@ class Row(Button):
 
   def _handle_mouse_release(self, mouse_pos: MousePos):
     star = rl.Rectangle(self._rect.x + self._rect.width - STAR_HIT, self._rect.y, STAR_HIT, self._rect.height)
-    if self._on_star is not None and rl.check_collision_point_rec(mouse_pos, star):
+    if self._on_star is not None and rl.check_collision_point_rec(rl.Vector2(mouse_pos.x, mouse_pos.y), star):
       self._on_star()
       return
     super()._handle_mouse_release(mouse_pos)

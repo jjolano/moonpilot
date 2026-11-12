@@ -28,10 +28,10 @@ dependencies = [
   # vendored native dependencies
   "comma-deps-capnproto",
   "comma-deps-acados",
+  "Cython",  # acados solver python bindings
   "comma-deps-ffmpeg",
   "comma-deps-zstd",
   "comma-deps-json11",
-  "comma-deps-git-lfs",
   "comma-deps-gcc-arm-none-eabi",
 
   # athena
@@ -61,6 +61,9 @@ testing = [
 tools = [
   "matplotlib",
 
+  # LFS uploads (lfs.py pre-push)
+  "hf-xet==1.7.0",
+
   "comma-deps-imgui",
   "comma-deps-bootstrap-icons",
   "comma-deps-libusb",
@@ -71,7 +74,7 @@ tools = [
 ]
 
 submodules = [
-  "msgq-ipc",
+  "msgq-ipc[build]",
   "opendbc",
   "pandacan",
   "rednose",
@@ -135,11 +138,14 @@ lint.flake8-implicit-str-concat.allow-multiline = false
 
 [tool.ruff.lint.flake8-tidy-imports.banned-api]
 "time.time".msg = "Use time.monotonic. time.time can skip due to its reference clock, you probably want a monotonic clock"
-"pyray.measure_text_ex".msg = "Use openpilot.system.ui.lib.text_measure"
-"pyray.is_mouse_button_pressed".msg = "This can miss events. Use Widget._handle_mouse_press"
-"pyray.is_mouse_button_released".msg = "This can miss events. Use Widget._handle_mouse_release"
-"pyray.draw_text".msg = "Use a function (such as rl.draw_font_ex) that takes font as an argument"
-"pyray.draw_texture".msg = "Use rl.draw_texture_ex for float position support"
+"raylib_nb.measure_text_ex".msg = "Use openpilot.system.ui.lib.text_measure"
+"raylib_nb.is_mouse_button_pressed".msg = "This can miss events. Use Widget._handle_mouse_press"
+"raylib_nb.is_mouse_button_released".msg = "This can miss events. Use Widget._handle_mouse_release"
+"raylib_nb.draw_text".msg = "Use a function (such as rl.draw_font_ex) that takes font as an argument"
+"raylib_nb.draw_texture".msg = "Use rl.draw_texture_ex for float position support"
+"raylib_nb.load_shader".msg = "raylib draws on the CPU, where shaders don't run. Draw with rl.cpu"
+"raylib_nb.load_shader_from_memory".msg = "raylib draws on the CPU, where shaders don't run. Draw with rl.cpu"
+"raylib_nb.load_render_texture".msg = "raylib draws on the CPU, and quickly only onto the screen"
 
 [tool.ruff.format]
 quote-style = "preserve"
