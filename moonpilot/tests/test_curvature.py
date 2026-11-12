@@ -154,12 +154,14 @@ class TestLookahead(unittest.TestCase):
     self.assertEqual(_bits(_update(model, 0.03125, lat_delay=late, lead=0.0, lookahead=lookahead)), _bits(0.03125))
 
 
-def _lanes(bend=0.0, *, probs=(0.9, 0.9), heading=0.0, offset=0.0, edges=None, lane_change=log.LaneChangeState.off):
+def _lanes(bend=0.0, *, probs=(0.9, 0.9), heading=0.0, narrowing=0.0, offset=0.0, edges=None, lane_change=log.LaneChangeState.off):
   """A straight path whose ego lane lines bend at `bend` 1/m (positive right), 3.6 m apart, the car `offset` m right of the
-  lane's center; `edges` is (left y, right y, std) of straight road edges in the car's frame, none published by default."""
+  lane's center and each line turned `narrowing` rad toward it (negative: the lane widens); `edges` is (left y, right y, std)
+  of straight road edges in the car's frame, none published by default."""
   model = _corner(0.0)
   x = np.asarray(ModelConstants.X_IDXS)
-  model.laneLines = [log.XYZTData.new_message(x=x.tolist(), y=(line - offset + heading * x + 0.5 * bend * x**2).tolist())
+  model.laneLines = [log.XYZTData.new_message(x=x.tolist(), y=(line - offset + (heading - narrowing * math.copysign(1.0, line)) * x
+                                                                + 0.5 * bend * x**2).tolist())
                      for line in (-5.4, -1.8, 1.8, 5.4)]
   model.laneLineProbs = [0.5, probs[0], probs[1], 0.5]
   if edges is not None:
@@ -211,6 +213,20 @@ class TestRecenter(unittest.TestCase):
     near_left = _lanes(offset=-0.7)  # 1.1 m from the left line
     self.assertEqual(_bits(self._out(near_left, 4 * self.CAP)), _bits(4 * self.CAP))  # back toward the center: free
     self.assertAlmostEqual(self._out(near_left, -4 * self.CAP), -self.CAP, delta=1e-12)  # further toward the line: capped
+
+  def test_a_correction_the_cap_could_not_finish_short_of_the_line_is_never_capped(self):
+    # Centered, 1.8 m from each line, steering responding 0.28 s out (capture age + lateral delay): at 25 m/s the car keeps
+    # 1.3 m only from an approach below 0.47 m/s, a heading of 0.019 rad.
+    toward_right = _lanes(heading=-0.03)  # the right line closes on the car at 0.75 m/s
+    self.assertEqual(_bits(self._out(toward_right, -4 * self.CAP)), _bits(-4 * self.CAP))  # the left move recovers: free
+    self.assertAlmostEqual(self._out(toward_right, 4 * self.CAP), self.CAP, delta=1e-8)  # further toward it: capped
+    self.assertAlmostEqual(self._out(_lanes(heading=-0.01), -4 * self.CAP), -self.CAP, delta=1e-8)  # the cap stops 0.25 m/s in time
+    # 0.5 m/s: the cap alone would stop it 1.38 m short, but not after the 0.14 m covered before steering responds
+    self.assertEqual(_bits(self._out(_lanes(heading=-0.02), -4 * self.CAP)), _bits(-4 * self.CAP))
+    # each line's own slope: a narrowing lane closes on both sides, a widening one on neither
+    for move in (-4 * self.CAP, 4 * self.CAP):
+      self.assertEqual(_bits(self._out(_lanes(narrowing=0.03), move)), _bits(move))
+      self.assertAlmostEqual(self._out(_lanes(narrowing=-0.03), move), math.copysign(self.CAP, move), delta=1e-8)
 
   def test_a_move_away_from_an_unseen_line_is_never_capped_whatever_the_road_edge_says(self):
     # 1.1 m from a left line the model does not see: the right move may be the recovery from it, so it passes...

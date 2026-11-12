@@ -6,6 +6,7 @@ the driver's own steering on the same roads, and what the cap does to it.
 One row per modelV2 (20 Hz), with the newest carState/carControl/controlsState it saw. The lane lines' first
 MOONPILOT_RECENTER_FIT_X m are kept, which is all `lane_bend` reads.
 """
+import argparse
 from types import SimpleNamespace
 
 import numpy as np
@@ -18,13 +19,13 @@ from moonpilot.curvature import MOONPILOT_RECENTER_FIT_X, MOONPILOT_RECENTER_LAT
 from moonpilot.lab import DEFAULT_ROOT, cached, expand
 from moonpilot.lab.routes import LURCH_EVENT, add_routes_arg
 
-VERSION = 2  # v2 keeps the road edges at the car and their stds, which the recovery-side guard reads
+VERSION = 3  # v3 keeps each frame's capture age and lateralDelay, the horizon the recovery-side guard reads
 N_X = int(np.searchsorted(ModelConstants.X_IDXS, MOONPILOT_RECENTER_FIT_X, side="right"))
 
 
 
 def _build(segs):
-  rows, cs, lat, curv = [], (0.0, False), False, 0.0
+  rows, cs, lat, curv, delay = [], (0.0, False), False, 0.0, 0.0  # no lateralDelay yet: the guard reads no response horizon
   # One reader per segment, so each is freed once read: a LogReader over the whole route keeps every segment it has read.
   for m in (msg for seg in segs for msg in LogReader(seg, sort_by_time=True)):
     w = m.which()
@@ -34,6 +35,8 @@ def _build(segs):
       lat = m.carControl.latActive
     elif w == "controlsState":
       curv = m.controlsState.curvature
+    elif w == "lateralDelay":
+      delay = m.lateralDelay.lateralDelay
     elif w == "modelV2":
       mv = m.modelV2
       if len(mv.laneLines) != 4 or len(mv.laneLineProbs) != 4 or min(len(mv.laneLines[1].y), len(mv.laneLines[2].y)) < N_X:
@@ -41,10 +44,11 @@ def _build(segs):
       edges = [e.y[0] if len(e.y) else float("nan") for e in mv.roadEdges] if len(mv.roadEdges) == 2 else [float("nan")] * 2
       stds = list(mv.roadEdgeStds) if len(mv.roadEdgeStds) == 2 else [float("nan")] * 2
       rows.append((m.logMonoTime * 1e-9, cs[0], cs[1], lat, curv, mv.action.desiredCurvature, mv.meta.laneChangeState.raw,
-                   mv.laneLineProbs[1], mv.laneLineProbs[2], *edges, *stds, *list(mv.laneLines[1].y)[:N_X], *list(mv.laneLines[2].y)[:N_X]))
+                   mv.laneLineProbs[1], mv.laneLineProbs[2], *edges, *stds, (m.logMonoTime - mv.timestampEof) * 1e-9, delay,
+                   *list(mv.laneLines[1].y)[:N_X], *list(mv.laneLines[2].y)[:N_X]))
   a = np.asarray(rows, dtype=float)
   keys = ("t", "v", "pressed", "lat", "curvature", "action", "lane_change", "prob_left", "prob_right", "edge_left", "edge_right",
-          "edge_std_left", "edge_std_right")
+          "edge_std_left", "edge_std_right", "capture_age", "lat_delay")
   d = {k: a[:, i] for i, k in enumerate(keys)}
   d["left"], d["right"] = a[:, len(keys):len(keys) + N_X], a[:, len(keys) + N_X:]
   return d
@@ -70,8 +74,17 @@ def _route(job):
   except (FileNotFoundError, ValueError) as e:
     return route, None, str(e)
   lane = lanes(d)
-  capped = np.asarray([recentered(r, b, s, cap) if c == 0 else r for r, b, s, c in zip(d["action"], lane, d["v"], d["lane_change"], strict=True)])
-  return route, {**d, "bend": np.asarray([b.bend for b in lane]), "weight": np.asarray([b.weight for b in lane]), "capped": capped}, None
+  # controlsd's horizon at the model's arrival; ceiling: the drive's PathSmooth lead and a marketplace model's smoothing are not added
+  horizon = d["capture_age"] + d["lat_delay"]
+
+  def replay(lanes_):
+    return np.asarray([recentered(r, b, s, cap, h) if c == 0 else r
+                       for r, b, s, c, h in zip(d["action"], lanes_, d["v"], d["lane_change"], horizon, strict=True)])
+
+  capped = replay(lane)
+  position_only = replay([b._replace(left_slope=0.0, right_slope=0.0) for b in lane])  # the guard reading distance alone
+  return route, {**d, "bend": np.asarray([b.bend for b in lane]), "weight": np.asarray([b.weight for b in lane]), "capped": capped,
+                 "position_only": position_only}, None
 
 
 def _q(x):
@@ -106,9 +119,18 @@ def _recenter(args):
   steer = (v > 12.0) & (cat(lambda r: r["lat"]) > 0) & (cat(lambda r: r["pressed"]) == 0)
   print(f"\ncap {args.cap} m/s^2, openpilot steering above 12 m/s ({steer.sum() * DT_MDL / 60:.0f} min):")
   for name, m in (("straight-ish (bend < 0.5 m/s^2)", steer & ~curve), ("curves (bend >= 0.5 m/s^2)", steer & curve)):
+    if not m.any():
+      print(f"  {name}: no frames")
+      continue
     r = removed[m]
     print(f"  {name}: the request lowered by > 0.05 m/s^2 on {np.mean(r > 0.05) * 100:.2f}% of {m.sum() * DT_MDL / 60:.0f} min, "
           + f"by p99 {np.percentile(r, 99):.2f}, max {r.max():.2f}")
+  action, capped, position_only = cat(lambda r: r["action"]), cat(lambda r: r["capped"]), cat(lambda r: r["position_only"])
+  by_position = np.abs(action - position_only) * v**2 > 0.05
+  harder = steer & (np.abs(action - capped) > np.abs(action - position_only))
+  print(f"  the approach term passes {np.sum(steer & by_position & (removed <= 0.05))} of the {np.sum(steer & by_position)} frames "
+        + f"a guard reading the line's distance alone lowers by > 0.05 m/s^2; it changes {np.sum(steer & (capped != position_only))} "
+        + f"and lowers {np.sum(harder)} harder")
 
   route, lo, hi = LURCH_EVENT
   if route in done:
@@ -122,8 +144,15 @@ def _recenter(args):
     print(f"  peak left {np.min(e['action'][win] * e['v'][win] ** 2):+.2f} -> {np.min(e['capped'][win] * e['v'][win] ** 2):+.2f}")
 
 
+def _cap(text):
+  cap = float(text)
+  if not cap > 0.0:  # the guard's stopping distance divides by it; on the car, 0 is the feature off
+    raise argparse.ArgumentTypeError("must be above 0 m/s^2")
+  return cap
+
+
 def register(sub):
   p = sub.add_parser("recenter", help="MoonpilotPathRecenter: the request beyond the lane's bend, openpilot against the driver, and the cap")
   add_routes_arg(p, ["recenter"])
-  p.add_argument("--cap", type=float, default=MOONPILOT_RECENTER_LAT_ACCEL, help="m/s^2 beyond the lane's bend")
+  p.add_argument("--cap", type=_cap, default=MOONPILOT_RECENTER_LAT_ACCEL, help="m/s^2 beyond the lane's bend, above 0")
   p.set_defaults(fn=_recenter)

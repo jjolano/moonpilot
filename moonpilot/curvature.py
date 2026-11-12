@@ -42,11 +42,14 @@ MOONPILOT_MAX_MODEL_AGE = 2 * DT_MDL  # s; two missed 20 Hz model periods disabl
 # the lane lines' curvature from a quadratic fit over the first MOONPILOT_RECENTER_FIT_X m, weighted by how well each line
 # is seen. The cap only ever takes turn away from the request, never adds any or reverses it; it fades out in curves,
 # where taking turn away runs wide; and it only touches a move whose recovery side -- the side the car is leaving -- has a
-# seen lane line at least MOONPILOT_RECENTER_NEAR_LINE away. A lane line is the only thing that can certify that: a road
-# edge is the road's boundary, not the lane's, so it says nothing about a boundary the car might be recovering from.
-# `python -m moonpilot.lab recenter`: above 12 m/s on well-seen lanes the request goes beyond the bend by p99 0.40 m/s^2
-# against the driver's own 0.34; capped at 0.3 it is lowered by > 0.05 on 0.22% of straight-ish frames and 0.03% in
-# curves. It does not act on 0000046b's lurch, whose recovery side (the right lane line) is unseen throughout.
+# seen lane line that stays at least MOONPILOT_RECENTER_NEAR_LINE away while the car keeps approaching it until steering
+# responds and the cap alone then stops it (approach: that line's slope at the car times speed). A lane line is the only
+# thing that can certify that: a road edge is the road's boundary, not the lane's, so it says nothing about a boundary the
+# car might be recovering from.
+# `python -m moonpilot.lab recenter` (32 drives): above 12 m/s on well-seen lanes the request goes beyond the bend by p99
+# 0.40 m/s^2 against the driver's own 0.38; capped at 0.3 it is lowered by > 0.05 on 0.17% of straight-ish frames and 0.03%
+# in curves. The approach term passes 59 of the 259 frames a distance-only guard lowered, and lowers none harder. It does
+# not act on 0000046b's leftward lurch, whose recovery side (the right lane line) is unseen throughout.
 MOONPILOT_RECENTER_LAT_ACCEL = 0.3  # m/s^2
 MOONPILOT_CORRECTION_SPEEDS = ([8.0, 12.0], [0.0, 1.0])  # m/s
 MOONPILOT_RECENTER_PROBS = ([0.4, 0.6], [0.0, 1.0])  # laneLineProbs: a line earns its weight across this band
@@ -60,43 +63,54 @@ class LaneBend(NamedTuple):
   weight: float  # 0..1, what the better-seen line earns
   left: float  # m, the seen left line's offset at the car (negative); nan when not seen
   right: float  # m, the seen right line's offset (positive); nan when not seen
+  left_slope: float  # dy/dx of the seen left line at the car, positive when it runs off to the right; nan when not seen
+  right_slope: float  # the same for the right line
+
+
+NO_LANE = LaneBend(math.nan, 0.0, math.nan, math.nan, math.nan, math.nan)
 
 
 @functools.lru_cache(maxsize=4)
-def _curvature_weights(x: tuple[float, ...]) -> np.ndarray:
-  """Least-squares weights that read twice the quadratic coefficient of y(x) off the samples at `x`: the curvature."""
-  return 2.0 * np.linalg.pinv(np.vander(np.asarray(x), 3))[0]
+def _fit_weights(x: tuple[float, ...]) -> np.ndarray:
+  """Least-squares weights that read y(x)'s curvature (twice the quadratic coefficient) and its slope at x = 0 off the
+  samples at `x`."""
+  pinv = np.linalg.pinv(np.vander(np.asarray(x), 3))
+  return np.stack((2.0 * pinv[0], pinv[1]))
 
 
 def lane_bend(model) -> LaneBend:
-  """The ego lane's bend from laneLines 1 and 2, confidence-weighted, and where each seen line is."""
+  """The ego lane's bend from laneLines 1 and 2, confidence-weighted, and where each seen line is and how it runs."""
   lines, probs = model.laneLines, model.laneLineProbs
   if len(lines) != 4 or len(probs) != 4:
-    return LaneBend(math.nan, 0.0, math.nan, math.nan)
-  bends, weights, offsets = [], [], [math.nan, math.nan]
+    return NO_LANE
+  bends, weights, offsets, slopes = [], [], [math.nan, math.nan], [math.nan, math.nan]
   for side, i in enumerate((1, 2)):
     x, y = np.asarray(lines[i].x, dtype=float), np.asarray(lines[i].y, dtype=float)
     near = np.flatnonzero((x >= 0.0) & (x <= MOONPILOT_RECENTER_FIT_X))
     weight = float(np.interp(probs[i], *MOONPILOT_RECENTER_PROBS))
     if len(near) < 5 or len(x) != len(y) or weight <= 0.0 or not np.isfinite(y[near]).all():
       continue
-    bends.append(float(_curvature_weights(tuple(x[near])) @ y[near]))
+    bend, slopes[side] = map(float, _fit_weights(tuple(x[near])) @ y[near])
+    bends.append(bend)
     weights.append(weight)
     offsets[side] = float(y[near[0]])
   if not weights:
-    return LaneBend(math.nan, 0.0, math.nan, math.nan)
-  return LaneBend(float(np.average(bends, weights=weights)), max(weights), *offsets)
+    return NO_LANE
+  return LaneBend(float(np.average(bends, weights=weights)), max(weights), *offsets, *slopes)
 
 
-def recentered(request: float, lane: LaneBend, v_ego: float, cap: float) -> float:
-  """See the comment above `MOONPILOT_RECENTER_LAT_ACCEL`."""
+def recentered(request: float, lane: LaneBend, v_ego: float, cap: float, horizon: float) -> float:
+  """See the comment above `MOONPILOT_RECENTER_LAT_ACCEL`; `horizon` is the seconds until steering responds."""
   if not math.isfinite(lane.bend):
     return request
   beyond = request - lane.bend
-  recovery_side = lane.left if beyond > 0.0 else lane.right  # positive is right, so a right move leaves the left side
-  if not abs(recovery_side) >= MOONPILOT_RECENTER_NEAR_LINE:  # close, or nan -- not established: this may be a correction
-    return request
+  # positive is right, so a right move leaves the left side
+  line, slope = (lane.left, lane.left_slope) if beyond > 0.0 else (lane.right, lane.right_slope)
   v = max(v_ego, MIN_SPEED)
+  closing = max(-v * slope * math.copysign(1.0, line), 0.0)  # m/s, the car's approach to that line
+  # How near that approach brings the car: close, or nan -- not established: this may be a correction.
+  if not abs(line) - closing * horizon - closing**2 / (2.0 * cap) >= MOONPILOT_RECENTER_NEAR_LINE:
+    return request
   fade = float(np.interp(v_ego, *MOONPILOT_CORRECTION_SPEEDS) * np.interp(abs(lane.bend) * v**2, *MOONPILOT_RECENTER_BENDS)) * lane.weight
   if fade <= 0.0:
     return request
@@ -162,7 +176,7 @@ def curvature_reference(model, desired_curvature: float, *, v_ego: float, lat_de
     ahead = today if (ahead - today) * today < 0.0 else ahead
   if recenter <= 0.0 or model.meta.laneChangeState.raw != 0:  # a lane change is a sideways move the driver asked for
     return ahead
-  return recentered(ahead, lane_bend(model), v_ego, recenter)
+  return recentered(ahead, lane_bend(model), v_ego, recenter, start)
 
 
 def moonpilot_curvature(params: Params | None = None) -> Callable[..., float] | None:
