@@ -58,7 +58,7 @@ ALLOWED = {
   "openpilot/selfdrive/ui/onroad/augmented_road_view.py": "half-engaged border color; offroad-mode hold gesture",
   "openpilot/selfdrive/ui/onroad/model_renderer.py": "shared lead path draw (tizi and mici)",
   "openpilot/selfdrive/ui/mici/onroad/augmented_road_view.py": "offroad-mode hold gesture (mici)",
-  "openpilot/selfdrive/ui/mici/onroad/model_renderer.py": "half-engaged lane color (mici)",
+  "openpilot/selfdrive/ui/mici/onroad/model_renderer.py": "lead-path update/draw hooks; half-engaged lane color (mici)",
   "openpilot/selfdrive/ui/mici/onroad/alert_renderer.py": "turn-desire banner icon and height",
   "openpilot/selfdrive/ui/layouts/home.py": "brand string",
   "openpilot/selfdrive/ui/layouts/settings/settings.py": "moonpilot panel",
