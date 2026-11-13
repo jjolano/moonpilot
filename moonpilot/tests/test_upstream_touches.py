@@ -53,6 +53,7 @@ ALLOWED = {
   "openpilot/selfdrive/selfdrived/selfdrived.py": "engagement, panda checks, startup/turn/path banners, bounded locationd ride-through",
   "openpilot/selfdrive/selfdrived/events.py": "the half-engagement banner; the turn-desire banner; the path-outside banner",
   "openpilot/selfdrive/test/process_replay/process_replay.py": "moonpilotState in plannerd pubs",
+  "openpilot/selfdrive/ui/ui.py": "UI realtime priority below radar and planning",
   "openpilot/selfdrive/ui/ui_state.py": "moonpilotState subscription",
   "openpilot/selfdrive/ui/soundd.py": "alert volume hold from moonpilot/soundd.py; preserve critical-sound escalation",
   "openpilot/selfdrive/ui/onroad/augmented_road_view.py": "half-engaged border color; offroad-mode hold gesture",

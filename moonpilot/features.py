@@ -4,6 +4,7 @@ from typing import Any
 
 from moonpilot import deps
 from openpilot.common.params import Params
+from openpilot.common.realtime import Priority
 from openpilot.common.version import get_version
 
 
@@ -339,6 +340,11 @@ def choice(feature: Feature, params: Params) -> int:
 
 def value(feature: Feature, params: Params) -> Any:
   return feature.at(choice(feature, params) if not missing_modules(feature) else 0)
+
+
+def ui_priority(upstream: int) -> int:
+  """UI shares CPU 5 with radar and planning; rendering must yield to their realtime work."""
+  return min(upstream, Priority.CTRL_LOW - 1)
 
 
 def brand() -> str:

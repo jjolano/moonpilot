@@ -9,14 +9,15 @@ from openpilot.system.ui.lib.application import gui_app
 from openpilot.selfdrive.ui.layouts.main import MainLayout
 from openpilot.selfdrive.ui.mici.layouts.main import MiciMainLayout
 from openpilot.selfdrive.ui.ui_state import ui_state
+from moonpilot.features import ui_priority as moonpilot_ui_priority  # moonpilot seam, see AGENTS.md
 
 BIG_UI = gui_app.big_ui()
 
 
 def main():
   cores = {5, }
-  # above plannerd and radard
-  config_realtime_process(0, Priority.CTRL_HIGH)
+  # moonpilot seam, see AGENTS.md: display frames must yield to plannerd and radard.
+  config_realtime_process(0, moonpilot_ui_priority(Priority.CTRL_HIGH))
 
   gui_app.init_window("UI")
   if BIG_UI:

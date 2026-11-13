@@ -5,8 +5,9 @@ import unittest
 from pathlib import Path
 
 from openpilot.common.params import ParamKeyType, Params
+from openpilot.common.realtime import Priority
 
-from moonpilot.features import FEATURES, GROUPS, car_reason, choice, enabled, in_force, missing_modules, value, wanted
+from moonpilot.features import FEATURES, GROUPS, car_reason, choice, enabled, in_force, missing_modules, ui_priority, value, wanted
 from moonpilot.tests.fakes import ABSENT, PRESENT, feature as make_feature, params
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -103,6 +104,14 @@ class TestGate(unittest.TestCase):
     for feature in FEATURES:
       with self.subTest(key=feature.key):
         self.assertIsNone(car_reason(feature, None))
+
+
+class TestUiPriority(unittest.TestCase):
+  def test_rendering_yields_to_lead_processing_without_raising_an_already_lower_priority(self):
+    for upstream in (1, Priority.CTRL_LOW - 1, Priority.CTRL_LOW, Priority.CTRL_HIGH):
+      with self.subTest(upstream=upstream):
+        self.assertLess(ui_priority(upstream), Priority.CTRL_LOW)
+        self.assertLessEqual(ui_priority(upstream), upstream)
 
 
 if __name__ == "__main__":
